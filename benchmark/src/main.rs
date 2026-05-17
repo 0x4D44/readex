@@ -193,6 +193,16 @@ fn run_no_subcommand() -> ExitCode {
                 }
             };
 
+            // Stage 8 (HLD §9 + §2.9): regression-gate against the committed
+            // baseline. This prepends the REGRESSIONS / ADVISORY / skipped
+            // block to the TOP of report.md ON DISK (so a human/CI reads the
+            // verdict first) and returns the process exit code: non-zero ONLY
+            // for a gated (same-canonical-host) regression; advisory /
+            // no-baseline / clean ⇒ 0. A malformed baseline is a LOUD distinct
+            // error (Bug-E2 — a broken baseline must NEVER be silently treated
+            // as "no regressions"), non-zero, with NO laundering.
+            let gate_exit = run_regression_gate(&results, &report_path);
+
             println!(
                 "scored {} urls ({}) | crate {} | trafilatura {} | \
                  readability {} | trusted-scores {} | results: {} | report: {}",
@@ -205,7 +215,7 @@ fn run_no_subcommand() -> ExitCode {
                 path.display(),
                 report_path.display()
             );
-            ExitCode::SUCCESS
+            gate_exit
         }
         Err(e) => {
             eprintln!("error: writing results.json: {e}");
@@ -225,6 +235,295 @@ fn fmt_counts(counts: &std::collections::BTreeMap<String, usize>) -> String {
         .map(|(k, v)| format!("{k}:{v}"))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// The committed baseline `results.json` (HLD §9 / §4.1).
+///
+/// `benchmark/baseline/results.json` is the **only** persisted run state in
+/// git (distinct from the gitignored `benchmark/runs/`). The harness only ever
+/// **reads** it; updating it is a deliberate manual `cp` + commit (documented
+/// in `benchmark/README.md`) — there is deliberately **no** baseline-writer
+/// here (HLD §9: "No tooling, no migration — a file copy under version control
+/// is the entire mechanism"). Fixed convention, not configuration (HLD §10).
+fn baseline_results_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("baseline")
+        .join("results.json")
+}
+
+/// Stage-8 regression gate (HLD §9 + §2.9). Compares `current` against the
+/// committed baseline and **prepends** the verdict block to the TOP of
+/// `report.md` on disk (so a human / CI sees it before the summary). Returns
+/// the process exit code.
+///
+/// Exit semantics (HLD §9):
+/// * **No baseline committed** (e.g. first ever run) ⇒ prepend an explicit
+///   *skipped (baseline candidate)* line — never silence, never a false
+///   "no regressions" — and exit **0** (this run is a baseline candidate).
+/// * **Malformed / unreadable baseline** ⇒ a **loud, distinct** error and exit
+///   **non-zero** (Bug-E2: a broken baseline must NOT be silently treated as
+///   "no regressions"). The report is left as written (no laundered block).
+/// * **Valid baseline** ⇒ `regression::compare`; prepend the
+///   `REGRESSIONS` / `BASELINE ADVISORY` block; exit **non-zero ONLY** for a
+///   gated (same-canonical-host) regression — advisory / clean ⇒ **0**.
+///
+/// A failure to prepend the block to `report.md` is itself a loud non-zero
+/// error: the report missing its gate verdict must not pass silently.
+///
+/// Thin orchestrator: it resolves the **fixed** committed-baseline path and
+/// delegates the decision to the pure-seam [`regression_gate_outcome`], then
+/// maps the structured [`GateOutcome`] to the process [`ExitCode`] + the
+/// human-facing stderr line. The seam (path injected) is what makes every
+/// branch — absent / unreadable / malformed / gating / advisory — unit-testable
+/// without touching the real `benchmark/baseline/` location (mirrors the
+/// established `score::score_corpus_with_host` testable-seam convention).
+fn run_regression_gate(current: &score::RunResults, report_path: &std::path::Path) -> ExitCode {
+    let baseline_path = baseline_results_path();
+    match regression_gate_outcome(&baseline_path, current, report_path) {
+        GateOutcome::NoBaseline => {
+            // Honest: the check was SKIPPED (no baseline yet), not passed.
+            eprintln!(
+                "no baseline committed ({}); regression check skipped — this \
+                 run is a baseline candidate (see benchmark/README.md to \
+                 promote it).",
+                baseline_path.display()
+            );
+            ExitCode::SUCCESS
+        }
+        GateOutcome::Clean { host, vacuous } => {
+            if vacuous {
+                // #4b: honest — correctly not a regression (exit 0) but the
+                // gate compared NO trusted numbers (every URL not_scored on
+                // both sides — the M1 floor). It must NOT read as a real pass.
+                eprintln!(
+                    "no regressions vs the committed baseline on host `{host}`, \
+                     but VACUOUS — every URL is not_scored on both the baseline \
+                     and this run (the Milestone-1 floor); this gate compared \
+                     no trusted numbers and is NOT a substantive pass."
+                );
+            } else {
+                eprintln!(
+                    "no regressions vs the committed baseline on host `{host}` \
+                     (clean — ≥1 trusted score compared)."
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        GateOutcome::ReferenceLostNonGating { host, count } => {
+            // #2c: honest — exit 0 (the crate is not implicated) but NOT a
+            // clean pass; the reference/oracle moved under us.
+            eprintln!(
+                "no crate regressions vs the committed baseline on host \
+                 `{host}`, but {count} reference/oracle loss(es) listed in \
+                 report.md (NOT crate regressions — the comparison basis \
+                 changed under us; CI exits 0). Re-bless the baseline if the \
+                 reference environment legitimately changed (see \
+                 benchmark/README.md)."
+            );
+            ExitCode::SUCCESS
+        }
+        GateOutcome::Advisory {
+            current_host,
+            baseline_host,
+            count,
+        } => {
+            eprintln!(
+                "BASELINE ADVISORY: ran on `{current_host}`, baseline from \
+                 `{baseline_host}` — {count} difference(s) listed in \
+                 report.md, NOT regression-gating (HLD §2.9)."
+            );
+            ExitCode::SUCCESS
+        }
+        GateOutcome::Gated { count } => {
+            eprintln!(
+                "REGRESSIONS: {count} offending URL(s) on the declared host — \
+                 regression-gating, exiting non-zero (see report.md)."
+            );
+            ExitCode::FAILURE
+        }
+        GateOutcome::BaselineBroken { message } => {
+            // Loud, distinct, non-zero. A broken baseline is NEVER laundered
+            // into "no regressions" (Bug-E2).
+            eprintln!("error: {message}");
+            ExitCode::FAILURE
+        }
+        GateOutcome::ReportWriteFailed { message } => {
+            eprintln!("error: {message}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The structured result of the regression gate — the **testable** outcome of
+/// [`regression_gate_outcome`], decoupled from `ExitCode` / stderr so every
+/// branch is unit-asserted directly. `BaselineBroken` is a single loud
+/// non-zero outcome covering *unreadable* and *malformed* (both Bug-E2: a
+/// broken baseline must never read as "no regressions"); the carried message
+/// names which.
+#[derive(Debug, PartialEq)]
+enum GateOutcome {
+    /// No baseline committed (NotFound). Exit 0; the skipped line is prepended.
+    NoBaseline,
+    /// Same canonical host, zero regressions. Exit 0. `vacuous` is `true` when
+    /// every URL was `not_scored` on **both** the baseline and this run (the
+    /// M1 floor) — the gate compared no trusted numbers, so it is correctly
+    /// not a regression but is **NOT a substantive pass** (#4b); the stderr
+    /// line says so explicitly (mirrors the honest no-baseline line).
+    Clean { host: String, vacuous: bool },
+    /// Same canonical host, ≥1 offender, but **every** offender is non-gating
+    /// ([`regression::RegressionKind::ReferenceLost`] — the oracle/reference
+    /// changed under us, #2c). Exit **0** (the crate is not implicated; never
+    /// laundered into a crate red-CI), but it is **NOT** "clean": the offenders
+    /// are still listed in `report.md` as signal, and stderr says so honestly
+    /// (re-bless the baseline if the reference environment legitimately
+    /// changed).
+    ReferenceLostNonGating { host: String, count: usize },
+    /// Different host (or unparseable baseline host) — advisory only, exit 0
+    /// even with differences (HLD §2.9).
+    Advisory {
+        current_host: String,
+        baseline_host: String,
+        count: usize,
+    },
+    /// Same canonical host **and** ≥1 regression — regression-gating, exit
+    /// non-zero (HLD §9).
+    Gated { count: usize },
+    /// The baseline exists but is unreadable or malformed — loud, non-zero,
+    /// NOT laundered into a pass (Bug-E2).
+    BaselineBroken { message: String },
+    /// The verdict block could not be prepended to `report.md` — loud,
+    /// non-zero (the report missing its verdict must not pass silently).
+    ReportWriteFailed { message: String },
+}
+
+/// Pure-seam regression gate (HLD §9 + §2.9) — the testable core of
+/// [`run_regression_gate`] with the baseline path **injected** so every branch
+/// is exercisable without touching the fixed `benchmark/baseline/` location.
+///
+/// Side effect (the one this stage owns): on every non-`BaselineBroken`
+/// outcome it **prepends** the appropriate block to `report_path` so the gate
+/// verdict is the first thing in `report.md`. A prepend failure is its own
+/// loud `ReportWriteFailed` outcome (the report missing its verdict must not
+/// pass silently). `BaselineBroken` deliberately does **not** prepend — there
+/// is no trustworthy verdict to write, and the report is left as the report
+/// layer wrote it (no laundered block).
+fn regression_gate_outcome(
+    baseline_path: &std::path::Path,
+    current: &score::RunResults,
+    report_path: &std::path::Path,
+) -> GateOutcome {
+    // Absent baseline ⇒ NOT an error: the honest skipped block, exit 0. Any
+    // OTHER read error (permission, not-a-file, …) is a real, loud failure —
+    // a baseline that exists but cannot be read must never be laundered into
+    // "no regressions" (Bug-E2).
+    let raw = match fs::read_to_string(baseline_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if let Err(pe) = prepend_to_report(report_path, &regression::no_baseline_block()) {
+                return GateOutcome::ReportWriteFailed {
+                    message: format!("prepending no-baseline notice to report.md: {pe}"),
+                };
+            }
+            return GateOutcome::NoBaseline;
+        }
+        Err(e) => {
+            return GateOutcome::BaselineBroken {
+                message: format!(
+                    "the committed baseline {} exists but could not be read: \
+                     {e}. A broken baseline must fail loudly — it is NOT \
+                     silently treated as 'no regressions' (Bug-E2).",
+                    baseline_path.display()
+                ),
+            };
+        }
+    };
+
+    // Malformed JSON / wrong shape ⇒ loud, distinct, non-zero. A baseline that
+    // does not deserialize to RunResults must NEVER be laundered into a pass.
+    let baseline: score::RunResults = match serde_json::from_str(&raw) {
+        Ok(b) => b,
+        Err(e) => {
+            return GateOutcome::BaselineBroken {
+                message: format!(
+                    "the committed baseline {} is malformed (not a valid \
+                     results.json / RunResults): {e}. A broken baseline must \
+                     fail loudly and is NOT treated as 'no regressions' \
+                     (Bug-E2). Fix or re-capture the baseline (see \
+                     benchmark/README.md).",
+                    baseline_path.display()
+                ),
+            };
+        }
+    };
+
+    // Pure comparator (HLD §9). Timestamp ignored; per-URL keyed by url+host;
+    // host-pin gate decides gating vs advisory (HLD §2.9).
+    let cmp = regression::compare(&baseline, current);
+    let block = regression::render_block(&cmp);
+    if let Err(e) = prepend_to_report(report_path, &block) {
+        return GateOutcome::ReportWriteFailed {
+            message: format!("prepending REGRESSIONS block to report.md: {e}"),
+        };
+    }
+
+    if cmp.should_fail() {
+        GateOutcome::Gated {
+            count: cmp.regressions.len(),
+        }
+    } else {
+        match cmp.gate {
+            regression::Gate::Advisory => GateOutcome::Advisory {
+                current_host: cmp.current_host.clone(),
+                baseline_host: cmp
+                    .baseline_host
+                    .clone()
+                    .unwrap_or_else(|| "<absent/unparseable>".to_string()),
+                count: cmp.regressions.len(),
+            },
+            regression::Gate::Gating => {
+                if cmp.regressions.is_empty() {
+                    GateOutcome::Clean {
+                        host: cmp.current_host.clone(),
+                        // #4b: a gating run with zero offenders is only a
+                        // *substantive* pass if a trusted number was actually
+                        // compared. If every URL was not_scored on both sides
+                        // (the M1 floor) it is VACUOUS — surfaced honestly,
+                        // not as a real pass.
+                        vacuous: cmp.is_vacuous_clean(),
+                    }
+                } else {
+                    // !should_fail() yet offenders present on the gating host
+                    // ⇒ every offender is non-gating (#2c — `ReferenceLost`):
+                    // the oracle/reference moved under us. Exit 0, but NOT
+                    // "clean" — the offenders are real listed signal.
+                    GateOutcome::ReferenceLostNonGating {
+                        host: cmp.current_host.clone(),
+                        count: cmp.regressions.len(),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Prepend `block` to the **front** of `report.md` (HLD §9 — the gate verdict
+/// must be the first thing a human / CI sees, before the report header). Reads
+/// the just-written report, writes `block` followed by the original content.
+/// A single read+write; the report is small and this is the final step.
+///
+/// **Intentionally NON-atomic (#5 — no atomic-rename machinery, premature per
+/// HLD §3).** This operates only on the **disposable, gitignored per-run
+/// scratch** `runs/<ts>/report.md` — regenerated *wholesale* from
+/// `results.json` on the next run, and **never** the committed
+/// `baseline/results.json` (the gate only ever reads the baseline). A torn
+/// write therefore corrupts at most one throwaway scratch file, and any write
+/// failure is surfaced **loudly** as a non-zero
+/// [`GateOutcome::ReportWriteFailed`] by the caller — **never** swallowed. A
+/// temp-file + atomic-rename would add machinery for a failure mode whose blast
+/// radius is a single regenerated scratch file: deliberately not built.
+fn prepend_to_report(report_path: &std::path::Path, block: &str) -> std::io::Result<()> {
+    let existing = fs::read_to_string(report_path)?;
+    fs::write(report_path, format!("{block}{existing}"))
 }
 
 /// `fetch <url>` — one-shot, out-of-band snapshot capture (HLD §6).
@@ -402,5 +701,343 @@ mod tests {
         assert_eq!(civil(18_628), (2021, 1, 1)); // 2021-01-01.
         assert_eq!(civil(19_723), (2024, 1, 1)); // 2024-01-01 (leap year).
         assert_eq!(civil(20_589), (2026, 5, 16)); // 2026-05-16.
+    }
+
+    // ---- Stage 8: regression-gate wiring (the testable seam) ---------------
+    //
+    // `regression_gate_outcome` takes the baseline path as an argument so
+    // every branch is exercised against a temp dir, never the committed
+    // `benchmark/baseline/` location (the established score.rs seam pattern).
+    // The pure transition matrix itself is exhaustively tested in
+    // `regression`'s own module; these assert the I/O wiring + exit mapping +
+    // the Bug-E2 "broken baseline is loud, not laundered" contract.
+
+    use crate::score::{
+        NotScoredReason, RunResults, ScoreOutcome, StatusCounts, UrlRecord, WordCounts,
+    };
+
+    fn rec_scored(url: &str, coverage: f64, wc: usize) -> UrlRecord {
+        UrlRecord {
+            url: url.to_string(),
+            shape_class: "news".to_string(),
+            crate_status: "ok".to_string(),
+            trafilatura_status: "ok".to_string(),
+            readability_status: "ok".to_string(),
+            status_detail: Default::default(),
+            word_counts: WordCounts {
+                crate_wc: Some(wc),
+                trafilatura_wc: Some(wc),
+                readability_wc: Some(wc),
+            },
+            score: ScoreOutcome::Scored {
+                coverage,
+                precision: coverage,
+                edit_sim: coverage,
+            },
+            edit_sim: Some(coverage),
+            guardrail_flag: false,
+            agreement: None,
+        }
+    }
+
+    fn rec_not_scored(url: &str) -> UrlRecord {
+        UrlRecord {
+            url: url.to_string(),
+            shape_class: "news".to_string(),
+            crate_status: "not_implemented".to_string(),
+            trafilatura_status: "oracle_error".to_string(),
+            readability_status: "oracle_error".to_string(),
+            status_detail: Default::default(),
+            word_counts: WordCounts {
+                crate_wc: None,
+                trafilatura_wc: None,
+                readability_wc: None,
+            },
+            score: ScoreOutcome::NotScored {
+                reason: NotScoredReason::CrateNotImplemented,
+            },
+            edit_sim: None,
+            guardrail_flag: false,
+            agreement: None,
+        }
+    }
+
+    fn run(host: &str, ts: &str, urls: Vec<UrlRecord>) -> RunResults {
+        RunResults {
+            host: host.to_string(),
+            utc_timestamp: ts.to_string(),
+            corpus_size: urls.len(),
+            status_counts: StatusCounts::default(),
+            urls,
+        }
+    }
+
+    /// A fresh temp dir + a stub `report.md` (the report layer always writes
+    /// one before the gate runs). Returns `(dir, report_path, baseline_path)`.
+    fn scratch(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("mdrcel-reg-{tag}"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let report = dir.join("report.md");
+        fs::write(&report, "# mdrcel differential test report\n\nbody\n").unwrap();
+        let baseline = dir.join("results.json");
+        (dir, report, baseline)
+    }
+
+    fn write_baseline(path: &std::path::Path, r: &RunResults) {
+        fs::write(path, serde_json::to_string_pretty(r).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn gate_absent_baseline_is_skipped_not_a_false_pass_and_block_prepended() {
+        // No baseline committed (the first-ever-run / current M1 state):
+        // NoBaseline (exit 0), and the report gets an explicit *skipped
+        // (baseline candidate)* block at the TOP — never silence, never a
+        // false "no regressions" (Bug-E2).
+        let (_d, report, baseline) = scratch("absent");
+        // baseline path deliberately does NOT exist.
+        let cur = run("anvil", "t", vec![rec_not_scored("u")]);
+        let out = regression_gate_outcome(&baseline, &cur, &report);
+        assert_eq!(out, GateOutcome::NoBaseline);
+        let body = fs::read_to_string(&report).unwrap();
+        assert!(
+            body.starts_with("# REGRESSIONS"),
+            "skipped notice must be prepended at the TOP: {body:?}"
+        );
+        assert!(
+            body.contains("No baseline committed") && body.contains("baseline candidate"),
+            "must be the honest skipped line, not a false pass: {body}"
+        );
+        // The original report content is preserved AFTER the block.
+        assert!(body.contains("# mdrcel differential test report"));
+    }
+
+    #[test]
+    fn gate_malformed_baseline_is_loud_not_laundered_into_no_regressions() {
+        // THE Bug-E2 wiring test. A baseline that exists but does not
+        // deserialize to RunResults MUST be a loud, distinct, non-zero
+        // BaselineBroken — NEVER silently "no regressions".
+        let (_d, report, baseline) = scratch("malformed");
+        fs::write(&baseline, "{ this is not valid results json ]").unwrap();
+        let cur = run("anvil", "t", vec![rec_scored("u", 0.9, 100)]);
+        let out = regression_gate_outcome(&baseline, &cur, &report);
+        match &out {
+            GateOutcome::BaselineBroken { message } => {
+                assert!(
+                    message.contains("malformed") && message.contains("Bug-E2"),
+                    "broken-baseline message must be loud + explain Bug-E2: {message}"
+                );
+            }
+            other => panic!("malformed baseline must be BaselineBroken, got {other:?}"),
+        }
+        // run_regression_gate maps BaselineBroken → non-zero exit.
+        // And the report is NOT given a laundered "clean" block.
+        let body = fs::read_to_string(&report).unwrap();
+        assert!(
+            !body.contains("clean") && !body.contains("No baseline committed"),
+            "a broken baseline must NOT prepend a clean/skipped block: {body}"
+        );
+    }
+
+    #[test]
+    fn gate_host_match_with_regression_is_gated_non_zero_and_block_at_top() {
+        // Same canonical host + a coverage drop ⇒ Gated (run_regression_gate
+        // maps this to a NON-ZERO exit), with the REGRESSIONS block at the TOP.
+        let (_d, report, baseline) = scratch("gated");
+        write_baseline(
+            &baseline,
+            &run(
+                "ANVIL.corp.local",
+                "old",
+                vec![rec_scored("https://x/1", 0.95, 100)],
+            ),
+        );
+        let cur = run("anvil", "new", vec![rec_scored("https://x/1", 0.10, 100)]);
+        let out = regression_gate_outcome(&baseline, &cur, &report);
+        assert_eq!(out, GateOutcome::Gated { count: 1 });
+        let body = fs::read_to_string(&report).unwrap();
+        assert!(body.starts_with("# REGRESSIONS"), "block at TOP: {body:?}");
+        assert!(body.contains("FAILS") && body.contains("https://x/1"));
+    }
+
+    #[test]
+    fn gate_host_mismatch_is_advisory_exit_zero_even_with_regressions() {
+        // Different host ⇒ Advisory even with a blatant regression (HLD §2.9).
+        // run_regression_gate maps Advisory → exit 0.
+        let (_d, report, baseline) = scratch("advisory");
+        write_baseline(
+            &baseline,
+            &run("anvil", "old", vec![rec_scored("https://x/1", 0.95, 100)]),
+        );
+        let cur = run("borg", "new", vec![rec_scored("https://x/1", 0.01, 1)]);
+        let out = regression_gate_outcome(&baseline, &cur, &report);
+        match &out {
+            GateOutcome::Advisory {
+                current_host,
+                baseline_host,
+                count,
+            } => {
+                assert_eq!(current_host, "borg");
+                assert_eq!(baseline_host, "anvil");
+                assert_eq!(*count, 1, "the delta is still listed as advisory signal");
+            }
+            other => panic!("host mismatch must be Advisory, got {other:?}"),
+        }
+        let body = fs::read_to_string(&report).unwrap();
+        assert!(
+            body.starts_with("# BASELINE ADVISORY"),
+            "advisory block at TOP: {body:?}"
+        );
+        assert!(body.contains("not regression-gating"));
+    }
+
+    #[test]
+    fn gate_same_host_no_regression_is_clean_exit_zero() {
+        // Same host, identical scored records, only the timestamp differs ⇒
+        // Clean (exit 0), timestamp ignored, explicit clean block prepended.
+        let (_d, report, baseline) = scratch("clean");
+        write_baseline(
+            &baseline,
+            &run(
+                "anvil",
+                "2026-01-01T00-00-00Z",
+                vec![rec_scored("u", 0.80, 100)],
+            ),
+        );
+        let cur = run(
+            "anvil",
+            "2026-12-31T23-59-59Z",
+            vec![rec_scored("u", 0.80, 100)],
+        );
+        let out = regression_gate_outcome(&baseline, &cur, &report);
+        assert_eq!(
+            out,
+            GateOutcome::Clean {
+                host: "anvil".to_string(),
+                // A real Scored→Scored pair ⇒ substantive, NOT vacuous (#4b).
+                vacuous: false,
+            }
+        );
+        let body = fs::read_to_string(&report).unwrap();
+        assert!(body.starts_with("# REGRESSIONS") && body.contains("clean"));
+        assert!(
+            !body.contains("VACUOUS"),
+            "a substantive clean must NOT be VACUOUS: {body}"
+        );
+    }
+
+    #[test]
+    fn gate_m1_floor_self_compare_is_clean_but_vacuous_exit_zero() {
+        // The end-to-end M1 floor (#4b): a baseline that is itself the
+        // all-NotScored floor vs the same floor now ⇒ Clean but **VACUOUS**,
+        // exit 0. It is correctly NOT a regression (nothing laundered into a
+        // fake delta), but it compared NO trusted numbers, so it must be
+        // surfaced as NOT a substantive pass (not laundered into a fake pass
+        // either) — and the prepended block says VACUOUS.
+        let (_d, report, baseline) = scratch("m1floor");
+        write_baseline(
+            &baseline,
+            &run(
+                "anvil",
+                "t1",
+                vec![rec_not_scored("u1"), rec_not_scored("u2")],
+            ),
+        );
+        let cur = run(
+            "anvil",
+            "t2",
+            vec![rec_not_scored("u1"), rec_not_scored("u2")],
+        );
+        let out = regression_gate_outcome(&baseline, &cur, &report);
+        assert_eq!(
+            out,
+            GateOutcome::Clean {
+                host: "anvil".to_string(),
+                vacuous: true,
+            },
+            "M1 floor self-compare must be Clean{{vacuous:true}} / exit 0"
+        );
+        // run_regression_gate maps Clean{vacuous:true} → exit 0, and the
+        // prepended block must honestly say it is NOT a substantive pass.
+        let body = fs::read_to_string(&report).unwrap();
+        assert!(
+            body.starts_with("# REGRESSIONS") && body.contains("VACUOUS"),
+            "the M1-floor self-compare block must be prepended and say VACUOUS: {body}"
+        );
+        assert!(
+            body.contains("NOT a substantive pass"),
+            "vacuous block must say it is NOT a substantive pass: {body}"
+        );
+    }
+
+    #[test]
+    fn gate_substantive_clean_is_not_vacuous_exit_zero() {
+        // A gating run with ≥1 Scored→Scored within-threshold pair is a
+        // SUBSTANTIVE clean: Clean{vacuous:false}, exit 0, block says clean
+        // and NOT vacuous.
+        let (_d, report, baseline) = scratch("substantive");
+        write_baseline(
+            &baseline,
+            &run("anvil", "t1", vec![rec_scored("https://x/1", 0.80, 100)]),
+        );
+        let cur = run("anvil", "t2", vec![rec_scored("https://x/1", 0.80, 100)]);
+        let out = regression_gate_outcome(&baseline, &cur, &report);
+        assert_eq!(
+            out,
+            GateOutcome::Clean {
+                host: "anvil".to_string(),
+                vacuous: false,
+            },
+            "a real Scored→Scored pair ⇒ substantive Clean, NOT vacuous"
+        );
+        let body = fs::read_to_string(&report).unwrap();
+        assert!(
+            body.contains("clean") && !body.contains("VACUOUS"),
+            "substantive clean must say clean, not VACUOUS: {body}"
+        );
+    }
+
+    #[test]
+    fn gate_reference_loss_on_declared_host_is_non_gating_exit_zero_but_listed() {
+        // #2c end-to-end: a Scored→NotScored(ReferenceUnavailable) on the
+        // DECLARED host. The crate is NOT implicated ⇒ exit 0
+        // (ReferenceLostNonGating, NOT Gated, NOT Clean), but the offender is
+        // still LISTED in the prepended block as signal.
+        let (_d, report, baseline) = scratch("reflost");
+        write_baseline(
+            &baseline,
+            &run(
+                "ANVIL.corp.local",
+                "old",
+                vec![rec_scored("https://x/1", 0.95, 100)],
+            ),
+        );
+        let mut cur = run("anvil", "new", vec![rec_scored("https://x/1", 0.95, 100)]);
+        // Flip the single URL to a reference/oracle loss in the current run.
+        cur.urls[0].score = ScoreOutcome::NotScored {
+            reason: NotScoredReason::ReferenceUnavailable,
+        };
+        cur.urls[0].crate_status = "ok".to_string();
+        cur.urls[0].trafilatura_status = "oracle_error".to_string();
+        let out = regression_gate_outcome(&baseline, &cur, &report);
+        assert_eq!(
+            out,
+            GateOutcome::ReferenceLostNonGating {
+                host: "anvil".to_string(),
+                count: 1,
+            },
+            "a reference/oracle loss on the declared host MUST be \
+             ReferenceLostNonGating (exit 0), never Gated and never Clean"
+        );
+        let body = fs::read_to_string(&report).unwrap();
+        assert!(
+            body.starts_with("# REGRESSIONS") && body.contains("https://x/1"),
+            "the reference loss MUST still be listed in the block as signal: {body}"
+        );
+        assert!(
+            body.contains("does NOT fail") && !body.contains("FAILS"),
+            "the block must say it does NOT fail (not laundered into a crate \
+             red-CI): {body}"
+        );
     }
 }

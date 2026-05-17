@@ -516,6 +516,23 @@ fn canonical_host(raw: &str) -> Option<String> {
     }
 }
 
+/// Public, read-only access to the **canonical host form** — the single
+/// host-identity equality definition (HLD §2.9), exposed for the Stage-8
+/// regression host-pin gate.
+///
+/// This is a thin `pub` re-export of the private [`canonical_host`]: the
+/// Stage-8 forward contract ([`HostDetectionFailed`], `report.rs` §"host
+/// pinning") binds the regression check to compare hosts using **this exact**
+/// canonicalisation on **both** the running host and the baseline's stamped
+/// `host` (`ANVIL` / `anvil` / `anvil.corp.local` are the same host). It
+/// **must not** reimplement the rule — there is exactly one definition and
+/// `regression.rs` calls through here so the two can never drift. Adds no new
+/// behaviour and changes none: same trim / lowercase / FQDN-strip, same
+/// `None` for nothing-non-empty.
+pub fn canonical_host_of(raw: &str) -> Option<String> {
+    canonical_host(raw)
+}
+
 /// Resolve the canonical host from already-collected detection candidates —
 /// the **pure testable seam** for [`host_identity`]. First candidate that
 /// canonicalises to a non-empty value wins; if *every* candidate is
