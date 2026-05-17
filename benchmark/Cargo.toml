@@ -1,6 +1,6 @@
 [package]
 name = "benchmark"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 
 [dependencies]
@@ -12,6 +12,17 @@ serde_json = "1"
 # `unicode-rs` reference implementation, has no transitive runtime deps beyond
 # `tinyvec`, and exposes exactly the `.nfc()` iterator adaptor we need.
 unicode-normalization = "0.1"
+# Snapshot filename derivation: snapshot_filename = hex(sha256(url))[:16]
+# (HLD §6). `sha2` is the `RustCrypto` canonical SHA-256 implementation —
+# minimal, no_std-capable, audited, and the de-facto standard. We need exactly
+# one well-known hash for content-addressing; rolling our own SHA-256 would be
+# strictly worse than this single small dependency.
+sha2 = "0.10"
+# NOTE: the `fetch` subcommand performs its one-shot HTTP GET by shelling out
+# to the system `curl` (see `main.rs`), so there is deliberately **no** HTTP
+# client dependency here. `fetch` is out-of-band (HLD §6) and never on the
+# scoring path; the scoring path is therefore free of any HTTP stack, matching
+# HLD §3 ("Sync, no async"; minimal deps).
 
 [dev-dependencies]
 # Property-based testing for the metric oracle laws (HLD §8): Jaccard/edit

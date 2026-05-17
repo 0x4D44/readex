@@ -32,3 +32,11 @@ Declared reproducibility host: Anvil (Windows 11 Pro 10.0.26200)
   page flags suspected Trafilatura truncation.
 - Corpus path, oracle entrypoints, and the above are conventions/constants,
   not configuration.
+
+## Snapshot capture (`fetch`) — developer-only, out-of-band (HLD §6)
+
+`cargo run -p benchmark -- fetch <url>` captures a snapshot. It is **not**
+part of the scoring run (which never touches the network). It shells out to
+the system **`curl`**, which must be installed and on `PATH`; the harness
+links no HTTP client of its own. If `curl` is absent or the request fails,
+`fetch` errors and leaves no partial snapshot behind.

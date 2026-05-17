@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Synthetic Encyclopedia Article — Differential Test Fixture</title>
+<meta name="description" content="A small synthetic article-shaped page for harness development.">
+<link rel="canonical" href="https://example.test/wikipedia-article">
+</head>
+<body>
+<nav id="site-nav">
+  <ul><li><a href="/">Home</a></li><li><a href="/random">Random</a></li><li><a href="/about">About</a></li></ul>
+</nav>
+<div id="content">
+  <h1>Synthetic Encyclopedia Article</h1>
+  <p><b>The Synthetic Article</b> is a deliberately hand-crafted document used
+  by the mdrcel differential test harness during development. It is not fetched
+  from the live network; it exists so that downstream stages have a stable,
+  byte-identical article-shaped input to exercise extraction against.</p>
+  <h2>Body structure</h2>
+  <p>The page mimics the salient shape of an encyclopedia article: a leading
+  summary paragraph, section headings, and several paragraphs of running prose
+  surrounded by navigation and footer boilerplate that a good extractor should
+  strip. The prose here is intentionally mundane and self-describing so that
+  the expected extracted text is obvious to a human curating a gold entry.</p>
+  <p>A second body paragraph adds enough tokens that token-set Jaccard and the
+  normalised edit distance produce non-degenerate values when this fixture is
+  scored against an oracle or a future crate output.</p>
+  <h2>References</h2>
+  <ol><li>Synthetic source one.</li><li>Synthetic source two.</li></ol>
+</div>
+<footer id="site-footer">
+  <p>Boilerplate footer — privacy policy, terms, and copyright notice that is
+  not part of the article body.</p>
+</footer>
+</body>
+</html>

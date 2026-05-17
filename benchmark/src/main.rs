@@ -1,8 +1,24 @@
 //! `benchmark` — the mdrcel differential test harness CLI entrypoint.
 //!
-//! Stage 0+1 (Bootstrap): the workspace skeleton compiles and runs. The full
-//! CLI (corpus loading, oracle invocation, scoring, report, regression) is
-//! implemented in later stages; the modules below are stubs for now.
+//! Stage 3 (corpus loader + fetch). Subcommand dispatch:
+//!
+//! * `cargo run -p benchmark` (no subcommand) — load + validate the corpus
+//!   manifest **and** assert every snapshot exists (`corpus::load_checked` —
+//!   the Bug-E2 backstop). Absent manifest **or** zero entries ⇒ prints
+//!   exactly `no corpus` (preserves the Stage-1 contract); a row pointing at
+//!   an absent snapshot is a hard error, not laundered into success.
+//!   Otherwise prints a one-line summary. The scoring pipeline itself is
+//!   Stage 6+ and is deliberately not here yet.
+//! * `cargo run -p benchmark -- fetch <url>` — one-shot, **out-of-band**
+//!   snapshot capture (HLD §6). Shells out to the system `curl` to GET the URL
+//!   straight into the content-addressed snapshot path, then echoes a
+//!   ready-to-paste `urls.tsv` row. This is the ONLY path that performs
+//!   network I/O or writes into `corpus/`; the no-subcommand scoring path
+//!   never reaches it and links no HTTP stack at all.
+//!
+//! The corpus directory is a fixed convention (HLD §10 — no config / env /
+//! flags): `benchmark/corpus/`, resolved relative to this crate's manifest
+//! dir so it is independent of the process working directory.
 
 mod corpus;
 mod crate_run;
@@ -12,6 +28,253 @@ mod regression;
 mod report;
 mod score;
 
-fn main() {
-    println!("no corpus");
+use std::fs;
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+/// The corpus directory, resolved at compile time relative to this crate.
+///
+/// `CARGO_MANIFEST_DIR` is `benchmark/`, so the corpus is always
+/// `benchmark/corpus/` regardless of the process working directory. Fixed
+/// convention, not configuration (HLD §10).
+fn corpus_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("corpus")
+}
+
+fn main() -> ExitCode {
+    // args[0] is the binary; args[1] (if any) is the subcommand.
+    let args: Vec<String> = std::env::args().collect();
+
+    match args.get(1).map(String::as_str) {
+        None => run_no_subcommand(),
+        Some("fetch") => match args.get(2) {
+            Some(url) => run_fetch(url),
+            None => {
+                eprintln!("usage: cargo run -p benchmark -- fetch <url>");
+                ExitCode::FAILURE
+            }
+        },
+        Some(other) => {
+            eprintln!(
+                "unknown subcommand {other:?}\n\
+                 usage:\n  \
+                 cargo run -p benchmark              # load corpus / summary\n  \
+                 cargo run -p benchmark -- fetch <url>   # capture a snapshot"
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// No-subcommand path: load the corpus and print a one-line status.
+///
+/// Preserves the Stage-1 contract exactly: an absent manifest or a manifest
+/// with zero entries prints `no corpus`. Otherwise a one-line summary noting
+/// scoring is not yet implemented (the run pipeline is Stage 6+). Never
+/// touches the network — `fetch` is the only path that does.
+fn run_no_subcommand() -> ExitCode {
+    let dir = corpus_dir();
+    let manifest = dir.join("urls.tsv");
+    // `load_checked` (not `load`): a manifest row pointing at an absent
+    // snapshot must fail loudly here, BEFORE any "loaded N" success — the
+    // Bug-E2 backstop. An absent *manifest* is still Ok(empty) ⇒ `no corpus`.
+    match corpus::load_checked(&manifest, &dir) {
+        Ok(entries) if entries.is_empty() => {
+            // Stage-1 contract: absent OR zero entries ⇒ exactly this string.
+            println!("no corpus");
+            ExitCode::SUCCESS
+        }
+        Ok(entries) => {
+            println!(
+                "loaded {} corpus entries (scoring: not implemented)",
+                entries.len()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            // A malformed/inconsistent manifest is a hard, loud failure (not
+            // silently treated as "no corpus"): the Bug-E2 lesson — a broken
+            // input must never be laundered into a passing/empty state.
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `fetch <url>` — one-shot, out-of-band snapshot capture (HLD §6).
+///
+/// GETs `url` (via system `curl`) straight into the content-addressed snapshot
+/// path under `corpus/snapshots/`, and prints a ready-to-paste `urls.tsv` row
+/// (the operator fills in `shape_class` and adjusts the note).
+///
+/// Immutability (HLD §6): if a snapshot already exists for this URL the bytes
+/// are **not** overwritten — re-fetching is a new row + new snapshot by
+/// design, and a content-addressed name only collides when the URL is
+/// identical, in which case the existing committed bytes are authoritative.
+/// This path is unreachable from the scoring run.
+fn run_fetch(url: &str) -> ExitCode {
+    let filename = corpus::snapshot_filename(url);
+    let snapshots = corpus_dir().join("snapshots");
+    let dest = snapshots.join(&filename);
+
+    if let Err(e) = fs::create_dir_all(&snapshots) {
+        eprintln!("error: creating {}: {e}", snapshots.display());
+        return ExitCode::FAILURE;
+    }
+
+    if dest.exists() {
+        // Immutable (HLD §6): the snapshot is already present and committed.
+        // Its bytes may have been fetched long ago, so we must NOT emit a
+        // fresh manifest row stamped with today's date — that would launder a
+        // stale snapshot as freshly fetched. Keep the original row's
+        // `fetched_date`; nothing to add.
+        eprintln!(
+            "snapshot already present (immutable, HLD §6): {}",
+            dest.display()
+        );
+        eprintln!(
+            "not overwritten and no new row emitted — keep the existing \
+             urls.tsv row (its original fetched_date stands)."
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    if let Err(e) = curl_download(url, &dest) {
+        // Never leave a truncated/partial snapshot behind: a half-written
+        // file would later be laundered into scoring as a valid fixture.
+        let _ = fs::remove_file(&dest);
+        eprintln!("error: GET {url} failed: {e}");
+        return ExitCode::FAILURE;
+    }
+    let len = fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+    eprintln!("wrote {len} bytes -> {}", dest.display());
+
+    // Ready-to-paste manifest row. shape_class is left as a placeholder for
+    // the operator to fill from the closed set; today's date is stamped
+    // because these bytes were genuinely fetched just now.
+    let today = today_utc_date();
+    eprintln!("\nadd this row to benchmark/corpus/urls.tsv (set <shape_class>):");
+    println!("{url}\t<shape_class>\t{filename}\t{today}\tfetched via `fetch`");
+    ExitCode::SUCCESS
+}
+
+/// One-shot HTTP GET via the system `curl`, written directly to `dest`.
+///
+/// Deliberately shells out instead of linking an HTTP client: `fetch` is an
+/// out-of-band, developer-only step (HLD §6) that must never put an HTTP stack
+/// on the scoring path (HLD §3 — minimal deps, sync, no async). Reachable ONLY
+/// from `run_fetch`, i.e. only via the explicit `fetch` subcommand.
+///
+/// `curl` writes the body straight to `dest` (`--output`); `--fail` makes a
+/// non-2xx response a non-zero exit (no error page masquerading as a
+/// snapshot), `--location` follows redirects, `--max-time 60` bounds the call.
+/// Returns an error if `curl` is absent (spawn fails) or exits non-zero; the
+/// caller removes any partial `dest` so no truncated snapshot survives.
+fn curl_download(url: &str, dest: &std::path::Path) -> Result<(), String> {
+    let status = std::process::Command::new("curl")
+        .arg("--fail")
+        .arg("--silent")
+        .arg("--show-error")
+        .arg("--location")
+        .arg("--max-time")
+        .arg("60")
+        .arg("--output")
+        .arg(dest)
+        .arg(url)
+        .status()
+        .map_err(|e| format!("could not run `curl` (is it installed and on PATH?): {e}"))?;
+
+    if !status.success() {
+        return Err(format!("`curl` exited unsuccessfully: {status}"));
+    }
+    Ok(())
+}
+
+/// Today's date as `YYYY-MM-DD` (UTC), for the `fetched_date` column.
+///
+/// Computed from `SystemTime` with the civil-date algorithm (Howard Hinnant's
+/// `days_from_civil` inverse) so no date crate is pulled in for one stamp —
+/// the only consumer is a human-pasted manifest row, not scored logic.
+fn today_utc_date() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = (secs / 86_400) as i64; // days since 1970-01-01 (UTC).
+
+    // civil_from_days (Hinnant). `SystemTime::now()` is always post-epoch
+    // (and the error path clamps to 0), so `days >= 0` and `z >= 719_468 > 0`
+    // — the pre-epoch (`z < 0`) era adjustment is unreachable here and is
+    // therefore omitted; `era = z / 146_097` directly.
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn corpus_dir_is_under_this_crate() {
+        let d = corpus_dir();
+        assert!(d.ends_with("corpus"));
+        // Parent is the crate manifest dir (benchmark/).
+        assert_eq!(
+            d.parent().unwrap(),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        );
+    }
+
+    #[test]
+    fn today_utc_date_is_well_formed() {
+        let s = today_utc_date();
+        // YYYY-MM-DD
+        let parts: Vec<&str> = s.split('-').collect();
+        assert_eq!(parts.len(), 3, "date {s:?} not YYYY-MM-DD");
+        assert_eq!(parts[0].len(), 4);
+        assert_eq!(parts[1].len(), 2);
+        assert_eq!(parts[2].len(), 2);
+        let y: i64 = parts[0].parse().unwrap();
+        let m: i64 = parts[1].parse().unwrap();
+        let d: i64 = parts[2].parse().unwrap();
+        assert!((2020..=2100).contains(&y), "year out of sane range: {y}");
+        assert!((1..=12).contains(&m), "month out of range: {m}");
+        assert!((1..=31).contains(&d), "day out of range: {d}");
+    }
+
+    /// Civil-date conversion spot-checks against known UNIX-epoch day counts
+    /// (the algorithm is the testing oracle for the inline date math).
+    #[test]
+    fn civil_date_known_vectors() {
+        // We can't inject time into today_utc_date(); instead re-derive the
+        // pure conversion here from a fixed day count and assert known dates.
+        // Mirrors production: post-epoch only (all vectors below have
+        // `days >= 0`), so no pre-epoch era adjustment.
+        fn civil(days: i64) -> (i64, i64, i64) {
+            let z = days + 719_468;
+            let era = z / 146_097;
+            let doe = z - era * 146_097;
+            let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+            let y = yoe + era * 400;
+            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+            let mp = (5 * doy + 2) / 153;
+            let d = doy - (153 * mp + 2) / 5 + 1;
+            let m = if mp < 10 { mp + 3 } else { mp - 9 };
+            (if m <= 2 { y + 1 } else { y }, m, d)
+        }
+        assert_eq!(civil(0), (1970, 1, 1)); // UNIX epoch.
+        assert_eq!(civil(18_628), (2021, 1, 1)); // 2021-01-01.
+        assert_eq!(civil(19_723), (2024, 1, 1)); // 2024-01-01 (leap year).
+        assert_eq!(civil(20_589), (2026, 5, 16)); // 2026-05-16.
+    }
 }

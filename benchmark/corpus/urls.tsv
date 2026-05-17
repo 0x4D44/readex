@@ -1,0 +1,20 @@
+# mdrcel corpus manifest (HLD section 6). Tab-separated, 5 columns:
+#   url<TAB>shape_class<TAB>snapshot_filename<TAB>fetched_date<TAB>note
+# snapshot_filename = hex(sha256(url))[:16] + .html  (immutable, committed).
+# The three rows below are SYNTHETIC hand-crafted fixtures for downstream
+# stage development -- they were NOT fetched from the live network.
+# Re-fetching a URL means a NEW row + NEW snapshot, never editing an old one.
+#
+# CAVEAT -- EDGAR / table-heavy gap (deliberate, on record):
+# These 3 fixtures cover only the wikipedia, hub_index, and edge_case shapes.
+# They DELIBERATELY EXCLUDE the table-heavy `sec_edgar` shape -- precisely the
+# the consumer breaking case and HLD gold members #3 (SEC 10-K), #5 (table-heavy
+# SEC), #6 (table-heavy regulator). Therefore Stages 6-8 passing on this file
+# is NOT evidence about EDGAR/table extraction or regulator filings. Real
+# EDGAR/regulator snapshots are corpus-curation work (HLD section 11, item 4)
+# and are MANDATORY before the section 2.7 gold-set baseline freeze. Do not
+# treat green here as coverage of the weak point this harness exists to catch.
+
+https://example.test/wikipedia-article	wikipedia	4f87da126dcc0f7a.html	2026-05-17	synthetic article-shaped fixture
+https://example.test/hub-index	hub_index	cb6ee3ae74f2e4c2.html	2026-05-17	synthetic navigation/hub fixture
+https://example.test/edge-empty	edge_case	779af8542eafdd9d.html	2026-05-17	synthetic near-empty body fixture
