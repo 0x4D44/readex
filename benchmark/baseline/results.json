@@ -1,34 +1,34 @@
 {
   "host": "anvil",
-  "utc_timestamp": "2026-05-17T09-02-22Z",
-  "corpus_size": 3,
+  "utc_timestamp": "2026-05-17T16-51-42Z",
+  "corpus_size": 51,
   "status_counts": {
     "crate_status": {
-      "not_implemented": 3
+      "not_implemented": 51
     },
     "trafilatura_status": {
-      "oracle_error": 3
+      "ok": 51
     },
     "readability_status": {
-      "oracle_error": 3
+      "ok": 51
     }
   },
   "urls": [
     {
-      "url": "https://example.test/wikipedia-article",
+      "url": "https://en.wikipedia.org/wiki/Apple_Inc.",
       "shape_class": "wikipedia",
       "crate_status": "not_implemented",
-      "trafilatura_status": "oracle_error",
-      "readability_status": "oracle_error",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
       "status_detail": {
         "crate_reason": null,
-        "trafilatura_reason": "oracle process `python` exited unsuccessfully (exit code: 2); stdout was: ",
-        "readability_reason": "oracle process `node` exited unsuccessfully (exit code: 1); stdout was: "
+        "trafilatura_reason": null,
+        "readability_reason": null
       },
       "word_counts": {
         "crate_wc": null,
-        "trafilatura_wc": null,
-        "readability_wc": null
+        "trafilatura_wc": 28794,
+        "readability_wc": 27915
       },
       "score": {
         "outcome": "not_scored",
@@ -39,20 +39,956 @@
       "agreement": null
     },
     {
-      "url": "https://example.test/hub-index",
+      "url": "https://en.wikipedia.org/wiki/Wm_Morrison_Supermarkets",
+      "shape_class": "wikipedia",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 7629,
+        "readability_wc": 7514
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    },
+    {
+      "url": "https://en.wikipedia.org/wiki/Berkshire_Hathaway",
+      "shape_class": "wikipedia",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 10932,
+        "readability_wc": 10176
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    },
+    {
+      "url": "https://en.wikipedia.org/wiki/Rust_(programming_language)",
+      "shape_class": "wikipedia",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 10668,
+        "readability_wc": 10314
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    },
+    {
+      "url": "https://en.wikipedia.org/wiki/HTML",
+      "shape_class": "wikipedia",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 10265,
+        "readability_wc": 10170
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    },
+    {
+      "url": "https://en.wikipedia.org/wiki/United_States_Securities_and_Exchange_Commission",
+      "shape_class": "wikipedia",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 8829,
+        "readability_wc": 8235
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    },
+    {
+      "url": "https://de.wikipedia.org/wiki/Rust_(Programmiersprache)",
+      "shape_class": "wikipedia",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 5932,
+        "readability_wc": 5654
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    },
+    {
+      "url": "https://fr.wikipedia.org/wiki/Apple",
+      "shape_class": "wikipedia",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 20053,
+        "readability_wc": 21388
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    },
+    {
+      "url": "https://www.sec.gov/Archives/edgar/data/320193/000032019325000079/aapl-20250927.htm",
+      "shape_class": "sec_edgar",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 35991,
+        "readability_wc": 28566
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    },
+    {
+      "url": "https://www.sec.gov/Archives/edgar/data/320193/000032019319000119/a10-k20199282019.htm",
+      "shape_class": "sec_edgar",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 43446,
+        "readability_wc": 32102
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    },
+    {
+      "url": "https://www.sec.gov/Archives/edgar/data/51143/000104746909001737/a2189817z10-k.htm",
+      "shape_class": "sec_edgar",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 0,
+        "readability_wc": 11273
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": true,
+      "agreement": null
+    },
+    {
+      "url": "https://www.sec.gov/Archives/edgar/data/1067983/000095017025025210/brka-20241231.htm",
+      "shape_class": "sec_edgar",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 82647,
+        "readability_wc": 72336
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    },
+    {
+      "url": "https://www.sec.gov/Archives/edgar/data/789019/000095017025100235/msft-20250630.htm",
+      "shape_class": "sec_edgar",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 63663,
+        "readability_wc": 46155
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    },
+    {
+      "url": "https://www.sec.gov/Archives/edgar/data/320193/000032019326000013/aapl-20260328.htm",
+      "shape_class": "sec_edgar",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 17683,
+        "readability_wc": 11501
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    },
+    {
+      "url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=0000320193&type=10-K&dateb=&owner=include&count=40",
+      "shape_class": "sec_edgar",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 1029,
+        "readability_wc": 771
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    },
+    {
+      "url": "https://www.sec.gov/Archives/edgar/data/320193/000032019325000079/0000320193-25-000079-index.htm",
+      "shape_class": "sec_edgar",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 35,
+        "readability_wc": 154
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": true,
+      "agreement": null
+    },
+    {
+      "url": "https://www.gov.uk/government/publications/rates-and-allowances-income-tax/income-tax-rates-and-allowances-current-and-past",
+      "shape_class": "regulator",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 1059,
+        "readability_wc": 817
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    },
+    {
+      "url": "https://www.gov.uk/guidance/rates-and-thresholds-for-employers-2025-to-2026",
+      "shape_class": "regulator",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 3182,
+        "readability_wc": 2548
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    },
+    {
+      "url": "https://www.gov.uk/guidance/rates-and-thresholds-for-employers-2024-to-2025",
+      "shape_class": "regulator",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 3112,
+        "readability_wc": 2493
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    },
+    {
+      "url": "https://www.federalreserve.gov/monetarypolicy/openmarket.htm",
+      "shape_class": "regulator",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 440,
+        "readability_wc": 908
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": true,
+      "agreement": null
+    },
+    {
+      "url": "https://www.federalreserve.gov/releases/h15/",
+      "shape_class": "regulator",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 1023,
+        "readability_wc": 1027
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    },
+    {
+      "url": "https://www.sec.gov/newsroom/press-releases/2024-1",
+      "shape_class": "regulator",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 339,
+        "readability_wc": 328
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    },
+    {
+      "url": "https://www.bankofengland.co.uk/monetary-policy/the-interest-rate-bank-rate",
+      "shape_class": "regulator",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 707,
+        "readability_wc": 800
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    },
+    {
+      "url": "https://www.gov.uk/government/organisations/companies-house",
+      "shape_class": "regulator",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 382,
+        "readability_wc": 212
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    },
+    {
+      "url": "https://www.bbc.com/news/technology",
+      "shape_class": "news",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 355,
+        "readability_wc": 277
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    },
+    {
+      "url": "https://apnews.com/hub/technology",
+      "shape_class": "news",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 155,
+        "readability_wc": 152
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    },
+    {
+      "url": "https://text.npr.org/",
+      "shape_class": "news",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 257,
+        "readability_wc": 6
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    },
+    {
+      "url": "https://text.npr.org/1004",
+      "shape_class": "news",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 245,
+        "readability_wc": 6
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    },
+    {
+      "url": "https://www.theguardian.com/technology",
+      "shape_class": "news",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 49,
+        "readability_wc": 708
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": true,
+      "agreement": null
+    },
+    {
+      "url": "https://www.aljazeera.com/economy/",
+      "shape_class": "news",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 209,
+        "readability_wc": 264
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": true,
+      "agreement": null
+    },
+    {
+      "url": "https://www.cnbc.com/technology/",
+      "shape_class": "news",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 883,
+        "readability_wc": 115
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    },
+    {
+      "url": "https://www.theverge.com/tech",
+      "shape_class": "news",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 76,
+        "readability_wc": 1429
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": true,
+      "agreement": null
+    },
+    {
+      "url": "https://blog.rust-lang.org/",
+      "shape_class": "tech_blog",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 28,
+        "readability_wc": 2473
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": true,
+      "agreement": null
+    },
+    {
+      "url": "https://blog.rust-lang.org/2024/11/28/Rust-1.83.0/",
+      "shape_class": "tech_blog",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 699,
+        "readability_wc": 695
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    },
+    {
+      "url": "https://blog.rust-lang.org/2024/10/17/Rust-1.82.0/",
+      "shape_class": "tech_blog",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 2924,
+        "readability_wc": 2894
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    },
+    {
+      "url": "https://kubernetes.io/docs/concepts/overview/",
+      "shape_class": "tech_blog",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 1403,
+        "readability_wc": 1357
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    },
+    {
+      "url": "https://github.com/rust-lang/rust",
+      "shape_class": "tech_blog",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 207,
+        "readability_wc": 216
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    },
+    {
+      "url": "https://blog.cloudflare.com/",
+      "shape_class": "tech_blog",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 59,
+        "readability_wc": 295
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": true,
+      "agreement": null
+    },
+    {
+      "url": "https://github.blog/",
+      "shape_class": "tech_blog",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 539,
+        "readability_wc": 102
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    },
+    {
+      "url": "https://kubernetes.io/blog/",
+      "shape_class": "tech_blog",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 594,
+        "readability_wc": 65
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    },
+    {
+      "url": "https://www.gov.uk/",
       "shape_class": "hub_index",
       "crate_status": "not_implemented",
-      "trafilatura_status": "oracle_error",
-      "readability_status": "oracle_error",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
       "status_detail": {
         "crate_reason": null,
-        "trafilatura_reason": "oracle process `python` exited unsuccessfully (exit code: 2); stdout was: ",
-        "readability_reason": "oracle process `node` exited unsuccessfully (exit code: 1); stdout was: "
+        "trafilatura_reason": null,
+        "readability_reason": null
       },
       "word_counts": {
         "crate_wc": null,
-        "trafilatura_wc": null,
-        "readability_wc": null
+        "trafilatura_wc": 278,
+        "readability_wc": 234
       },
       "score": {
         "outcome": "not_scored",
@@ -63,20 +999,236 @@
       "agreement": null
     },
     {
-      "url": "https://example.test/edge-empty",
-      "shape_class": "edge_case",
+      "url": "https://en.wikipedia.org/wiki/Main_Page",
+      "shape_class": "hub_index",
       "crate_status": "not_implemented",
-      "trafilatura_status": "oracle_error",
-      "readability_status": "oracle_error",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
       "status_detail": {
         "crate_reason": null,
-        "trafilatura_reason": "oracle process `python` exited unsuccessfully (exit code: 2); stdout was: ",
-        "readability_reason": "oracle process `node` exited unsuccessfully (exit code: 1); stdout was: "
+        "trafilatura_reason": null,
+        "readability_reason": null
       },
       "word_counts": {
         "crate_wc": null,
-        "trafilatura_wc": null,
-        "readability_wc": null
+        "trafilatura_wc": 1003,
+        "readability_wc": 837
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    },
+    {
+      "url": "https://news.ycombinator.com/",
+      "shape_class": "hub_index",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 722,
+        "readability_wc": 538
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    },
+    {
+      "url": "https://www.sec.gov/",
+      "shape_class": "hub_index",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 135,
+        "readability_wc": 62
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    },
+    {
+      "url": "https://lite.cnn.com/",
+      "shape_class": "hub_index",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 1389,
+        "readability_wc": 1289
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    },
+    {
+      "url": "https://example.com/",
+      "shape_class": "edge_case",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 17,
+        "readability_wc": 16
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    },
+    {
+      "url": "https://example.org/",
+      "shape_class": "edge_case",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 17,
+        "readability_wc": 16
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    },
+    {
+      "url": "https://www.iana.org/help/example-domains",
+      "shape_class": "edge_case",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 112,
+        "readability_wc": 113
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    },
+    {
+      "url": "https://httpbin.org/html",
+      "shape_class": "edge_case",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 601,
+        "readability_wc": 605
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    },
+    {
+      "url": "https://www.w3.org/TR/2017/REC-html52-20171214/",
+      "shape_class": "edge_case",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 389,
+        "readability_wc": 348
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    },
+    {
+      "url": "https://info.cern.ch/hypertext/WWW/TheProject.html",
+      "shape_class": "edge_case",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "ok",
+      "readability_status": "ok",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": null,
+        "readability_reason": null
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": 188,
+        "readability_wc": 167
       },
       "score": {
         "outcome": "not_scored",
