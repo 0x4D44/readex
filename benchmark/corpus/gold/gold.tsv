@@ -1,0 +1,15 @@
+# mdrcel GOLD set (HLD §7) — hand-adjudicated ground truth. Tab-separated, 6 columns:
+#   url<TAB>snapshot_filename<TAB>expected_text_file<TAB>min_words<TAB>max_words<TAB>why_critical
+# Comment/blank lines (trimmed line empty or starting with '#') are skipped by
+# both gold parsers (score::GoldSet::load and report::GoldBands::load); each
+# data row has EXACTLY 6 tab-separated fields. Gold body text is derived
+# DIRECTLY from the committed snapshot bytes per Arthur's adjudicated rules and
+# is materially independent of the Trafilatura/Readability oracles (the "beats
+# SOTA" claim would be circular otherwise). Bands: prose entries use
+# floor(0.9*n)..ceil(1.1*n) around the gold's own harness token count n; the
+# two tiny entries use a tight absolute ±3-word band (a ±10% band on n<20 is a
+# sub-word and meaningless). min_words > 0 and min <= actual <= max for all.
+https://en.wikipedia.org/wiki/Apple_Inc.	ae2c2184beb6d264.html	apple-wikipedia.txt	12200	14912	HLD §7 gold #1; human-adjudicated per Arthur's rule: Wikipedia article PROSE ONLY (lead + body, excl. infobox/refs/navboxes/footer), correct Unicode from snapshot — independent of both oracles which dump full References+infobox.
+https://en.wikipedia.org/wiki/Wm_Morrison_Supermarkets	9c8f49f04f792f81.html	morrison-wikipedia.txt	3906	4774	HLD §7 gold #2; human-adjudicated per Arthur's rule: Wikipedia article PROSE ONLY (lead + body, excl. infobox/refs/navboxes/footer), correct Unicode (£/é/– hand-correct vs oracle U+FFFD) — independent of both oracles.
+https://example.com/	0f115db062b7c0dd.html	example-com.txt	14	20	HLD §7 gold; human-adjudicated per Arthur's rule: <h1> 'Example Domain' + the descriptive sentence only, 'Learn more' link excluded; verbatim from snapshot — both oracles drop the <h1> and fuse/spacing-differ on the link.
+https://www.gov.uk/	a604eb8a03efa82d.html	govuk-hub.txt	6	12	HLD §7 gold (hub); human-adjudicated per Arthur's rule: minimal genuine body — only the real <h1> homepage lead line; nav-card grid/services lists/chrome excluded; both oracles wrongly dump 234–278 words of nav link text (the documented hub failure mode).

@@ -1868,6 +1868,102 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    // ---- The COMMITTED gold artifact (HLD §7) — integrity vs the real corpus
+
+    /// The hand-adjudicated gold set committed at `benchmark/corpus/gold/`
+    /// must load cleanly and be internally consistent with the real corpus:
+    ///
+    /// * all 4 rows load via [`GoldSet::load`] with **no** error (so none was
+    ///   silently dropped — the Bug-E2 backstop is satisfied by construction);
+    /// * every gold `url` is a member of the committed corpus
+    ///   (`corpus/urls.tsv`, resolved + existence-checked via `load_checked`)
+    ///   — a gold entry for a URL the harness never scores would be inert;
+    /// * each gold body is non-empty / non-whitespace under the **shared**
+    ///   tokenizer (the exact `tokens()` predicate `GoldSet::load` itself
+    ///   gates on — re-asserted here against the real files);
+    /// * the `gold.tsv` band columns satisfy `0 < min_words ≤ actual ≤
+    ///   max_words`, where `actual` is the gold body's own harness
+    ///   `word_count` (the single word-count definition, HLD §8). The band
+    ///   columns are deliberately not modelled by `GoldSet` (no premature
+    ///   abstraction), so this re-parses `gold.tsv` with the *same* shape the
+    ///   loader validates — it does not weaken or restate the existing
+    ///   `GoldSet`/`GoldError` unit tests, which pin the loader's behaviour on
+    ///   synthetic fixtures; this one pins the *committed artifact* itself.
+    #[test]
+    fn committed_gold_set_is_consistent_with_the_real_corpus() {
+        let corpus_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus");
+
+        // Loads with no error, and is the expected 4-entry curated set
+        // (NOT the empty pre-freeze state).
+        let gold = GoldSet::load(&corpus_dir).expect("committed gold.tsv must load");
+        assert!(!gold.is_empty(), "committed gold set must not be empty");
+        assert_eq!(gold.len(), 4, "expected exactly 4 adjudicated gold entries");
+
+        // The authoritative corpus URL set (drift + snapshot existence both
+        // enforced by load_checked — the same path scoring uses).
+        let manifest = corpus_dir.join("urls.tsv");
+        let entries = crate::corpus::load_checked(&manifest, &corpus_dir)
+            .expect("committed corpus must load");
+        let corpus_urls: std::collections::BTreeSet<&str> =
+            entries.iter().map(|e| e.url.as_str()).collect();
+
+        // Re-parse gold.tsv for the band columns (GoldSet models only
+        // URL→text; the band is a report-layer concern — HLD §7). Same
+        // skip/field rules the loader uses, kept consistent on purpose.
+        let tsv = fs::read_to_string(corpus_dir.join("gold").join("gold.tsv"))
+            .expect("gold.tsv readable");
+        let mut rows = 0usize;
+        for raw in tsv.lines() {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let fields: Vec<&str> = raw.split('\t').collect();
+            assert_eq!(
+                fields.len(),
+                6,
+                "gold.tsv data row must have exactly 6 tab fields: {raw:?}"
+            );
+            let url = fields[0];
+            let min_words: usize = fields[3]
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("min_words not a usize: {raw:?}"));
+            let max_words: usize = fields[4]
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("max_words not a usize: {raw:?}"));
+
+            // The gold URL must be a real, snapshot-backed corpus member.
+            assert!(
+                corpus_urls.contains(url),
+                "gold url {url:?} is not in the committed corpus urls.tsv"
+            );
+
+            // The gold body (via the authoritative loader) must be present
+            // and non-empty under the shared tokenizer.
+            let body = gold
+                .text_for(url)
+                .unwrap_or_else(|| panic!("gold body missing for {url:?}"));
+            assert!(
+                !tokens(body).is_empty(),
+                "gold body for {url:?} is empty / whitespace-only"
+            );
+
+            // Band guard: 0 < min ≤ actual ≤ max, actual = the gold body's
+            // OWN harness word count (the single word-count definition).
+            let actual = word_count(body);
+            assert!(min_words > 0, "min_words must be > 0 for {url:?}");
+            assert!(
+                min_words <= actual && actual <= max_words,
+                "gold word count {actual} for {url:?} outside band \
+                 [{min_words}, {max_words}]"
+            );
+            rows += 1;
+        }
+        assert_eq!(rows, 4, "expected 4 gold.tsv data rows");
+    }
+
     // ---- The honest floor: a NotImplemented crate is NEVER laundered, even
     //      against a REAL oracle reference (the enduring anti-Bug-E2 invariant)
 
