@@ -7,3 +7,14 @@ edition = "2024"
 mdrcel = { path = ".." }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# NFC normalisation for the single tokenizer (HLD §8). `unicode-normalization`
+# is the canonical, minimal crate for Unicode normalization forms — it is the
+# `unicode-rs` reference implementation, has no transitive runtime deps beyond
+# `tinyvec`, and exposes exactly the `.nfc()` iterator adaptor we need.
+unicode-normalization = "0.1"
+
+[dev-dependencies]
+# Property-based testing for the metric oracle laws (HLD §8): Jaccard/edit
+# identity, symmetry, range, triangle sanity. proptest is the standard Rust
+# property-testing tool; dev-only — never linked into the harness binary.
+proptest = "1"
