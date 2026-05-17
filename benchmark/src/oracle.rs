@@ -44,8 +44,11 @@
 //! present), and so a future need (e.g. surfacing the adapter's own count for
 //! diagnostics) needs no type change. They carry `#[allow(dead_code)]` until a
 //! consumer exists — matching the established `metrics.rs`/`corpus.rs`
-//! pre-consumer convention (a per-item allow, never a module-wide one, so
-//! genuinely dead code added later is still caught).
+//! pre-consumer convention (a per-item allow, never a module-wide one, so an
+//! unused `pub` item added later is still caught now that a non-test consumer
+//! of this bin crate exists — see the O4 status note below for the precise,
+//! partial scope of that enforcement; private items and never-constructed
+//! enum variants remain uncaught and rely on convention).
 //!
 //! # Why no `#[serde(deny_unknown_fields)]`
 //!
@@ -87,14 +90,35 @@
 //! legitimately-slow large SEC filing with a hard error would be a
 //! Bug-E2-class loss of information on exactly the named acceptance-critical cases.
 
-// Built ahead of its sole non-test consumer (Stage 6 `score.rs`, harness HLD
-// §12), exactly like `metrics.rs`/`corpus.rs`. Each public item with no
-// in-crate caller until then carries its OWN `#[allow(dead_code)]` + a
-// `TODO(stage-6)` tripwire — deliberately NOT a module-wide `#![allow]`, which
-// would also mask genuinely dead code added later. Per the verified caveat in
-// `metrics.rs`, for this binary crate the `dead_code` lint is currently a
-// no-op under `--test`; the per-item attributes are correct hygiene that
-// becomes enforced the moment a non-test caller exists.
+// O4 status (Stage 6, 2026-05-17). `score.rs` (reachable from `main`'s
+// no-subcommand path) now constructs `OracleKind` and calls `run_oracle`,
+// which transitively reaches `oracle_command`, `run_command_with_timeout` and
+// `ORACLE_TIMEOUT` — their pre-Stage-6 `#[allow(dead_code)]` + `TODO(stage-6)`
+// tripwires were REMOVED (no longer dead code by construction: each now has a
+// real consumer, so none depends on the lint to stay non-dead).
+//
+// O4 is only PARTIALLY discharged for this `benchmark` bin crate, NOT proven
+// fully enforcing — state exactly what a verification probe under
+// `clippy --workspace --all-targets -- -D warnings` shows:
+//   * Unused `pub` items in this bin crate ARE now caught, because a real
+//     non-test consumer (`score.rs`, reachable from `main`) exists, so rustc
+//     seeds dead-code analysis from the binary root through the `pub` surface.
+//   * Unused PRIVATE items and never-constructed ENUM VARIANTS in this bin
+//     crate are STILL NOT compiler-caught — the original Stage-2 O4 caveat
+//     persists there unchanged (notably: `OracleKind`'s variants are kept
+//     non-dead by `score.rs` constructing them, NOT by the lint flagging an
+//     unconstructed variant). These rely on convention + review.
+// No module-wide `#![allow]` was ever added (deliberate), so the `pub`-surface
+// half of the enforcement is genuine; the private / enum-variant half remains
+// a convention, not a proven guarantee.
+//
+// Three items KEEP a scoped allow because Stage 6 deliberately does NOT
+// consume them: `OracleKind::wire_name` (retargeted `TODO(stage-7)` — a
+// report-label candidate, still test-only) and the `OracleResult.html` /
+// `OracleResult.word_count` fields (INTENTIONALLY never scored — HLD §5/§8;
+// kept purely for true 10-field wire fidelity, not a pending consumer). These
+// are `pub`, so they sit in the genuinely-enforced half above: the scoped
+// allow is load-bearing precisely because the lint WOULD otherwise flag them.
 
 use std::io::Read;
 use std::path::Path;
@@ -112,20 +136,30 @@ use serde::{Deserialize, Serialize};
 /// [`OracleStatus::OracleTimeout`]. Revisitable once real corpus timings
 /// exist (evidence-driven, not predicted) — changing it is a one-line edit
 /// here, by design.
-#[allow(dead_code)] // TODO(stage-6): consumed when score.rs drives real runs.
+//
+// O4 (Stage 6, `pub`-surface half — genuinely caught): consumed by
+// `run_oracle` on the non-test `score::score_corpus` → `main` path, so this
+// `pub const` has a real consumer and the pre-Stage-6 `#[allow(dead_code)]` +
+// `TODO(stage-6)` was removed. As a `pub` item it is in the half a probe
+// shows IS now lint-enforced; see the module-level O4 status note for the
+// private / enum-variant half that remains uncaught.
 pub const ORACLE_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Which oracle to invoke. Exactly two, hardcoded by name (harness HLD §3 —
 /// **no** plugin/registry abstraction; the M8-ring-road antipattern).
 ///
-/// Built ahead of its Stage-6 consumer, so the variants carry the established
-/// per-item `#[allow(dead_code)]` + `TODO(stage-6)` convention. NB: unlike the
-/// `metrics.rs` *function* caveat, rustc *does* flag never-constructed enum
-/// variants in a `--test` binary build, so this allow is genuinely enforced
-/// and required for the clippy gate today — it is removed when `score.rs`
-/// constructs an `OracleKind`.
-// TODO(stage-6): remove once score.rs constructs OracleKind.
-#[allow(dead_code)]
+/// O4 status (Stage 6): `score::score_corpus` constructs both
+/// `OracleKind::Trafilatura` and `OracleKind::ReadabilityJs` on the non-test
+/// `main` path, so the pre-Stage-6 per-item `#[allow(dead_code)]` +
+/// `TODO(stage-6)` was removed because every variant now has a real
+/// constructor — NOT because the lint would otherwise flag an unconstructed
+/// variant. A verification probe confirms never-constructed ENUM VARIANTS
+/// (and unused private items) in this `benchmark` bin crate are STILL NOT
+/// compiler-caught under `clippy --workspace --all-targets -- -D warnings`:
+/// the original Stage-2 O4 caveat persists for the non-`pub`-surface case.
+/// These variants stay non-dead by convention + `score.rs` actually
+/// constructing them, not by the dead-code lint (contrast the `pub`-surface
+/// items, which the same probe shows ARE now caught).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OracleKind {
     /// Trafilatura (#1 in the asymmetric hierarchy) — `python run.py`.
@@ -138,7 +172,11 @@ impl OracleKind {
     /// The exact `oracle` string this kind's adapter stamps into its JSON
     /// (sibling §3.2 hardcoded literal). The inverse pairing is asserted in
     /// tests so the wire spelling is pinned.
-    #[allow(dead_code)] // TODO(stage-6): consumed by score.rs result attribution.
+    // NOT consumed by Stage 6: `score.rs` derives status/attribution from the
+    // parsed `OracleResult.oracle` + `OracleStatus`, never via this helper, so
+    // the allow is KEPT (still test-only). TODO retargeted to Stage 7 (the
+    // report may use it for per-oracle column labels).
+    #[allow(dead_code)] // TODO(stage-7): candidate for report.rs oracle labels.
     pub fn wire_name(self) -> &'static str {
         match self {
             OracleKind::Trafilatura => "trafilatura",
@@ -174,7 +212,12 @@ pub struct OracleResult {
     pub text: String,
     /// Extracted HTML where the tool produces it for free. **Captured but
     /// never scored** (harness HLD §5; sibling §3.2 "never scored").
-    #[allow(dead_code)] // TODO(stage-6): never scored; kept for true wire shape.
+    //
+    // O4: allow KEPT — Stage 6 (`score.rs`) confirmed this is deliberately
+    // never read by scoring (HLD §5). It is wire-fidelity only (so the
+    // serialized form is the true 10-field shape and the schema cross-check
+    // sees every property), NOT a pending future-stage consumer.
+    #[allow(dead_code)] // INTENTIONALLY never scored; kept for true wire shape.
     pub html: Option<String>,
     /// The adapter's *own* word count — **informational only**. The harness
     /// recomputes word count via the single tokenizer (`metrics.rs`, HLD §8);
@@ -182,7 +225,13 @@ pub struct OracleResult {
     /// `i64` (signed) because JSON has no unsigned integers and the schema
     /// types it as a plain integer; the harness never arithmetically depends
     /// on it so the (impossible-in-practice) negative is harmless here.
-    #[allow(dead_code)] // TODO(stage-6): harness recomputes; kept for wire shape.
+    //
+    // O4: allow KEPT — Stage 6 (`score.rs`) recomputes word count via
+    // `metrics::word_count` on `.text` and DELIBERATELY never reads this
+    // field (HLD §8 — exactly one word-count definition). Wire-fidelity only,
+    // NOT a pending future-stage consumer; the inertness is now an enforced
+    // Stage-6 fact, not a forward promise.
+    #[allow(dead_code)] // INTENTIONALLY unused by scoring; kept for wire shape.
     pub word_count: Option<i64>,
     /// The tool's reported canonical URL, or `null`. Not scored.
     pub canonical_url: Option<String>,
@@ -248,7 +297,13 @@ pub enum OracleStatus {
 /// The script path is rooted at this crate's `oracles/` tree via
 /// `CARGO_MANIFEST_DIR` (compile-time, working-directory independent — same
 /// technique as `main.rs::corpus_dir`).
-#[allow(dead_code)] // TODO(stage-6): production caller is score.rs (Stage 6).
+// O4 (Stage 6, `pub`-surface half — genuinely caught): reached via
+// `run_oracle` from the non-test `score::score_corpus` → `main` path, so this
+// `pub fn` has a real consumer and the pre-Stage-6 allow was removed. As a
+// `pub` item it is in the half a verification probe shows IS now lint-enforced
+// (unused `pub` items in this bin crate are caught once a non-test consumer
+// exists); the private / enum-variant half remains uncaught — see the
+// module-level O4 status note.
 pub fn oracle_command(
     kind: OracleKind,
     snapshot_abs: &Path,
@@ -297,7 +352,12 @@ pub fn oracle_command(
 /// only chooses the fixed argv and the [`ORACLE_TIMEOUT`] constant, so the
 /// spawn / timeout / parse / tri-state logic is exercised by tests **without**
 /// the real adapters (which the oracle team has not yet delivered).
-#[allow(dead_code)] // TODO(stage-6): production caller is score.rs (Stage 6).
+// O4 (Stage 6, `pub`-surface half — genuinely caught): `score::score_corpus`
+// calls this for both oracles on the non-test `main` path, so this `pub fn`
+// has a real consumer and the pre-Stage-6 allow was removed. As a `pub` item
+// it is in the half a verification probe shows IS now lint-enforced; the
+// private / enum-variant half remains uncaught — see the module-level O4
+// status note.
 pub fn run_oracle(kind: OracleKind, snapshot_abs: &Path, base_url: Option<&str>) -> OracleStatus {
     let (program, args) = oracle_command(kind, snapshot_abs, base_url);
     run_command_with_timeout(&program, &args, ORACLE_TIMEOUT)
@@ -382,7 +442,12 @@ pub fn run_oracle(kind: OracleKind, snapshot_abs: &Path, base_url: Option<&str>)
 ///    alone — §5 doctrine).
 /// 7. exited 0, parsed, `ok:true`, `error == null` → [`Ok`](OracleStatus::Ok)
 ///    (**even if `text:""`** — "found little" is success).
-#[allow(dead_code)] // TODO(stage-6): production caller is score.rs (Stage 6).
+// O4 (Stage 6, `pub`-surface half — genuinely caught): reached via
+// `run_oracle` from the non-test `score::score_corpus` → `main` path, so this
+// `pub fn` has a real consumer and the pre-Stage-6 allow was removed. As a
+// `pub` item it is in the half a verification probe shows IS now lint-enforced;
+// the private / enum-variant half remains uncaught — see the module-level O4
+// status note.
 pub fn run_command_with_timeout(program: &str, args: &[String], timeout: Duration) -> OracleStatus {
     let mut child = match Command::new(program)
         .args(args)

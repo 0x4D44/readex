@@ -1,14 +1,22 @@
 //! `benchmark` — the mdrcel differential test harness CLI entrypoint.
 //!
-//! Stage 3 (corpus loader + fetch). Subcommand dispatch:
+//! Stage 6 (hierarchy scoring + `results.json`). Subcommand dispatch:
 //!
 //! * `cargo run -p benchmark` (no subcommand) — load + validate the corpus
 //!   manifest **and** assert every snapshot exists (`corpus::load_checked` —
 //!   the Bug-E2 backstop). Absent manifest **or** zero entries ⇒ prints
 //!   exactly `no corpus` (preserves the Stage-1 contract); a row pointing at
 //!   an absent snapshot is a hard error, not laundered into success.
-//!   Otherwise prints a one-line summary. The scoring pipeline itself is
-//!   Stage 6+ and is deliberately not here yet.
+//!   Otherwise it **runs the differential pass**: for every URL it spawns both
+//!   oracle adapters (`oracle::run_oracle`), calls the crate in-process
+//!   (`crate_run::run_crate`), applies the anti-Bug-E2 status gate
+//!   (`score::score_url`), writes `runs/<UTC-ts>/results.json`
+//!   (`score::write_results` — gitignored scratch, HLD §4.1/§9), and prints a
+//!   one-line per-status summary. At M1 the adapters do not exist yet, so
+//!   every URL is `crate=not_implemented`, both oracles `oracle_error`
+//!   (a spawn-fail recorded **honestly**), and every score `NotScored` —
+//!   nothing laundered into a passing number (the M1 floor). The Stage-7
+//!   report is generated *from* `results.json` and is deliberately not here.
 //! * `cargo run -p benchmark -- fetch <url>` — one-shot, **out-of-band**
 //!   snapshot capture (HLD §6). Shells out to the system `curl` to GET the URL
 //!   straight into the content-addressed snapshot path, then echoes a
@@ -66,39 +74,119 @@ fn main() -> ExitCode {
     }
 }
 
-/// No-subcommand path: load the corpus and print a one-line status.
+/// No-subcommand path: load the corpus and **run the differential pass**.
 ///
 /// Preserves the Stage-1 contract exactly: an absent manifest or a manifest
-/// with zero entries prints `no corpus`. Otherwise a one-line summary noting
-/// scoring is not yet implemented (the run pipeline is Stage 6+). Never
-/// touches the network — `fetch` is the only path that does.
+/// with zero entries prints `no corpus`. Otherwise it scores every URL
+/// (`score::score_corpus` — spawns both oracles, calls the crate in-process,
+/// applies the anti-Bug-E2 status gate), writes `runs/<UTC-ts>/results.json`
+/// (gitignored scratch, HLD §4.1/§9), and prints a one-line per-status
+/// summary. Never touches the network — `fetch` is the only path that does;
+/// the scoring path only spawns the (local) oracle adapters and reads
+/// committed snapshots.
+///
+/// At M1 the oracle adapters do not exist yet, so every URL is
+/// `crate=not_implemented`, both oracles `oracle_error` (a spawn-fail recorded
+/// honestly), and every score `NotScored` — the documented M1 floor with
+/// nothing laundered into a passing number. The summary line is built from the
+/// recorded statuses, so the floor is visible at a glance.
 fn run_no_subcommand() -> ExitCode {
     let dir = corpus_dir();
     let manifest = dir.join("urls.tsv");
     // `load_checked` (not `load`): a manifest row pointing at an absent
-    // snapshot must fail loudly here, BEFORE any "loaded N" success — the
-    // Bug-E2 backstop. An absent *manifest* is still Ok(empty) ⇒ `no corpus`.
-    match corpus::load_checked(&manifest, &dir) {
+    // snapshot must fail loudly here, BEFORE any scoring — the Bug-E2
+    // backstop. An absent *manifest* is still Ok(empty) ⇒ `no corpus`.
+    let entries = match corpus::load_checked(&manifest, &dir) {
         Ok(entries) if entries.is_empty() => {
             // Stage-1 contract: absent OR zero entries ⇒ exactly this string.
             println!("no corpus");
-            ExitCode::SUCCESS
+            return ExitCode::SUCCESS;
         }
-        Ok(entries) => {
-            println!(
-                "loaded {} corpus entries (scoring: not implemented)",
-                entries.len()
-            );
-            ExitCode::SUCCESS
-        }
+        Ok(entries) => entries,
         Err(e) => {
             // A malformed/inconsistent manifest is a hard, loud failure (not
             // silently treated as "no corpus"): the Bug-E2 lesson — a broken
             // input must never be laundered into a passing/empty state.
             eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Gold set (HLD §7): an absent gold/ dir ⇒ empty set (the M1 / pre-freeze
+    // state). A *present* gold.tsv referencing a missing expected-text file is
+    // a hard error — a broken gold promise must fail loudly (Bug-E2 backstop),
+    // never silently demote a gold URL to the Trafilatura reference.
+    let gold = match score::GoldSet::load(&dir) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Run the differential pass and persist results.json (the single source
+    // of truth for the run; the Stage-7 report is generated from it).
+    //
+    // Fail-closed on host provenance (HLD §2.9): if no real host identity can
+    // be determined the run is unscorable — print a clear message, exit
+    // non-zero, and write NO results.json. A run with no provenance must never
+    // produce a poisoned baseline candidate (see `score::HostDetectionFailed`).
+    let results = match score::score_corpus(&entries, &dir, &gold) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let runs_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("runs");
+    match score::write_results(&results, &runs_root) {
+        Ok(path) => {
+            // One-line per-status summary (HLD §9). The M1 floor is visible
+            // here: crate=not_implemented:N, oracles oracle_error:N — and
+            // every score NotScored (nothing laundered).
+            let scored = results
+                .urls
+                .iter()
+                .filter(|u| matches!(u.score, score::ScoreOutcome::Scored { .. }))
+                .count();
+            // "no gold (M1/pre-freeze)" vs "N gold" — `is_empty` distinguishes
+            // the deliberate pre-freeze state (HLD §2.7/§7) from a curated set.
+            let gold_summary = if gold.is_empty() {
+                "no gold (pre-freeze)".to_string()
+            } else {
+                format!("{} gold", gold.len())
+            };
+            println!(
+                "scored {} urls ({}) | crate {} | trafilatura {} | \
+                 readability {} | trusted-scores {} | results: {}",
+                results.corpus_size,
+                gold_summary,
+                fmt_counts(&results.status_counts.crate_status),
+                fmt_counts(&results.status_counts.trafilatura_status),
+                fmt_counts(&results.status_counts.readability_status),
+                scored,
+                path.display()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: writing results.json: {e}");
             ExitCode::FAILURE
         }
     }
+}
+
+/// Render a per-status count map as a compact `a:1, b:2` string for the
+/// one-line run summary (HLD §9). Deterministic order (`BTreeMap`).
+fn fmt_counts(counts: &std::collections::BTreeMap<String, usize>) -> String {
+    if counts.is_empty() {
+        return "-".to_string();
+    }
+    counts
+        .iter()
+        .map(|(k, v)| format!("{k}:{v}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// `fetch <url>` — one-shot, out-of-band snapshot capture (HLD §6).

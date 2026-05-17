@@ -93,16 +93,26 @@
 //! calls `mdrcel::extract`. Tests inject closures that return each variant (and
 //! one that `panic!`s) to exercise every arm without the algorithm existing.
 
-// Built ahead of its sole non-test consumer (Stage 6 `score.rs`, harness HLD
-// §12), exactly like `oracle.rs`/`metrics.rs`/`corpus.rs`. Each public item
-// with no in-crate caller until then carries its OWN `#[allow(dead_code)]` +
-// a `TODO(stage-6)` tripwire — deliberately NOT a module-wide `#![allow]`,
-// which would also mask genuinely dead code added later. Per the verified
-// caveat in `oracle.rs`/`metrics.rs`, for this binary crate the `dead_code`
-// lint is currently a no-op for *functions* under `--test`, but it IS enforced
-// for never-constructed enum variants — so `CrateStatus`'s variants genuinely
-// need the allow for the clippy gate today; it is removed when `score.rs`
-// constructs/inspects a `CrateStatus`.
+// O4 status (Stage 6, 2026-05-17). `score.rs` (reachable from `main`'s
+// no-subcommand path) constructs/inspects `CrateStatus` (all three variants)
+// and calls `run_crate`, which reaches `run_extraction` — every pre-Stage-6
+// per-item `#[allow(dead_code)]` + `TODO(stage-6)` tripwire in this module
+// was REMOVED (no longer dead code by construction: every item here now has a
+// real consumer, so none of them depends on the lint to stay non-dead).
+//
+// O4 is only PARTIALLY discharged here, NOT proven fully enforcing for this
+// bin crate. A verification probe under
+// `clippy --workspace --all-targets -- -D warnings` establishes only that
+// unused `pub` items in the `benchmark` bin crate ARE now caught (a real
+// non-test consumer, `score.rs`, exists, so rustc seeds dead-code analysis
+// from the binary root through the `pub` surface). It does NOT establish
+// enforcement for unused PRIVATE items or never-constructed ENUM VARIANTS in
+// this bin crate — the original Stage-2 O4 caveat persists there unchanged
+// (notably: `CrateStatus`'s variants are kept non-dead by `score.rs`
+// constructing them, NOT by the lint flagging an unconstructed variant). No
+// module-wide `#![allow]` was ever added (deliberate), so the `pub`-surface
+// half of the enforcement is genuine; the private / enum-variant half remains
+// convention + review, not a proven guarantee.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
@@ -122,8 +132,16 @@ use mdrcel::{ExtractError, Extracted};
 /// clippy's `large_enum_variant`). [`CrateError`](Self::CrateError) carries a
 /// human-readable reason so the Stage-7 report can surface *why* (a hard error
 /// message, or `"panic: …"`) without re-deriving it.
-// TODO(stage-6): remove the allow once score.rs constructs/inspects CrateStatus.
-#[allow(dead_code)]
+//
+// O4 status (Stage 6): `score.rs` constructs/inspects `CrateStatus`
+// (matching all three variants) on the non-test `main` path; the pre-Stage-6
+// `#[allow(dead_code)]` + `TODO(stage-6)` was removed because every variant
+// now has a real constructor — NOT because the lint would otherwise flag an
+// unconstructed variant. A verification probe confirms unused PRIVATE items
+// and never-constructed ENUM VARIANTS in this `benchmark` bin crate are
+// STILL NOT compiler-caught (the original Stage-2 O4 caveat persists for the
+// non-`pub`-surface case); these variants stay non-dead by convention +
+// `score.rs` actually constructing them, not by the dead-code lint.
 #[derive(Debug)]
 pub enum CrateStatus {
     /// `mdrcel::extract` returned `Ok` — **even if `text` is `""`** ("found
@@ -164,7 +182,13 @@ pub enum CrateStatus {
 /// existing (at M1 the real call only ever yields `NotImplemented`). An
 /// end-to-end test asserts this production path yields
 /// [`CrateStatus::NotImplemented`] at M1 (the documented floor).
-#[allow(dead_code)] // TODO(stage-6): production caller is score.rs (Stage 6).
+// O4 (Stage 6, `pub`-surface half — genuinely caught): `score::score_corpus`
+// calls `run_crate` for every URL on the non-test `main` path, so this `pub`
+// fn has a real consumer and the pre-Stage-6 allow was removed. As a `pub`
+// item it is in the half a verification probe shows IS now lint-enforced
+// (unused `pub` items in this bin crate are caught once a non-test consumer
+// exists); the private / enum-variant half remains uncaught (see the
+// module-level O4 status note).
 pub fn run_crate(html: &str, base_url: Option<&str>) -> CrateStatus {
     run_extraction(|| mdrcel::extract(html, base_url))
 }
@@ -196,7 +220,11 @@ pub fn run_crate(html: &str, base_url: Option<&str>) -> CrateStatus {
 /// have mutated is observed after a panic — on the panic path we return a
 /// fresh `CrateError` and touch none of `f`'s captures, so there is no
 /// broken-invariant hazard the `UnwindSafe` bound exists to prevent.
-#[allow(dead_code)] // TODO(stage-6): exercised in production via run_crate (Stage 6).
+// O4 (Stage 6, `pub`-surface half — genuinely caught): reached via `run_crate`
+// from the non-test `score::score_corpus` → `main` path, so this `pub` fn has
+// a real consumer and the pre-Stage-6 allow was removed. `pub`-surface
+// enforcement is the half a verification probe shows IS now real; private /
+// enum-variant items remain uncaught (see the module-level O4 status note).
 pub fn run_extraction<F>(f: F) -> CrateStatus
 where
     F: FnOnce() -> Result<Extracted, ExtractError>,

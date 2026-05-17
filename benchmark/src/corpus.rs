@@ -81,13 +81,17 @@ impl ShapeClass {
     /// The exact lowercase manifest token for this class (HLD §6 spelling).
     ///
     /// The inverse of [`ShapeClass::parse`]; the round-trip is the testing
-    /// oracle for the closed-set spellings. Consumed by the report's
-    /// per-class breakdown (HLD §9, Stage 7) — not yet called from a non-test
-    /// path, so it carries a scoped `#[allow(dead_code)]` like the equivalent
-    /// pre-Stage-6 items in `metrics.rs` (a module-wide allow would mask
-    /// genuinely dead code added later).
-    // TODO(stage-7): remove once report.rs consumes this for the per-class table.
-    #[allow(dead_code)]
+    /// oracle for the closed-set spellings.
+    //
+    // O4 (Stage 6, `pub`-surface half — genuinely caught): `score::score_corpus`
+    // calls `as_str()` to stamp the manifest `shape_class` token into each
+    // `results.json` record on the non-test `main` path, so this `pub fn` has
+    // a real consumer and the pre-Stage-6 `#[allow(dead_code)]` +
+    // `TODO(stage-7)` was removed (no longer dead code by construction). As a
+    // `pub` item it is in the half a verification probe shows IS now
+    // lint-enforced; private items / never-constructed enum variants in this
+    // bin crate remain uncaught (the original Stage-2 O4 caveat persists for
+    // those) — so O4 is only PARTIALLY discharged, not blanket-enforced.
     pub fn as_str(self) -> &'static str {
         match self {
             ShapeClass::Wikipedia => "wikipedia",
@@ -275,9 +279,22 @@ pub fn snapshot_filename(url: &str) -> String {
 ///   hard error — see module docs).
 ///
 /// The line-stripped pure surface the unit tests assert against; the non-test
-/// path goes through [`load_checked`] → [`parse_manifest_with_lines`]. Scoped
-/// `#[allow(dead_code)]` per the [`ShapeClass::as_str`] pre-consumer
-/// convention (not a module-wide allow).
+/// path goes through [`load_checked`] → [`parse_manifest_with_lines`].
+//
+// O4 (Stage 6): allow KEPT — Stage 6's `score`/`main` path uses
+// `load_checked` (the Bug-E2 backstop), never this unchecked pure helper, so
+// it is DELIBERATELY test-only. Scoped (not module-wide) on purpose.
+//
+// Accuracy caveat: `parse_manifest` is a PRIVATE fn, and a verification probe
+// shows unused private items (and never-constructed enum variants) in this
+// `benchmark` bin crate are STILL NOT compiler-caught under
+// `clippy --workspace --all-targets -- -D warnings` — the original Stage-2 O4
+// caveat persists for the non-`pub`-surface case. So this scoped allow is a
+// convention marker, NOT a lint that would currently fire if this helper
+// became genuinely dead; that protection holds for `pub` items (a non-test
+// consumer now exists) but not for private ones like this. The scope is still
+// kept tight so the intent is explicit and so the allow becomes load-bearing
+// if this item is ever made `pub`.
 #[allow(dead_code)]
 fn parse_manifest(text: &str) -> Result<Vec<CorpusEntry>, CorpusError> {
     // Public/pure surface: drop the 1-based line numbers the internal parser
@@ -358,11 +375,22 @@ fn parse_manifest_with_lines(text: &str) -> Result<Vec<(usize, CorpusEntry)>, Co
 /// (HLD §6 immutability).
 ///
 /// Pure layer, consumed by tests and as the documented unchecked entry; the
-/// non-test scoring path uses [`load_checked`] (Bug-E2). Scoped
-/// `#[allow(dead_code)]` follows the same pre-consumer convention as
-/// [`ShapeClass::as_str`] — a module-wide allow would mask genuinely dead code
-/// added later.
-// TODO(stage-6): a non-test caller may use load() directly once score.rs lands.
+/// non-test scoring path uses [`load_checked`] (Bug-E2).
+//
+// O4 (Stage 6): allow KEPT — Stage 6 landed and the `score`/`main` path uses
+// [`load_checked`] (snapshot-existence backstop), NOT this unchecked `load`,
+// so `load` stays DELIBERATELY test-only (the documented pure unchecked
+// surface). Scoped (not module-wide) on purpose, and here that scoping is
+// genuinely load-bearing: `load` is a `pub` fn, and a verification probe
+// shows unused `pub` items in this `benchmark` bin crate ARE now caught under
+// `clippy --workspace --all-targets -- -D warnings` (a real non-test
+// consumer, `score.rs`, now exists, so rustc seeds dead-code analysis from
+// the binary root through the `pub` surface). Without this scoped allow the
+// lint WOULD flag this test-only `pub` fn. (That `pub`-surface enforcement is
+// only the partial O4 discharge: unused PRIVATE items and never-constructed
+// ENUM VARIANTS in this bin crate are STILL NOT compiler-caught — the
+// original Stage-2 O4 caveat persists for those — so do not over-read this as
+// blanket dead-code enforcement.)
 #[allow(dead_code)]
 pub fn load(manifest_path: &Path) -> Result<Vec<CorpusEntry>, CorpusError> {
     Ok(read_manifest_with_lines(manifest_path)?

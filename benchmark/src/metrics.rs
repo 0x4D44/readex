@@ -34,30 +34,32 @@
 //! NFC first would not give that guarantee, so the order is not symmetric and
 //! is fixed here.
 
-// This module is built ahead of its consumer: per harness HLD §12 the pure
-// metrics core (build step 2) lands before `score.rs` (step 6), which is the
-// only non-test caller of these functions. Until that stage lands they are
-// exercised solely by this module's own test/oracle suite, so each carries a
-// scoped `#[allow(dead_code)]` and is NOT dead code in the finished harness.
+// O4 status (Stage 6, 2026-05-17): every function below now has a non-test
+// caller. `score.rs` (the scoring stage, reachable from `main`'s
+// no-subcommand path) calls `tokens`, `word_count`, `jaccard`, `precision`
+// and `edit_similarity` directly; `levenshtein` is reached transitively via
+// `edit_similarity`. The pre-Stage-6 per-item `#[allow(dead_code)]` +
+// `TODO(stage-6)` tripwires were therefore REMOVED — these items are no
+// longer dead code by construction (they all have a real consumer; nothing
+// here relies on the lint to stay non-dead).
 //
-// Deliberately NOT a module-wide `#![allow(dead_code)]`: that would also mask
-// genuinely dead code anywhere else in the module. Instead each item with no
-// in-crate caller until Stage 6 carries its OWN `#[allow(dead_code)]` plus a
-// `TODO(stage-6)` tripwire, so the allow is removed item-by-item as `score.rs`
-// starts consuming each function (a module-wide attribute would silently keep
-// covering later additions long after it stopped being needed).
-//
-// HONEST CAVEAT (verified 2026-05-17): for *this* crate the `dead_code` lint
-// is currently a no-op regardless of which form the attribute takes. The crate
-// is a binary whose only build target under `cargo clippy --all-targets` is
-// its own unit-test target; in a `--test` build of a *binary*, rustc's
-// dead-code seeding is permissive and does NOT flag items merely unreachable
-// from `#[test]` fns (an unguarded unused private fn added here was NOT caught
-// by `clippy --workspace --all-targets -D warnings`, plain `cargo check`, or
-// `cargo build --bin`). So the per-item attributes are correct *hygiene* and
-// become genuinely enforced the moment a non-test caller exists (Stage 6
-// `score.rs`, or any non-test bin path) — but do not rely on CI to catch new
-// dead code in this module before then; that gap closes with Stage 6.
+// O4 is only PARTIALLY discharged, NOT proven fully enforcing for this bin
+// crate — be precise about what a verification probe under
+// `clippy --workspace --all-targets -- -D warnings` actually establishes:
+//   * Unused `pub` items in the `benchmark` bin crate ARE now caught, because
+//     a real non-test consumer (`score.rs`, reachable from `main`) exists, so
+//     rustc's dead-code seeding reaches `pub` surface from the binary root.
+//     This is why every `pub` fn here is deliberately a *named consumed* item
+//     rather than a `pub` + `#[allow(dead_code)]` one.
+//   * Unused PRIVATE items and never-constructed ENUM VARIANTS in this bin
+//     crate are STILL NOT compiler-caught — the original Stage-2 O4 caveat
+//     persists unchanged. (`levenshtein` is private but stays non-dead only
+//     because `edit_similarity` actually calls it, NOT because the lint would
+//     flag it if that call were removed.) Such items rely on convention +
+//     review, not the lint.
+// No module-wide `#![allow(dead_code)]` was ever added (deliberate), so the
+// `pub`-surface half of the enforcement is genuine; the private / enum-variant
+// half remains a convention, not a proven guarantee.
 
 use std::collections::HashSet;
 
@@ -91,8 +93,6 @@ use unicode_normalization::UnicodeNormalization;
 /// spec change, not a Stage-2 patch** — it is deliberately out of scope here
 /// and pinned by `known_limitation_ligature_not_casefolded` so any future
 /// casefold change is an intentional, reviewed test edit.
-// TODO(stage-6): remove once score.rs consumes this.
-#[allow(dead_code)]
 pub fn tokens(text: &str) -> Vec<String> {
     text.split(char::is_whitespace)
         .filter(|fragment| !fragment.is_empty())
@@ -105,8 +105,6 @@ pub fn tokens(text: &str) -> Vec<String> {
 ///
 /// The harness **never** trusts an external word count; it is always
 /// recomputed from [`tokens`] so there is exactly one word-count definition.
-// TODO(stage-6): remove once score.rs consumes this.
-#[allow(dead_code)]
 pub fn word_count(text: &str) -> usize {
     tokens(text).len()
 }
@@ -149,8 +147,6 @@ pub fn word_count(text: &str) -> usize {
 /// `not_implemented` / `crate_error` are NOT `ok`-with-empty-text) **before**
 /// trusting any empty-driven `1.0` from this function. An empty-vs-empty
 /// `1.0` is only meaningful once both sides are known-`ok`.
-// TODO(stage-6): remove once score.rs consumes this.
-#[allow(dead_code)]
 pub fn jaccard(a: &str, b: &str) -> f64 {
     let set_a: HashSet<String> = tokens(a).into_iter().collect();
     let set_b: HashSet<String> = tokens(b).into_iter().collect();
@@ -201,8 +197,6 @@ pub fn jaccard(a: &str, b: &str) -> f64 {
 ///
 /// The result is always in `[0.0, 1.0]`, and `precision(x, x) = 1.0` for
 /// non-empty `x`.
-// TODO(stage-6): remove once score.rs consumes this.
-#[allow(dead_code)]
 pub fn precision(extracted: &str, reference: &str) -> f64 {
     let set_e: HashSet<String> = tokens(extracted).into_iter().collect();
 
@@ -247,8 +241,6 @@ pub fn precision(extracted: &str, reference: &str) -> f64 {
 ///   `J(∅, ∅) = 1.0`).
 ///
 /// `lev ≤ max(len_a, len_b)` always, so the result is always in `[0.0, 1.0]`.
-// TODO(stage-6): remove once score.rs consumes this.
-#[allow(dead_code)]
 pub fn edit_similarity(a: &str, b: &str) -> f64 {
     let seq_a = tokens(a);
     let seq_b = tokens(b);
@@ -276,8 +268,6 @@ pub fn edit_similarity(a: &str, b: &str) -> f64 {
 /// only with a non-zero unit substitution cost. Weighted / token-similarity
 /// substitution costs would break that equivalence and are intentionally not
 /// used.
-// TODO(stage-6): remove once score.rs consumes this.
-#[allow(dead_code)]
 fn levenshtein(a: &[String], b: &[String]) -> usize {
     // Operate on the shorter sequence as the row width to bound memory.
     let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
