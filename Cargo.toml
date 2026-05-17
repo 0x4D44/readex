@@ -3,7 +3,17 @@ members = ["benchmark"]
 
 [package]
 name = "mdrcel"
-version = "0.1.0"
+version = "0.2.1"
 edition = "2024"
 
 [dependencies]
+# DEC-3: intentionally EMPTY. The mdrcel library is a zero-dependency crate at
+# the Milestone-1 floor. `thiserror` was removed: at M1 `ExtractError` has one
+# variant with a static message and no `#[from]`/`#[source]`, so the derive
+# saved ~5 lines while pulling a proc-macro (`thiserror`/`proc-macro2`/
+# `quote`/`syn`) into an otherwise zero-dep library — `Display`/`Error` are
+# now hand-written in `src/lib.rs`. `thiserror` is deferred until
+# `ExtractError` actually grows variants / `#[from]` / `#[source]` (mirrors
+# how `scraper`/`html5ever`/`regex` are deferred until the extraction
+# algorithm needs them — minimal dependency graph, parent brief). Reversible:
+# re-add the dependency and the `#[derive(thiserror::Error)]` at that point.
