@@ -592,7 +592,9 @@ fn run_fetch(url: &str) -> ExitCode {
 ///
 /// `curl` writes the body straight to `dest` (`--output`); `--fail` makes a
 /// non-2xx response a non-zero exit (no error page masquerading as a
-/// snapshot), `--location` follows redirects, `--max-time 60` bounds the call.
+/// snapshot), `--location` follows redirects, `--user-agent` identifies the
+/// fetcher honestly (DEC-5 — some hosts 403 a blank or `curl/x` UA), `--max-time
+/// 60` bounds the call.
 /// Returns an error if `curl` is absent (spawn fails) or exits non-zero; the
 /// caller removes any partial `dest` so no truncated snapshot survives.
 fn curl_download(url: &str, dest: &std::path::Path) -> Result<(), String> {
@@ -601,6 +603,8 @@ fn curl_download(url: &str, dest: &std::path::Path) -> Result<(), String> {
         .arg("--silent")
         .arg("--show-error")
         .arg("--location")
+        .arg("--user-agent")
+        .arg("mdrcel-benchmark/0.1 (+martingdavidson@gmail.com)")
         .arg("--max-time")
         .arg("60")
         .arg("--output")

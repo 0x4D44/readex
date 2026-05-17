@@ -1054,6 +1054,7 @@ mod tests {
     /// wire `word_count` set to a lie (must never be trusted — HLD §8).
     fn oracle_result(oracle: &str, text: &str) -> crate::oracle::OracleResult {
         crate::oracle::OracleResult {
+            contract_version: 1,
             oracle: oracle.to_string(),
             oracle_version: Some("9.9.9".to_string()),
             title: None,
@@ -1867,105 +1868,130 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // ---- score_corpus end-to-end (M1 floor — nothing laundered) ------------
+    // ---- The honest floor: a NotImplemented crate is NEVER laundered, even
+    //      against a REAL oracle reference (the enduring anti-Bug-E2 invariant)
 
+    /// **The anti-Bug-E2 floor invariant, post-oracle/post-corpus.**
+    ///
+    /// The original form of this test asserted `trafilatura_status ==
+    /// "oracle_error"` — a now-DEAD assumption that the oracle adapters did not
+    /// exist, so `run_oracle` always spawn-failed. The real adapters
+    /// (`benchmark/oracles/**`) and the 51-URL corpus now exist, so that
+    /// premise is false (a live run yields `trafilatura ok:51`). The *spirit*
+    /// of the name — "nothing laundered at the floor" — is preserved and made
+    /// **stronger**: the dangerous case is no longer "the oracle failed" but
+    /// "the oracle **succeeded with real reference text** while the crate
+    /// produces nothing". The crate gate (`score_url` step 1, BEFORE reference
+    /// resolution) MUST still refuse to score — a successful real oracle output
+    /// must NEVER be laundered into a *trusted* number while the crate is
+    /// `NotImplemented`.
+    ///
+    /// Hermetic & deterministic by construction: it drives the **pure**
+    /// `score_url` gate (the actual laundering seam) and aggregates a
+    /// trusted-score count over a small constructed multi-URL scenario. It
+    /// invokes **no** live Python/Node and reads **no** corpus — the live
+    /// end-to-end run is the harness binary's job, not a unit test (an
+    /// oracle-dependent unit test would be exactly the fragile coupling the
+    /// rewrite removes).
     #[test]
     fn score_corpus_m1_floor_nothing_laundered() {
-        // Build a tiny real corpus on disk: one snapshot file, one entry.
-        // At M1: crate = NotImplemented (real mdrcel::extract), oracles =
-        // OracleError (python/node adapters absent ⇒ spawn-fail, recorded
-        // HONESTLY). The record MUST be NotScored with NOTHING laundered to a
-        // passing number. This is the M1 baseline floor.
-        let dir = std::env::temp_dir().join("mdrcel-score-corpus-m1");
-        let _ = fs::remove_dir_all(&dir);
-        let snaps = dir.join("snapshots");
-        fs::create_dir_all(&snaps).unwrap();
-        let url = "https://example.test/m1";
-        let fname = crate::corpus::snapshot_filename(url);
-        fs::write(
-            snaps.join(&fname),
-            "<html><body><article><p>hello world</p></article></body></html>",
-        )
-        .unwrap();
+        // The crate is NotImplemented for EVERY URL (the M1 floor). The
+        // oracles, however, return valid `Ok` with REAL, non-empty reference
+        // text — the post-oracle reality. Spread across the cases that would,
+        // for an *implemented* crate, each produce a trusted score (full
+        // overlap → 1.0; partial; disjoint → trusted 0.0; gold-referenced):
+        let ni = CrateStatus::NotImplemented;
+        let traf_real = oracle_ok("trafilatura", "the quick brown fox jumps over");
 
-        let entry = CorpusEntry {
-            url: url.to_string(),
-            shape_class: ShapeClass::Wikipedia,
-            snapshot_filename: fname,
-            fetched_date: "2026-05-17".to_string(),
-            note: String::new(),
-        };
-        let gold = GoldSet::default();
-        // The dev/CI host always resolves, so score_corpus is Ok here; the
-        // fail-closed host-detection path is unit-tested via `resolve_host`.
-        let results = score_corpus(std::slice::from_ref(&entry), &dir, &gold)
-            .expect("dev/CI host always resolves");
+        // (a) No gold, Trafilatura is a valid Ok reference with real text.
+        //     For an implemented crate this is the *trusted-score* path; with
+        //     NotImplemented it MUST be NotScored(CrateNotImplemented) — the
+        //     crate gate fires FIRST, the real reference is never reached.
+        let a = score_url(&ni, &traf_real, None);
+        // (b) A gold reference present (curated, non-empty). Gold "wins" the
+        //     reference, but the crate gate is still upstream of it.
+        let b = score_url(&ni, &traf_real, Some("a curated gold reference body"));
+        // (c) Trafilatura Ok but its text is "" ("found little" — a valid Ok,
+        //     not an error). Still must NOT be scored (crate gate first).
+        let traf_empty_ok = oracle_ok("trafilatura", "");
+        let c = score_url(&ni, &traf_empty_ok, None);
 
-        assert_eq!(results.corpus_size, 1);
-        assert_eq!(results.urls.len(), 1);
-        assert!(!results.host.is_empty());
-        // The stamped host is the canonical form (HLD §2.9): lowercase, short.
-        assert_eq!(results.host, results.host.to_lowercase());
-        assert!(!results.host.contains('.'), "host must be the short name");
-        let rec = &results.urls[0];
-        assert_eq!(rec.crate_status, "not_implemented");
-        // The oracle adapters (benchmark/oracles/**) do not exist at M1, so
-        // `run_oracle` either fails to spawn `python`/`node` OR they exit
-        // non-zero — EITHER way the honest record is `oracle_error` (never
-        // laundered into ok-with-empty). Timeout is also acceptable in
-        // principle but not expected here; assert it is one of the non-ok
-        // statuses and specifically not `ok`.
-        assert_ne!(rec.trafilatura_status, "ok");
-        assert_ne!(rec.readability_status, "ok");
-        assert_eq!(rec.trafilatura_status, "oracle_error");
-        assert_eq!(rec.readability_status, "oracle_error");
-        // ANTI-LAUNDERING: the failure stays EXPLAINED — a non-empty reason
-        // is recorded, not a bare token (HLD §5; Bug-E2 lesson).
-        assert!(
-            rec.status_detail
-                .trafilatura_reason
-                .as_deref()
-                .is_some_and(|r| !r.is_empty()),
-            "a failed oracle must carry a non-empty reason, got {:?}",
-            rec.status_detail.trafilatura_reason
-        );
-        assert!(
-            rec.status_detail
-                .readability_reason
-                .as_deref()
-                .is_some_and(|r| !r.is_empty())
-        );
-        // The crate is `not_implemented` (a reason-less status) ⇒ no
-        // free-text crate reason (distinct from a `crate_error`, which would).
-        assert_eq!(rec.status_detail.crate_reason, None);
-        // NOTHING laundered: the score is NotScored, the crate gate fired
-        // FIRST (NotImplemented), so the reason is CrateNotImplemented — never
-        // a Scored 0.0/1.0.
-        match &rec.score {
-            ScoreOutcome::NotScored {
-                reason: NotScoredReason::CrateNotImplemented,
-            } => {}
-            other => panic!("M1 floor must be NotScored(CrateNotImplemented), got {other:?}"),
+        // INVARIANT 1: every outcome is NotScored(CrateNotImplemented). A
+        // successful real oracle reference is NEVER laundered into a Scored
+        // (not a trusted 1.0, not a trusted 0.0) while the crate produces
+        // nothing.
+        for (label, outcome) in [
+            ("no-gold/real-traf", &a),
+            ("gold", &b),
+            ("traf-empty-ok", &c),
+        ] {
+            match outcome {
+                ScoreOutcome::NotScored {
+                    reason: NotScoredReason::CrateNotImplemented,
+                } => {}
+                other => panic!(
+                    "{label}: a NotImplemented crate must be \
+                     NotScored(CrateNotImplemented) even against a valid real \
+                     oracle reference — got {other:?} (Bug-E2 laundering)"
+                ),
+            }
+            // Belt-and-braces: it is categorically NOT a Scored of any value.
+            assert!(
+                !matches!(outcome, ScoreOutcome::Scored { .. }),
+                "{label}: must never be Scored while the crate is NotImplemented"
+            );
         }
-        assert_eq!(rec.edit_sim, None);
-        assert!(!rec.guardrail_flag);
-        assert_eq!(rec.agreement, None);
-        // Word counts: crate is not Ok ⇒ None; oracles failed ⇒ None. No wire
-        // value ever surfaces.
-        assert_eq!(rec.word_counts.crate_wc, None);
-        assert_eq!(rec.word_counts.trafilatura_wc, None);
-        assert_eq!(rec.word_counts.readability_wc, None);
-        // Status counts reflect exactly the M1 floor.
+
+        // INVARIANT 2: aggregate "trusted scores" over the whole scenario is
+        // exactly ZERO — the run-summary number a human reads. This is the
+        // direct analogue of the end-to-end `trusted-scores:0` line: even with
+        // every oracle returning real text, the trusted-score tally stays 0
+        // because the crate is NotImplemented everywhere.
+        let trusted = [&a, &b, &c]
+            .iter()
+            .filter(|o| matches!(o, ScoreOutcome::Scored { .. }))
+            .count();
         assert_eq!(
-            results.status_counts.crate_status.get("not_implemented"),
-            Some(&1)
-        );
-        assert_eq!(
-            results.status_counts.trafilatura_status.get("oracle_error"),
-            Some(&1)
+            trusted, 0,
+            "trusted-scores MUST be 0 when the crate is NotImplemented for \
+             every URL, regardless of real oracle output (the honest floor)"
         );
 
-        let _ = fs::remove_dir_all(&dir);
+        // CONTROL (the test's own oracle): the gate is NOT vacuously rejecting
+        // everything — swap ONLY the crate to a real Ok and the SAME real
+        // Trafilatura reference now legitimately yields a trusted Scored. This
+        // proves INVARIANT 1 is the crate gate doing its job, not an artifact
+        // of the inputs (without this, a gate that rejected *everything* would
+        // also pass — a false-confidence oracle the rewrite must not have).
+        match score_url(
+            &crate_ok("the quick brown fox jumps over"),
+            &traf_real,
+            None,
+        ) {
+            ScoreOutcome::Scored { coverage, .. } => assert!(
+                (coverage - 1.0).abs() < EPS,
+                "control: an implemented crate matching the real reference \
+                 must be a trusted 1.0, got coverage={coverage}"
+            ),
+            other => panic!(
+                "control: an Ok crate vs a real Ok reference MUST be Scored \
+                 (proves the floor rejection above is the crate gate, not a \
+                 gate that rejects everything); got {other:?}"
+            ),
+        }
+        // And the disjoint control is a *trusted* 0.0 (a real score — the
+        // crate genuinely extracted nothing matching), categorically distinct
+        // from the NotScored floor above (the exact Bug-E2 distinction).
+        match score_url(&crate_ok("totally unrelated words here"), &traf_real, None) {
+            ScoreOutcome::Scored { coverage, .. } => assert!(
+                coverage.abs() < EPS,
+                "control: disjoint crate vs real reference is a TRUSTED 0.0, \
+                 got {coverage}"
+            ),
+            other => {
+                panic!("control: disjoint Ok crate must be a trusted Scored 0.0, got {other:?}")
+            }
+        }
     }
 
     #[test]

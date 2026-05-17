@@ -17,13 +17,17 @@
 //!
 //! # What the harness reads, and what it deliberately ignores
 //!
-//! The adapter emits **10** fields (sibling §3.2 — note: this build's sibling
-//! revision lists `html`/`word_count` as captured-but-unscored; an earlier
-//! draft mentioned an 11th `contract_version` which the reconciled harness §5
-//! does not enumerate, so it is simply tolerated as an unknown field — see the
-//! `deny_unknown_fields` note below). [`OracleResult`] captures all 10 so the
-//! type is a faithful mirror of the wire object, but two are **captured yet
-//! unused** by the harness:
+//! The adapter emits **11** fields (sibling §3.2). [`OracleResult`] captures
+//! all 11 so the type is a faithful mirror of the wire object.
+//! `contract_version` is a **modelled, contractually-mandatory, value-checked**
+//! field (DEC-4 + DEC-7, HLD §9): it is in the schema `required` set and the
+//! harness types it a NON-optional `i64` with **no** `#[serde(default)]`, so an
+//! absent/`null` value is a hard parse failure surfaced as
+//! [`OracleStatus::OracleError`]; and the seam additionally fails closed on the
+//! *value* — `contract_version != `[`SUPPORTED_CONTRACT_VERSION`] is an
+//! OracleError, never laundered — so a contract bump cannot be consumed
+//! silently (the Bug-E2 lesson applied to the contract itself). Two fields are
+//! **captured yet not branched on** by the harness:
 //!
 //! * `html` — never scored (harness HLD §5; sibling §3.2 "never scored").
 //! * `word_count` — the adapter's own count is **informational only**. The
@@ -191,6 +195,16 @@ impl OracleKind {
     }
 }
 
+/// The contract version this harness build supports. Single source of truth
+/// for the Rust side of the cross-language pin; mirrors the committed schema's
+/// `contract_version.const` (benchmark/oracles/contract.schema.json). DEC-7:
+/// the seam fails closed on any envelope whose `contract_version` differs, so a
+/// contract bump (the schema `const` incremented at an HLD §9 reconciliation)
+/// becomes an instrument-wide OracleError — impossible to consume silently.
+/// Module-private: the only consumers are the seam gate and its tests; a
+/// `pub` const with no external user would itself draw the dead-code lint.
+const SUPPORTED_CONTRACT_VERSION: i64 = 1;
+
 /// The single JSON object an oracle adapter prints on stdout (sibling §3.2 —
 /// the non-normative restatement; the committed schema governs on any
 /// discrepancy).
@@ -205,6 +219,21 @@ impl OracleKind {
 /// on its account.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct OracleResult {
+    /// Schema/contract revision constant (sibling §3.2 — emitted as the FIRST
+    /// field on **every** path, incl. failures, so each result row is
+    /// self-describing; v1 = `1`). **Contractually mandatory and NON-optional**
+    /// (DEC-4 reconciliation, HLD §9): it is now in the schema `required` set,
+    /// so a missing/`null` value is a contract violation that MUST fail
+    /// deserialization (surfacing as [`OracleStatus::OracleError`] at the
+    /// seam). Deliberately **no** `#[serde(default)]` — defaulting an absent
+    /// `contract_version` would silently launder a malformed/unversioned
+    /// envelope into a valid one, the exact Bug-E2 information loss the project
+    /// forbids. DEC-7: the seam also fails closed on the *value* — an envelope
+    /// whose `contract_version != `[`SUPPORTED_CONTRACT_VERSION`] is surfaced
+    /// as [`OracleStatus::OracleError`], never trusted — so this field has a
+    /// real consumer (no `#[allow(dead_code)]`) and a contract bump cannot be
+    /// consumed silently.
+    pub contract_version: i64,
     /// `"trafilatura"` | `"readability-js"` (sibling §3.2 hardcoded literal).
     pub oracle: String,
     /// `null` iff the library could not be imported / its version was
@@ -600,6 +629,24 @@ pub fn run_command_with_timeout(program: &str, args: &[String], timeout: Duratio
         }
     };
 
+    // Fail closed on contract drift (DEC-7): the envelope parsed, but if it
+    // declares a contract_version this build does not support we MUST NOT
+    // trust its contents (nor even its own `ok`/`error` semantics — the whole
+    // contract may have changed underneath us). Surfacing it as an OracleError
+    // (never Ok) turns a contract bump into an instrument-wide,
+    // impossible-to-miss failure (every row → oracle_error → a large baseline
+    // diff at the next §9 reconciliation) — delivering the HLD drift-visibility
+    // intent without laundering an unknown-contract envelope into a trusted
+    // number (the Bug-E2 lesson, applied to the contract itself).
+    if result.contract_version != SUPPORTED_CONTRACT_VERSION {
+        return OracleStatus::OracleError(format!(
+            "oracle process `{program}` emitted unsupported contract_version \
+             {} (this harness pins v{SUPPORTED_CONTRACT_VERSION}); refusing to \
+             trust an unknown-contract envelope",
+            result.contract_version
+        ));
+    }
+
     // Parsed. `ok:false` is the adapter's own failure path → OracleError
     // carrying its message. `ok:true` (even with text:"") is success — UNLESS
     // it also carries a non-null `error`, which violates the sibling §3.2
@@ -649,11 +696,15 @@ mod tests {
 
     // ---- A representative, fully-populated wire object ----------------------
 
-    /// A valid Trafilatura envelope with **all 10** contract fields present
-    /// and `ok:true`. The shared fixture for the deserialize / status / schema
-    /// tests so "the wire shape" is defined in exactly one place.
+    /// A valid Trafilatura envelope with **all 11** contract fields present
+    /// and `ok:true` (DEC-4: `contract_version` is now a modelled, required
+    /// field — see [`OracleResult::contract_version`]). The shared fixture for
+    /// the deserialize / status / schema tests so "the wire shape" is defined
+    /// in exactly one place. Field order mirrors sibling §3.2
+    /// (`contract_version` first).
     fn full_json_ok() -> String {
         r#"{
+            "contract_version": 1,
             "oracle": "trafilatura",
             "oracle_version": "2.0.0",
             "title": "An Example Article",
@@ -821,8 +872,10 @@ mod tests {
     // ---- OracleResult deserialization --------------------------------------
 
     #[test]
-    fn deserializes_full_ten_field_object() {
+    fn deserializes_full_eleven_field_object() {
         let r: OracleResult = serde_json::from_str(&full_json_ok()).unwrap();
+        // DEC-4: contract_version is a modelled, required, integer-typed field.
+        assert_eq!(r.contract_version, 1);
         assert_eq!(r.oracle, "trafilatura");
         assert_eq!(r.oracle_version.as_deref(), Some("2.0.0"));
         assert_eq!(r.title.as_deref(), Some("An Example Article"));
@@ -841,12 +894,119 @@ mod tests {
         assert_eq!(r.error, None);
     }
 
+    /// DEC-4 anti-Bug-E2: `contract_version` is **contractually mandatory**
+    /// (sibling §3.2 — emitted on every path; now in the schema `required`
+    /// set). The harness models it NON-optional with **no** `#[serde(default)]`,
+    /// so an envelope that omits it (or sends `null`) MUST fail deserialization
+    /// — never be laundered into a "valid" result with a defaulted version.
+    /// That is exactly the Bug-E2 information loss the project forbids.
+    #[test]
+    fn missing_or_null_contract_version_fails_deserialization_not_laundered() {
+        // Absent entirely (a pre-DEC-4 / unversioned envelope).
+        let absent = r#"{
+            "oracle": "trafilatura",
+            "oracle_version": "2.0.0",
+            "title": null,
+            "text": "body",
+            "html": null,
+            "word_count": 1,
+            "canonical_url": null,
+            "language": null,
+            "ok": true,
+            "error": null
+        }"#;
+        assert!(
+            serde_json::from_str::<OracleResult>(absent).is_err(),
+            "an absent contract_version MUST fail to deserialize (no \
+             #[serde(default)] — never laundered into a defaulted version)"
+        );
+        // Present but explicitly null — also a contract violation (the field
+        // is an integer constant, never nullable).
+        let null_cv = absent.replacen(
+            "\"oracle\": \"trafilatura\"",
+            "\"contract_version\": null,\n            \"oracle\": \"trafilatura\"",
+            1,
+        );
+        assert!(
+            serde_json::from_str::<OracleResult>(&null_cv).is_err(),
+            "a null contract_version MUST fail to deserialize (it is a \
+             non-nullable integer constant)"
+        );
+
+        // And end-to-end through the seam: exit 0 + a contract-versionless
+        // stdout is "not a single valid contract JSON object" → OracleError,
+        // NEVER Ok-with-content (the Bug-E2 consumer-side mapping).
+        let (p, a, path) = emit_file_command(absent);
+        let status = run_command_with_timeout(&p, &a, ORACLE_TIMEOUT);
+        let _ = std::fs::remove_file(&path);
+        match status {
+            OracleStatus::OracleError(msg) => assert!(
+                msg.contains("not a single valid contract JSON object"),
+                "a versionless envelope must surface as a hard OracleError, \
+                 got: {msg}"
+            ),
+            other => panic!(
+                "missing contract_version must be OracleError (never \
+                 laundered to Ok), got {other:?}"
+            ),
+        }
+    }
+
+    /// DEC-7 anti-Bug-E2: the envelope is *well-formed and otherwise valid*
+    /// but declares a `contract_version` this harness build does not support.
+    /// The seam MUST fail closed — surface it as an [`OracleStatus::OracleError`]
+    /// and NEVER as `Ok` — so a contract bump cannot be silently consumed as a
+    /// trusted result. Companion to the missing/null test above: that guards
+    /// the field's *presence*; this guards its *value*.
+    #[test]
+    fn unsupported_contract_version_fails_closed_not_laundered() {
+        let bumped = r#"{
+            "contract_version": 2,
+            "oracle": "trafilatura",
+            "oracle_version": "2.0.0",
+            "title": "T",
+            "text": "real extracted body text",
+            "html": null,
+            "word_count": 4,
+            "canonical_url": null,
+            "language": "en",
+            "ok": true,
+            "error": null
+        }"#;
+        // It deserializes fine (a structurally valid envelope) — proving the
+        // guard is the explicit *value* gate, not an accident of parsing.
+        assert!(
+            serde_json::from_str::<OracleResult>(bumped).is_ok(),
+            "the v2 envelope is structurally valid; the gate must be the \
+             explicit version check, not a parse failure"
+        );
+        let (p, a, path) = emit_file_command(bumped);
+        let status = run_command_with_timeout(&p, &a, ORACLE_TIMEOUT);
+        let _ = std::fs::remove_file(&path);
+        match status {
+            OracleStatus::OracleError(msg) => assert!(
+                msg.contains("unsupported contract_version 2"),
+                "an unsupported contract_version must surface as a hard \
+                 OracleError naming the version, got: {msg}"
+            ),
+            other => panic!(
+                "unsupported contract_version must be OracleError (never \
+                 laundered to Ok-with-content), got {other:?}"
+            ),
+        }
+    }
+
     #[test]
     fn deserializes_with_unknown_extra_field_no_deny_unknown() {
-        // An extra field the harness does not model (e.g. a future
-        // `contract_version`, or the sibling's `dir`/`byline`) MUST NOT fail
+        // An extra field the harness does not model (e.g. the sibling's
+        // `dir`/`byline`, modelled here by `some_future_field`) MUST NOT fail
         // the parse — no #[serde(deny_unknown_fields)] (HLD §5 / sibling O3).
+        // `contract_version` is present too: post-DEC-4 it is a *modelled*
+        // required field (no longer the "unknown extra" example), so this
+        // fixture exercises both — a modelled required field AND a genuinely
+        // unknown one — without rejecting either.
         let json = r#"{
+            "contract_version": 1,
             "oracle": "readability-js",
             "oracle_version": "0.6.0",
             "title": null,
@@ -857,20 +1017,23 @@ mod tests {
             "language": null,
             "ok": true,
             "error": null,
-            "contract_version": 1,
             "some_future_field": {"nested": true}
         }"#;
         let r: OracleResult =
             serde_json::from_str(json).expect("unknown fields must be ignored, not rejected");
         assert_eq!(r.oracle, "readability-js");
         assert_eq!(r.text, "body");
+        assert_eq!(r.contract_version, 1);
     }
 
     #[test]
     fn oracle_version_null_deserializes_to_none() {
         // A failed import still emits a valid envelope with
         // oracle_version: null → MUST map to None (sibling O3 / HLD §5).
+        // The §3.4 failure envelope still carries contract_version (emitted on
+        // EVERY path — sibling §3.2; DEC-4 makes it required here too).
         let json = r#"{
+            "contract_version": 1,
             "oracle": "trafilatura",
             "oracle_version": null,
             "title": null,
@@ -900,6 +1063,7 @@ mod tests {
         for wc in [-5_i64, i64::MAX] {
             let json = format!(
                 r#"{{
+                    "contract_version": 1,
                     "oracle": "trafilatura",
                     "oracle_version": "2.0.0",
                     "title": null,
@@ -937,6 +1101,7 @@ mod tests {
         // text is guaranteed valid UTF-8 by the adapter (sibling §3.3);
         // non-ASCII (incl. astral) must round-trip through serde unchanged.
         let json = r#"{
+            "contract_version": 1,
             "oracle": "trafilatura",
             "oracle_version": "2.0.0",
             "title": "Café — résumé",
@@ -1039,6 +1204,7 @@ mod tests {
         // "found little" (text:"") with ok:true is SUCCESS, not an error —
         // the exact distinction Bug E2 collapsed (HLD §5 / sibling §3.4).
         let json = r#"{
+            "contract_version": 1,
             "oracle": "readability-js",
             "oracle_version": "0.6.0",
             "title": null,
@@ -1065,8 +1231,10 @@ mod tests {
     #[test]
     fn status_error_when_ok_false_with_message() {
         // ok:false (the adapter's own catchable-failure path) → OracleError
-        // carrying the message; NOT silently treated as empty content.
+        // carrying the message; NOT silently treated as empty content. The
+        // §3.4 failure envelope still carries contract_version (DEC-4).
         let json = r#"{
+            "contract_version": 1,
             "oracle": "trafilatura",
             "oracle_version": null,
             "title": null,
@@ -1100,6 +1268,7 @@ mod tests {
         // invariant and launder this to Ok on the strength of `ok` alone —
         // it is internally contradictory and must surface as a hard error.
         let json = r#"{
+            "contract_version": 1,
             "oracle": "trafilatura",
             "oracle_version": "2.0.0",
             "title": "Contradictory envelope",
@@ -1246,6 +1415,7 @@ mod tests {
         let big_text = "lorem ipsum dolor sit amet ".repeat(12_000); // ≈324 KB
         let json = format!(
             r#"{{
+                "contract_version": 1,
                 "oracle": "trafilatura",
                 "oracle_version": "2.0.0",
                 "title": "A very large SEC 10-K filing",
@@ -1471,6 +1641,65 @@ mod tests {
                 );
             }
         }
+
+        // 6. DEC-4: `contract_version` is now a first-class part of the
+        //    contract the harness STRUCTURALLY depends on (it models it as a
+        //    NON-optional `i64` with no #[serde(default)]; an absent value is
+        //    a hard parse failure → OracleError, never laundered). The schema
+        //    must therefore (a) mark it `required`, (b) type it integer (the
+        //    harness types it `i64`), (c) NOT mark it nullable (a non-Option
+        //    field), and it must (d) be present in OracleResult's serialized
+        //    output. This is an explicit ADDITION; every assertion above is
+        //    retained. Was deliberately excluded from `required` only while the
+        //    harness lacked the field — that reason is gone (DEC-4 / HLD §9).
+        let required: std::collections::BTreeSet<&str> = schema
+            .get("required")
+            .and_then(|r| r.as_array())
+            .expect("schema must declare `required`")
+            .iter()
+            .map(|v| v.as_str().expect("`required` entries are strings"))
+            .collect();
+        assert!(
+            required.contains("contract_version"),
+            "DEC-4: schema MUST list `contract_version` in `required` (the \
+             harness models it non-Option and a missing value is a hard \
+             parse failure, not laundered); required = {required:?}"
+        );
+        let cv_decl = props
+            .get("contract_version")
+            .expect("schema must declare `contract_version`");
+        assert!(
+            json_type_admits(cv_decl, "integer"),
+            "DEC-4: schema MUST type `contract_version` as integer (the \
+             harness types it `i64`); declaration was: {cv_decl}"
+        );
+        assert!(
+            !json_type_is_nullable(cv_decl),
+            "DEC-4: schema MUST NOT mark `contract_version` nullable — the \
+             harness types it non-Option `i64`; a nullable contract_version \
+             is a Bug-E2 trap; declaration was: {cv_decl}"
+        );
+        assert!(
+            our_fields.contains("contract_version"),
+            "DEC-4: OracleResult MUST serialize `contract_version` (it is a \
+             modelled, required field); our fields = {our_fields:?}"
+        );
+        // DEC-7: the schema pins the value via `const`, and the seam fails
+        // closed on a mismatch using SUPPORTED_CONTRACT_VERSION. Assert the two
+        // sides of that cross-language pin agree — so dropping/changing the
+        // schema `const` (or the Rust constant) can never drift silently
+        // (closes the reviewers' MINOR: `const` was previously asserted
+        // nowhere, so a weakened version pin stayed green).
+        let schema_const = cv_decl
+            .get("const")
+            .and_then(|c| c.as_i64())
+            .expect("DEC-7: schema MUST pin `contract_version` with an integer `const`");
+        assert_eq!(
+            schema_const, SUPPORTED_CONTRACT_VERSION,
+            "DEC-7: schema `contract_version.const` ({schema_const}) MUST equal \
+             the harness SUPPORTED_CONTRACT_VERSION ({SUPPORTED_CONTRACT_VERSION}) \
+             — the fail-closed pin and the schema pin are one contract"
+        );
     }
 
     /// True if a JSON-Schema property declaration permits `null`, across the

@@ -6,6 +6,7 @@
   "type": "object",
   "additionalProperties": true,
   "required": [
+    "contract_version",
     "oracle",
     "oracle_version",
     "title",
@@ -19,7 +20,7 @@
   ],
   "properties": {
     "contract_version": {
-      "description": "Schema/contract revision constant. Emitted as the FIRST field on EVERY path (success, found-nothing, and the catchable-failure envelope) so each result row is self-describing (parent brief). v1 = 1; increments only if HLD section 9 reconciliation amends this schema. Declared here and emitted by both adapters, but DELIBERATELY ABSENT from `required`: the current harness OracleResult (benchmark/src/oracle.rs) does not yet model this field, and the harness schema_conformance test asserts schema-required is a subset of OracleResult's serialized fields. Listing it in `required` would break that green cross-team gate before the harness side adds the field. It remains a contract-mandated constant via HLD section 3.2 (behavioural), not via `required`.",
+      "description": "Schema/contract revision constant. Emitted as the FIRST field on EVERY path (success, found-nothing, and the catchable-failure envelope) so each result row is self-describing (parent brief). v1 = 1; increments only if HLD section 9 reconciliation amends this schema. REQUIRED (DEC-4): the harness OracleResult (benchmark/src/oracle.rs) now models this field as a non-optional i64 with no serde default, and the harness fails closed on any envelope whose contract_version != 1 (treated as an OracleError, not a trusted result) — so a contract bump cannot be silently consumed and surfaces as an instrument-wide error. The schema_conformance test asserts schema-required is exactly the set OracleResult deserializes; listing it here keeps that cross-side symmetry honest.",
       "type": "integer",
       "const": 1
     },
