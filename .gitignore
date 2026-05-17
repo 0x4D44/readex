@@ -11,3 +11,6 @@ env/
 # Per-run harness output — scratch, not persisted (harness HLD §4.1/§9).
 # The only persisted run state is benchmark/baseline/results.json (in git).
 benchmark/runs/
+
+# Agent scratchpads (CLAUDE.md notes/ convention) — working notes, not deliverables.
+notes/
