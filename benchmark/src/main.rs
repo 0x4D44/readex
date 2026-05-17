@@ -124,6 +124,18 @@ fn run_no_subcommand() -> ExitCode {
         }
     };
 
+    // Gold word-bands (HLD §7 `min_words`/`max_words`) — a *report-layer*
+    // input (the §9 gold pass/fail), not scoring data, so it is loaded
+    // separately from `GoldSet` (which models only the URL→text the hierarchy
+    // needs). Same absent-is-empty contract; a malformed band fails loudly.
+    let gold_bands = match report::GoldBands::load(&dir) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     // Run the differential pass and persist results.json (the single source
     // of truth for the run; the Stage-7 report is generated from it).
     //
@@ -156,16 +168,42 @@ fn run_no_subcommand() -> ExitCode {
             } else {
                 format!("{} gold", gold.len())
             };
+
+            // Generate report.md *from the same in-memory RunResults* (the
+            // single source of truth — never reparse results.json) into the
+            // SAME runs/<ts>/ directory results.json was just written to
+            // (HLD §9). `write_results` returns the results.json path, so its
+            // parent IS the unique per-run directory. The host-detection
+            // failure path short-circuits BEFORE write_results, so a poisoned
+            // run produces neither results.json NOR report.md (contract
+            // preserved). report generation is pure given the RunResults +
+            // the gold word-bands; only the final write touches disk.
+            let run_dir = path.parent().unwrap_or(&runs_root);
+            // Pass the authoritative `GoldSet` (the URL→gold-text hierarchy
+            // input) alongside the word-bands so the report can cross-check
+            // the two independent `gold.tsv` parsers (a count-preserving
+            // column swap desyncs them silently — HLD §7/§2.7). Both are
+            // already loaded above; nothing is re-parsed.
+            let markdown = report::render_report(&results, &gold, &gold_bands);
+            let report_path = match report::write_report(&markdown, run_dir) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("error: writing report.md: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+
             println!(
                 "scored {} urls ({}) | crate {} | trafilatura {} | \
-                 readability {} | trusted-scores {} | results: {}",
+                 readability {} | trusted-scores {} | results: {} | report: {}",
                 results.corpus_size,
                 gold_summary,
                 fmt_counts(&results.status_counts.crate_status),
                 fmt_counts(&results.status_counts.trafilatura_status),
                 fmt_counts(&results.status_counts.readability_status),
                 scored,
-                path.display()
+                path.display(),
+                report_path.display()
             );
             ExitCode::SUCCESS
         }

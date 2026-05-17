@@ -172,11 +172,17 @@ impl OracleKind {
     /// The exact `oracle` string this kind's adapter stamps into its JSON
     /// (sibling §3.2 hardcoded literal). The inverse pairing is asserted in
     /// tests so the wire spelling is pinned.
-    // NOT consumed by Stage 6: `score.rs` derives status/attribution from the
-    // parsed `OracleResult.oracle` + `OracleStatus`, never via this helper, so
-    // the allow is KEPT (still test-only). TODO retargeted to Stage 7 (the
-    // report may use it for per-oracle column labels).
-    #[allow(dead_code)] // TODO(stage-7): candidate for report.rs oracle labels.
+    //
+    // O4 (Stage 7): the pre-Stage-7 `#[allow(dead_code)]` + `TODO(stage-7)`
+    // was REMOVED — `report.rs` now genuinely consumes this for the per-oracle
+    // column labels / status-line headings (`render_report`'s summary,
+    // coverage and guardrail tables), so it is no longer dead code by
+    // construction (it has a real non-test consumer reachable from `main`'s
+    // no-subcommand path). As a `pub` item it is in the half a verification
+    // probe shows IS lint-enforced for this `benchmark` bin crate; the scoped
+    // allow is dropped because the lint would no longer fire and nothing here
+    // relies on it to stay non-dead (private items / never-constructed enum
+    // variants remain uncaught — the original O4 caveat persists for those).
     pub fn wire_name(self) -> &'static str {
         match self {
             OracleKind::Trafilatura => "trafilatura",

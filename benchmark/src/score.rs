@@ -652,6 +652,18 @@ impl GoldSet {
         self.by_url.len()
     }
 
+    /// The gold member URLs (the authoritative key set), in deterministic
+    /// `BTreeMap` order. **Read-only**: this exposes the existing key set for
+    /// the Stage-7 report's gold/band cross-check (the report's `GoldBands`
+    /// independently re-parses `gold.tsv`, so a count-preserving column swap —
+    /// which §7/§2.7 explicitly anticipates as a post-freeze human edit — could
+    /// silently desync band-vs-text with no parse error; the report asserts
+    /// these two URL sets are equal). It does **not** touch the reference
+    /// resolution / scoring / `load` logic in any way and changes no behaviour.
+    pub fn urls(&self) -> impl Iterator<Item = &str> {
+        self.by_url.keys().map(String::as_str)
+    }
+
     /// Whether the gold set is empty (no curated members yet — the M1 state).
     pub fn is_empty(&self) -> bool {
         self.by_url.is_empty()
@@ -1732,6 +1744,31 @@ mod tests {
             Some("the apple gold body")
         );
         assert_eq!(g.text_for("https://other.test/"), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn goldset_urls_iterates_the_key_set_deterministically() {
+        // The read-only accessor used by the Stage-7 gold/band cross-check:
+        // it yields exactly the loaded URL keys, in BTreeMap (deterministic)
+        // order, and does not alter the URL→text mapping.
+        let dir = std::env::temp_dir().join("mdrcel-goldset-urls");
+        let _ = fs::remove_dir_all(&dir);
+        let gold_dir = dir.join("gold");
+        fs::create_dir_all(&gold_dir).unwrap();
+        fs::write(gold_dir.join("b.txt"), "beta body").unwrap();
+        fs::write(gold_dir.join("a.txt"), "alpha body").unwrap();
+        // Inserted b-then-a; BTreeMap must yield a-then-b.
+        let manifest = "https://z.test/b\tx.html\tb.txt\t1\t9\twhy\n\
+            https://z.test/a\ty.html\ta.txt\t1\t9\twhy\n";
+        fs::write(gold_dir.join("gold.tsv"), manifest).unwrap();
+
+        let g = GoldSet::load(&dir).expect("valid gold.tsv");
+        let urls: Vec<&str> = g.urls().collect();
+        assert_eq!(urls, vec!["https://z.test/a", "https://z.test/b"]);
+        // Accessor is purely a view: the text mapping is unchanged.
+        assert_eq!(g.text_for("https://z.test/a"), Some("alpha body"));
+        assert_eq!(g.text_for("https://z.test/b"), Some("beta body"));
         let _ = fs::remove_dir_all(&dir);
     }
 
