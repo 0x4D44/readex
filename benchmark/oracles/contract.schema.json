@@ -1,0 +1,68 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://mdrcel.local/benchmark/oracles/contract.schema.json",
+  "title": "mdrcel oracle adapter output contract",
+  "description": "Normative shape/types/nullability of the single JSON object each oracle adapter (run.py / run.mjs) writes to stdout. The BEHAVIOURAL contract (invocation, single-write+flush serialization, the ok/error/exit tri-state, same-machine determinism) is defined by HLD 'mdrcel Oracle Adapters' section 3 and CANNOT be expressed here; on any discrepancy between this schema and section 3.2/3.4 annotations the schema governs, but section 3 governs behaviour. additionalProperties is intentionally true: the consuming harness (benchmark/src/oracle.rs) reads a subset of fields with serde and MUST NOT reject an otherwise-valid envelope that carries an extra field (sibling O3 / no deny_unknown_fields).",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "oracle",
+    "oracle_version",
+    "title",
+    "text",
+    "html",
+    "word_count",
+    "canonical_url",
+    "language",
+    "ok",
+    "error"
+  ],
+  "properties": {
+    "contract_version": {
+      "description": "Schema/contract revision constant. Emitted as the FIRST field on EVERY path (success, found-nothing, and the catchable-failure envelope) so each result row is self-describing (parent brief). v1 = 1; increments only if HLD section 9 reconciliation amends this schema. Declared here and emitted by both adapters, but DELIBERATELY ABSENT from `required`: the current harness OracleResult (benchmark/src/oracle.rs) does not yet model this field, and the harness schema_conformance test asserts schema-required is a subset of OracleResult's serialized fields. Listing it in `required` would break that green cross-team gate before the harness side adds the field. It remains a contract-mandated constant via HLD section 3.2 (behavioural), not via `required`.",
+      "type": "integer",
+      "const": 1
+    },
+    "oracle": {
+      "description": "Hardcoded adapter identity literal.",
+      "type": "string",
+      "enum": ["trafilatura", "readability-js"]
+    },
+    "oracle_version": {
+      "description": "Resolved upstream extractor version, or null iff the library could not be imported / its version was unreadable (sibling O3 — the harness types this Option<String> and structurally depends on null being legal).",
+      "type": ["string", "null"]
+    },
+    "title": {
+      "description": "Document title verbatim from the extractor, or null. Not coerced ''->null.",
+      "type": ["string", "null"]
+    },
+    "text": {
+      "description": "Primary comparison surface. NEVER null — '' when nothing was extracted ('found little' is a valid ok:true result, not an error). Guaranteed valid UTF-8 by the adapter's well-formed primitive (HLD section 3.3); a nullable text would silently defeat the never-null guarantee (Bug-E2 trap).",
+      "type": "string"
+    },
+    "html": {
+      "description": "Extracted HTML where the tool produces it for free (Readability .content; null for Trafilatura v1). Never scored; wire-fidelity only.",
+      "type": ["string", "null"]
+    },
+    "word_count": {
+      "description": "The adapter's own simple word count over `text`. Informational only — the harness recomputes via its single tokenizer and ignores this. null on the failure path. JSON has no unsigned integers; a plain integer.",
+      "type": ["integer", "null"]
+    },
+    "canonical_url": {
+      "description": "Tool-reported canonical URL, or null. Faithful-to-tool; never scored.",
+      "type": ["string", "null"]
+    },
+    "language": {
+      "description": "Best-effort tool-reported language, or null.",
+      "type": ["string", "null"]
+    },
+    "ok": {
+      "description": "true iff the adapter ran and produced a (possibly empty) result; false on the adapter's own failure path (co-occurs with non-zero exit). Invariant: ok == (error == null). The harness types this non-Option bool and branches the tri-state on it.",
+      "type": "boolean"
+    },
+    "error": {
+      "description": "Human-readable failure message on the failure path; null when ok:true (invariant ok == (error == null)).",
+      "type": ["string", "null"]
+    }
+  }
+}

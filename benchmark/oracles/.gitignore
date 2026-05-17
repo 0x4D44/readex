@@ -1,0 +1,12 @@
+# Owned by the Oracle Adapters HLD (section 2.2 / section 8). Committed in the
+# SAME change that creates benchmark/oracles/ so adapter dependency trees can
+# never be accidentally committed or CRLF-mangled. Absent on a fresh clone;
+# the per-adapter README bootstrap step recreates these and MUST run before
+# any oracle invocation or self-test.
+*/.venv/
+*/node_modules/
+
+# Python bytecode caches produced by running the Trafilatura adapter / its
+# self-test. Build artifacts, never deliverables — must not be committed.
+*/__pycache__/
+*.pyc

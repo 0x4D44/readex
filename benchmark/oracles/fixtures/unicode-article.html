@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Unicode Self-Test Article — “curly” µ 日本語</title>
+<meta name="description" content="Non-Latin-1 article fixture: the Windows cp1252 stdout regression guard.">
+<link rel="canonical" href="https://example.test/selftest-unicode">
+<script>
+  // This script content MUST NOT leak into extracted `text`.
+  var leaked = "SCRIPT_SHOULD_NOT_APPEAR_IN_TEXT";
+  console.log(leaked);
+</script>
+<style>
+  body { color: #123456 ;;; }
+</style>
+</head>
+<body>
+<nav id="site-nav">
+  <ul><li><a href="/">Home</a></li><li><a href="/about">About</a></li></ul>
+</nav>
+<article id="content">
+  <h1>Unicode Self-Test Article — “curly” µ 日本語</h1>
+  <p><b>This synthetic article</b> exists solely so the oracle adapter
+  self-test exercises extraction against main content that is deliberately
+  NOT Latin-1: it carries curly quotes “like this”, an em-dash — right here,
+  the accented name Beyoncé, the micro sign µ, and the CJK phrase 日本語,
+  every one of which the legacy Windows console codepage cp1252 cannot
+  encode. It is never fetched from the live network.</p>
+  <h2>Body structure</h2>
+  <p>A second body paragraph adds enough running prose — with another
+  Beyoncé reference, a stray µ, the curly pair “again”, and 日本語 once
+  more — that an extractor is unambiguously expected to return substantive,
+  non-empty text and the adapter must emit it as valid UTF-8 regardless of
+  the host console codepage.</p>
+  <h2>References</h2>
+  <ol><li>Synthetic source one.</li><li>Synthetic source two.</li></ol>
+</article>
+<footer id="site-footer">
+  <p>Boilerplate footer with a privacy policy and copyright notice that is
+  not part of the article body and should be stripped by the extractor.</p>
+</footer>
+</body>
+</html>

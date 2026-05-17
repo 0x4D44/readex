@@ -1,0 +1,17 @@
+{
+  "name": "mdrcel-readability-oracle",
+  "version": "1.0.0",
+  "private": true,
+  "description": "mdrcel Mozilla Readability oracle adapter (run.mjs). Pinned exact; the committed package-lock.json is the reproduction source. The dev-time-only schema validator (ajv) is in devDependencies and is NOT in the adapter's runtime closure (HLD section 6).",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@mozilla/readability": "0.6.0",
+    "jsdom": "29.1.1"
+  },
+  "devDependencies": {
+    "ajv": "^8.17.1"
+  }
+}

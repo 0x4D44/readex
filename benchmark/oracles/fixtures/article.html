@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Synthetic Self-Test Article</title>
+<meta name="description" content="Synthetic article fixture for the oracle adapter self-test.">
+<link rel="canonical" href="https://example.test/selftest-article">
+<script>
+  // This script content MUST NOT leak into extracted `text`.
+  var leaked = "SCRIPT_SHOULD_NOT_APPEAR_IN_TEXT";
+  console.log(leaked);
+</script>
+<style>
+  /* A deliberately malformed CSS rule exercises the stderr-only console
+     hygiene (HLD section 5): jsdom must not route the parse error to stdout. */
+  body { color: #123456 ;;; }
+  .broken { color: ; background:: }
+  @media screen and (min-width {
+</style>
+</head>
+<body>
+<nav id="site-nav">
+  <ul><li><a href="/">Home</a></li><li><a href="/about">About</a></li></ul>
+</nav>
+<article id="content">
+  <h1>Synthetic Self-Test Article</h1>
+  <p><b>This synthetic article</b> exists solely so the oracle adapter
+  self-test has a stable, byte-identical article-shaped input to exercise
+  extraction against. It is never fetched from the live network.</p>
+  <h2>Body structure</h2>
+  <p>The page carries a leading summary paragraph, a section heading, and
+  several paragraphs of running prose surrounded by navigation and footer
+  boilerplate that a competent extractor should strip from the article body.</p>
+  <p>A second body paragraph adds enough running tokens that an extractor is
+  unambiguously expected to return substantive, non-empty text for this
+  fixture, distinguishing it from the deliberately empty companion fixture.</p>
+  <h2>References</h2>
+  <ol><li>Synthetic source one.</li><li>Synthetic source two.</li></ol>
+</article>
+<footer id="site-footer">
+  <p>Boilerplate footer with a privacy policy and copyright notice that is
+  not part of the article body and should be stripped by the extractor.</p>
+</footer>
+</body>
+</html>

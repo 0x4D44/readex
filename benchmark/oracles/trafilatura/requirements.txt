@@ -1,0 +1,34 @@
+# mdrcel Trafilatura oracle adapter — PINNED RUNTIME CLOSURE (HLD section 6).
+#
+# Full transitive freeze with exact `==`, INCLUDING the fallback cascade:
+# the Barbaresi-2021 SOTA *is* Trafilatura + its fallbacks (jusText, lxml,
+# htmldate, ...), so pinning the top-level package alone under-specifies the
+# algorithm. Frozen on the declared reproducibility host:
+#   Python 3.12.10, Windows 11 (win32), 2026-05-17.
+# lxml ships per-CPython-ABI wheels (=> a different native libxml2 under a
+# different interpreter => a different `text`); this file ONLY reproduces
+# under the matching interpreter, which run.py guarantees by construction
+# (the venv self-re-exec, HLD section 4).
+#
+# The dev-time-only schema validator (jsonschema) is DELIBERATELY NOT here:
+# it is installed by a separate README bootstrap step into the same
+# git-ignored .venv and is NOT in the adapter's pinned runtime closure, so it
+# does not widen the determinism surface (HLD section 6).
+babel==2.18.0
+certifi==2026.4.22
+charset-normalizer==3.4.7
+courlan==1.3.2
+dateparser==1.4.0
+htmldate==1.9.4
+jusText==3.0.2
+lxml==6.1.0
+lxml_html_clean==0.4.4
+python-dateutil==2.9.0.post0
+pytz==2026.2
+regex==2026.5.9
+six==1.17.0
+tld==0.13.2
+trafilatura==2.0.0
+tzdata==2026.2
+tzlocal==5.3.1
+urllib3==2.7.0

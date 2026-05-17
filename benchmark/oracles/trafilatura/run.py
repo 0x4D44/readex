@@ -1,0 +1,309 @@
+#!/usr/bin/env python3
+"""mdrcel Trafilatura oracle adapter.
+
+Invocation (HLD 'mdrcel Oracle Adapters' section 3.1):
+
+    python <repo>/benchmark/oracles/trafilatura/run.py <abs.html> [--base-url <URL>]
+
+Writes EXACTLY ONE JSON object to stdout (single write + flush) and nothing
+else; all logs/warnings/parser noise go to stderr. The output shape is
+governed by ../contract.schema.json; the behavioural contract (the
+ok/error/exit tri-state, same-machine determinism, the well-formed `text`
+primitive) is HLD section 3.
+
+Self-correcting interpreter (HLD section 4, B2 spike resolution): the harness
+invokes BARE `python` from PATH and activates no venv. `requirements.txt` only
+reproduces under the matching interpreter (lxml ships per-CPython-ABI wheels
+=> a different native libxml2 => different `text`). So this script resolves
+the venv interpreter relative to __file__ and, if the running interpreter is
+not it (compared via resolved real paths), re-runs itself as a CHILD under the
+venv interpreter using subprocess, relays the child's stdout/stderr verbatim,
+and propagates the child's exit code. It MUST NOT use os.execv (the B2 spike
+proved Windows os.execv returns exit 0 regardless of the child and shreds a
+spaced --base-url). Re-exec happens AT MOST ONCE, enforced by one tightly
+scoped internal env sentinel (the sole, justified exception to 'no env vars').
+"""
+
+import json
+import os
+import sys
+
+# --- The single internal re-exec sentinel (HLD section 4) ------------------
+# Set by the parent before spawning the venv child; the child sees it and runs
+# the adapter directly, so re-exec can happen AT MOST ONCE (fork-bomb guard).
+_REEXEC_SENTINEL = "MDRCEL_TRAFILATURA_REEXECED"
+
+
+def _emit_json(obj):
+    """The SOLE stdout writer: serialize `obj` and emit it as UTF-8 in one
+    atomic write + flush, independent of the host console/pipe codepage.
+
+    The harness invokes this adapter with stdout = an OS pipe (Stdio::piped()).
+    On Windows, Python then sets ``sys.stdout.encoding`` to the ANSI codepage
+    (cp1252), so a text-layer ``sys.stdout.write`` of the contract object
+    raises ``UnicodeEncodeError`` on any non-Latin-1 code point real pages
+    carry (curly quotes, em-dashes, accents, CJK) and the whole envelope is
+    lost. HLD §3.3 mandates UTF-8 stdout regardless of the host codepage, so
+    we serialize with ``ensure_ascii=False`` and write the UTF-8 BYTES to the
+    raw binary buffer (``sys.stdout.buffer``), bypassing the text encoder
+    entirely. Still EXACTLY one write + one flush and nothing else on stdout
+    (HLD §3.3 no partial/interleaved output); ``json.dumps`` is deterministic
+    for our fixed-shape dict, preserving same-machine byte-identity (§3.5).
+    """
+    sys.stdout.buffer.write(json.dumps(obj, ensure_ascii=False).encode("utf-8"))
+    sys.stdout.buffer.flush()
+
+
+def _venv_python_path():
+    """Absolute path to the committed venv's interpreter, relative to __file__.
+
+    Platform-correct: Windows venvs put python.exe under Scripts/, POSIX under
+    bin/. This does NOT chdir and does NOT resolve the snapshot path.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    if os.name == "nt":
+        return os.path.join(here, ".venv", "Scripts", "python.exe")
+    return os.path.join(here, ".venv", "bin", "python")
+
+
+def _same_interpreter(a, b):
+    """True iff two interpreter paths are the same file by RESOLVED real path.
+
+    realpath + normcase so symlink / Windows short-path (8.3) / case
+    differences cannot produce a spurious mismatch (HLD section 4).
+    """
+    try:
+        ra = os.path.normcase(os.path.realpath(a))
+        rb = os.path.normcase(os.path.realpath(b))
+        return ra == rb
+    except OSError:
+        return False
+
+
+def _emit_failure(message, oracle_version=None):
+    """Emit the fully field-determined section 3.4 failure envelope and exit !=0.
+
+    `ok:false` and a non-zero exit ALWAYS co-occur (the consumer treats either
+    alone as failure). Imports/version reads happen inside the guarded block so
+    an ImportError still yields this envelope.
+    """
+    obj = {
+        "contract_version": 1,
+        "oracle": "trafilatura",
+        "oracle_version": oracle_version,
+        "title": None,
+        "text": "",
+        "html": None,
+        "word_count": None,
+        "canonical_url": None,
+        "language": None,
+        "ok": False,
+        "error": str(message),
+    }
+    _emit_json(obj)
+    sys.exit(1)
+
+
+def _reexec_into_venv():
+    """If not already running under the venv interpreter, re-run as a child.
+
+    subprocess-proxy, NOT os.execv (HLD section 4 / B2 spike): spawn the venv
+    interpreter as a child with the SAME argv, relay stdout/stderr verbatim,
+    and propagate the child's exit code. A corrupt/unspawnable venv is a
+    CATCHABLE failure that still emits the section 3.4 envelope. A genuinely
+    ABSENT venv (fresh clone — git-ignored) emits the section 3.4 envelope
+    whose `error` names the one-time bootstrap command.
+    """
+    if os.environ.get(_REEXEC_SENTINEL) == "1":
+        return  # Already the venv child — run directly (at-most-once guard).
+
+    venv_py = _venv_python_path()
+    if _same_interpreter(sys.executable, venv_py):
+        return  # Bare `python` already IS the venv interpreter.
+
+    if not os.path.isfile(venv_py):
+        _emit_failure(
+            "Trafilatura venv not bootstrapped (expected interpreter "
+            f"missing: {venv_py}). One-time bootstrap (see "
+            "benchmark/oracles/trafilatura/README.md):  python -m venv "
+            "benchmark/oracles/trafilatura/.venv  &&  "
+            "benchmark/oracles/trafilatura/.venv/Scripts/python -m pip "
+            "install -r benchmark/oracles/trafilatura/requirements.txt"
+        )
+
+    import subprocess
+
+    child_env = dict(os.environ)
+    child_env[_REEXEC_SENTINEL] = "1"
+    try:
+        completed = subprocess.run(
+            [venv_py, os.path.abspath(__file__)] + sys.argv[1:],
+            env=child_env,
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+            check=False,
+        )
+    except OSError as exc:
+        _emit_failure(
+            f"Trafilatura venv interpreter unspawnable ({venv_py}): {exc}"
+        )
+        return  # unreachable; _emit_failure exits.
+    sys.exit(completed.returncode)
+
+
+def _to_well_formed(text):
+    """HLD section 3.3 pinned, never-raising primitive (Python side).
+
+    Replace lone surrogates so `text` is valid UTF-8 before serialization
+    (a serde_json reject of an otherwise-valid extraction is a Bug-E2 trap).
+    Identity on well-formed input (verified incl. astral/BOM/NUL).
+    """
+    return text.encode("utf-8", "surrogatepass").decode("utf-8", "replace")
+
+
+def _word_count(text):
+    """Informational only (HLD section 3.2). The consumer recomputes and
+    ignores this; a simple whitespace split is sufficient and deterministic."""
+    return len(text.split())
+
+
+def _parse_args(argv):
+    """Positional <abs.html> plus optional --base-url <URL>. No argparse: a
+    fixed two-shape CLI; argparse would print to stdout on error."""
+    path = None
+    base_url = None
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--base-url":
+            if i + 1 >= len(argv):
+                return None, None, "--base-url requires a URL argument"
+            base_url = argv[i + 1]
+            i += 2
+            continue
+        if path is None:
+            path = a
+            i += 1
+            continue
+        return None, None, f"unexpected extra argument: {a!r}"
+    if path is None:
+        return None, None, "missing required <abs.html> argument"
+    return path, base_url, None
+
+
+def main():
+    # Self-correct the interpreter FIRST (HLD section 4). On return we are
+    # guaranteed to be the venv child (or bare python already was the venv).
+    _reexec_into_venv()
+
+    # Everything that can fail at the tool/import layer is inside this guard so
+    # an ImportError / version-read failure still emits the section 3.4
+    # envelope (the Bug-E2 'adapter blew up — catchable' guard).
+    oracle_version = None
+    try:
+        snapshot_path, base_url, arg_err = _parse_args(sys.argv[1:])
+        if arg_err is not None:
+            _emit_failure(arg_err)
+
+        # Import + version read INSIDE the guard (HLD section 3.4).
+        import importlib.metadata
+
+        from trafilatura import bare_extraction
+        from trafilatura.settings import use_config
+
+        try:
+            oracle_version = importlib.metadata.version("trafilatura")
+        except Exception:  # noqa: BLE001 — null on any unreadable version.
+            oracle_version = None
+
+        if not os.path.isfile(snapshot_path):
+            _emit_failure(
+                f"snapshot file not found or not a regular file: "
+                f"{snapshot_path!r}",
+                oracle_version,
+            )
+
+        # Bytes read RAW and handed to the library unmodified; the library
+        # does whatever decoding it does — part of the pinned algorithm
+        # (HLD section 3.1, honest framing).
+        with open(snapshot_path, "rb") as fh:
+            raw = fh.read()
+
+        # Explicit committed config, never ambient (HLD section 4).
+        # EXTRACTION_TIMEOUT=0 disables the signal-based timeout: SIGALRM is
+        # POSIX-only (unusable on the Windows CI host) and a wall-clock cutoff
+        # would make `text` non-deterministic. deduplicate=False is passed
+        # explicitly below (Trafilatura's module-level dedup LRU is stateful
+        # and non-deterministic).
+        cfg = use_config(
+            os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "trafilatura.cfg"
+            )
+        )
+
+        doc = bare_extraction(
+            raw,
+            url=base_url,
+            with_metadata=True,
+            deduplicate=False,
+            include_comments=False,
+            config=cfg,
+        )
+
+        if doc is None:
+            # 'Found nothing' is a VALID ok:true result, NOT an error — the
+            # exact distinction Bug E2 collapsed (HLD section 3.4).
+            result = {
+                "contract_version": 1,
+                "oracle": "trafilatura",
+                "oracle_version": oracle_version,
+                "title": None,
+                "text": "",
+                "html": None,
+                "word_count": 0,
+                "canonical_url": None,
+                "language": None,
+                "ok": True,
+                "error": None,
+            }
+        else:
+            d = doc.as_dict()  # the .as_dict() METHOD (as_dict= param is
+            #                    deprecated in Trafilatura 2.x — HLD section 4).
+            title = d.get("title")
+            raw_text = d.get("text") or ""
+            text = _to_well_formed(raw_text)
+            language = d.get("language")  # None unless py3langid present
+            #                                (null-acceptable per HLD section 4).
+            canonical = d.get("url")  # tool's source/canonical URL or None.
+            result = {
+                "contract_version": 1,
+                "oracle": "trafilatura",
+                "oracle_version": oracle_version,
+                "title": title if title else None,
+                "text": text,
+                "html": None,  # v1: the body is an lxml element, not a
+                #                 string; not serialized (HLD section 4).
+                "word_count": _word_count(text),
+                "canonical_url": canonical if canonical else None,
+                "language": language if language else None,
+                "ok": True,
+                "error": None,
+            }
+    except SystemExit:
+        raise  # _emit_failure's sys.exit must propagate unaltered.
+    except BaseException as exc:  # noqa: BLE001 — any catchable tool/runtime
+        #                            error still emits the section 3.4 envelope.
+        _emit_failure(f"{type(exc).__name__}: {exc}", oracle_version)
+        return  # unreachable; _emit_failure exits.
+
+    # Build the COMPLETE object in memory, then a SINGLE UTF-8 write + flush;
+    # never begin emitting until the object is complete (HLD section 3.3 — no
+    # partial/interleaved stdout). _emit_json serializes with
+    # ensure_ascii=False and writes the UTF-8 bytes to the raw buffer, so the
+    # contract holds regardless of the host console/pipe codepage.
+    _emit_json(result)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
