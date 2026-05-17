@@ -1,0 +1,20 @@
+# Repo-root .gitattributes — CONTENT owned by the Oracle Adapters HLD (§8/§2.1);
+# Team #1 (crate + harness) ACTIONS its commit first in M0 because Team #1
+# commits first, and it MUST land before any byte-stable artifact is added
+# (Cargo.lock is already committed and is repaired here via --renormalize).
+#
+# core.autocrlf=true on the dev box mangles bytes on check-in unless a
+# .gitattributes is in effect for the path at `git add` time. Adding it later
+# does NOT fix already-staged index entries — only `git add --renormalize`
+# does. This file therefore exists before metrics/snapshots/fixtures land.
+
+# Default: text files are normalised to LF in the repo on check-in.
+* text=auto eol=lf
+
+# Byte-stable artifacts — stored verbatim, never line-ending-normalised, so
+# they are byte-identical run-to-run on the declared reproducibility host
+# (harness HLD §2.9; oracle HLD §3.5). Locks, schema, and HTML fixtures.
+Cargo.lock -text
+package-lock.json -text
+benchmark/oracles/contract.schema.json -text
+*.html -text
