@@ -7,3 +7,7 @@ venv/
 env/
 *.tmp
 *.log
+
+# Per-run harness output — scratch, not persisted (harness HLD §4.1/§9).
+# The only persisted run state is benchmark/baseline/results.json (in git).
+benchmark/runs/

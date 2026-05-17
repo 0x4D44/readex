@@ -1,3 +1,6 @@
+[workspace]
+members = ["benchmark"]
+
 [package]
 name = "mdrcel"
 version = "0.1.0"
