@@ -1,0 +1,90 @@
+{
+  "host": "anvil",
+  "utc_timestamp": "2026-05-17T09-02-22Z",
+  "corpus_size": 3,
+  "status_counts": {
+    "crate_status": {
+      "not_implemented": 3
+    },
+    "trafilatura_status": {
+      "oracle_error": 3
+    },
+    "readability_status": {
+      "oracle_error": 3
+    }
+  },
+  "urls": [
+    {
+      "url": "https://example.test/wikipedia-article",
+      "shape_class": "wikipedia",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "oracle_error",
+      "readability_status": "oracle_error",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": "oracle process `python` exited unsuccessfully (exit code: 2); stdout was: ",
+        "readability_reason": "oracle process `node` exited unsuccessfully (exit code: 1); stdout was: "
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": null,
+        "readability_wc": null
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    },
+    {
+      "url": "https://example.test/hub-index",
+      "shape_class": "hub_index",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "oracle_error",
+      "readability_status": "oracle_error",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": "oracle process `python` exited unsuccessfully (exit code: 2); stdout was: ",
+        "readability_reason": "oracle process `node` exited unsuccessfully (exit code: 1); stdout was: "
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": null,
+        "readability_wc": null
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    },
+    {
+      "url": "https://example.test/edge-empty",
+      "shape_class": "edge_case",
+      "crate_status": "not_implemented",
+      "trafilatura_status": "oracle_error",
+      "readability_status": "oracle_error",
+      "status_detail": {
+        "crate_reason": null,
+        "trafilatura_reason": "oracle process `python` exited unsuccessfully (exit code: 2); stdout was: ",
+        "readability_reason": "oracle process `node` exited unsuccessfully (exit code: 1); stdout was: "
+      },
+      "word_counts": {
+        "crate_wc": null,
+        "trafilatura_wc": null,
+        "readability_wc": null
+      },
+      "score": {
+        "outcome": "not_scored",
+        "reason": "crate_not_implemented"
+      },
+      "edit_sim": null,
+      "guardrail_flag": false,
+      "agreement": null
+    }
+  ]
+}
