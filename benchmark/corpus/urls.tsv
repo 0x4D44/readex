@@ -1,20 +1,113 @@
-# mdrcel corpus manifest (HLD section 6). Tab-separated, 5 columns:
+# mdrcel corpus manifest (HLD §6). Tab-separated, 5 columns:
 #   url<TAB>shape_class<TAB>snapshot_filename<TAB>fetched_date<TAB>note
-# snapshot_filename = hex(sha256(url))[:16] + .html  (immutable, committed).
-# The three rows below are SYNTHETIC hand-crafted fixtures for downstream
-# stage development -- they were NOT fetched from the live network.
+# snapshot_filename = hex(sha256(url-utf8))[:16] + .html  (first 8 bytes of the
+#   digest = 16 lowercase hex chars; immutable, committed). The loader
+#   (corpus::load_checked) re-derives this and HARD-ERRORS on any drift, an
+#   unknown shape_class, a malformed row, or a missing snapshot — by design.
 # Re-fetching a URL means a NEW row + NEW snapshot, never editing an old one.
+# shape_class ∈ {wikipedia, sec_edgar, regulator, news, tech_blog, hub_index,
+#   edge_case} (exact lowercase tokens; closed set).
 #
-# CAVEAT -- EDGAR / table-heavy gap (deliberate, on record):
-# These 3 fixtures cover only the wikipedia, hub_index, and edge_case shapes.
-# They DELIBERATELY EXCLUDE the table-heavy `sec_edgar` shape -- precisely the
-# the consumer breaking case and HLD gold members #3 (SEC 10-K), #5 (table-heavy
-# SEC), #6 (table-heavy regulator). Therefore Stages 6-8 passing on this file
-# is NOT evidence about EDGAR/table extraction or regulator filings. Real
-# EDGAR/regulator snapshots are corpus-curation work (HLD section 11, item 4)
-# and are MANDATORY before the section 2.7 gold-set baseline freeze. Do not
-# treat green here as coverage of the weak point this harness exists to catch.
-
-https://example.test/wikipedia-article	wikipedia	4f87da126dcc0f7a.html	2026-05-17	synthetic article-shaped fixture
-https://example.test/hub-index	hub_index	cb6ee3ae74f2e4c2.html	2026-05-17	synthetic navigation/hub fixture
-https://example.test/edge-empty	edge_case	779af8542eafdd9d.html	2026-05-17	synthetic near-empty body fixture
+# PROVENANCE: every row below was fetched from the LIVE public web on the
+# fetched_date with curl and User-Agent "mdrcel-benchmark/0.1
+# (+martingdavidson@gmail.com)", and each snapshot was authenticity-checked (real
+# title + body content; no SEC rate-limit / Cloudflare / login / error /
+# redirect-stub pages). The earlier 3 synthetic hand-crafted fixtures have
+# been REMOVED (rows and snapshot files); this corpus is now ALL-REAL.
+#
+# REPRODUCIBILITY DISCLOSURE (honest scope of the immutable-corpus contract):
+# the contract is "these exact committed snapshot bytes, forever" — the loader
+# (corpus::load_checked) hard-errors on any filename/URL drift or missing
+# snapshot, so that contract DOES hold for every row here. It is NOT a claim
+# that each capture can be re-fetched and re-validated against its live source.
+# A substantial subset (~15+ rows) is intrinsically non-reproducible: the news
+# sections (8), the hub_index landing/aggregator pages (5), and the
+# daily/continuously-updated regulator pages (e.g. Federal Reserve H.15
+# Selected Interest Rates, dated "Daily"; Bank of England Bank Rate; the
+# gov.uk/Fed hubs) all change at the source between fetches. For those rows the
+# committed bytes are a frozen point-in-time capture and the only authority is
+# the file in this repo — they are deliberately NOT presented as stable,
+# re-checkable-against-live captures. Stable, re-fetchable rows (dated SEC
+# EDGAR filings by accession, dated blog posts, the dated W3C HTML 5.2
+# Recommendation, IANA/example.* reserved domains) are the re-checkable subset.
+#
+# EDGAR / table-heavy coverage (the weak point this harness exists to catch):
+# the deliberate EDGAR-exclusion caveat that previously stood here is now
+# FALSE and has been removed. This corpus DOES include real table-heavy SEC
+# EDGAR 10-K filings and real table-heavy regulator pages:
+#   * sec_edgar, Apple FY2025 10-K  -> aapl-20250927.htm (HLD §7 gold #3; 62
+#     <table>, full 10-K prose incl. "Part I Item 1. Business").
+#   * sec_edgar, Apple FY2019 10-K  -> a10-k20199282019.htm (older table-heavy
+#     filing, 124 <table>; HLD §7 gold #5 candidate).
+#   * sec_edgar, IBM FY2008 10-K (filed 2009) -> a2189817z10-k.htm (legacy
+#     table-heavy EDGAR HTML — the classic EDGAR weak point).
+#   * sec_edgar, Berkshire FY2024 & Microsoft FY2025 10-Ks, Apple Q2-FY2026
+#     10-Q (all large, table-heavy financial statements).
+#   * regulator, gov.uk HMRC employer rates 2025-26 (23 <table>) & 2024-25
+#     (22 <table>), gov.uk income-tax rates (7 <table>), US Federal Reserve
+#     open-market ops (16 <table>) and H.15 selected interest rates.
+# Stages 6-8 passing on this file IS therefore evidence about EDGAR/table
+# extraction and regulator filings. (HLD §11 item 4 corpus-curation work;
+# precedes the §2.7 gold-set baseline freeze.)
+#
+# 51 real URLs. Per shape_class: wikipedia 8, sec_edgar 8, regulator 8,
+# news 8, tech_blog 8, hub_index 5, edge_case 6.
+#
+# ---- wikipedia (8) ----
+https://en.wikipedia.org/wiki/Apple_Inc.	wikipedia	ae2c2184beb6d264.html	2026-05-17	English Wikipedia article (the consumer gold case, ~5k-word article)
+https://en.wikipedia.org/wiki/Wm_Morrison_Supermarkets	wikipedia	9c8f49f04f792f81.html	2026-05-17	English Wikipedia article (the consumer gold case)
+https://en.wikipedia.org/wiki/Berkshire_Hathaway	wikipedia	8638632aa27b2f45.html	2026-05-17	English Wikipedia, long article with infoboxes
+https://en.wikipedia.org/wiki/Rust_(programming_language)	wikipedia	f76ec833b4b5e57d.html	2026-05-17	English Wikipedia, technical article
+https://en.wikipedia.org/wiki/HTML	wikipedia	86df4d2e654952e4.html	2026-05-17	English Wikipedia, reference article
+https://en.wikipedia.org/wiki/United_States_Securities_and_Exchange_Commission	wikipedia	0a8d11a0ba2ed7cd.html	2026-05-17	English Wikipedia, institutional article
+https://de.wikipedia.org/wiki/Rust_(Programmiersprache)	wikipedia	5714710c8c9a3e8a.html	2026-05-17	German Wikipedia, multilingual case
+https://fr.wikipedia.org/wiki/Apple	wikipedia	507b9cdbe036bf58.html	2026-05-17	French Wikipedia, multilingual case
+# ---- sec_edgar (8) ----
+https://www.sec.gov/Archives/edgar/data/320193/000032019325000079/aapl-20250927.htm	sec_edgar	9a1590d0917107a7.html	2026-05-17	Apple FY2025 10-K aapl-20250927.htm (HLD gold #3; 62 tables, full 10-K prose)
+https://www.sec.gov/Archives/edgar/data/320193/000032019319000119/a10-k20199282019.htm	sec_edgar	577e61856ca2770d.html	2026-05-17	Apple FY2019 10-K (older table-heavy filing, 124 tables; HLD gold #5 candidate)
+https://www.sec.gov/Archives/edgar/data/51143/000104746909001737/a2189817z10-k.htm	sec_edgar	41d2afac25d46010.html	2026-05-17	IBM FY2008 10-K filed 2009: legacy EDGAR HTML, NOT modern-table-heavy — financial data sits in old uppercase <TABLE> plus pervasive <font>/spacing presentational markup (~1500 <font> tags), the classic legacy-EDGAR extraction weak-point
+https://www.sec.gov/Archives/edgar/data/1067983/000095017025025210/brka-20241231.htm	sec_edgar	dc8ba3c086153274.html	2026-05-17	Berkshire Hathaway FY2024 10-K (very large, table-heavy)
+https://www.sec.gov/Archives/edgar/data/789019/000095017025100235/msft-20250630.htm	sec_edgar	683d5643b173c7fd.html	2026-05-17	Microsoft FY2025 10-K (modern HTML, table-heavy financials)
+https://www.sec.gov/Archives/edgar/data/320193/000032019326000013/aapl-20260328.htm	sec_edgar	340e6571c584979a.html	2026-05-17	Apple Q2-FY2026 10-Q (table-heavy condensed financial statements)
+https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=0000320193&type=10-K&dateb=&owner=include&count=40	sec_edgar	e6037cf1c861d089.html	2026-05-17	EDGAR company filing index page for Apple (EDGAR listing shape)
+https://www.sec.gov/Archives/edgar/data/320193/000032019325000079/0000320193-25-000079-index.htm	sec_edgar	6c688ba250fbc628.html	2026-05-17	EDGAR filing detail/index page for Apple FY2025 10-K
+# ---- regulator (8) ----
+https://www.gov.uk/government/publications/rates-and-allowances-income-tax/income-tax-rates-and-allowances-current-and-past	regulator	803b534a50a3f584.html	2026-05-17	gov.uk HMRC income tax rates and allowances (7 tables, table-heavy)
+https://www.gov.uk/guidance/rates-and-thresholds-for-employers-2025-to-2026	regulator	9ec7aaf8edb71ac1.html	2026-05-17	gov.uk HMRC employer rates 2025-26 (23 tables, strongly table-heavy)
+https://www.gov.uk/guidance/rates-and-thresholds-for-employers-2024-to-2025	regulator	d159708a94e68ab6.html	2026-05-17	gov.uk HMRC employer rates 2024-25 (22 tables, table-heavy)
+https://www.federalreserve.gov/monetarypolicy/openmarket.htm	regulator	e339ce76eb1cba73.html	2026-05-17	US Federal Reserve open market operations (16 tables, table-heavy)
+https://www.federalreserve.gov/releases/h15/	regulator	8740577e8c7803f2.html	2026-05-17	US Federal Reserve H.15 Selected Interest Rates (daily): one large interest-rate matrix <table> plus one small secondary table (2 <table> total), not many dense tables — daily-updated live page
+https://www.sec.gov/newsroom/press-releases/2024-1	regulator	8d5cc5247b273722.html	2026-05-17	SEC press release (regulator prose publication)
+https://www.bankofengland.co.uk/monetary-policy/the-interest-rate-bank-rate	regulator	8670676aae5747a2.html	2026-05-17	Bank of England Bank Rate explainer page
+https://www.gov.uk/government/organisations/companies-house	regulator	0e657595b198c359.html	2026-05-17	gov.uk Companies House organisation page
+# ---- news (8) ----
+https://www.bbc.com/news/technology	news	f405a9e3314e15da.html	2026-05-17	BBC News technology section
+https://apnews.com/hub/technology	news	455761fa318c01ef.html	2026-05-17	Associated Press technology section
+https://text.npr.org/	news	25a711d6ecb6768d.html	2026-05-17	NPR text-only edition front (lightweight news index)
+https://text.npr.org/1004	news	2ea386b478856ebc.html	2026-05-17	NPR text-only World section listing
+https://www.theguardian.com/technology	news	3d00ac8ea9abae79.html	2026-05-17	The Guardian technology section
+https://www.aljazeera.com/economy/	news	0d8e2588d2d1b931.html	2026-05-17	Al Jazeera economy section
+https://www.cnbc.com/technology/	news	de79cc5a2c3b5416.html	2026-05-17	CNBC technology section
+https://www.theverge.com/tech	news	d153da3363ba7cf1.html	2026-05-17	The Verge tech section
+# ---- tech_blog (8) ----
+https://blog.rust-lang.org/	tech_blog	9c64e8e3fcd844d4.html	2026-05-17	Official Rust language blog index
+https://blog.rust-lang.org/2024/11/28/Rust-1.83.0/	tech_blog	65e1c5b5502a5c81.html	2026-05-17	Rust 1.83.0 release announcement (canonical post)
+https://blog.rust-lang.org/2024/10/17/Rust-1.82.0/	tech_blog	39ca4af9befa0524.html	2026-05-17	Rust 1.82.0 release announcement post
+https://kubernetes.io/docs/concepts/overview/	tech_blog	eceb960849e96838.html	2026-05-17	Kubernetes concepts overview (long technical doc)
+https://github.com/rust-lang/rust	tech_blog	3dbf9e15ef26c109.html	2026-05-17	GitHub repo page rendered HTML (README-as-HTML)
+https://blog.cloudflare.com/	tech_blog	859b46bf108e3db4.html	2026-05-17	Cloudflare engineering blog index
+https://github.blog/	tech_blog	aa562fed8195cd92.html	2026-05-17	GitHub official blog index
+https://kubernetes.io/blog/	tech_blog	5f27add4419ace7c.html	2026-05-17	Kubernetes project blog index
+# ---- hub_index (5) ----
+https://www.gov.uk/	hub_index	a604eb8a03efa82d.html	2026-05-17	gov.uk homepage, navigation hub (near-empty article body)
+https://en.wikipedia.org/wiki/Main_Page	hub_index	d71ec714e950bddf.html	2026-05-17	Wikipedia Main Page, navigation/portal hub
+https://news.ycombinator.com/	hub_index	0f63a2a5a5620b74.html	2026-05-17	Hacker News front page, link aggregator hub
+https://www.sec.gov/	hub_index	3b766ea17775d5f2.html	2026-05-17	SEC.gov homepage, navigation hub
+https://lite.cnn.com/	hub_index	e1106c5e26712078.html	2026-05-17	CNN Lite text-only news hub (link aggregator)
+# ---- edge_case (6) ----
+https://example.com/	edge_case	0f115db062b7c0dd.html	2026-05-17	Minimal page, body text only no metadata (the consumer gold case)
+https://example.org/	edge_case	8198d1bac40a1033.html	2026-05-17	Minimal IANA reserved-domain page (very short body)
+https://www.iana.org/help/example-domains	edge_case	7630c14a6e2b99f6.html	2026-05-17	Short IANA explanatory page
+https://httpbin.org/html	edge_case	8badbcb95530e9c2.html	2026-05-17	Single Moby-Dick excerpt, minimal HTML structure
+https://www.w3.org/TR/2017/REC-html52-20171214/	edge_case	78e3fc9fe5c86c8d.html	2026-05-17	Frozen dated W3C "HTML 5.2" Recommendation, 14 December 2017 (REC-html52-20171214) — very long single-page spec, immutable archival snapshot (no "Last Updated"; not the WHATWG Living Standard)
+https://info.cern.ch/hypertext/WWW/TheProject.html	edge_case	74ef4dadd5f70cb5.html	2026-05-17	Historic minimal HTML (first website, tiny body)
