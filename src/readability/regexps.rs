@@ -185,6 +185,30 @@ pub fn commas() -> &'static Regex {
     })
 }
 
+/// `/\.( |$)/` — the inline regex in `_grabArticle`'s sibling-append `<p>`
+/// short-content clause (`Readability.js:1477`,
+/// `nodeContent.search(/\.( |$)/) !== -1`). NOT a `REGEXPS`-table entry (it is
+/// an inline literal at the call site), but it is load-bearing on the scored
+/// path (it decides whether a short `<p>` sibling is appended), so it lives
+/// here with the rest of the patterns and the §8 conformance table.
+///
+/// Semantics: a literal `.` immediately followed by **either** a single ASCII
+/// U+0020 space **or** end-of-input (`$`). The space is a literal U+0020 in
+/// the JS source (NOT `\s`), ported verbatim as a literal space. JS `String
+/// .prototype.search` returns the match index or `-1`; the caller's
+/// `!== -1` is exactly "this pattern matches somewhere", i.e.
+/// [`Regex::is_match`].
+///
+/// **Dialect note (HLD §8):** JS `$` without `/m` is end-of-input and also
+/// matches immediately before a final `\n`; Rust `regex` `$` without `(?m)`
+/// behaves identically. The input here is `_getInnerText(sibling)` (already
+/// JS-trimmed + `/\s{2,}/`-collapsed), so it never ends in `\n` and the
+/// nuance is moot — behaviourally identical to JS `/\.( |$)/`.
+pub fn period_space_or_end() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| compile("\\.( |$)"))
+}
+
 /// `REGEXPS.videos` (`Readability.js:153-154`, `/…/i`). The default
 /// `_allowedVideoRegex`. Used by `_clean` for embed allow-listing. Stage 1a's
 /// `_clean` targets object/embed/footer/link/aside — `isEmbed` is true for
@@ -471,6 +495,15 @@ mod tests {
             (extraneous, "email", true), // e[\-]?mail -> '-' optional
             (extraneous, "archive", true),
             (extraneous, "BodyText", false),
+            // --- period_space_or_end: /\.( |$)/ (Stage-1b <p> clause) ---
+            (period_space_or_end, "end.", true), // '.' then end-of-input ($)
+            (period_space_or_end, "a. b", true), // '.' then a literal U+0020
+            (period_space_or_end, "Mr. Smith ran.", true), // matches first ". "
+            (period_space_or_end, "no period here", false),
+            (period_space_or_end, "ends with dot then more.x", false), // '.' then 'x' (not space/end)
+            (period_space_or_end, "a.b. ", true), // second '.' is followed by ' '
+            (period_space_or_end, "", false),
+            (period_space_or_end, ".", true), // '.' immediately at end
         ];
 
         for (i, (f, hay, expect)) in rows.iter().enumerate() {

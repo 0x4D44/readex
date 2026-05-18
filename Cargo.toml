@@ -15,7 +15,20 @@ name = "mdrcel"
 # functionality behind the existing frozen surface, nothing removed or broken.
 # (Stage 0's 0.2.1->0.2.2 was a PATCH precisely because no behaviour was
 # observable then; that condition no longer holds.)
-version = "0.3.0"
+#
+# M2 Stage 1b (2026-05-18): 0.3.0 -> 0.3.1 PATCH. `_grabArticle` now completes
+# the sibling-append block (`Readability.js:1415-1535`) it deliberately
+# STOPPED before at Stage 1a — preambles / content split by ads / qualifying
+# `<p>`/scored siblings are appended to the article. This MATURES the
+# already-shipped extraction behaviour behind the SAME frozen public surface:
+# no new public type/function/signature, `ExtractError` unchanged,
+# `extract == extract_with(&Options::default())` preserved, an empty
+# extraction still a valid `Ok` (Bug-E2). Per semver (CLAUDE.md "Version
+# management") that is a PATCH — an internal behaviour refinement of an
+# already-public capability, nothing added to or removed from the API (Stage
+# 1a was MINOR because it introduced the *first* real extraction; 1b only
+# extends that same already-public behaviour, so it is a PATCH not a MINOR).
+version = "0.3.1"
 edition = "2024"
 
 [dependencies]

@@ -393,8 +393,16 @@ pub fn grab_article(
     }
 
     let mut top_candidate = top_candidates.first().cloned();
-    let mut needed_to_create_top_candidate = false;
-    let mut parent_of_top_candidate: Option<NodeRef>;
+
+    // `neededToCreateTopCandidate` (`Readability.js:1314`) gates ONLY the
+    // score-invisible 1517-1532 page-wrap (assigning `id="readability-page-1"`
+    // / `className="page"` and, in the non-fallback arm, wrapping
+    // articleContent's children in an extra `<div>`). Both are id/className
+    // (score-invisible, HLD §2) and a wrapper DIV adds ZERO `#text`
+    // characters, so 1517-1532 is provably `text_content`-invariant and is
+    // deliberately NOT ported at Stage 1b (recorded in notes/m2-stage1b.md;
+    // the variable returns when Stage 1c needs the `_attempts` bookkeeping
+    // context). It therefore intentionally does not exist here.
 
     // If no top candidate, OR it is BODY: build a fake DIV from page children
     // (Readability.js:1314-1327). Needed for the first Ok.
@@ -405,7 +413,6 @@ pub fn grab_article(
             .unwrap_or(false)
     {
         let tc = create_element("DIV");
-        needed_to_create_top_candidate = true;
         // Move EVERY child (incl. text nodes) of page into tc.
         while let Some(fc) = first_child(&page) {
             append_child(&tc, &fc);
@@ -500,32 +507,175 @@ pub fn grab_article(
     }
 
     let top_candidate = top_candidate?;
-    parent_of_top_candidate = parent(&top_candidate);
 
-    // --- Build articleContent (Readability.js:1418). ---
-    // Stage 1a: NO sibling-append (HLD §7.1 — STOP at 1415). articleContent
-    // gets the top candidate only. (isPaging=false so no id set.)
+    // --- Build articleContent + sibling-append (Readability.js:1415-1535). ---
+    // Stage 1b ports the block Stage 1a deliberately STOPPED before. Still NO
+    // FLAG_* retry/flag-sieve loop (1546+, Stage 1c), NO _cleanConditionally /
+    // _markDataTables (Stage 2). Faithful transcription, line-cited.
+
+    // 1418: articleContent = doc.createElement("DIV").
+    // (1419-1421 `if (isPaging) articleContent.id = "readability-content"` —
+    //  isPaging is always false here (`page` is always `doc.body`, never a
+    //  paging arg), and `id` is score-invisible regardless (HLD §2) — SKIP.)
     let article_content = create_element("DIV");
 
-    if needed_to_create_top_candidate {
-        // The fake div already holds every page child AND was appended to
-        // `page`. JS keeps `articleContent` = the fresh div and (post-prep)
-        // wraps. Faithfully: with no sibling loop, articleContent should hold
-        // the fake top candidate's content. Move the fake-div into
-        // articleContent (the JS sibling loop would have appended exactly the
-        // topCandidate==fakeDiv as `sibling===topCandidate` → append=true).
-        append_child(&article_content, &top_candidate);
-    } else {
-        // The JS sibling loop's very first iteration always appends the top
-        // candidate itself (`sibling === topCandidate` ⇒ append=true,
-        // Readability.js:1447-1448). With sibling-append deferred (Stage 1b),
-        // the Stage-1a articleContent is exactly that single append: the top
-        // candidate. (Recorded over-inclusion until 1b adds the *other*
-        // siblings — HLD §7.1; NOT tuned.)
-        append_child(&article_content, &top_candidate);
+    // 1423-1426: siblingScoreThreshold = Math.max(10,
+    //              topCandidate.readability.contentScore * 0.2).
+    // `topCandidate.readability.contentScore` is whatever the side table holds
+    // for the chosen top candidate now: the finalized candidateScore (1283)
+    // for a real candidate, or the fake div's _initializeNode score for the
+    // fallback. Stage-1a leaves exactly that in place.
+    let top_candidate_score = dom.content_score(&top_candidate).unwrap_or(0.0);
+    let sibling_score_threshold = 10.0_f64.max(top_candidate_score * 0.2);
+
+    // 1428: parentOfTopCandidate = topCandidate.parentNode.
+    let parent_of_top_candidate = parent(&top_candidate);
+
+    // 1429: siblings = parentOfTopCandidate.children (the LIVE element list in
+    // JS). We mirror the JS variable as an explicit refetched snapshot `Vec`
+    // and an INDEX WALK — never a Rust iterator (HLD §7.2 critical fidelity
+    // point: the JS mutates `siblings`/indices mid-iteration; a live iterator
+    // would be UB-adjacent and divergent). When `top_candidate` is detached
+    // (the fake-div fallback appended it to `page`, so its parent IS `page`;
+    // or a genuinely parentless candidate) there are no siblings to walk —
+    // `parentOfTopCandidate` is then `page`/`None`. For the fallback the only
+    // node that would qualify is `sibling === topCandidate` itself, so we
+    // still append the top candidate (mirrors the loop's 1447-1448 for the
+    // single fake-div child case).
+    let siblings_parent = parent_of_top_candidate.clone();
+
+    match &siblings_parent {
+        Some(stc) => {
+            // `siblings = parentOfTopCandidate.children`.
+            let mut siblings = children(stc);
+            // 1431: `for (var s = 0, sl = siblings.length; s < sl; s++)`.
+            // JS Number semantics: `s -= 1` at s==0 yields -1, then `s++` → 0
+            // (the just-vacated index is revisited). `usize` would panic on
+            // that underflow, so `s`/`sl` are `i64`, indexing with `s as
+            // usize` — an exact mirror of the JS `var s`/`var sl`.
+            let mut s: i64 = 0;
+            let mut sl: i64 = siblings.len() as i64;
+            while s < sl {
+                // 1432: sibling = siblings[s].
+                let sibling = siblings[s as usize].clone();
+                // 1433: append = false.
+                let mut append = false;
+
+                // (1435-1445 are this.log(...) — diagnostics only, SKIP.)
+
+                if std::rc::Rc::ptr_eq(&sibling, &top_candidate) {
+                    // 1447-1448: if (sibling === topCandidate) append = true.
+                    append = true;
+                } else {
+                    // 1450: contentBonus = 0.
+                    let mut content_bonus = 0.0_f64;
+
+                    // 1453-1458: same non-empty className as topCandidate ⇒
+                    // contentBonus += topCandidate.readability.contentScore *
+                    // 0.2.
+                    let tc_class = class_name(&top_candidate);
+                    if class_name(&sibling) == tc_class && !tc_class.is_empty() {
+                        content_bonus += top_candidate_score * 0.2;
+                    }
+
+                    if dom.has_content_score(&sibling)
+                        && dom.content_score(&sibling).unwrap_or(0.0) + content_bonus
+                            >= sibling_score_threshold
+                    {
+                        // 1460-1465: sibling.readability &&
+                        // sibling.readability.contentScore + contentBonus >=
+                        // siblingScoreThreshold.
+                        append = true;
+                    } else if tag_name(&sibling).as_deref() == Some("P") {
+                        // 1466-1481: the nodeName === "P" clause. `nodeName`
+                        // for an HTML element is the upper-cased tag, == our
+                        // `tag_name`.
+                        let link_density = get_link_density(&sibling);
+                        // 1468: nodeContent = _getInnerText(sibling) (default
+                        // normalizeSpaces=true).
+                        let node_content = dom::inner_text(&sibling, true);
+                        // 1469: nodeLength = nodeContent.length (JS UTF-16
+                        // code units; `char` count is BMP-exact for this
+                        // prose, consistent with the rest of the port).
+                        let node_length = node_content.chars().count();
+
+                        if node_length > 80 && link_density < 0.25 {
+                            // 1471-1472.
+                            append = true;
+                        } else if node_length < 80
+                            && node_length > 0
+                            && link_density == 0.0
+                            && regexps::period_space_or_end().is_match(&node_content)
+                        {
+                            // 1473-1480: nodeContent.search(/\.( |$)/) !== -1
+                            // (search != -1 ⇔ is_match).
+                            append = true;
+                        }
+                    }
+                }
+
+                if append {
+                    // (1485 this.log — SKIP.)
+
+                    // 1487-1493: if (!ALTER_TO_DIV_EXCEPTIONS.includes(
+                    //   sibling.nodeName)) sibling = _setNodeTag(sibling,
+                    //   "DIV"); — turn non-block siblings (form, td, …) into a
+                    //   div so they survive later filtering. `_setNodeTag`
+                    //   returns the NEW handle (slow branch, HLD §2.2) and
+                    //   transfers the score side-table entry old→new.
+                    let node_name = tag_name(&sibling).unwrap_or_default();
+                    let sibling = if !regexps::ALTER_TO_DIV_EXCEPTIONS.contains(&node_name.as_str())
+                    {
+                        dom.set_node_tag(&sibling, "DIV")
+                    } else {
+                        sibling
+                    };
+
+                    // 1495: articleContent.appendChild(sibling) — moves it out
+                    // of parentOfTopCandidate (DOM move semantics).
+                    append_child(&article_content, &sibling);
+
+                    // 1498: siblings = parentOfTopCandidate.children — REFETCH
+                    // (the JS comment: "compatible with DOM parsers without
+                    // live collection support"; the append shifted the list).
+                    siblings = children(stc);
+
+                    // 1503-1504: s -= 1; sl -= 1 — the append removed one
+                    // element from the parent, so revisit this index (the
+                    // next element shifted down into it) and shrink the bound.
+                    // `sl` mirrors the JS *variable* (decremented), NOT a
+                    // re-read of `siblings.length` (which would coincidentally
+                    // be equal here, but faithful = mirror the JS counter).
+                    s -= 1;
+                    sl -= 1;
+                }
+
+                // 1431: the for-loop `s++`.
+                s += 1;
+            }
+        }
+        None => {
+            // No parent (detached top candidate, e.g. the fake-div fallback
+            // whose parent is `page`, OR a parentless candidate). The JS
+            // sibling loop would still hit `sibling === topCandidate` for the
+            // top candidate and append it; with no real sibling list there is
+            // nothing else. Append the top candidate exactly as 1447-1448
+            // would. (For the fallback this preserves the Stage-1a behaviour:
+            // articleContent ends up holding the fake div's content.)
+            append_child(&article_content, &top_candidate);
+        }
     }
 
-    let _ = &mut parent_of_top_candidate;
+    // (1508-1510 debug — SKIP. 1512 `this._prepArticle(articleContent)` is
+    //  invoked by `mod.rs::parse` AFTER this returns — Stage-1a wiring, kept;
+    //  it mirrors the JS call site, which is also after the sibling loop.
+    //  1517-1532 the `readability-page-1`/`page` wrap: id/className are
+    //  score-invisible (HLD §2) AND wrapping articleContent's children in an
+    //  extra DIV adds ZERO `#text` characters, so it is provably
+    //  `text_content`-invariant — deliberately NOT implemented here, recorded
+    //  in notes/m2-stage1b.md. 1538+ `parseSuccessful`/the
+    //  `textLength < charThreshold` retry is Stage 1c — STOP here, exactly as
+    //  Stage 1a STOPPED at 1415.)
 
     Some(GrabResult { article_content })
 }
@@ -558,7 +708,7 @@ mod tests {
     //! Expected selections hand-derived by tracing `Readability.js:1031-1413`
     //! (NOT by running an oracle — inversion, HLD §4).
     use super::*;
-    use crate::readability::dom::{Dom, text_content};
+    use crate::readability::dom::{Dom, get_elements_by_tag_name, text_content};
 
     fn grab(html: &str, title: &str) -> Option<(Dom, NodeRef)> {
         let mut dom = Dom::parse(html);
@@ -665,5 +815,374 @@ mod tests {
             "faithful: title-duplicating <h1> must be removed (Readability.js:1112): {t}"
         );
         assert!(t.contains("illustrative examples"), "body missing: {t}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Stage 1b — sibling-append (`Readability.js:1415-1535`).
+    //
+    // Every expected outcome below is hand-traced from `Readability.js:1415-
+    // 1535` (the cited block), NOT from running any oracle (anti-inversion,
+    // HLD §4). The qualitative cases (clause A / clause B / `=== topCandidate`
+    // / `_setNodeTag`-to-DIV) are deterministic and independent of the exact
+    // top-candidate float score; the threshold/contentBonus cases carry a
+    // full score hand-trace in their comments.
+    // -----------------------------------------------------------------------
+
+    /// Long preamble + content div + long trailing paragraph — the canonical
+    /// "content split by ads/preamble" case the JS comment (1415-1417)
+    /// describes. The top candidate is the `<div id=tc>` (two long scored
+    /// `<p>`s under a positive-class div); its parent is `<body>`, so siblings
+    /// are `[#pre, #tc, #post]`.
+    ///
+    /// Trace: `#pre` is a `<p>`, not the top candidate, `sibling.readability`
+    /// is undefined (a bare `<p>` is never `_initializeNode`d unless it became
+    /// a candidate-ancestor — it is not, it has no scored descendant), so the
+    /// score branch (1460) is false → the `nodeName === "P"` branch (1466):
+    /// `nodeLength > 80 && linkDensity 0 < 0.25` ⇒ append=true (clause A,
+    /// 1471-1472). `#tc` === topCandidate ⇒ append (1447-1448). `#post`
+    /// identical to `#pre` ⇒ clause A append. So articleContent must contain
+    /// ALL THREE texts, in document order (the index walk visits them all).
+    #[test]
+    fn sibling_append_preamble_content_trailing_all_included() {
+        let html = "<html><body>\
+            <p id=pre>This is a sufficiently long preamble paragraph of real readable prose that comfortably exceeds eighty characters and contains no links at all.</p>\
+            <div id=tc class=content>\
+              <p>The first genuine article body paragraph here is well past twenty-five characters of real prose content for scoring.</p>\
+              <p>A second article body paragraph also with ample genuine readable prose content so the div accrues a high score.</p>\
+            </div>\
+            <p id=post>This is a sufficiently long trailing paragraph of real readable prose that also exceeds eighty characters and has no links whatsoever.</p>\
+            </body></html>";
+        let (_d, ac) = grab(html, "").expect("grab");
+        let t = text_content(&ac);
+        assert!(
+            t.contains("long preamble paragraph"),
+            "clause-A preamble <p> sibling must be appended (Readability.js:1471): {t}"
+        );
+        assert!(
+            t.contains("first genuine article body"),
+            "top candidate itself must be appended (Readability.js:1447): {t}"
+        );
+        assert!(
+            t.contains("long trailing paragraph"),
+            "clause-A trailing <p> sibling must be appended (Readability.js:1471): {t}"
+        );
+    }
+
+    /// P clause B (`Readability.js:1473-1480`): a SHORT (`< 80`, `> 0`) `<p>`
+    /// sibling with `linkDensity === 0` whose text matches `/\.( |$)/`
+    /// (ends with `.` or contains `. `) is appended; an equally short `<p>`
+    /// with NO period is NOT appended (neither clause A — too short — nor
+    /// clause B — no period match — nor score — unscored bare `<p>`).
+    #[test]
+    fn sibling_append_short_p_clause_b_period_rule() {
+        // #dot: "Short note." -> length 11 (<80, >0), linkDensity 0,
+        //   /\.( |$)/ matches "." at end ⇒ append (1477-1479).
+        // #nodot: "No period here either way" -> length 25 (<80,>0),
+        //   linkDensity 0, /\.( |$)/ does NOT match (no '.') ⇒ NOT appended.
+        let html = "<html><body>\
+            <p id=dot>Short note.</p>\
+            <div id=tc class=content>\
+              <p>A long genuine article paragraph well over twenty five characters of real readable prose for scoring here.</p>\
+              <p>Another sufficiently long article body paragraph of genuine readable prose to drive the container score up high.</p>\
+            </div>\
+            <p id=nodot>No period here either way</p>\
+            </body></html>";
+        let (_d, ac) = grab(html, "").expect("grab");
+        let t = text_content(&ac);
+        assert!(
+            t.contains("Short note."),
+            "clause-B short <p> with trailing period must be appended (Readability.js:1477): {t}"
+        );
+        assert!(
+            !t.contains("No period here"),
+            "short <p> with no period must NOT be appended (clause B fails, Readability.js:1473-1480): {t}"
+        );
+    }
+
+    /// `sibling.nodeName === "P"` + `nodeLength > 80` but `linkDensity >= 0.25`
+    /// ⇒ clause A fails (`Readability.js:1471`), clause B fails (`nodeLength`
+    /// not `< 80`), unscored ⇒ NOT appended. The link-dense `<p>` (a list of
+    /// links) is correctly excluded by the faithful link-density gate.
+    #[test]
+    fn sibling_append_link_dense_long_p_excluded() {
+        // #links: a long <p> that is entirely anchor text -> linkDensity 1.0
+        //   (>= 0.25) ⇒ clause A false; length > 80 so clause B false;
+        //   unscored ⇒ append stays false.
+        let html = "<html><body>\
+            <div id=tc class=content>\
+              <p>The genuine article body paragraph here is comfortably past twenty five characters of real readable prose content.</p>\
+              <p>Second genuine article paragraph also well past the minimum with ample real readable prose to score the container.</p>\
+            </div>\
+            <p id=links><a href=/a>First navigation link label text</a> <a href=/b>Second navigation link label text here</a> <a href=/c>Third navigation link label text here</a></p>\
+            </body></html>";
+        let (_d, ac) = grab(html, "").expect("grab");
+        let t = text_content(&ac);
+        assert!(
+            t.contains("genuine article body paragraph"),
+            "top candidate must be present: {t}"
+        );
+        assert!(
+            !t.contains("First navigation link label"),
+            "link-dense long <p> sibling must NOT be appended (linkDensity>=0.25, Readability.js:1471): {t}"
+        );
+    }
+
+    /// Non-`ALTER_TO_DIV_EXCEPTIONS` qualifying sibling is `_setNodeTag`'d to
+    /// DIV before append (`Readability.js:1487-1493`); an
+    /// `ALTER_TO_DIV_EXCEPTIONS` sibling (here `<section>`) is appended
+    /// **without** retag. We assert via the rendered tree shape after grab.
+    ///
+    /// Construction: top candidate is `<div id=tc class=col>`; a SECTION
+    /// sibling with the *same* className `col` (non-empty) gets
+    /// `contentBonus = topCandidate.contentScore * 0.2` (1453-1458) added to
+    /// its own (it has a long scored `<p>`, so it is `_initializeNode`d as a
+    /// candidate-ancestor and has a real score) so it clears the threshold
+    /// and is appended (1460-1465) — SECTION ∈ ALTER excs ⇒ NOT retagged. A
+    /// `<form>` sibling (NOT in ALTER excs) that also qualifies by the same
+    /// className contentBonus is `_setNodeTag`'d to DIV before append.
+    /// Non-`ALTER_TO_DIV_EXCEPTIONS` qualifying sibling is `_setNodeTag`'d to
+    /// DIV before append (`Readability.js:1487-1493`); an
+    /// `ALTER_TO_DIV_EXCEPTIONS` sibling (here `<section>`) is appended
+    /// **without** retag.
+    ///
+    /// Full hand-trace. The top candidate is `<div id=tc class=col>` with 20
+    /// long scored `<p>`s; its score (≈ DIV +5 + 20·contentScore at level-0
+    /// divider 1, finalized ×(1-linkDensity 0)) is well over **50**, so
+    /// `siblingScoreThreshold = max(10, tc_score·0.2) = tc_score·0.2` (the
+    /// `tc_score·0.2 ≥ 10` regime — the `max`'s computed arm wins, not the
+    /// floor). `<body>` is level-1 ancestor of those `<p>`s (divider 2) so it
+    /// accrues only ≈ half and never out-scores `div#tc` (no score-walk-up to
+    /// BODY; no fake-div fallback). Siblings = `body.children = [div#tc,
+    /// section, form]`.
+    ///
+    /// `div#tc` === topCandidate ⇒ append (1447-1448). `<section class=col>`:
+    /// `className "col" === topCandidate.className "col"` and `!== ""` ⇒
+    /// `contentBonus += tc_score·0.2` (1453-1458); the section has two scored
+    /// `<p>`s so `section.readability.contentScore > 0`; thus
+    /// `section.score + tc_score·0.2 ≥ tc_score·0.2 = threshold` ⇒ append
+    /// (1460-1465). `SECTION ∈ ALTER_TO_DIV_EXCEPTIONS` ⇒ **NOT** retagged.
+    /// `<form class=col>` qualifies identically (same-className contentBonus,
+    /// positive own score); `FORM ∉ ALTER_TO_DIV_EXCEPTIONS` ⇒
+    /// `_setNodeTag(form,"DIV")` (1487-1492) before append. (This is the
+    /// faithful JS mechanism: when `tc_score·0.2 ≥ 10`, a same-non-empty-
+    /// className sibling's contentBonus exactly equals the threshold's
+    /// computed arm, so any positively-scored such sibling clears it — NOT a
+    /// tuned constant, the cited-line arithmetic.)
+    #[test]
+    fn sibling_append_setnodetag_to_div_and_alter_exception() {
+        let p = "Genuine readable article prose sentence comfortably past the twenty five character minimum for scoring purposes here now.";
+        let tcps = format!("<p>{p}</p>").repeat(20);
+        let html = format!(
+            "<html><body>\
+            <div id=tc class=col>{tcps}</div>\
+            <section class=col><p>{p}</p><p>{p}</p></section>\
+            <form class=col><p>{p}</p><p>{p}</p></form>\
+            </body></html>"
+        );
+        let (_d, ac) = grab(&html, "").expect("grab");
+        // The SECTION ∈ ALTER_TO_DIV_EXCEPTIONS ⇒ appended as-is (still a
+        // SECTION element directly under articleContent).
+        let section_kids: Vec<String> = children(&ac)
+            .iter()
+            .map(|c| tag_name(c).unwrap_or_default())
+            .collect();
+        assert!(
+            section_kids.contains(&"SECTION".to_string()),
+            "SECTION sibling (∈ ALTER_TO_DIV_EXCEPTIONS) must be appended WITHOUT retag (Readability.js:1487); articleContent children = {section_kids:?}"
+        );
+        // The FORM ∉ ALTER excs ⇒ _setNodeTag(form,"DIV"): NO <form> element
+        // anywhere under articleContent (it was replaced by a DIV)…
+        assert!(
+            get_elements_by_tag_name(&ac, "form").is_empty(),
+            "FORM sibling must be _setNodeTag'd to DIV (no <form> remains, Readability.js:1492); articleContent children = {section_kids:?}"
+        );
+        // …and the top candidate itself is the first appended child (a DIV).
+        assert_eq!(
+            section_kids.first().map(String::as_str),
+            Some("DIV"),
+            "the top candidate (div#tc) is appended first (Readability.js:1447): {section_kids:?}"
+        );
+        // articleContent children are exactly: DIV(tc), SECTION(as-is),
+        // DIV(form retagged) — in document order, none retagged that
+        // shouldn't be, the FORM retagged.
+        assert_eq!(
+            section_kids,
+            vec!["DIV".to_string(), "SECTION".to_string(), "DIV".to_string()],
+            "faithful 1415-1535 result: [div#tc, section(as-is), form→div] in order"
+        );
+        // The retagged FORM's prose survived the _setNodeTag child-move.
+        assert!(
+            text_content(&ac).contains("Genuine readable article prose"),
+            "retagged FORM text must still be present: {}",
+            text_content(&ac).chars().take(60).collect::<String>()
+        );
+    }
+
+    /// The index-mutation walk (`Readability.js:1431/1498/1503-1504`). The top
+    /// candidate is in the MIDDLE of several qualifying siblings; every
+    /// qualifying sibling must be appended **exactly once and in order** —
+    /// the `siblings = parentOfTopCandidate.children; s -= 1; sl -= 1` fixup
+    /// is what prevents skipping the sibling that shifts into the just-vacated
+    /// index. Five clause-A `<p>` siblings around the top candidate; all five
+    /// + the top candidate must appear, none duplicated, in document order.
+    #[test]
+    fn sibling_append_index_walk_visits_every_sibling_once_in_order() {
+        let html = "<html><body>\
+            <p id=s1>Sibling one is a long readable preamble paragraph well beyond eighty characters with no link content at all here.</p>\
+            <p id=s2>Sibling two is likewise a long readable paragraph comfortably beyond eighty characters and contains zero links here.</p>\
+            <div id=tc class=content>\
+              <p>The principal article body sentence here is well past twenty five characters of genuine readable prose content for scoring.</p>\
+              <p>An additional article body sentence of genuine readable prose well past the minimum so this div is the top candidate.</p>\
+            </div>\
+            <p id=s3>Sibling three is again a long readable paragraph well past eighty characters in length and with no links present.</p>\
+            <p id=s4>Sibling four is similarly a long readable paragraph beyond eighty characters and again carries no link content here.</p>\
+            </body></html>";
+        let (_d, ac) = grab(html, "").expect("grab");
+        let t = text_content(&ac);
+        for needle in [
+            "Sibling one is a long",
+            "Sibling two is likewise",
+            "principal article body sentence",
+            "Sibling three is again",
+            "Sibling four is similarly",
+        ] {
+            assert!(
+                t.contains(needle),
+                "every qualifying sibling must be appended exactly once (index walk, Readability.js:1503-1504); missing {needle:?} in: {t}"
+            );
+        }
+        // Order is document order: s1 < s2 < tc-body < s3 < s4 (the index
+        // walk + appendChild preserves source order into articleContent).
+        let i1 = t.find("Sibling one is a long").unwrap();
+        let i2 = t.find("Sibling two is likewise").unwrap();
+        let itc = t.find("principal article body sentence").unwrap();
+        let i3 = t.find("Sibling three is again").unwrap();
+        let i4 = t.find("Sibling four is similarly").unwrap();
+        assert!(
+            i1 < i2 && i2 < itc && itc < i3 && i3 < i4,
+            "appended siblings must be in document order: got offsets {i1},{i2},{itc},{i3},{i4} in {t}"
+        );
+        // The top candidate div is appended exactly once (its unique first
+        // sentence appears once — not revisited/duplicated by the index walk).
+        assert_eq!(
+            t.matches("principal article body sentence").count(),
+            1,
+            "the top candidate must be appended exactly once, not revisited/duplicated: {t}"
+        );
+    }
+
+    /// `siblingScoreThreshold = Math.max(10, topCandidate.contentScore * 0.2)`
+    /// (`Readability.js:1423-1426`) with the explicit `max(10, …)` FLOOR
+    /// exercised, plus the same-className `contentBonus` (`Readability.js:
+    /// 1453-1458`).
+    ///
+    /// Full hand-trace. Doc:
+    /// `<body><div id=tc class=main><p>Plong…</p></div><div id=sib class=main><p>Pshort…(>25,<? )</p></div></body>`
+    ///
+    /// `#tc` has one long `<p>`. Scoring (`Readability.js:1215-1273`): the
+    /// `<p>` is in `elementsToScore`; `innerText.length >= 25`; ancestors
+    /// (maxDepth 5) = `[div#tc, body, html, #document]` (filterable). For
+    /// `div#tc` (level 0, scoreDivider 1): `_initializeNode(div)` ⇒ DIV base
+    /// **+5**, `_getClassWeight`: class "main" is NOT in `negative` and NOT in
+    /// `positive` (the JS `positive` list has no "main"? — re-check: `positive`
+    /// = article|body|content|entry|hentry|h-entry|main|page|… — "main" IS in
+    /// `positive`) ⇒ **+25**. So `div#tc` init score = 5 + 25 = **30**. Then
+    /// `+= contentScore/1`. `contentScore` for the `<p>` = 1 (base) +
+    /// `split(commas).length` (no commas → 1 part → **+1**) +
+    /// `min(floor(len/100),3)`. The `<p>` text is engineered to ~110 chars ⇒
+    /// `min(floor(110/100),3)=min(1,3)=1` ⇒ contentScore = 1+1+1 = **3**.
+    /// `div#tc.score = 30 + 3/1 = 33`. (body/html get the /2, /3·level shares
+    /// but `div#tc` is the max.) Candidate-finalize (`Readability.js:1283`):
+    /// `candidateScore = contentScore * (1 - linkDensity)`. `div#tc` has no
+    /// links ⇒ linkDensity 0 ⇒ candidateScore = 33 * 1 = **33**. `topCandidate
+    /// = div#tc` (highest). Single-child-parent climb (1400-1409): `div#tc`'s
+    /// parent is `<body>` whose `children.length` is 2 (div#tc, div#sib) ≠ 1
+    /// ⇒ no climb. `topCandidate.readability` exists (33) ⇒ no re-init.
+    ///
+    /// Sibling-append: `siblingScoreThreshold = max(10, 33 * 0.2) = max(10,
+    /// 6.6) = **10**` (the FLOOR wins — 6.6 < 10; this is the case the
+    /// `max(10,…)` clause exists for). Siblings = body.children =
+    /// `[div#tc, div#sib]`. `div#tc` === topCandidate ⇒ append. `div#sib`:
+    /// `className "main" === topCandidate.className "main"` and `!== ""` ⇒
+    /// `contentBonus += 33 * 0.2 = 6.6`. `div#sib` has its own scored `<p>`
+    /// (≥25 chars) so it WAS `_initializeNode`d as a candidate-ancestor:
+    /// init = DIV +5 + class "main" +25 = 30; its `<p>` contentScore: ~30-char
+    /// text ⇒ 1 + 1 + min(floor(30/100),3)=0 = **2**; level0 /1 ⇒ score 30 +
+    /// 2 = 32; finalize: linkDensity 0 ⇒ candidateScore 32 (NOTE: 1283 sets
+    /// `.contentScore = candidateScore` for EVERY candidate, so `div#sib
+    /// .readability.contentScore` is **32** at sibling-time). `sibling
+    /// .readability.contentScore + contentBonus = 32 + 6.6 = 38.6 >=
+    /// threshold 10` ⇒ append=true (1460-1465). `div#sib` ∈
+    /// ALTER_TO_DIV_EXCEPTIONS (DIV) ⇒ no retag. ⇒ BOTH divs' text in
+    /// articleContent.
+    #[test]
+    fn sibling_append_threshold_floor_and_content_bonus() {
+        let html = "<html><body>\
+            <div id=tc class=main><p>Alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau ups</p></div>\
+            <div id=sib class=main><p>Short related body sentence here.</p></div>\
+            </body></html>";
+        let (_d, ac) = grab(html, "").expect("grab");
+        let t = text_content(&ac);
+        assert!(
+            t.contains("Alpha beta gamma"),
+            "top candidate div#tc text must be present: {t}"
+        );
+        assert!(
+            t.contains("Short related body sentence"),
+            "div#sib clears max(10, 33*0.2)=10 via score 32 + contentBonus 6.6 (Readability.js:1453-1465): {t}"
+        );
+    }
+
+    /// NodeKey ABA re-audit (HLD/DA carried forward). A *scored* sibling that
+    /// is NOT in `ALTER_TO_DIV_EXCEPTIONS` is `_setNodeTag`'d to DIV during the
+    /// walk; the score side-table entry MUST follow the pointer to the new DIV
+    /// handle and the old (now-detached) handle MUST have no entry — i.e. the
+    /// `set_node_tag` transfer (`Readability.js:765-767` + HLD §2.2) stays
+    /// sound under sibling-append churn. Invariant asserted: no scored node is
+    /// dropped while a stale `NodeKey` persists; `set_node_tag` is the only
+    /// address change and it transfers the entry old→new atomically.
+    ///
+    /// We reach into `grab_article`'s building blocks directly (the public
+    /// `grab_article` discards the `Dom` score table shape we want to assert),
+    /// reproducing the exact 1487-1495 sub-sequence on a scored `<table>`
+    /// (TABLE ∉ ALTER excs) sibling.
+    #[test]
+    fn sibling_append_nodekey_aba_setnodetag_transfer_holds() {
+        let mut dom = Dom::parse(
+            "<html><body><div id=ac></div><table id=sib><tr><td>cell text</td></tr></table></body></html>",
+        );
+        let body = dom.body().unwrap();
+        let article_content = get_elements_by_tag_name(&body, "div")[0].clone();
+        let sib = get_elements_by_tag_name(&body, "table")[0].clone();
+        // Pretend the scoring pass scored this sibling (the analogue of it
+        // being a candidate-ancestor with `node.readability.contentScore`).
+        dom.set_content_score(&sib, 17.5);
+        assert!(dom.has_content_score(&sib));
+
+        // The exact 1487-1495 sub-sequence for a non-ALTER-exception sibling:
+        // sibling = _setNodeTag(sibling, "DIV"); articleContent.appendChild(sibling);
+        assert!(
+            !regexps::ALTER_TO_DIV_EXCEPTIONS.contains(&"TABLE"),
+            "precondition: TABLE ∉ ALTER_TO_DIV_EXCEPTIONS"
+        );
+        let new_sib = dom.set_node_tag(&sib, "DIV");
+        append_child(&article_content, &new_sib);
+
+        // ABA invariant: the score followed the pointer to the NEW handle…
+        assert_eq!(
+            dom.content_score(&new_sib),
+            Some(17.5),
+            "score side-table entry must transfer to the new DIV handle (Readability.js:765-767)"
+        );
+        // …and the OLD (detached, still-alive-as-`sib`) handle has none — no
+        // stale key persists for a node that lost its score.
+        assert_eq!(
+            dom.content_score(&sib),
+            None,
+            "the old handle must have NO score entry after transfer (no stale NodeKey)"
+        );
+        // The retagged node is a DIV holding the original cell text.
+        assert_eq!(tag_name(&new_sib).as_deref(), Some("DIV"));
+        assert!(text_content(&article_content).contains("cell text"));
     }
 }
