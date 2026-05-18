@@ -86,7 +86,53 @@ name = "mdrcel"
 # many real docs — converging to RJS), but the same shift class held for
 # 1b/1c. If a future reviewer wants MINOR for behavioural-shift visibility,
 # the rationale supports either; PATCH is recorded.
-version = "0.3.3"
+#
+# M2 Stage 3 (2026-05-18): 0.3.3 -> 0.3.4 PATCH. Adds the three remaining
+# Stage-3 ports HLD §7.5 names: `_simplifyNestedElements`
+# (`Readability.js:537-565`), `_fixLazyImages` (`:2332-2412`, wired into
+# `_prepArticle`'s `:790` slot), and the CSSOM-faithful `!important`
+# stripping in `_isProbablyVisible`'s inline-style probe (`:2697-2698`).
+# `_postProcessContent`'s structural half (`:281-291`,
+# `_simplifyNestedElements`) is now wired between `_grabArticle` and the
+# `textContent` capture (`:2754`/`:2766`). The `aria-modal`/`role=dialog`
+# check the brief named was already ported in `_grabArticle`'s main loop
+# (`grab_article.rs:192-198`, `Readability.js:1073-1079`) — no work needed.
+#
+# **Word-count parity preserved (token-sequence invariant).** All 50 scored
+# corpus URLs have **byte-identical word counts** to Stage 2 (`crate_wc`
+# unchanged on every URL; ZERO crate_wc diffs). The harness `edit_sim` over
+# token sequences is also unchanged on every URL.
+# `_simplifyNestedElements` is token-sequence-invariant by construction
+# (the only branch that touches `#text` descendants is the
+# `_isElementWithoutContent` removal, which removes JS-whitespace-only
+# content the harness tokenizer collapses anyway), so the scored Coverage
+# numbers do not move. The bankofengland 4-word residual
+# (`crate_wc` 796 vs RJS 800) is **unchanged** — investigated and recorded
+# as a faithful divergence (the cookie-notice text RJS keeps but the
+# crate strips, and the page-last-updated / MPC announcements section
+# the crate keeps but RJS strips, both attributable to `_grabArticle`
+# top-candidate selection on a regulator hub page; no Readability.js line
+# closes it without out-cleaning RJS in one direction or tuning the
+# unlikely-candidate regex in the other — HLD §4 anti-inversion forbids
+# both).
+#
+# **Raw-byte convergence (Stage-3 bonus, recorded honestly).** Crate↔RJS
+# raw `textContent` byte-equality rose from **29/51 to 50/51** on the
+# corpus — `_simplifyNestedElements` normalises the JS-whitespace pattern
+# in raw bytes to match RJS (which runs the same JS function). Token-
+# stability is the load-bearing harness invariant; byte convergence is
+# bonus evidence that the port is JS-faithful at the raw-`textContent`
+# level too. The remaining diverging URL is bankofengland (the same 4-word
+# residual on a different observed surface).
+#
+# Per semver (CLAUDE.md) PATCH — internal behaviour refinement / completion
+# of an already-public capability behind the same frozen public surface: NO
+# new public type/function/signature, `ExtractError` unchanged,
+# `extract == extract_with(&Options::default())` preserved, Bug-E2
+# preserved. The public-observable default `extract` does NOT shift its
+# token output on any scored URL (zero `crate_wc` changes); only raw-byte
+# `textContent` whitespace normalises. PATCH is correct.
+version = "0.3.4"
 edition = "2024"
 
 [dependencies]

@@ -10,10 +10,13 @@
 
 use crate::readability::dom::{
     self, Dom, NodeRef, append_child, child_nodes, children, create_element,
-    get_all_nodes_with_tag, get_attribute, get_elements_by_tag_name, inner_text, is_element,
+    get_all_nodes_with_tag, get_attribute, get_elements_by_tag_name, id, inner_text, is_element,
     parent, replace_child, set_attribute, tag_name, text_content,
 };
-use crate::readability::helpers::{is_phrasing_content, is_whitespace, next_node, next_sibling};
+use crate::readability::helpers::{
+    get_next_node, has_single_tag_inside_element, is_element_without_content, is_phrasing_content,
+    is_whitespace, next_node, next_sibling,
+};
 use crate::readability::regexps;
 
 /// `_getInnerText(e, normalizeSpaces=true)` (`Readability.js:2058-2067`).
@@ -445,7 +448,17 @@ pub fn prep_article(
     clean_styles(article_content);
     // 2. _markDataTables
     mark_data_tables(dom, article_content);
-    // 3. _fixLazyImages — DEFERRED (score-invisible).
+    // 3. _fixLazyImages — Stage-3 ported (Readability.js:790, :2332-2412).
+    // Mostly attribute-only (score-invisible) EXCEPT the empty-`<figure>`
+    // branch (`:2398-2407`) which CREATES a new `<img>` child of an empty
+    // figure; that increases the img descendant count `_cleanConditionally`
+    // (`:2498`) reads at the next step. Without porting, a corpus URL with
+    // a `<figure data-src="foo.jpg">` (no inner img) could be `_cleanConditionally`-
+    // removed where RJS keeps it. Validated against the current corpus to
+    // confirm no scored URL exercises the figure branch (zero measurable
+    // residual moved), but ported anyway per HLD §7.5 for structural
+    // faithfulness — the cost is bounded.
+    fix_lazy_images(article_content);
 
     // 4-5. _cleanConditionally for form / fieldset.
     clean_conditionally(dom, flags, article_content, "form");
@@ -553,6 +566,306 @@ fn any_attr_matches_videos(element: &NodeRef) -> Option<bool> {
 #[allow(dead_code)]
 fn is_el(n: &NodeRef) -> bool {
     is_element(n)
+}
+
+// ===========================================================================
+// Stage 3 — `_simplifyNestedElements` and `_fixLazyImages`
+// ===========================================================================
+//
+// HLD §7.5 / supervisor Stage-3 brief. Both were deferred at Stage 2 as
+// "attribute-only / structural cleanups whose effect on the scored
+// `text_content` is invisible by inspection"; Stage 3 re-examines that
+// reading. `_simplifyNestedElements` is **token-sequence-invariant** (the
+// only branch that touches `#text` descendants is the
+// `_isElementWithoutContent` removal, which removes JS-whitespace-only
+// content the harness tokenizer would collapse anyway), but it normalises
+// the raw `textContent` whitespace byte-pattern to match RJS — porting it
+// raised crate↔RJS byte equality from 29/51 to 50/51 on the corpus. The
+// element-unwrap branch is byte-and-token invariant. `_fixLazyImages` is
+// attribute-only EXCEPT for the `<figure>` branch that CREATES a new
+// `<img>` child of an empty figure (`Readability.js:2398-2407`), which
+// raises the `<img>` descendant count consumed by `_cleanConditionally`
+// (`:2498`) — a real cross-stage effect, so the function MUST be ported
+// (even if the corpus does not exercise the figure branch). Both are
+// ported here behind the same frozen public surface as the rest of
+// `prep`.
+
+/// `_simplifyNestedElements(articleContent)` (`Readability.js:537-565`).
+///
+/// Walks the article tree via [`get_next_node`] (the JS `_getNextNode`).
+/// For every visited `<DIV>` or `<SECTION>` that has a parent and whose `id`
+/// does not start with `readability` (the JS skip for the page-wrap):
+///
+/// 1. If the node is `_isElementWithoutContent` (no non-whitespace
+///    `textContent`, children empty or only `<br>`/`<hr>`), remove it via
+///    `_removeAndGetNext` and continue from the returned next node.
+/// 2. Else if it has a single `<DIV>` or single `<SECTION>` element child,
+///    clone all the node's attributes onto the child (faithful to the JS's
+///    `setAttributeNode(node.attributes[i].cloneNode())` — same-name
+///    attrs on the child are overwritten with the node's value, distinct
+///    names are added), then `parentNode.replaceChild(child, node)` and
+///    continue from `child` (NOT from `_getNextNode` — the JS keeps the
+///    same `node` cursor pointed at the child).
+///
+/// **Effect on `textContent` (Stage-3 differential measurement, recorded).**
+/// Branch (1) removes elements whose `textContent` is JS-whitespace-only:
+/// removing them strips those whitespace characters from the parent's
+/// `textContent` byte-string. The harness tokenizer collapses whitespace
+/// runs, so the **token sequence** the harness scores is unchanged (token-
+/// invariant by construction — no non-whitespace token can be created or
+/// destroyed). Branch (2) re-parents a single element child (no text
+/// descendants gained or lost), token-and-byte invariant. The Stage-3
+/// benchmark observed this exactly: token-Coverage / word-count was
+/// UNCHANGED on all 50 scored URLs (token sequence invariant), but raw
+/// `textContent` byte-equality against RJS rose from 29/51 to 50/51 — RJS
+/// runs the same JS function, so the crate's raw bytes converge to RJS's
+/// exact `textContent` on every URL the corpus exercises. **Token-
+/// stability is the load-bearing invariant** (the harness scores tokens,
+/// not bytes); the byte convergence is bonus evidence that the port is
+/// JS-faithful at the raw-`textContent` level too.
+///
+/// Called from [`post_process_content`] (the JS `_postProcessContent`,
+/// `Readability.js:281-291`), which runs AFTER `_grabArticle` and BEFORE
+/// the scored `textContent` capture (`Readability.js:2754`/`:2766`). The
+/// supervisor-brief framing of "ported in `parse()` immediately before
+/// `_grabArticle`" was a slot-mistake (the JS call site is post-grab); the
+/// JS-faithful position is used here, anchored by the citation above.
+pub fn simplify_nested_elements(article_content: &NodeRef) {
+    let mut node_opt: Option<NodeRef> = Some(article_content.clone());
+
+    while let Some(node) = node_opt.clone() {
+        let tag = tag_name(&node);
+        let tag_is_div_or_section = matches!(tag.as_deref(), Some("DIV") | Some("SECTION"));
+        let has_parent = parent(&node).is_some();
+        let id_is_readability = id(&node).starts_with("readability");
+
+        if has_parent && tag_is_div_or_section && !id_is_readability {
+            // Branch 1: empty element -> remove and continue from next.
+            if is_element_without_content(&node) {
+                node_opt = crate::readability::grab_article::remove_and_get_next(&node);
+                continue;
+            }
+
+            // Branch 2: single DIV-or-SECTION child -> unwrap. Clone all of
+            // node's attrs onto the child, then `parentNode.replaceChild`.
+            if has_single_tag_inside_element(&node, "DIV")
+                || has_single_tag_inside_element(&node, "SECTION")
+            {
+                // children() returns element-only children; the JS `node.children`
+                // is the same (HTMLCollection of element children).
+                let kids = children(&node);
+                // `_hasSingleTagInsideElement` already passed -> exactly one elt
+                // child whose tag is DIV/SECTION.
+                let child = kids.into_iter().next().expect("single child by predicate");
+
+                // for (i ; i < node.attributes.length ; i++)
+                //   child.setAttributeNode(node.attributes[i].cloneNode())
+                // Set every node attribute on child (overwriting any same-named
+                // child attribute, faithful to `setAttributeNode`).
+                clone_attributes_onto(&node, &child);
+
+                // node.parentNode.replaceChild(child, node)
+                if let Some(p) = parent(&node) {
+                    replace_child(&p, &child, &node);
+                }
+
+                // node = child;  continue;
+                node_opt = Some(child);
+                continue;
+            }
+        }
+
+        // node = this._getNextNode(node);
+        node_opt = get_next_node(&node, false);
+    }
+}
+
+/// Copy every attribute from `src` onto `dst`, overwriting `dst`'s same-named
+/// attributes (faithful to the JS `setAttributeNode(attr.cloneNode())`
+/// semantics — `setAttributeNode` replaces an existing attribute node with
+/// the same `name` and returns the old, otherwise inserts).
+fn clone_attributes_onto(src: &NodeRef, dst: &NodeRef) {
+    // Snapshot the src attrs (name+value pairs) to a Vec — borrowing both
+    // RefCells at once would otherwise be a hazard. The set is short.
+    let pairs: Vec<(String, String)> = match &src.data {
+        markup5ever_rcdom::NodeData::Element { attrs, .. } => attrs
+            .borrow()
+            .iter()
+            .map(|a| (a.name.local.to_string(), a.value.to_string()))
+            .collect(),
+        _ => return,
+    };
+    for (name, value) in &pairs {
+        set_attribute(dst, name, value);
+    }
+}
+
+/// `_fixLazyImages(root)` (`Readability.js:2332-2412`).
+///
+/// Visits every `<img>` / `<picture>` / `<figure>` descendant and rewires
+/// the lazy-load attributes (`data-src`, `data-srcset`, etc.) into proper
+/// `src` / `srcset` attributes so a downstream renderer can load them
+/// without JS.
+///
+/// Three branches per element (faithful transcription of `:2336-2407`):
+///
+/// 1. **Tiny base64 `src` cull (`:2336-2369`).** If the element's `src`
+///    matches `REGEXPS.b64DataUrl` AND the mediatype is NOT `image/svg+xml`
+///    AND any OTHER attribute value matches `/\.(jpg|jpeg|png|webp)/i`
+///    (i.e. there's a real image elsewhere), then if the base64 payload is
+///    `< 133` chars (a likely placeholder), `removeAttribute("src")`.
+///
+/// 2. **Has-image short-circuit (`:2371-2377`).** If the element has
+///    `src` OR (`srcset` !== `"null"`) AND the class name does NOT contain
+///    `"lazy"`, return — nothing to fix.
+///
+/// 3. **Attribute promotion (`:2379-2409`).** For every attribute (except
+///    `src`/`srcset`/`alt`), if its value looks like a srcset
+///    (`/\.(jpg|jpeg|png|webp)\s+\d/`) OR a plain image URL
+///    (`/^\s*\S+\.(jpg|jpeg|png|webp)\S*\s*$/`), copy it to `srcset` or
+///    `src` respectively — directly on `<IMG>`/`<PICTURE>`, or, on a
+///    `<FIGURE>` with no inner `<img>`/`<picture>`, by **creating a new
+///    `<img>` child** of the figure (`elem.appendChild(img)`).
+///
+/// **The figure-img branch (`:2398-2407`) is the load-bearing reason this
+/// must be ported.** All other branches are attribute-only and
+/// `text_content`-invariant. The figure branch INCREMENTS the number of
+/// `<img>` descendants under the figure's ancestors, which `_cleanConditionally`
+/// reads (`Readability.js:2498` — `var img = node.getElementsByTagName("img")
+/// .length;`) to decide whether the ancestor is "too few paragraphs per
+/// image, remove". Without porting `_fixLazyImages`, a `<figure data-src=
+/// "foo.jpg">` with no inner `<img>` would have `img == 0` for its
+/// ancestors and could be removed where the JS would keep it.
+///
+/// The corpus probe shows zero scored URL exercises the figure branch
+/// (no inline `<figure>` with a `data-`/`srcset`-style attribute on a
+/// figure that lacks an inner `<img>`/`<picture>`). The function is ported
+/// anyway because the cost is bounded and the spec gap is named (HLD §7.5).
+///
+/// Called from [`prep_article`] in the `_fixLazyImages` slot
+/// (`Readability.js:790`), AFTER `_markDataTables` and BEFORE any
+/// `_cleanConditionally`.
+pub fn fix_lazy_images(root: &NodeRef) {
+    let targets = get_all_nodes_with_tag(root, &["img", "picture", "figure"]);
+    for elem in targets {
+        let elem_tag = match tag_name(&elem) {
+            Some(t) => t,
+            None => continue,
+        };
+
+        // ------- (1) tiny base64 placeholder src cull (:2336-2369) -------
+        if let Some(src) = get_attribute(&elem, "src")
+            && let Some(caps) = regexps::b64_data_url().captures(&src)
+        {
+            let mediatype = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            if mediatype != "image/svg+xml" {
+                // any OTHER attribute value matching /\.(jpg|jpeg|png|webp)/i ?
+                let mut src_could_be_removed = false;
+                if let markup5ever_rcdom::NodeData::Element { attrs, .. } = &elem.data {
+                    for a in attrs.borrow().iter() {
+                        if a.name.local.to_string() == "src" {
+                            continue;
+                        }
+                        if regexps::image_ext_anywhere().is_match(&a.value) {
+                            src_could_be_removed = true;
+                            break;
+                        }
+                    }
+                }
+                if src_could_be_removed {
+                    // b64starts = parts[0].length (the prefix incl. ";base64,")
+                    let b64starts = caps.get(0).map(|m| m.as_str().chars().count()).unwrap_or(0);
+                    let total = src.chars().count();
+                    let b64length = total.saturating_sub(b64starts);
+                    if b64length < 133 {
+                        dom::remove_attribute(&elem, "src");
+                    }
+                }
+            }
+        }
+
+        // ------- (2) has-image short-circuit (:2371-2377) -------
+        // `(elem.src || (elem.srcset && elem.srcset != "null")) &&
+        //  !elem.className.toLowerCase().includes("lazy")` -> return.
+        // Note: re-read src AFTER step (1) (it may have been removed).
+        let cur_src = get_attribute(&elem, "src");
+        let cur_srcset = get_attribute(&elem, "srcset");
+        let has_image = (cur_src.is_some() && !cur_src.as_deref().unwrap_or("").is_empty())
+            || (cur_srcset.is_some()
+                && cur_srcset.as_deref() != Some("null")
+                && !cur_srcset.as_deref().unwrap_or("").is_empty());
+        let class_lazy = dom::class_name(&elem).to_ascii_lowercase().contains("lazy");
+        if has_image && !class_lazy {
+            continue;
+        }
+
+        // ------- (3) attribute promotion (:2379-2409) -------
+        // Snapshot attrs to a Vec — we may MUTATE the element below
+        // (setAttribute / appendChild) which would invalidate a live
+        // borrow of attrs.
+        let pairs: Vec<(String, String)> = match &elem.data {
+            markup5ever_rcdom::NodeData::Element { attrs, .. } => attrs
+                .borrow()
+                .iter()
+                .map(|a| (a.name.local.to_string(), a.value.to_string()))
+                .collect(),
+            _ => continue,
+        };
+        for (name, value) in pairs.iter() {
+            if name == "src" || name == "srcset" || name == "alt" {
+                continue;
+            }
+            let copy_to: Option<&str> = if regexps::image_srcset_value().is_match(value) {
+                Some("srcset")
+            } else if regexps::image_src_value().is_match(value) {
+                Some("src")
+            } else {
+                None
+            };
+            if let Some(target_attr) = copy_to {
+                if elem_tag == "IMG" || elem_tag == "PICTURE" {
+                    set_attribute(&elem, target_attr, value);
+                } else if elem_tag == "FIGURE"
+                    && get_all_nodes_with_tag(&elem, &["img", "picture"]).is_empty()
+                {
+                    // The score-affecting branch: empty <figure> with a
+                    // promotable attribute -> create a new <img> child.
+                    let img = create_element("IMG");
+                    set_attribute(&img, target_attr, value);
+                    append_child(&elem, &img);
+                }
+            }
+        }
+    }
+}
+
+/// `_postProcessContent(articleContent)` (`Readability.js:281-291`) —
+/// **Stage 3 text-affecting parts**.
+///
+/// The JS body is:
+/// ```text
+/// _fixRelativeUris(articleContent);     // attribute-only, score-invisible
+/// _simplifyNestedElements(articleContent);
+/// if (!_keepClasses) _cleanClasses(articleContent);  // attribute-only
+/// ```
+///
+/// Of the three, only `_simplifyNestedElements` has structural effect;
+/// `_fixRelativeUris` and `_cleanClasses` are attribute-only and
+/// `text_content`-invariant (HLD §2). For Stage 3 we port the structural
+/// half; the attribute halves remain deferred (they are score-invisible
+/// and Stage-4 cleanup territory). `_simplifyNestedElements` is itself
+/// `text_content`-invariant (see [`simplify_nested_elements`] doc), so
+/// calling `post_process_content` does not perturb the scored body —
+/// porting is for structural faithfulness, not Coverage.
+///
+/// The supervisor brief noted `aria-modal`/`role=dialog` removal as a
+/// candidate text-affecting `_postProcessContent` step; that check is in
+/// fact inside `_grabArticle`'s main visitor loop (`Readability.js:1073-1079`),
+/// already ported in `grab_article.rs:192-198` — nothing to port here.
+pub fn post_process_content(article_content: &NodeRef) {
+    // _fixRelativeUris — attribute-only (score-invisible, HLD §2): deferred.
+    simplify_nested_elements(article_content);
+    // _cleanClasses — attribute-only (score-invisible): deferred.
 }
 
 #[cfg(test)]
@@ -979,6 +1292,262 @@ mod tests {
             Some("real.jpg")
         );
     }
+
+    // ---- Stage 3: _simplifyNestedElements (Readability.js:537-565) ----
+
+    #[test]
+    fn simplify_nested_elements_removes_empty_div_and_section() {
+        // Readability.js:546-548: a <div>/<section> with parent, id NOT
+        // starting with "readability", and `_isElementWithoutContent` ⇒
+        // _removeAndGetNext. Empty divs (no children, no text) qualify.
+        let dom =
+            Dom::parse("<body><article><div></div><section></section><p>keep</p></article></body>");
+        let art = get_elements_by_tag_name(&dom.body().unwrap(), "article")[0].clone();
+        simplify_nested_elements(&art);
+        // The two empty containers are gone; the <p>keep</p> remains.
+        assert_eq!(get_elements_by_tag_name(&art, "div").len(), 0);
+        assert_eq!(get_elements_by_tag_name(&art, "section").len(), 0);
+        assert_eq!(get_elements_by_tag_name(&art, "p").len(), 1);
+    }
+
+    #[test]
+    fn simplify_nested_elements_skips_readability_prefix_id() {
+        // Readability.js:544: `!(node.id && node.id.startsWith("readability"))`
+        // — the page-wrap (`readability-page-1`) MUST NOT be removed even if
+        // empty.
+        let dom =
+            Dom::parse(r#"<body><article><div id="readability-page-1"></div></article></body>"#);
+        let art = get_elements_by_tag_name(&dom.body().unwrap(), "article")[0].clone();
+        simplify_nested_elements(&art);
+        // The id="readability-page-1" div MUST survive.
+        let divs = get_elements_by_tag_name(&art, "div");
+        assert_eq!(divs.len(), 1);
+        assert_eq!(
+            get_attribute(&divs[0], "id").as_deref(),
+            Some("readability-page-1")
+        );
+    }
+
+    #[test]
+    fn simplify_nested_elements_unwraps_single_div_child() {
+        // Readability.js:549-559: <div ATTR><div ATTR2>x</div></div> →
+        // <div ATTR ATTR2>x</div> (child's attrs union with node's; same-name
+        // attrs overwritten by node's via `setAttributeNode`).
+        let dom = Dom::parse(
+            r#"<body><article><div class="outer" data-x="o"><div class="inner" data-y="i">hi</div></div></article></body>"#,
+        );
+        let art = get_elements_by_tag_name(&dom.body().unwrap(), "article")[0].clone();
+        simplify_nested_elements(&art);
+        // Only ONE <div> remains; the inner survives, with outer's attrs
+        // overwritten onto it.
+        let divs = get_elements_by_tag_name(&art, "div");
+        assert_eq!(divs.len(), 1);
+        // class is overwritten by outer's `outer` value (faithful to
+        // setAttributeNode replace-on-same-name).
+        assert_eq!(get_attribute(&divs[0], "class").as_deref(), Some("outer"));
+        // data-x from outer.
+        assert_eq!(get_attribute(&divs[0], "data-x").as_deref(), Some("o"));
+        // data-y survives from inner.
+        assert_eq!(get_attribute(&divs[0], "data-y").as_deref(), Some("i"));
+        // Text content preserved.
+        assert_eq!(text_content(&divs[0]), "hi");
+    }
+
+    #[test]
+    fn simplify_nested_elements_preserves_text_content_invariant() {
+        // The faithfulness invariant: _simplifyNestedElements MUST be
+        // text_content-invariant (branch 1 removes only empty elements; branch
+        // 2 moves a child up — neither changes the #text DFS concatenation).
+        let html = "<body><article>\
+            <div></div>\
+            <section><div><p>main body text here</p></div></section>\
+            <div id='readability-page-1'></div>\
+        </article></body>";
+        let dom = Dom::parse(html);
+        let art_before = get_elements_by_tag_name(&dom.body().unwrap(), "article")[0].clone();
+        let tc_before = text_content(&art_before);
+        simplify_nested_elements(&art_before);
+        let tc_after = text_content(&art_before);
+        assert_eq!(tc_before, tc_after, "text_content MUST be invariant");
+    }
+
+    #[test]
+    fn simplify_nested_elements_skips_root_with_no_parent() {
+        // Readability.js:542: `node.parentNode && ...`. The first node visited
+        // (articleContent itself) has no parent in this test — so the branch
+        // is skipped on it. The walk then proceeds via _getNextNode to its
+        // descendants and processes those.
+        let dom = Dom::parse(r#"<div id="root"><div></div><p>x</p></div>"#);
+        let root = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        // Detach root so it has no parent.
+        crate::readability::dom::remove(&root);
+        // Now root has no parent.
+        assert!(parent(&root).is_none());
+        simplify_nested_elements(&root);
+        // Descendants (the inner empty <div>) get processed → removed.
+        // <p>x</p> stays.
+        assert_eq!(get_elements_by_tag_name(&root, "div").len(), 0);
+        assert_eq!(get_elements_by_tag_name(&root, "p").len(), 1);
+    }
+
+    // ---- Stage 3: _fixLazyImages (Readability.js:2332-2412) ----
+
+    #[test]
+    fn fix_lazy_images_empty_figure_creates_img_score_affecting_branch() {
+        // The branch that justifies porting (Readability.js:2398-2407): a
+        // <figure data-src="foo.jpg"> with NO inner <img>/<picture> AND no
+        // existing src/srcset gets a new <img> appended. This INCREASES
+        // _cleanConditionally's img descendant count for the figure's
+        // ancestors (`Readability.js:2498`).
+        let dom =
+            Dom::parse(r#"<body><div id=art><figure data-src="hero.jpg"></figure></div></body>"#);
+        let art = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let imgs_before = get_elements_by_tag_name(&art, "img").len();
+        assert_eq!(imgs_before, 0);
+        fix_lazy_images(&art);
+        let imgs_after = get_elements_by_tag_name(&art, "img").len();
+        assert_eq!(imgs_after, 1, "figure branch MUST create a new <img>");
+        let imgs = get_elements_by_tag_name(&art, "img");
+        assert_eq!(get_attribute(&imgs[0], "src").as_deref(), Some("hero.jpg"));
+    }
+
+    #[test]
+    fn fix_lazy_images_figure_with_inner_img_does_not_add_another() {
+        // The guard `!_getAllNodesWithTag(elem, ["img","picture"]).length`
+        // (`:2400`) blocks the figure-img creation if any img/picture exists
+        // inside. The data-src is still on the figure; no extra img.
+        let dom = Dom::parse(
+            r#"<body><div id=art><figure data-src="x.jpg"><img src="real.jpg"></figure></div></body>"#,
+        );
+        let art = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        fix_lazy_images(&art);
+        let imgs = get_elements_by_tag_name(&art, "img");
+        assert_eq!(imgs.len(), 1);
+        // Real img untouched (it already has src; short-circuit at :2371-2377).
+        assert_eq!(get_attribute(&imgs[0], "src").as_deref(), Some("real.jpg"));
+    }
+
+    #[test]
+    fn fix_lazy_images_img_with_data_src_promotes_to_src() {
+        // Plain <img data-src="x.jpg"> with no src/srcset and no `lazy` class
+        // ⇒ the attribute promotion branch (:2391) matches /^.../.test → copy
+        // value to `src`.
+        let dom = Dom::parse(r#"<body><img data-src="real.jpg"></body>"#);
+        let body = dom.body().unwrap();
+        fix_lazy_images(&body);
+        let img = get_elements_by_tag_name(&body, "img")[0].clone();
+        assert_eq!(get_attribute(&img, "src").as_deref(), Some("real.jpg"));
+    }
+
+    #[test]
+    fn fix_lazy_images_picture_data_srcset_promotes_to_srcset() {
+        // <picture data-srcset="foo.jpg 2x"> ⇒ /\.(jpg|jpeg|png|webp)\s+\d/
+        // matches → copy value to `srcset`.
+        let dom = Dom::parse(r#"<body><picture data-srcset="foo.jpg 2x"></picture></body>"#);
+        let body = dom.body().unwrap();
+        fix_lazy_images(&body);
+        let pic = get_elements_by_tag_name(&body, "picture")[0].clone();
+        assert_eq!(get_attribute(&pic, "srcset").as_deref(), Some("foo.jpg 2x"));
+    }
+
+    #[test]
+    fn fix_lazy_images_b64_tiny_placeholder_src_removed() {
+        // Readability.js:2336-2369: data:image/png;base64,SHORT (b64length<133)
+        // AND another attribute value with image extension ⇒ removeAttribute("src").
+        // Tiny base64 placeholder + `data-real-src="real.jpg"` (image-ext).
+        let dom = Dom::parse(
+            r#"<body><img src="data:image/png;base64,iVBOR" data-real-src="real.jpg"></body>"#,
+        );
+        let body = dom.body().unwrap();
+        fix_lazy_images(&body);
+        let img = get_elements_by_tag_name(&body, "img")[0].clone();
+        // Tiny base64 src removed; then attribute promotion kicks in for
+        // data-real-src → src.
+        assert_eq!(get_attribute(&img, "src").as_deref(), Some("real.jpg"));
+    }
+
+    #[test]
+    fn fix_lazy_images_b64_svg_carve_out() {
+        // Readability.js:2341-2343: svg+xml mediatype short-circuits BEFORE
+        // the placeholder cull. A short svg+xml base64 src MUST be kept.
+        let dom = Dom::parse(
+            r#"<body><img src="data:image/svg+xml;base64,PHN2" data-real-src="real.jpg"></body>"#,
+        );
+        let body = dom.body().unwrap();
+        fix_lazy_images(&body);
+        let img = get_elements_by_tag_name(&body, "img")[0].clone();
+        // src is unchanged (svg carve-out triggered `return;` at :2342).
+        assert_eq!(
+            get_attribute(&img, "src").as_deref(),
+            Some("data:image/svg+xml;base64,PHN2")
+        );
+    }
+
+    #[test]
+    fn fix_lazy_images_has_image_and_not_lazy_short_circuits() {
+        // (elem.src OR (elem.srcset && != "null")) && !class.contains("lazy")
+        //   ⇒ return (no attribute promotion). A real img with `src` plus a
+        //   benign data-some attribute that looks like an image must NOT
+        //   overwrite `src`.
+        let dom = Dom::parse(r#"<body><img src="real.jpg" data-something="other.jpg"></body>"#);
+        let body = dom.body().unwrap();
+        fix_lazy_images(&body);
+        let img = get_elements_by_tag_name(&body, "img")[0].clone();
+        // src stays at "real.jpg" — short-circuit prevented overwrite.
+        assert_eq!(get_attribute(&img, "src").as_deref(), Some("real.jpg"));
+    }
+
+    #[test]
+    fn fix_lazy_images_lazy_class_bypasses_short_circuit() {
+        // class contains "lazy" ⇒ short-circuit does NOT fire ⇒ attribute
+        // promotion runs even when src exists. The lazy-class case is
+        // exactly the kind of placeholder src this function was written for.
+        // (Note: srcset takes priority over src in the promotion test.)
+        let dom =
+            Dom::parse(r#"<body><img class="lazy" src="placeholder" data-src="real.jpg"></body>"#);
+        let body = dom.body().unwrap();
+        fix_lazy_images(&body);
+        let img = get_elements_by_tag_name(&body, "img")[0].clone();
+        assert_eq!(get_attribute(&img, "src").as_deref(), Some("real.jpg"));
+    }
+
+    #[test]
+    fn fix_lazy_images_text_content_invariant_on_pure_attribute_branches() {
+        // Branches 1-3 are attribute-only except the figure-img creation
+        // (which adds an <img> element with no text). So text_content of the
+        // root MUST be invariant.
+        let html = r#"<div id=r>
+            <img data-src="real.jpg">
+            <picture data-srcset="foo.png 2x"></picture>
+            <figure data-src="x.jpg"></figure>
+            inline text
+        </div>"#;
+        let dom = Dom::parse(html);
+        let root = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let tc_before = text_content(&root);
+        fix_lazy_images(&root);
+        let tc_after = text_content(&root);
+        assert_eq!(
+            tc_before, tc_after,
+            "text_content MUST be invariant under _fixLazyImages"
+        );
+    }
+
+    #[test]
+    fn post_process_content_runs_simplify_nested_elements() {
+        // Verifies the call wiring: _postProcessContent's structural half is
+        // _simplifyNestedElements.
+        let dom = Dom::parse(
+            r#"<body><article><div class="outer"><div class="inner">x</div></div></article></body>"#,
+        );
+        let art = get_elements_by_tag_name(&dom.body().unwrap(), "article")[0].clone();
+        post_process_content(&art);
+        let divs = get_elements_by_tag_name(&art, "div");
+        assert_eq!(divs.len(), 1);
+        assert_eq!(text_content(&divs[0]), "x");
+    }
+
+    // (Existing test below — keep.)
 
     #[test]
     fn is_single_image_recursive_descent() {

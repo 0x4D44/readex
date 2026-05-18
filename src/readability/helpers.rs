@@ -98,9 +98,27 @@ fn has_attribute(node: &NodeRef, name: &str) -> bool {
 /// Extract one `prop` value from an inline `style="..."` attribute, lower-cased
 /// and trimmed (so `display: None` → `none`). `None` if no style attribute or
 /// the property is absent. CSS property names are ASCII case-insensitive; we
-/// match `prop` case-insensitively. This is the minimal CSSOM the two
-/// `_isProbablyVisible` checks (`display`, `visibility`) need — not a full
-/// CSS parser (out of Stage-1a scope; the JS only ever reads these two).
+/// match `prop` case-insensitively.
+///
+/// **CSSOM `!important` faithfulness (HLD §7.5 explicit Stage-3 item; the
+/// CSSOM spec — `CSSStyleDeclaration.getPropertyValue` returns just the value,
+/// `getPropertyPriority` returns the `"important"` marker separately).** A
+/// declaration like `display: none !important` has `display` value `"none"`
+/// and priority `"important"`; `node.style.display` in JS / jsdom evaluates to
+/// `"none"` (the priority is on a different accessor, not in the value
+/// string). Without stripping `!important` here, `display: none !important`
+/// would land as `"none !important"` and fail to match `Some("none")` in
+/// `_isProbablyVisible`, so the crate would treat the node as visible and the
+/// JS as hidden — a real divergence on any inline `display:none !important`.
+/// This is the deferred-Stage-3 fix from HLD §7.5 (Stage 1 ported only a
+/// minimal version). The corpus does not contain `display:none !important`
+/// (probed; no scored URL exercises this branch), so this fix moves no
+/// measurable Coverage residual; it is ported anyway because §7.5 names it
+/// explicitly and the cost (one regex test) is trivial.
+///
+/// We strip a trailing `!\s*important` suffix (CSS spec syntax — case-
+/// insensitive `!` plus any whitespace plus `important`), then lower-case and
+/// trim, faithful to how `getPropertyValue` would expose the value.
 fn inline_style_prop(node: &NodeRef, prop: &str) -> Option<String> {
     let style = get_attribute(node, "style")?;
     for decl in style.split(';') {
@@ -110,10 +128,33 @@ fn inline_style_prop(node: &NodeRef, prop: &str) -> Option<String> {
         if let Some(v) = v
             && k.eq_ignore_ascii_case(prop)
         {
-            return Some(v.trim().to_ascii_lowercase());
+            let value = strip_css_important(v.trim());
+            return Some(value.trim().to_ascii_lowercase());
         }
     }
     None
+}
+
+/// Strip a trailing `!\s*important` priority annotation from a CSS value.
+///
+/// CSS syntax: `value !important` where `!` may be followed by any amount of
+/// whitespace before `important` (CSS Syntax Module Level 3 §4.3.2). Case-
+/// insensitive on `important`. Returns the value substring without the
+/// `!important` suffix; if no such suffix, returns the original.
+fn strip_css_important(s: &str) -> &str {
+    // Find the LAST `!` (a value may not contain `!` legitimately for the
+    // properties we read — `display`/`visibility` — and a trailing
+    // `!important` is the only place a `!` should appear).
+    let Some(bang_pos) = s.rfind('!') else {
+        return s;
+    };
+    let after_bang = s[bang_pos + 1..].trim_start();
+    if after_bang.eq_ignore_ascii_case("important") {
+        // strip back to the bang then trim trailing ws on the value.
+        s[..bang_pos].trim_end()
+    } else {
+        s
+    }
 }
 
 /// `_isWhitespace(node)` (`Readability.js:2042-2048`).
@@ -366,6 +407,74 @@ mod tests {
     fn is_probably_visible_plain_div_is_visible() {
         let (_d, n) = el(r#"<div style="color:red">x</div>"#, "div");
         assert!(is_probably_visible(&n));
+    }
+
+    // Stage-3 — CSSOM `!important` faithfulness (HLD §7.5 explicit deferred
+    // item). Expected hand-derived: jsdom's `node.style.display` returns the
+    // plain value `"none"` for `style="display:none !important"`, so the
+    // `display != "none"` clause MUST treat both as hidden.
+
+    #[test]
+    fn is_probably_visible_display_none_important_is_hidden_cssom_faithful() {
+        let (_d, n) = el(r#"<div style="display:none !important">x</div>"#, "div");
+        assert!(
+            !is_probably_visible(&n),
+            "Readability.js:2697 `node.style.display != \"none\"`: jsdom's \
+             style.display for `display:none !important` is `\"none\"`, so \
+             the node MUST be hidden (HLD §7.5)"
+        );
+    }
+
+    #[test]
+    fn is_probably_visible_visibility_hidden_important_is_hidden_cssom_faithful() {
+        let (_d, n) = el(
+            r#"<div style="visibility:hidden !important">x</div>"#,
+            "div",
+        );
+        assert!(!is_probably_visible(&n));
+    }
+
+    #[test]
+    fn is_probably_visible_display_none_important_case_insensitive() {
+        // CSS `!important` is case-insensitive on `important`.
+        let (_d, n) = el(r#"<div style="display: None !IMPORTANT">x</div>"#, "div");
+        assert!(!is_probably_visible(&n));
+    }
+
+    #[test]
+    fn is_probably_visible_display_none_important_extra_ws() {
+        // `!` may be followed by any whitespace before `important`.
+        let (_d, n) = el(r#"<div style="display:none !  important;">x</div>"#, "div");
+        assert!(!is_probably_visible(&n));
+    }
+
+    #[test]
+    fn is_probably_visible_other_property_with_important_does_not_match_display() {
+        // `color: red !important` MUST NOT bleed into the `display` lookup —
+        // only the matching property's value/priority is inspected.
+        let (_d, n) = el(
+            r#"<div style="color:red !important;display:block">x</div>"#,
+            "div",
+        );
+        assert!(is_probably_visible(&n), "display:block is visible");
+    }
+
+    #[test]
+    fn strip_css_important_unit_cases() {
+        // No `!important` -> unchanged.
+        assert_eq!(strip_css_important("none"), "none");
+        assert_eq!(strip_css_important("block"), "block");
+        // Plain `!important`.
+        assert_eq!(strip_css_important("none !important"), "none");
+        // Tight `!important`.
+        assert_eq!(strip_css_important("none!important"), "none");
+        // Extra ws.
+        assert_eq!(strip_css_important("none !  important"), "none");
+        // Case-insensitive `important`.
+        assert_eq!(strip_css_important("none !IMPORTANT"), "none");
+        assert_eq!(strip_css_important("NONE !Important"), "NONE");
+        // `!` not followed by `important` is untouched.
+        assert_eq!(strip_css_important("0 !x"), "0 !x");
     }
 
     // ---- _isWhitespace (Readability.js:2042-2048) ----

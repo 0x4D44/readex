@@ -219,8 +219,18 @@ impl Readability {
             )?;
             let article_content = grab.article_content;
 
-            // (Readability.js:2754 _postProcessContent — score-invisible
-            // cosmetics, HLD §2 — NOT run here.)
+            // Readability.js:2754 _postProcessContent(articleContent) — the
+            // text-affecting portion ported at Stage 3 (HLD §7.5). The JS body
+            // is (a) _fixRelativeUris (attribute-only, score-invisible), (b)
+            // _simplifyNestedElements (structural — text_content-invariant
+            // because it only moves children up; see prep::simplify_nested_elements
+            // doc), (c) _cleanClasses (attribute-only, score-invisible). The
+            // attribute halves remain deferred (HLD §2); the structural half
+            // is run here. Calling this is text_content-invariant by
+            // construction but the SHAPE of the article tree converges to
+            // RJS's, which matters for any future stage that reads the tree
+            // (Stage 4 metadata excerpt etc.).
+            prep::post_process_content(&article_content);
 
             // 1545 textLength = _getInnerText(articleContent, true).length;
             // 2766 textContent = articleContent.textContent. Capture BOTH

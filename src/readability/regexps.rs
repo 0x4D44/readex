@@ -229,6 +229,72 @@ pub fn image_extension() -> &'static Regex {
     R.get_or_init(|| compile("(?i)\\.(jpg|jpeg|png|webp)"))
 }
 
+/// `REGEXPS.b64DataUrl` (`Readability.js:163`, `/^data:\s*([^\s;,]+)\s*;\s*base64\s*,/i`).
+///
+/// Used by `_fixLazyImages` (`:2338-2340`) to (a) detect a base64-encoded
+/// data: URI in an `<img>`'s `src` attribute, and (b) capture the mediatype
+/// (the first capture group) so the SVG carve-out (`:2341-2343`) can fire.
+/// The `parts[0].length` JS expression is the full prefix length up to and
+/// including `";base64,"` — used to subtract from the total `src.length` to
+/// estimate the base64 payload size (the `<133` placeholder check at
+/// `:2365`).
+///
+/// **Dialect note (HLD §8):** JS `\s` ⇒ JS-space class (`JS_SPACE_CLASS`).
+/// The pattern is anchored at `^`, case-insensitive on `data:` / `base64`.
+pub fn b64_data_url() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| {
+        compile(&format!(
+            "(?i)^data:[{JS_SPACE_CLASS}]*([^{JS_SPACE_CLASS};,]+)\
+             [{JS_SPACE_CLASS}]*;[{JS_SPACE_CLASS}]*base64[{JS_SPACE_CLASS}]*,"
+        ))
+    })
+}
+
+/// `/\.(jpg|jpeg|png|webp)/i` reused as "any attribute value contains an
+/// image extension" — `Readability.js:2354`'s inline literal inside
+/// `_fixLazyImages`. **Identical** pattern to [`image_extension`] (also at
+/// `:1907`/`:1950`); kept as a separate name to make the call sites
+/// readable. (Aliasing the function rather than recompiling the pattern.)
+pub fn image_ext_anywhere() -> &'static Regex {
+    // Reuses the same compiled regex — `image_extension` is already memoised.
+    image_extension()
+}
+
+/// `/\.(jpg|jpeg|png|webp)\s+\d/` (`Readability.js:2389`) — inline in
+/// `_fixLazyImages`. Detects a srcset-style attribute value: an image
+/// extension followed by JS whitespace and a digit (the density / width
+/// descriptor, e.g. `"foo.jpg 2x"` or `"foo.jpg 800w"`).
+///
+/// **Dialect note (HLD §8):** JS `\s` ⇒ JS-space class. JS `\d` is ASCII
+/// `[0-9]` — explicit here so we match the JS dialect exactly.
+pub fn image_srcset_value() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| {
+        compile(&format!(
+            "(?i)\\.(jpg|jpeg|png|webp)[{JS_SPACE_CLASS}]+[0-9]"
+        ))
+    })
+}
+
+/// `/^\s*\S+\.(jpg|jpeg|png|webp)\S*\s*$/` (`Readability.js:2391`) — inline
+/// in `_fixLazyImages`. Detects a plain image-URL attribute value: optional
+/// leading JS-whitespace, one or more non-whitespace chars (the path
+/// portion before the extension), the image extension, optional
+/// non-whitespace suffix (query string), optional trailing JS-whitespace.
+///
+/// Anchored `^…$`. **Dialect note (HLD §8):** JS `\s` ⇒ JS-space class; JS
+/// `\S` ⇒ `[^<JS-space-class>]`.
+pub fn image_src_value() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| {
+        compile(&format!(
+            "(?i)^[{JS_SPACE_CLASS}]*[^{JS_SPACE_CLASS}]+\\.(jpg|jpeg|png|webp)\
+             [^{JS_SPACE_CLASS}]*[{JS_SPACE_CLASS}]*$"
+        ))
+    })
+}
+
 /// `REGEXPS.videos` (`Readability.js:153-154`, `/…/i`). The default
 /// `_allowedVideoRegex`. Used by `_clean` for embed allow-listing. Stage 1a's
 /// `_clean` targets object/embed/footer/link/aside — `isEmbed` is true for
@@ -546,6 +612,29 @@ mod tests {
             (image_extension, "x.gif", false), // not in alternation
             (image_extension, "jpg", false),   // literal `.` required
             (image_extension, "", false),
+            // --- b64_data_url: ^data:\s*([^\s;,]+)\s*;\s*base64\s*, — Readability.js:163 ---
+            (b64_data_url, "data:image/png;base64,iVBOR", true),
+            (b64_data_url, "data:image/svg+xml;base64,PHN2", true), // svg too
+            (b64_data_url, "data:image/png ;base64 ,iVBOR", true),  // \s allowed
+            (b64_data_url, "Data:image/png;base64,iVBOR", true),    // /i
+            (b64_data_url, "data:image/png;base32,iVBOR", false),   // not base64
+            (b64_data_url, "data:;base64,iVBOR", false),            // empty mediatype excluded
+            (b64_data_url, "https://x/y", false),
+            (b64_data_url, "data:image/png,iVBOR", false), // no `;base64,`
+            // --- image_srcset_value: /\.(jpg|jpeg|png|webp)\s+\d/ — Readability.js:2389 ---
+            (image_srcset_value, "foo.jpg 2x", true),
+            (image_srcset_value, "foo.JPG  800w", true),
+            (image_srcset_value, "foo.webp\t1x", true), // \s
+            (image_srcset_value, "foo.jpg", false),     // missing srcset descriptor
+            (image_srcset_value, "foo.jpg 2", true),    // \d (any digit)
+            (image_srcset_value, "foo.gif 2x", false),  // not in alternation
+            // --- image_src_value: /^\s*\S+\.(jpg|jpeg|png|webp)\S*\s*$/ — Readability.js:2391 ---
+            (image_src_value, "foo.jpg", true),
+            (image_src_value, "  foo.jpg  ", true), // \s* leading + trailing
+            (image_src_value, "/path/to/x.png?v=1", true), // \S* suffix (query string)
+            (image_src_value, "image_srcset_value", false), // no extension
+            (image_src_value, "a.jpg b.jpg", false), // contains a space → \S+ doesn't span
+            (image_src_value, "", false),
             // --- videos (/i) ---
             (videos, "https://www.youtube.com/watch?v=x", true),
             (videos, "//player.vimeo.com/video/1", true),

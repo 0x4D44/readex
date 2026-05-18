@@ -66,7 +66,12 @@ pub struct GrabResult {
 
 /// `_removeAndGetNext(node)` (`Readability.js:932-936`):
 /// `var n = _getNextNode(node, true); node.remove(); return n;`.
-fn remove_and_get_next(node: &NodeRef) -> Option<NodeRef> {
+///
+/// `pub(crate)` because Stage 3's `_simplifyNestedElements`
+/// (`prep::simplify_nested_elements`, `Readability.js:537-565`) calls this on
+/// `_isElementWithoutContent` removal — same JS-faithful primitive, kept in
+/// one place rather than duplicated.
+pub(crate) fn remove_and_get_next(node: &NodeRef) -> Option<NodeRef> {
     let next = get_next_node(node, true);
     dom::remove(node);
     next
