@@ -45,6 +45,33 @@
 //! is provided for direct library consumers (e.g. the consumer) as a convenience;
 //! it is informational, not the harness's comparability surface.
 
+// M2 Readability port (HLD `2026.05.18 - HLD - mdrcel Readability Port (M2)`).
+//
+// `#[doc(hidden)] pub`: this is **internal infrastructure + in-workspace
+// verification surface only**, NOT part of the stable public contract. It is
+// `pub` purely so the in-workspace differential harness (the `benchmark`
+// path-dependency crate) and the Stage-0 parser-equivalence BLOCKER gate
+// (`tests/parser_equivalence_gate.rs`, HLD §6.1) can drive
+// `readability::dom::text_content` against jsdom — exactly the role the
+// `benchmark` crate already plays as an in-tree consumer. It is `#[doc(hidden)]`
+// so it does NOT appear in the crate's rendered API and external consumers get
+// no stability promise on it.
+//
+// The **frozen extraction surface** the parent brief pins —
+// `extract` / `extract_with` / `Extracted` / `Options` / `ExtractError` — is
+// byte-for-byte unchanged and still returns `ExtractError::NotImplemented` for
+// every input (HLD §5/§6 — the honestly vacuous Stage-0 floor). `extract_with`
+// is wired to the port only in Stage 1a; the version bump is a PATCH precisely
+// because no *stable* public API changed (a `#[doc(hidden)]` item carries no
+// semver promise).
+//
+// `#[allow(dead_code)]`: the facade has no *non-test* caller until Stage 1a
+// (it is exercised by `dom`'s own unit tests + the §6.1 gate) — flagging that
+// honestly here rather than letting unused-warnings accrue.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub mod readability;
+
 /// The extracted main content of an HTML document, plus light metadata.
 ///
 /// Every field is owned so the result outlives the input `&str`. `title`,

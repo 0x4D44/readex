@@ -3,17 +3,63 @@ members = ["benchmark"]
 
 [package]
 name = "mdrcel"
-version = "0.2.1"
+# M2 Stage 0 (2026-05-18): 0.2.1 -> 0.2.2 PATCH. New *internal* infrastructure
+# only (the `readability` module skeleton + `dom.rs` rcdom facade) plus the
+# three parser dependencies below. The public surface in `src/lib.rs`
+# (`extract`/`extract_with`/`Extracted`/`Options`/`ExtractError`) is **byte-for-
+# byte unchanged** and still returns `ExtractError::NotImplemented` for every
+# input, so per semver (CLAUDE.md "Version management") this is a patch, not a
+# minor: no new public API, no behaviour change observable to a consumer.
+version = "0.2.2"
 edition = "2024"
 
 [dependencies]
-# DEC-3: intentionally EMPTY. The mdrcel library is a zero-dependency crate at
-# the Milestone-1 floor. `thiserror` was removed: at M1 `ExtractError` has one
-# variant with a static message and no `#[from]`/`#[source]`, so the derive
-# saved ~5 lines while pulling a proc-macro (`thiserror`/`proc-macro2`/
-# `quote`/`syn`) into an otherwise zero-dep library — `Display`/`Error` are
-# now hand-written in `src/lib.rs`. `thiserror` is deferred until
-# `ExtractError` actually grows variants / `#[from]` / `#[source]` (mirrors
-# how `scraper`/`html5ever`/`regex` are deferred until the extraction
-# algorithm needs them — minimal dependency graph, parent brief). Reversible:
-# re-add the dependency and the `#[derive(thiserror::Error)]` at that point.
+# DEC-3 (M1): the library was a zero-dependency crate at the Milestone-1 floor;
+# `thiserror` was deliberately omitted (hand-written `Display`/`Error` in
+# `src/lib.rs`) and `scraper`/`html5ever`/`regex` were deferred "until the
+# extraction algorithm needs them". M2 Stage 0 is exactly that point for the
+# HTML parser: the Readability port is irreducibly a tree-rewriting algorithm
+# over a spec-compliant HTML5 DOM (HLD §3), so the parser dependency is now
+# load-bearing, not speculative. `thiserror` stays deferred (Stage 4 grows
+# `ExtractError`).
+#
+# HLD §3 / §3.1 dependency decision (pinned EXACTLY; `Cargo.lock` committed):
+#   html5ever 0.39 + markup5ever_rcdom 0.39 + tendril 0.5, verified to build on
+#   rustc 1.95.0 / edition 2024 (the toolchain in use here — confirmed).
+#
+# HONEST DEPENDENCY-COST RECORD (HLD §3.1, supervisor M-2 — recorded
+# deliberately, NOT glossed): `markup5ever_rcdom` is published as
+# `+unofficial` and self-describes as *"Basic, unsupported DOM structure for
+# use by tests in html5ever/xml5ever"* — i.e. test-support, not a supported
+# public DOM. It is adopted with eyes open because the alternative is
+# hand-writing a spec-compliant HTML5 parser + mutable DOM (the speculative
+# path, not the conservative one). The transitive graph is ~36 crates incl.
+# `xml5ever` / `web_atoms` which this port does NOT use; the architect plan's
+# "minimal transitive graph" phrasing is withdrawn — the honest figure is
+# stated, not hidden.
+#
+# KUCHIKIKI FALLBACK CRITERION (HLD §3 / §3.1 / §6 / M-2): if rcdom's
+# `Rc<RefCell>` borrow management blocks Stage 0 (a `RefCell` borrow held
+# across a tree mutation that cannot be refactored away behind the facade),
+# switch the substrate to `kuchikiki` — same algorithm, same html5ever,
+# **zero plan change**. Stage 0 did NOT hit this; the facade returns owned
+# `Handle` clones and never holds a borrow across a mutation.
+#
+# VERSION-BUMP FENCE (HLD §3.1): any bump of html5ever / markup5ever_rcdom /
+# tendril MUST re-run the §6.1 parser-equivalence BLOCKER gate before merge,
+# and the bump commit MUST state the gate was re-run green.
+html5ever = "=0.39.0"
+markup5ever_rcdom = "=0.39.0"
+tendril = "=0.5.0"
+
+[dev-dependencies]
+# Test-scaffolding ONLY (never linked into the shipped library — CLAUDE.md
+# "Tests are scaffolding"). Used by `tests/parser_equivalence_gate.rs` (the
+# HLD §6.1 BLOCKER gate) to reproduce the harness tokenizer
+# (`benchmark/src/metrics.rs::tokens`) EXACTLY: `split(char::is_whitespace) ->
+# drop-empty -> to_lowercase -> NFC`. NFC requires `unicode-normalization`;
+# version pinned to "0.1" to match `benchmark/Cargo.toml` so the gate's
+# tokeniser is bit-identical to the harness's (HLD §6.1 requires *the harness
+# tokenizer semantics*, not an approximation). The gate self-checks this
+# mirror against hand-derived vectors so any future drift fails loudly.
+unicode-normalization = "0.1"
