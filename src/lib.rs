@@ -11,20 +11,33 @@
 //!
 //! # Milestone status
 //!
-//! **M2 Stage 1a** (HLD `2026.05.18 - HLD - mdrcel Readability Port (M2)`
-//! §7.1): the public API is unchanged but [`extract`] / [`extract_with`] now
-//! run an idiomatic Rust port of Mozilla Readability v0.6.0 — the parse spine
-//! (`_removeScripts` / `_prepDocument`), title resolution, scoring, and
-//! **single top-candidate** selection. A page yielding an article returns a
-//! populated `Ok`; a genuinely-empty extraction is a valid empty `Ok` (the
-//! Bug-E2 doctrine — "found little" is success, never an error and never
-//! [`ExtractError::NotImplemented`]). Sibling-append, the `_cleanConditionally`
-//! / `_markDataTables` table passes, the retry/flag-sieve loop, and full
-//! non-body metadata are **later stages** (HLD §7.2–§7.6) and are deliberately
-//! not yet ported — so structured/nav/table pages legitimately over-include
-//! versus the prose-only gold until those stages land. The
+//! **M2 Stage 1a/1b/1c/2** (HLD `2026.05.18 - HLD - mdrcel Readability Port
+//! (M2)` §7.1–§7.4): the public API is unchanged but [`extract`] /
+//! [`extract_with`] now run an idiomatic Rust port of Mozilla Readability
+//! v0.6.0 — the parse spine (`_removeScripts` / `_prepDocument`), title
+//! resolution, scoring, single top-candidate selection, sibling-append, the
+//! `FLAG_*` retry / flag-sieve / longest-text fallback, the `readability-
+//! page-1` page-wrap, AND (Stage 2) the full faithful `_prepArticle`:
+//! `_markDataTables` (with the JS-faithful `parse_int_js` rowspan/colspan
+//! coercion), `_cleanConditionally` (the complete shadiness checklist incl.
+//! the data-table KEEP, ancestor-table KEEP, ancestor-code KEEP, and
+//! image-gallery exception), `_cleanHeaders`, `_cleanStyles`,
+//! `_cleanMatchedNodes` (share-strip), single-cell-`<table>` unwrap,
+//! `<h1>`→`<h2>` retag, `<br>`-before-`<p>` removal. A page yielding an
+//! article returns a populated `Ok`; a genuinely-empty extraction is a valid
+//! empty `Ok` (the Bug-E2 doctrine — "found little" is success, never an
+//! error and never [`ExtractError::NotImplemented`]). Full non-body metadata
+//! is the **last stage** (HLD §7.6) and is deliberately not yet ported. The
 //! [`ExtractError::NotImplemented`] variant is retained but is no longer
 //! returned on the happy path.
+//!
+//! **HLD §4 anti-inversion (Stage 2 anchor).** `_cleanConditionally`
+//! deliberately KEEPS marked data tables (`Readability.js:2461-2463` and the
+//! ancestor-data-table check `:2466-2468`); the port faithfully preserves
+//! EDGAR/HMRC financial tables exactly as Readability-JS does. The faithful
+//! port converges TO Readability-JS — it does NOT out-clean it. Word-count
+//! gaps versus a "narrative-only" human gold on table-heavy pages are
+//! therefore the documented diagnostic residual, never a tuning signal.
 //!
 //! There is intentionally **no** trait / strategy / plugin scaffolding here.
 //! The parent brief explicitly warns against premature abstraction (the "M8

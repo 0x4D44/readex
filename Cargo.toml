@@ -55,7 +55,38 @@ name = "mdrcel"
 # of an already-public capability, nothing added to or removed from the API
 # (1a MINOR = first real extraction; 1b/1c extend that same already-public
 # behaviour → PATCH).
-version = "0.3.2"
+#
+# M2 Stage 2 (2026-05-18): 0.3.2 -> 0.3.3 PATCH. Completes the full faithful
+# `_prepArticle` (`Readability.js:782-884`) Stage 1c left as a near-noop
+# (`prep_article_stage1a`): `_markDataTables` + `_getRowAndColumnCount` (with
+# the JS-faithful `parse_int_js` helper, HLD §9/M-6), `_cleanConditionally`
+# (the complete shadiness checklist incl. the data-table KEEP, ancestor-table
+# KEEP, ancestor-code KEEP, image-gallery exception), `_cleanHeaders`,
+# `_cleanStyles`, `_cleanMatchedNodes` (share-strip), `_getTextDensity`,
+# single-cell-`<table>` unwrap, `<h1>`→`<h2>` retag, `<br>`-before-`<p>`
+# removal. The page-wrap / `_prepArticle` order is now the JS order exactly
+# (`_prepArticle` at `Readability.js:1512` BEFORE page-wrap at `:1517-1532`)
+# — Stage 1c's swap was invariant for the Stage-1a `_prepArticle` slice but
+# NOT under the full Stage-2 `_cleanConditionally` whose
+# `_hasAncestorTag(_, "code", 3)` window is sensitive to the extra page-wrap
+# div. **HLD §4 anti-inversion**: the data-table KEEP clauses
+# (`Readability.js:2461-2463`, `:2466-2468`) deliberately preserve marked
+# data tables; this Stage matches RJS exactly on table-heavy EDGAR/HMRC
+# inputs, never out-cleans (HLD §4 — out-cleaning RJS is inversion). The
+# Stage-1c-era over-inclusion of `[edit]`/navbox/hatnotes (Wikipedia), gov.uk
+# nav, cnbc nav etc. — chrome NOT scored as data tables and so removed by
+# `_cleanConditionally` — converges toward RJS. NO new public
+# type/function/signature, `ExtractError` unchanged, `extract ==
+# extract_with(&Options::default())` preserved, Bug-E2 preserved. Per semver
+# (CLAUDE.md) PATCH — an internal behaviour refinement / completion of an
+# already-public capability (`_prepArticle` was already running, just as
+# `prep_article_stage1a`; Stage 2 expands it to the full JS scope without
+# touching the API), matching the Stage-1b/1c precedent. The
+# public-observable default-`extract` does shift (more chrome stripped on
+# many real docs — converging to RJS), but the same shift class held for
+# 1b/1c. If a future reviewer wants MINOR for behavioural-shift visibility,
+# the rationale supports either; PATCH is recorded.
+version = "0.3.3"
 edition = "2024"
 
 [dependencies]

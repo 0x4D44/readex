@@ -60,7 +60,13 @@ use std::rc::Rc;
 use html5ever::tendril::TendrilSink;
 use html5ever::tree_builder::TreeBuilderOpts;
 use html5ever::{Attribute, LocalName, ParseOpts, QualName, local_name, ns, parse_document};
-use markup5ever_rcdom::{Handle, Node, NodeData, RcDom};
+use markup5ever_rcdom::{Handle, Node, RcDom};
+
+/// Re-export of `markup5ever_rcdom::NodeData` so dependent modules can match
+/// on `Element { attrs, .. }` without taking a direct dep on `rcdom`. This is
+/// the **only** rcdom type that leaks past the facade, and ONLY for in-crate
+/// modules — external consumers still see exclusively [`NodeRef`].
+pub use markup5ever_rcdom::NodeData;
 
 /// An owned handle to a DOM node.
 ///

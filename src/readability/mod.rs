@@ -24,10 +24,13 @@
 //! `_cleanConditionally`/`_markDataTables` (Stage 2) and full non-body
 //! metadata (Stage 4) remain unported and are added in their scheduled stages.
 
+pub mod clean;
 pub mod dom;
 pub mod grab_article;
 pub mod helpers;
+pub mod mark_data_tables;
 pub mod metadata;
+pub mod parse_int;
 pub mod prep;
 pub mod regexps;
 pub mod scoring;
@@ -113,12 +116,13 @@ impl Readability {
     /// `_prepDocument` does not remove — so it is identical every attempt;
     /// recomputing it is simplest and faithful, not a behaviour change).
     ///
-    /// **Deliberately NOT ported here** (HLD §7): `_unwrapNoscriptImages`
-    /// (`:2733`), `_getJSONLD` (`:2736` — JSON-LD is `{}`),
-    /// `_postProcessContent` (`:2754` — score-invisible cosmetics, HLD §2),
-    /// `_cleanConditionally`/`_markDataTables`/`_cleanStyles`/`_cleanHeaders`
-    /// (Stage 2, HLD §7.4), the excerpt/byline/dir/lang/siteName/serialized
-    /// half of the return object (Stage 4, HLD §7.6).
+    /// **Deliberately NOT ported here** (HLD §7): `_getJSONLD` (`:2736` —
+    /// JSON-LD is `{}`), `_postProcessContent` (`:2754` — score-invisible
+    /// cosmetics, HLD §2), the excerpt/byline/dir/lang/siteName/serialized
+    /// half of the return object (Stage 4, HLD §7.6). Stage 2 ports
+    /// `_unwrapNoscriptImages` (`:2733`) — see [`prep::unwrap_noscript_images`]
+    /// — and `_cleanConditionally`/`_markDataTables`/`_cleanStyles`/
+    /// `_cleanHeaders` (HLD §7.4).
     ///
     /// Returns `None` only when every attempt's `_grabArticle` returns `null`
     /// (no `<body>` — `Readability.js:2748-2750`) or the flag sieve is
@@ -143,6 +147,15 @@ impl Readability {
         let article_title = {
             let mut doc = Dom::parse(&html);
             let doc_root = doc.document();
+            // _unwrapNoscriptImages(this._doc)  (Readability.js:2733) — must
+            // run BEFORE _removeScripts (`:2739`) drops `<noscript>` and
+            // BEFORE _prepDocument (`:2741`). The title path runs the same
+            // pre-grab pipeline as the attempt closure (HLD §m-3); inserting
+            // this call here is title-invariant (the function only touches
+            // `<img>`/`<noscript>` subtrees, never `<title>`/`<meta>`) but
+            // kept BY CONSTRUCTION identical to the attempt closure so any
+            // future divergence is structurally visible.
+            prep::unwrap_noscript_images(&doc_root);
             prep::remove_scripts(&doc_root);
             let body = doc.body();
             prep::prep_document(&mut doc, &doc_root, body.as_ref());
@@ -157,6 +170,15 @@ impl Readability {
             // tree + fresh empty Rc-keyed side tables (ABA-safe — HLD §5.1).
             let mut doc = Dom::parse(&html);
             let doc_root: NodeRef = doc.document();
+
+            // _unwrapNoscriptImages(this._doc)  (Readability.js:2733).
+            // Placeholder-img cull (`:1895-1913`) AND noscript-img unwrap
+            // (`:1916-1967`) — must run BEFORE `_removeScripts` drops
+            // `<noscript>` (the unwrap reads noscript children) and BEFORE
+            // `_prepDocument` / `_grabArticle` so the placeholder-cull's
+            // `_cleanConditionally` img-count impact (`Readability.js:2498`)
+            // matches RJS.
+            prep::unwrap_noscript_images(&doc_root);
 
             // _removeScripts(this._doc)  (Readability.js:2739)
             prep::remove_scripts(&doc_root);
@@ -176,6 +198,15 @@ impl Readability {
             // (Readability.js:2748-2750) — propagated as None (NOT an
             // _attempts push; 1551 is only reached when articleContent exists
             // but is too short).
+            //
+            // **Stage 2 ORDER**: `grab_article` now runs `_prepArticle`
+            // INTERNALLY (Readability.js:1512) **before** the page-wrap
+            // (`Readability.js:1517-1532`) — the JS order. Stage 1c's swap
+            // (page-wrap → `_prepArticle` in this closure) was retired
+            // because the full Stage-2 `_cleanConditionally`'s
+            // `_hasAncestorTag(node, "code", maxDepth=3)` is no longer
+            // ancestor-level-invariant under the extra page-wrap div (see
+            // the order-fidelity note in `grab_article`).
             let body = doc.body()?;
             let mut byline_found = false;
             let grab = grab_article::grab_article(
@@ -187,29 +218,6 @@ impl Readability {
                 &mut byline_found,
             )?;
             let article_content = grab.article_content;
-
-            // _prepArticle(articleContent) — Stage-1a safe slice
-            // (Readability.js:795-799 + 835-850). The JS runs this at 1512,
-            // INSIDE the loop, BEFORE the 1545 `_getInnerText` length test —
-            // so it must run here, per attempt, before we measure.
-            //
-            // FIDELITY NOTE — `_prepArticle` vs page-wrap order. JS order is
-            // sibling-append → `_prepArticle` (1512) → page-wrap (1517-1532) →
-            // textLength (1545). `grab_article` already applied the page-wrap
-            // (1517-1532) before returning, so here the order is
-            // sibling-append → page-wrap → `_prepArticle` → textLength — the
-            // `_prepArticle`/page-wrap pair is SWAPPED vs the JS. This is
-            // observationally identical: `prep_article_stage1a` is purely
-            // `get_all_nodes_with_tag(articleContent, …)` descendant searches
-            // (`_clean` of object/embed/footer/link/aside + empty-`<p>`
-            // removal). The page-wrap only interposes ONE extra `<div>`; it
-            // does NOT change the SET of `articleContent` descendants (same
-            // elements, one level deeper) and adds zero `#text`. So the
-            // descendant set `_prepArticle` operates on, and the resulting
-            // `text_content`, are identical regardless of which side of the
-            // page-wrap `_prepArticle` runs. (Pinned by
-            // `grab_article::tests::page_wrap_prep_article_order_invariant`.)
-            prep::prep_article_stage1a(&article_content);
 
             // (Readability.js:2754 _postProcessContent — score-invisible
             // cosmetics, HLD §2 — NOT run here.)

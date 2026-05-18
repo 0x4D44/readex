@@ -209,6 +209,26 @@ pub fn period_space_or_end() -> &'static Regex {
     R.get_or_init(|| compile("\\.( |$)"))
 }
 
+/// `/\.(jpg|jpeg|png|webp)/i` (`Readability.js:1907`, `:1950`) — the inline
+/// image-extension probe used by `_unwrapNoscriptImages` to decide whether
+/// an `<img>` attribute *value* looks like an image source (and so the `<img>`
+/// is NOT a placeholder to be removed at `:1912`, or the `prevImg` attribute
+/// IS worth copying onto the noscript-extracted `newImg` at `:1947-1951`).
+///
+/// Not a `REGEXPS`-table entry (inline literal at two call sites in the JS
+/// function body), but ported here so the §8 conformance table covers every
+/// regex on the Stage-2 pre-grab path.
+///
+/// **Dialect note (HLD §8):** the JS `.` operator is escaped (`\\.`), so this
+/// is a literal `.` followed by one of `jpg`/`jpeg`/`png`/`webp`. `/i` is
+/// keyword-only (ASCII alternations), so Rust `(?i)` is identical here. The
+/// pattern is **unanchored** — it matches anywhere in the attribute value
+/// (`"foo.jpg?x=1"` matches; the `?` query-string suffix does not break it).
+pub fn image_extension() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| compile("(?i)\\.(jpg|jpeg|png|webp)"))
+}
+
 /// `REGEXPS.videos` (`Readability.js:153-154`, `/…/i`). The default
 /// `_allowedVideoRegex`. Used by `_clean` for embed allow-listing. Stage 1a's
 /// `_clean` targets object/embed/footer/link/aside — `isEmbed` is true for
@@ -231,6 +251,42 @@ pub fn videos() -> &'static Regex {
 pub fn share_elements() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| compile("(?i)(\\b|_)(share|sharedaddy)(\\b|_)"))
+}
+
+/// `REGEXPS.adWords` (`Readability.js:171-172`,
+/// `/^(ad(vertising|vertisement)?|pub(licité)?|werb(ung)?|广告|Реклама|Anuncio)$/iu`).
+///
+/// Anchored alternation of "ad words" used by `_cleanConditionally` to detect
+/// inner text that is just an ad label (`Readability.js:2540`). The JS pattern
+/// carries `/u` to enable Unicode case folding for the non-ASCII alternatives
+/// (`广告`, `Реклама`, `Anuncio`); Rust `regex` defaults to Unicode mode (and
+/// `(?i)` is Unicode-aware), so it is dialect-faithful for these character
+/// classes (no ASCII-only `(?-u:..)` opt-out here). Pinned by the
+/// conformance table.
+pub fn ad_words() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| {
+        compile(
+            "(?i)^(ad(vertising|vertisement)?|pub(licit\u{00E9})?|werb(ung)?|\u{5E7F}\u{544A}|\
+             \u{0420}\u{0435}\u{043A}\u{043B}\u{0430}\u{043C}\u{0430}|Anuncio)$",
+        )
+    })
+}
+
+/// `REGEXPS.loadingWords` (`Readability.js:173-174`,
+/// `/^((loading|正在加载|Загрузка|chargement|cargando)(…|\.\.\.)?)$/iu`).
+///
+/// Anchored alternation of "loading" words used by `_cleanConditionally`
+/// (`Readability.js:2541`). Same `/u`/Unicode-default dialect note as
+/// [`ad_words`].
+pub fn loading_words() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| {
+        compile(
+            "(?i)^((loading|\u{6B63}\u{5728}\u{52A0}\u{8F7D}|\u{0417}\u{0430}\u{0433}\u{0440}\
+             \u{0443}\u{0437}\u{043A}\u{0430}|chargement|cargando)(\u{2026}|\\.\\.\\.)?)$",
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -481,6 +537,15 @@ mod tests {
             (commas, "a\u{FF0C}b", true), // fullwidth comma U+FF0C
             (commas, "a\u{060C}b", true), // Arabic comma U+060C
             (commas, "a;b", false),
+            // --- image_extension (/i) — Readability.js:1907, :1950 ---
+            (image_extension, "photo.jpg", true),
+            (image_extension, "photo.JPG", true),    // /i
+            (image_extension, "img.jpeg?v=2", true), // unanchored
+            (image_extension, "x.png", true),
+            (image_extension, "x.webp", true),
+            (image_extension, "x.gif", false), // not in alternation
+            (image_extension, "jpg", false),   // literal `.` required
+            (image_extension, "", false),
             // --- videos (/i) ---
             (videos, "https://www.youtube.com/watch?v=x", true),
             (videos, "//player.vimeo.com/video/1", true),
@@ -504,6 +569,22 @@ mod tests {
             (period_space_or_end, "a.b. ", true), // second '.' is followed by ' '
             (period_space_or_end, "", false),
             (period_space_or_end, ".", true), // '.' immediately at end
+            // --- ad_words (/iu) ---
+            (ad_words, "ad", true),
+            (ad_words, "advertising", true),
+            (ad_words, "advertisement", true),
+            (ad_words, "AD", true), // /i
+            (ad_words, "Anuncio", true),
+            (ad_words, "\u{5E7F}\u{544A}", true),   // 广告
+            (ad_words, "advertising stuff", false), // anchored ^..$
+            (ad_words, "ads", false),               // not in alternation
+            // --- loading_words (/iu) ---
+            (loading_words, "loading", true),
+            (loading_words, "Loading", true),         // /i
+            (loading_words, "loading...", true),      // optional "..." or "…"
+            (loading_words, "loading\u{2026}", true), // ellipsis char
+            (loading_words, "cargando", true),
+            (loading_words, "loading bar", false), // anchored
         ];
 
         for (i, (f, hay, expect)) in rows.iter().enumerate() {

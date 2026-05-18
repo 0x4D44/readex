@@ -691,29 +691,48 @@ pub fn grab_article(
         }
     }
 
-    // (1508-1510 debug — SKIP. 1512 `this._prepArticle(articleContent)` is
-    //  applied by the caller [`grab_article_with_retry`] AFTER this returns
-    //  and BEFORE the `textLength` test — faithfully mirroring the JS call
-    //  site, which is inside the loop after the sibling-append and before
-    //  1545. NOT done here so the page-wrap below sees the post-prep tree in
-    //  the same order the JS does NOT — see the note: JS order is _prepArticle
-    //  (1512) → page-wrap (1517-1532) → textLength (1545). The page-wrap is
-    //  text_content-invariant, so doing it here (pre-_prepArticle) cannot
-    //  change the scored text vs. the JS order; the caller still runs
-    //  _prepArticle before measuring `inner_text_len`.)
+    // (1508-1510 debug — SKIP.)
+
+    // 1512 `this._prepArticle(articleContent)` — Stage 2 full port
+    // (`Readability.js:782-884`). MUST run **BEFORE** the page-wrap below
+    // (the JS order is `_prepArticle` (1512) → page-wrap (1517-1532)).
+    //
+    // **Order fidelity decision (Stage 2 re-audit).** Stage 1c put the
+    // page-wrap inside `grab_article` and ran a near-noop `prep_article_stage1a`
+    // in the caller, because the swap was observationally invariant for the
+    // Stage-1a `_clean`/empty-`<p>` slice (pure descendant-`get_all_nodes_with_tag`
+    // searches, the page-wrap leaves the descendant set unchanged). With the
+    // full Stage-2 `_cleanConditionally` that invariant **NO LONGER HOLDS**:
+    // `_cleanConditionally` calls `_hasAncestorTag(node, "code", maxDepth=3)`
+    // (`Readability.js:2470`) whose default maxDepth=3 window can be PUSHED
+    // OUT by the extra page-wrap ancestor level. So for a `<code>` ancestor at
+    // depth 3 from a cleaning target, the JS finds it (KEEP applies); the
+    // swapped port misses it (KEEP does NOT apply ⇒ node removed). That is
+    // out-cleaning RJS ⇒ inversion (HLD §4). **Decision: port the JS order
+    // exactly** — `_prepArticle` first, then page-wrap. Pinned by a test.
+    crate::readability::prep::prep_article(dom, flags, &article_content);
 
     // 1517-1532: the `readability-page-1` / `page` wrap. **Faithfully ported**
-    // (Stage 1b deferred it as provably text_content-invariant; Stage 1c
-    // ports the real structure since the retry loop's bookkeeping path needs
-    // it). It remains `text_content`-invariant: `id`/`className` are
-    // score-invisible (HLD §2) and the extra wrapper `<div>` adds ZERO `#text`
-    // characters (a wrapper element contributes nothing to the WHATWG
-    // `Node.textContent` DFS). Pinned by a test.
+    // — runs AFTER `_prepArticle` (the JS order). It remains
+    // `text_content`-invariant: `id`/`className` are score-invisible (HLD §2)
+    // and the extra wrapper `<div>` adds ZERO `#text` characters (a wrapper
+    // element contributes nothing to the WHATWG `Node.textContent` DFS).
+    // Pinned by a test.
     if needed_to_create_top_candidate {
         // 1517-1523: the fake div IS topCandidate and was already appended in
         // the sibling loop (sibling === topCandidate). Just assign id/class —
         // no append, no child move. id/className are score-invisible (HLD §2);
         // `topCandidate` here is the appended child of `article_content`.
+        //
+        // FIDELITY: `_prepArticle` above may have removed/retagged the fake
+        // div via `_cleanConditionally` etc., but the JS handles this the
+        // same way: the `topCandidate` variable still points at whatever the
+        // fake div became (or, if it was removed, the JS `setAttribute` is
+        // a no-op on a detached node). Defensive: if `top_candidate` is now
+        // detached, the JS behaviour is "setAttribute on a detached element"
+        // — a no-op on subsequent serialization since the element is
+        // unreachable. Our `set_attribute` on a detached node is a no-op for
+        // textContent purposes (same outcome).
         set_attribute(&top_candidate, "id", "readability-page-1");
         set_attribute(&top_candidate, "class", "page");
     } else {
@@ -1767,46 +1786,52 @@ mod tests {
     }
 
     /// Page-wrap **fallback arm** (`Readability.js:1517-1523`): when the
-    /// fake-div fallback fired (`neededToCreateTopCandidate`), the fake div IS
-    /// the top candidate (already appended in the sibling loop) and is merely
-    /// given `id=readability-page-1` / `class=page` — NO new wrapper, NO child
-    /// move. Still `text_content`-invariant (id/class score-invisible).
+    /// fake-div fallback fired (`neededToCreateTopCandidate`), the fake div
+    /// IS the top candidate (already appended in the sibling loop) and the
+    /// JS attempts to assign `id=readability-page-1` / `class=page` to it.
+    ///
+    /// **Stage 2 fidelity** (`Readability.js:1512` runs BEFORE `:1517-1532`):
+    /// the full `_prepArticle` runs FIRST, and its `_cleanConditionally(
+    /// articleContent, "div")` will REMOVE the fake_div on most fallback
+    /// inputs (no commas, `img == 0 && textDensity == 0` ⇒ "no useful
+    /// content" shadiness check at `:2597-2601`). So the page-wrap fallback
+    /// arm in fact sees a DETACHED `topCandidate` and the `setAttribute`
+    /// calls touch a detached element with no DOM-tree effect.
+    ///
+    /// This is FAITHFUL: the JS does the same — `topCandidate.id = …` on a
+    /// detached node sets the attribute on the detached node, which is
+    /// unreachable from articleContent, so the scored `text_content` is the
+    /// same (empty) either way.
+    ///
+    /// The Stage-1c "fake_div is preserved with id assigned" expectation
+    /// was specific to the Stage-1a `_prepArticle` near-noop slice (which
+    /// did NOT run `_cleanConditionally`). With Stage 2's full
+    /// `_cleanConditionally`, the faithful outcome is **empty articleContent
+    /// and empty text_content for this minimal nav-only input**. We assert
+    /// the faithful outcome.
     #[test]
-    fn page_wrap_fallback_arm_assigns_id_class_only_text_invariant() {
-        // No scorable container (all short, link-y) ⇒ topCandidate is null/
-        // BODY ⇒ fake-div fallback ⇒ neededToCreateTopCandidate = true. Use
-        // raw body text + a short nav so no element scores >= the candidate.
+    fn page_wrap_fallback_arm_after_prep_article_removes_fake_div_faithful() {
+        // No scorable container, no <p>, no img, body holds a nav + loose
+        // text. fake-div fallback fires; _cleanConditionally("div") removes
+        // the fake_div via the "no useful content" check (img==0,
+        // textDensity==0). Faithful outcome: empty articleContent.
         let html = "<html><body>Loose body text directly under body element here.\
             <nav><a href=/a>A</a><a href=/b>B</a></nav></body></html>";
         let (_d, ac) = grab(html, "").expect("grab (fallback)");
-        // The fallback arm does NOT add a second wrapper div: articleContent's
-        // sole child is the fake-div top candidate, which now carries the id.
-        let kids = children(&ac);
-        assert_eq!(
-            kids.len(),
-            1,
-            "fallback: one child (the fake-div top candidate)"
-        );
-        assert_eq!(
-            get_attribute(&kids[0], "id").as_deref(),
-            Some("readability-page-1"),
-            "fallback arm assigns id to the EXISTING fake div (Readability.js:1522)"
-        );
-        assert_eq!(
-            get_attribute(&kids[0], "class").as_deref(),
-            Some("page"),
-            "fallback arm assigns class to the EXISTING fake div (Readability.js:1523)"
-        );
-        // text_content still contains the loose body text, no id/class leak.
+        // The fake_div was removed by _cleanConditionally; articleContent
+        // has no remaining children — the non-fallback page-wrap arm still
+        // runs (needed_to_create_top_candidate=true ⇒ first arm, which
+        // does setAttribute on the detached fake_div; that attr is
+        // unreachable from articleContent, so articleContent stays empty).
         let t = text_content(&ac);
         assert!(
-            t.contains("Loose body text directly under body"),
-            "body text: {t}"
+            !t.contains("Loose body text"),
+            "FAITHFUL: _cleanConditionally(div) removes the fake_div before \
+             page-wrap (no useful content shadiness check, Readability.js:2597-2601); \
+             text_content must be empty (or near-empty): {t:?}"
         );
-        assert!(
-            !t.contains("readability-page-1"),
-            "id must not leak into text_content: {t}"
-        );
+        // No id/class leaks into text_content.
+        assert!(!t.contains("readability-page-1"));
     }
 
     /// **Fidelity: `_prepArticle` ↔ page-wrap order is observationally
