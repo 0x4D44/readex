@@ -1873,7 +1873,7 @@ mod tests {
     /// The hand-adjudicated gold set committed at `benchmark/corpus/gold/`
     /// must load cleanly and be internally consistent with the real corpus:
     ///
-    /// * all 4 rows load via [`GoldSet::load`] with **no** error (so none was
+    /// * all 7 rows load via [`GoldSet::load`] with **no** error (so none was
     ///   silently dropped — the Bug-E2 backstop is satisfied by construction);
     /// * every gold `url` is a member of the committed corpus
     ///   (`corpus/urls.tsv`, resolved + existence-checked via `load_checked`)
@@ -1893,11 +1893,26 @@ mod tests {
     fn committed_gold_set_is_consistent_with_the_real_corpus() {
         let corpus_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus");
 
-        // Loads with no error, and is the expected 4-entry curated set
-        // (NOT the empty pre-freeze state).
+        // Loads with no error, and is the expected 7-entry curated set
+        // (NOT the empty pre-freeze state). Tranche-1 froze 4 entries
+        // (commit f6ed1e3); tranche-2 appended 3 scoped-excerpt entries:
+        // Apple FY2025 10-K Item 1; gov.uk HMRC 2025-26 lead-in; and the
+        // Apple FY2019 10-K Item 1 (HLD §7 #5). The FY2019 candidate PASSED
+        // its honest-failure gate under the DEC-G9 rule: that legacy filing
+        // wraps BOTH section headings in identical 2-row/4-cell layout
+        // <table>s — the "Item 1. Business" wrapper is the START boundary
+        // (it supplies the heading line, exactly as the FY2025 gold) and
+        // the "Item 1A. Risk Factors" wrapper is the EXCLUDED end boundary;
+        // a heading-wrapper layout table at a span boundary is NOT
+        // disqualifying. Zero <table> sit strictly inside the Business
+        // narrative and there is no EDGAR control-string pollution (it is
+        // a modern-style filing, NOT the rejected IBM-FY2008 typesetting
+        // pattern), so it IS a gold entry and the count is 7. This is the
+        // same team authoring the count forward; the exact-count assertion
+        // is intentionally kept (not weakened to >=).
         let gold = GoldSet::load(&corpus_dir).expect("committed gold.tsv must load");
         assert!(!gold.is_empty(), "committed gold set must not be empty");
-        assert_eq!(gold.len(), 4, "expected exactly 4 adjudicated gold entries");
+        assert_eq!(gold.len(), 7, "expected exactly 7 adjudicated gold entries");
 
         // The authoritative corpus URL set (drift + snapshot existence both
         // enforced by load_checked — the same path scoring uses).
@@ -1961,7 +1976,7 @@ mod tests {
             );
             rows += 1;
         }
-        assert_eq!(rows, 4, "expected 4 gold.tsv data rows");
+        assert_eq!(rows, 7, "expected 7 gold.tsv data rows");
     }
 
     // ---- The honest floor: a NotImplemented crate is NEVER laundered, even
