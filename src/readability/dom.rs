@@ -243,7 +243,14 @@ pub fn inner_text(node: &NodeRef, normalize_spaces: bool) -> String {
 /// CR U+000D, SPACE U+0020, NBSP U+00A0, ZWNBSP/BOM U+FEFF, LS U+2028,
 /// PS U+2029, and every `Zs` (space separator): U+1680, U+2000–U+200A,
 /// U+202F, U+205F, U+3000.
-fn is_js_space(c: char) -> bool {
+///
+/// **Canonical source of truth (single-definition rule).** This is the *one*
+/// predicate form of the JS-`\s` set; `metadata.rs::js_trim` calls it (no
+/// re-derived copy) and `regexps::JS_SPACE_CLASS` (the regex character-class
+/// literal — a fn cannot be spliced into a pattern) is mechanically pinned
+/// equal to it over the full relevant codepoint set by the `regexps`
+/// conformance tests, so any drift in *either* form fails the build.
+pub(crate) fn is_js_space(c: char) -> bool {
     matches!(
         c,
         '\u{0009}'

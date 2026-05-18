@@ -14,3 +14,7 @@ benchmark/runs/
 
 # Agent scratchpads (CLAUDE.md notes/ convention) — working notes, not deliverables.
 notes/
+
+# Gold-curation scratch area — untracked working dir, not a deliverable
+# (kept out so it cannot be swept into a commit).
+wrk_gold/

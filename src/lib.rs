@@ -11,14 +11,20 @@
 //!
 //! # Milestone status
 //!
-//! This is the **Milestone-1 floor**: the public API is frozen here but the
-//! extraction algorithm is not yet implemented. Both [`extract`] and
-//! [`extract_with`] return [`ExtractError::NotImplemented`] for every input.
-//! This is deliberate — the differential test harness is the project's first
-//! deliverable and its baseline run records `not_implemented` for every corpus
-//! URL (harness HLD §1/§5). The algorithm lands in later milestones (Mozilla
-//! Readability port, then Trafilatura's block classification) **without**
-//! changing this surface.
+//! **M2 Stage 1a** (HLD `2026.05.18 - HLD - mdrcel Readability Port (M2)`
+//! §7.1): the public API is unchanged but [`extract`] / [`extract_with`] now
+//! run an idiomatic Rust port of Mozilla Readability v0.6.0 — the parse spine
+//! (`_removeScripts` / `_prepDocument`), title resolution, scoring, and
+//! **single top-candidate** selection. A page yielding an article returns a
+//! populated `Ok`; a genuinely-empty extraction is a valid empty `Ok` (the
+//! Bug-E2 doctrine — "found little" is success, never an error and never
+//! [`ExtractError::NotImplemented`]). Sibling-append, the `_cleanConditionally`
+//! / `_markDataTables` table passes, the retry/flag-sieve loop, and full
+//! non-body metadata are **later stages** (HLD §7.2–§7.6) and are deliberately
+//! not yet ported — so structured/nav/table pages legitimately over-include
+//! versus the prose-only gold until those stages land. The
+//! [`ExtractError::NotImplemented`] variant is retained but is no longer
+//! returned on the happy path.
 //!
 //! There is intentionally **no** trait / strategy / plugin scaffolding here.
 //! The parent brief explicitly warns against premature abstraction (the "M8
@@ -59,17 +65,15 @@
 //
 // The **frozen extraction surface** the parent brief pins —
 // `extract` / `extract_with` / `Extracted` / `Options` / `ExtractError` — is
-// byte-for-byte unchanged and still returns `ExtractError::NotImplemented` for
-// every input (HLD §5/§6 — the honestly vacuous Stage-0 floor). `extract_with`
-// is wired to the port only in Stage 1a; the version bump is a PATCH precisely
-// because no *stable* public API changed (a `#[doc(hidden)]` item carries no
-// semver promise).
-//
-// `#[allow(dead_code)]`: the facade has no *non-test* caller until Stage 1a
-// (it is exercised by `dom`'s own unit tests + the §6.1 gate) — flagging that
-// honestly here rather than letting unused-warnings accrue.
+// **signature-unchanged**, but as of M2 **Stage 1a** `extract_with` is wired
+// to the port (parse → `Readability::new(doc).parse()` → `Result<Extracted,
+// _>`): a page yielding an article now returns a real populated `Ok`, and a
+// genuinely-empty extraction is a valid empty `Ok` (Bug-E2). The
+// `ExtractError` enum is unchanged (`NotImplemented` is retained as a variant
+// but is no longer returned on the happy path). This is the **0.3.0 MINOR**
+// bump (first real extraction behind the frozen surface — see `Cargo.toml`);
+// the public *types/signatures* are byte-for-byte unchanged.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub mod readability;
 
 /// The extracted main content of an HTML document, plus light metadata.
@@ -208,12 +212,54 @@ pub fn extract_with(
     base_url: Option<&str>,
     opts: &Options,
 ) -> Result<Extracted, ExtractError> {
-    // Milestone-1 floor: the API is frozen but no algorithm exists yet. We
-    // deliberately do not parse `html`, inspect `base_url`, or read `opts` —
-    // adding any of that now would be behaviour without a contract to anchor
-    // it. The harness maps this dedicated variant to `not_implemented`.
-    let _ = (html, base_url, opts);
-    Err(ExtractError::NotImplemented)
+    // M2 Stage 1a (HLD §7.1): parse → Readability::new(doc).parse() → map
+    // Option<Article> to Result<Extracted, _>.
+    //
+    // `base_url` / `opts` are intentionally still unused: relative-URL
+    // resolution and `include_html` / `min_word_count` are Stage-4 additive
+    // surface (HLD §7.6) — wiring them now would be behaviour ahead of its
+    // contract. The frozen signature is unchanged; only the body grows.
+    let _ = (base_url, opts);
+
+    let doc = readability::dom::Dom::parse(html);
+    match readability::Readability::new(doc).parse() {
+        // An article was produced — a real `Ok`. `text` is the article node's
+        // raw `text_content` (`Readability.js:2766` `articleContent.textContent`
+        // — the field the differential harness scores, HLD §2; the harness
+        // tokenizer does its own whitespace handling, so no pre-normalization
+        // here, keeping the scored text byte-faithful to the JS return object).
+        // `title` is `this._articleTitle`. Other metadata stays `None` until
+        // Stage 4 (HLD §7.6 — not scored, deliberately deferred).
+        Some(article) => {
+            let text = article.text_content;
+            let title = if article.title.is_empty() {
+                None
+            } else {
+                Some(article.title)
+            };
+            let word_count = text.split_whitespace().count();
+            Ok(Extracted {
+                title,
+                text,
+                html: None,
+                word_count,
+                canonical_url: None,
+                language: None,
+            })
+        }
+        // `_grabArticle` returned `null` (no `<body>` to grab —
+        // `Readability.js:2748-2750`). Per Bug-E2 (HLD §7.1) "found nothing"
+        // is a **valid empty `Ok`**, NOT an error and NOT `NotImplemented`:
+        // never fabricate, never regress a real extraction to the M1 floor.
+        None => Ok(Extracted {
+            title: None,
+            text: String::new(),
+            html: None,
+            word_count: 0,
+            canonical_url: None,
+            language: None,
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -224,51 +270,74 @@ mod tests {
                                <body><article><p>hello world</p></article></body></html>";
 
     #[test]
-    fn extract_returns_not_implemented_at_m1() {
-        let err = extract(SAMPLE_HTML, None).expect_err("M1 must not succeed");
-        assert!(matches!(err, ExtractError::NotImplemented));
+    fn extract_returns_ok_with_body_text_at_stage1a() {
+        // M2 Stage 1a: a page yielding an article now returns a real `Ok`
+        // (no longer the M1 `NotImplemented` floor — HLD §7.1). The sample's
+        // sole content is the article paragraph; its title is the <title>.
+        let e = extract(SAMPLE_HTML, None).expect("Stage 1a must extract");
+        assert!(e.text.contains("hello world"), "body text: {:?}", e.text);
+        // <title>T</title>: len 1 (<15), no separator/colon -> single-h1
+        // branch finds no <h1> (length != 1) so curTitle stays "T"; the
+        // <=4-word guard (1 word, no hierarchical sep) restores origTitle "T".
+        assert_eq!(e.title.as_deref(), Some("T"));
     }
 
     #[test]
-    fn extract_with_returns_not_implemented_at_m1() {
-        let err = extract_with(
+    fn extract_with_returns_ok_at_stage1a() {
+        let e = extract_with(
             SAMPLE_HTML,
             Some("https://example.com/"),
             &Options::default(),
         )
-        .expect_err("M1 must not succeed");
-        assert!(matches!(err, ExtractError::NotImplemented));
+        .expect("Stage 1a must extract");
+        assert!(e.text.contains("hello world"));
     }
 
     #[test]
-    fn extract_with_returns_not_implemented_for_non_default_options() {
-        // Even a non-default Options path is NotImplemented at M1 (no
-        // algorithm, no option ever takes effect yet).
+    fn extract_empty_extraction_is_ok_not_error_bug_e2() {
+        // Bug-E2 (HLD §7.1): a document that yields no content is a VALID
+        // empty `Ok`, never `NotImplemented`, never an error, never
+        // fabricated. (Non-default Options do not change this at Stage 1a —
+        // include_html / min_word_count are Stage-4 additive, HLD §7.6.)
         let opts = Options {
             include_html: true,
             min_word_count: 999,
         };
-        let err = extract_with("", None, &opts).expect_err("M1 must not succeed");
-        assert!(matches!(err, ExtractError::NotImplemented));
+        let e = extract_with("<html><body>   </body></html>", None, &opts)
+            .expect("empty extraction is a valid Ok");
+        assert!(
+            e.text.trim().is_empty(),
+            "expected empty text, got {:?}",
+            e.text
+        );
+        assert!(e.title.is_none());
     }
 
     /// The documented invariant: `extract(h,b)` ≡
-    /// `extract_with(h,b,&Options::default())`. At M1 both are the same
-    /// `Err`; this test is the tripwire that the equivalence holds (and keeps
-    /// holding once `Extracted` is actually produced — `Extracted: PartialEq`
-    /// makes the `Ok` arm comparable too).
+    /// `extract_with(h,b,&Options::default())`. Now that `Extracted` is really
+    /// produced this is exercised over the **`Ok` arm** (`Extracted:
+    /// PartialEq`), exactly as the original M1 tripwire anticipated ("keeps
+    /// holding once `Extracted` is actually produced").
     #[test]
     fn extract_is_extract_with_default_options() {
         for (html, base) in [
             ("", None),
             (SAMPLE_HTML, None),
             (SAMPLE_HTML, Some("https://example.com/page")),
+            (
+                "<html><body><div><p>A genuine readable paragraph well over the twenty-five character minimum.</p></div></body></html>",
+                None,
+            ),
         ] {
             let a = extract(html, base);
             let b = extract_with(html, base, &Options::default());
-            match (a, b) {
-                (Err(ExtractError::NotImplemented), Err(ExtractError::NotImplemented)) => {}
-                (a, b) => panic!("extract/extract_with diverged: {a:?} vs {b:?}"),
+            assert_eq!(
+                a.is_ok(),
+                b.is_ok(),
+                "extract/extract_with Ok-ness diverged for {html:?}"
+            );
+            if let (Ok(a), Ok(b)) = (a, b) {
+                assert_eq!(a, b, "extract/extract_with Extracted diverged for {html:?}");
             }
         }
     }

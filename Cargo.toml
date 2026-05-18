@@ -3,14 +3,19 @@ members = ["benchmark"]
 
 [package]
 name = "mdrcel"
-# M2 Stage 0 (2026-05-18): 0.2.1 -> 0.2.2 PATCH. New *internal* infrastructure
-# only (the `readability` module skeleton + `dom.rs` rcdom facade) plus the
-# three parser dependencies below. The public surface in `src/lib.rs`
-# (`extract`/`extract_with`/`Extracted`/`Options`/`ExtractError`) is **byte-for-
-# byte unchanged** and still returns `ExtractError::NotImplemented` for every
-# input, so per semver (CLAUDE.md "Version management") this is a patch, not a
-# minor: no new public API, no behaviour change observable to a consumer.
-version = "0.2.2"
+# M2 Stage 1a (2026-05-18): 0.2.2 -> 0.3.0 MINOR. First *real* extraction
+# behaviour: `extract`/`extract_with` now parse the HTML and run the
+# Readability port (parse spine + scoring + single top-candidate), returning a
+# populated `Ok(Extracted)` (with `title` + body `text`) for pages that yield
+# an article instead of the M1 `ExtractError::NotImplemented` floor. This is a
+# **backward-compatible behaviour addition** (no public type/signature change;
+# `ExtractError` unchanged; `extract == extract_with(&Options::default())`
+# invariant preserved; an empty extraction is still a valid `Ok` per Bug-E2),
+# so per semver (CLAUDE.md "Version management") it is a MINOR bump: new
+# functionality behind the existing frozen surface, nothing removed or broken.
+# (Stage 0's 0.2.1->0.2.2 was a PATCH precisely because no behaviour was
+# observable then; that condition no longer holds.)
+version = "0.3.0"
 edition = "2024"
 
 [dependencies]
@@ -51,6 +56,25 @@ edition = "2024"
 html5ever = "=0.39.0"
 markup5ever_rcdom = "=0.39.0"
 tendril = "=0.5.0"
+
+# M2 Stage 1a (2026-05-18): the Readability port reaches the point DEC-3
+# anticipated for `regex` ("deferred until the extraction algorithm needs
+# them"). `Readability.js`'s `REGEXPS` table (137-175) is load-bearing on the
+# scored path (`_grabArticle`'s unlikely-candidate strip, `_getClassWeight`,
+# `_getArticleTitle`). HLD §8 mandates these be ported with **explicit
+# JS-compatible character classes** in a real regex engine (it specifies Rust
+# `regex` syntax such as `(?-u:\W)` and confirms there are NO backreferences /
+# lookaround anywhere in `REGEXPS`, so the `regex` crate is expressively
+# sufficient and `fancy-regex` is explicitly NOT needed). Hand-rolling a
+# matcher for e.g. `negative`'s `^hid$| hid$| hid |^hid ` alternation would be
+# *more* code and a fresh correctness-divergence surface than a pinned,
+# audited dependency — the conservative path, per the same reasoning DEC-3
+# applied to the parser. Pinned EXACTLY (project new-dependency discipline);
+# `regex 1.12.3` is consistent with the `regex-syntax 0.8.10` already in the
+# committed `Cargo.lock`. `regex` is a pure-algorithm dependency and is NOT
+# under the HLD §3.1 parser-equivalence version-bump fence (that fence governs
+# only html5ever / markup5ever_rcdom / tendril).
+regex = "=1.12.3"
 
 [dev-dependencies]
 # Test-scaffolding ONLY (never linked into the shipped library — CLAUDE.md
