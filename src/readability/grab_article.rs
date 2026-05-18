@@ -62,6 +62,16 @@ pub struct GrabResult {
     /// (post `_prepArticle` is applied by the caller, as in the JS — see
     /// [`grab_article_with_retry`]).
     pub article_content: NodeRef,
+    /// `this._articleByline` (`Readability.js:1100`), captured when
+    /// `_grabArticle`'s byline-detect found and removed an in-body byline.
+    /// `None` when no in-body byline was found (e.g. because metadata.byline
+    /// was already set and gated the detect — `Readability.js:1083-1084`).
+    /// Stage 4 (HLD §7.6) addition.
+    pub article_byline: Option<String>,
+    /// `this._articleDir` (`Readability.js:1587-1592`), captured from the
+    /// first ancestor of `topCandidate` with a non-empty `dir` attribute.
+    /// `None` when no such ancestor exists. Stage 4 addition.
+    pub article_dir: Option<String>,
 }
 
 /// `_removeAndGetNext(node)` (`Readability.js:932-936`):
@@ -153,6 +163,7 @@ pub fn grab_article(
     article_title: &str,
     flags: &Flags,
     article_byline_found: &mut bool,
+    article_byline_text: &mut Option<String>,
 ) -> Option<GrabResult> {
     // var doc = this._doc; page = doc.body (isPaging=false at Stage 1a).
     let page = body.clone();
@@ -202,15 +213,39 @@ pub fn grab_article(
             continue;
         }
 
-        // byline detection (Readability.js:1082-1103). Stage 1a has no JSON-LD
-        // metadata byline and tracks _articleByline as "not yet found". The
-        // node is removed when it IS a valid byline (score-affecting: it
-        // deletes a subtree from the scored body), so port the removal
-        // faithfully. (The itemprop=name refinement only changes the *stored*
-        // byline string — Stage-4 metadata — so it is omitted; the REMOVAL is
-        // what changes scored text and that is preserved exactly.)
+        // byline detection (Readability.js:1082-1103).
+        //
+        // **Stage 4 (HLD §7.6)**: the JS gate is
+        //   `!this._articleByline && !this._metadata.byline && _isValidByline`
+        // (`Readability.js:1082-1085`). `_metadata.byline` is set by
+        // `_getArticleMetadata` BEFORE `_grabArticle` runs
+        // (`Readability.js:2743-2745` then `:2747`). At Stage 1a-3 the gate
+        // collapsed to `!this._articleByline && _isValidByline` because
+        // `_metadata.byline` was always unset (Stage 4 had not landed).
+        //
+        // Stage 4 fixes this faithfully: the caller passes in the score-
+        // affecting "byline already known from metadata?" via the SAME
+        // `article_byline_found` flag (the caller pre-seeds it to `true`
+        // when `metadata.byline.is_some()`, which short-circuits the gate
+        // exactly as `!_metadata.byline` does in JS). This routes the score
+        // change through the SAME flag the existing arm already drove —
+        // mechanically equivalent to the JS double-gate.
+        //
+        // The (itemprop=name ?? node).textContent.trim() refinement
+        // (`Readability.js:1087-1100`) ITSELF only changes the *stored*
+        // byline string surfaced as Article.byline — Stage 4 captures it
+        // now (faithful: walk descendants for `[itemprop*="name"]` until
+        // `endOfSearchMarkerNode`, falling back to `node`).
         if !*article_byline_found && is_valid_byline(&node, &match_string) {
             *article_byline_found = true;
+            // (itemPropNameNode ?? node).textContent.trim()
+            let item_prop_name_node = find_descendant_item_prop_name(&node);
+            let byline_source = item_prop_name_node.unwrap_or_else(|| node.clone());
+            let captured = dom::text_content(&byline_source);
+            let captured = captured.trim().to_string();
+            if !captured.is_empty() {
+                *article_byline_text = Some(captured);
+            }
             node_opt = remove_and_get_next(&node);
             continue;
         }
@@ -758,7 +793,81 @@ pub fn grab_article(
     //  `textLength < _charThreshold` retry loop is owned by
     //  [`grab_article_with_retry`] — this function is ONE attempt's body.)
 
-    Some(GrabResult { article_content })
+    // 1579-1593 _articleDir capture — Stage 4 (HLD §7.6). The JS only sets
+    // `_articleDir` on the parseSuccessful path; this attempt-local compute
+    // is always performed, and the retry driver discards it for failed
+    // attempts (faithful: a failed attempt's `_articleDir` would be
+    // overwritten by the next attempt anyway, or stay null if the longest-
+    // text fallback is taken — JS line 1578 only assigns dir for the
+    // `parseSuccessful` branch).
+    let parent_of_top_candidate_for_dir = parent(&top_candidate);
+    let article_dir = capture_article_dir(&top_candidate, parent_of_top_candidate_for_dir.as_ref());
+
+    Some(GrabResult {
+        article_content,
+        article_byline: article_byline_text.clone(),
+        article_dir,
+    })
+}
+
+/// `Readability.js:1580-1593` — walk `[parentOfTopCandidate, topCandidate,
+/// …ancestors of parentOfTopCandidate]` and return the first ancestor's
+/// non-empty `dir` attribute.
+fn capture_article_dir(
+    top_candidate: &NodeRef,
+    parent_of_top_candidate: Option<&NodeRef>,
+) -> Option<String> {
+    // 1580 `[parentOfTopCandidate, topCandidate].concat(_getNodeAncestors
+    //       (parentOfTopCandidate))`
+    let mut walk: Vec<NodeRef> = Vec::new();
+    if let Some(p) = parent_of_top_candidate {
+        walk.push(p.clone());
+    }
+    walk.push(top_candidate.clone());
+    if let Some(p) = parent_of_top_candidate {
+        // `_getNodeAncestors(parentOfTopCandidate)` with no maxDepth = walk
+        // all the way up.
+        let mut n = p.clone();
+        while let Some(parent_n) = parent(&n) {
+            walk.push(parent_n.clone());
+            n = parent_n;
+        }
+    }
+    // 1583-1592 _someNode: first ancestor with a non-empty `dir`.
+    for ancestor in &walk {
+        if tag_name(ancestor).is_none() {
+            continue;
+        }
+        if let Some(dir) = get_attribute(ancestor, "dir")
+            && !dir.is_empty()
+        {
+            return Some(dir);
+        }
+    }
+    None
+}
+
+/// `Readability.js:1087-1099` — walk descendants of `node` (in document order,
+/// via `_getNextNode`) up to the next non-descendant (`_getNextNode(node,
+/// true)`), looking for `[itemprop*="name"]`.
+fn find_descendant_item_prop_name(node: &NodeRef) -> Option<NodeRef> {
+    let end_marker = get_next_node(node, true);
+    let mut cur = get_next_node(node, false);
+    while let Some(n) = cur.clone() {
+        // `next != endOfSearchMarkerNode`
+        if let Some(em) = end_marker.as_ref()
+            && std::rc::Rc::ptr_eq(em, &n)
+        {
+            return None;
+        }
+        if let Some(ip) = get_attribute(&n, "itemprop")
+            && ip.contains("name")
+        {
+            return Some(n);
+        }
+        cur = get_next_node(&n, false);
+    }
+    None
 }
 
 /// `DEFAULT_CHAR_THRESHOLD` (`Readability.js:133`, `500`). With default
@@ -777,12 +886,9 @@ const CHAR_THRESHOLD: usize = 500;
 /// `.textContent` off `_attempts[0].articleContent`. Under re-parse-per-attempt
 /// that node lives in an attempt-local `Dom` that is dropped when the attempt
 /// goes out of scope, so storing the node would be a use-after-the-`Dom`-drops
-/// / `NodeKey`-ABA hazard. At Stage 1c the **only** scored observable of
-/// `articleContent` is `articleContent.textContent` (`Readability.js:2766`;
-/// `_postProcessContent` is Stage 3, excerpt/`dir` Stage 4 — none ported), so
-/// we capture that string (and the `_getInnerText` length the sieve sorts by)
-/// eagerly as owned values. No discarded-`Dom` node is ever read after its
-/// `Dom` drops — ABA-safe **by construction**.
+/// / `NodeKey`-ABA hazard. We capture the relevant *strings* eagerly so the
+/// retry driver never reads a node from a dropped `Dom` — ABA-safe **by
+/// construction**.
 struct Attempt {
     /// `_getInnerText(articleContent, true).length` (`Readability.js:1545`) —
     /// the value 1546 tests and 1564-1566 sorts attempts by (desc).
@@ -790,24 +896,51 @@ struct Attempt {
     /// `articleContent.textContent` (`Readability.js:2766`) captured at
     /// attempt time. The scored body for this attempt.
     text_content: String,
+    /// `articleContent.getElementsByTagName("p")[0].textContent.trim()` —
+    /// the first-`<p>` excerpt fallback (`Readability.js:2759-2763`).
+    /// Captured eagerly so the fallback path keeps the right attempt's
+    /// excerpt. `None` if no `<p>` qualifies.
+    first_paragraph_excerpt: Option<String>,
+    /// `this._serializer(articleContent)` (`Readability.js:2772`) — captured
+    /// eagerly for `Options.include_html`. `None` when not requested.
+    serialized_html: Option<String>,
+    /// `this._articleDir` (`Readability.js:1587-1592`) pre-captured for the
+    /// longest-text fallback path. JS sets `parseSuccessful = true` at 1574
+    /// before falling through to 1578's `if (parseSuccessful)` block, so
+    /// the dir ancestor-walk IS run on the WINNING attempt's
+    /// `topCandidate` on the fallback path too. We pre-capture so the
+    /// retry driver can pick the chosen attempt's dir without re-walking
+    /// the dropped Dom (ABA-safe).
+    article_dir: Option<String>,
 }
 
 /// The result of the full retry/flag-sieve loop (`Readability.js:1043`,
-/// `1546-1576`): the chosen `articleContent`'s `textContent`. `None` is the JS
-/// `return null` (`Readability.js:1570` — every attempt produced zero text;
-/// the caller maps it to an empty `Ok`, Bug-E2).
+/// `1546-1576`): the chosen `articleContent`'s `textContent` plus the
+/// metadata pieces the per-attempt closure captured eagerly.
 pub struct RetryResult {
     /// The final `articleContent.textContent` (`Readability.js:2766`) — either
     /// the first attempt whose `inner_text_len >= _charThreshold`, or, when the
     /// flag sieve is exhausted, the longest-text attempt (`Readability.js:1573`).
     pub text_content: String,
+    /// `metadata.excerpt`'s first-`<p>` fallback (`Readability.js:2759-2763`).
+    pub first_paragraph_excerpt: Option<String>,
+    /// `this._serializer(articleContent)` (`Readability.js:2772`); `None`
+    /// when not requested (`Options.include_html == false`).
+    pub serialized_html: Option<String>,
+    /// `this._articleDir` (`Readability.js:1589`) — only set on the
+    /// `parseSuccessful` branch; `None` when only the longest-text fallback
+    /// path was taken (matching JS line 1578-1593 only assigning `_articleDir`
+    /// when `parseSuccessful`).
+    pub article_dir: Option<String>,
 }
 
 /// One attempt's outcome, as the `prepare_attempt` closure returns it to the
-/// retry driver: the captured `articleContent.textContent` plus its
-/// `_getInnerText(articleContent, true).length` (`Readability.js:1545`).
+/// retry driver: the captured `articleContent.textContent`, its
+/// `_getInnerText(articleContent, true).length` (`Readability.js:1545`), and
+/// the per-attempt metadata pieces (excerpt fallback, serialized HTML, dir).
 /// `None` mirrors the per-attempt JS `_grabArticle` `return null` (no `<body>`
 /// / nothing to grab).
+#[derive(Default)]
 pub struct AttemptOutcome {
     /// `articleContent.textContent` (`Readability.js:2766`) for this attempt.
     pub text_content: String,
@@ -815,6 +948,19 @@ pub struct AttemptOutcome {
     /// measured **after** `_prepArticle` (`Readability.js:1512`), exactly as
     /// the JS measures it (1512 prep → 1517-1532 page-wrap → 1545 length).
     pub inner_text_len: usize,
+    /// Eagerly-captured first-`<p>.textContent.trim()` of `articleContent`
+    /// for the excerpt fallback (`Readability.js:2759-2763`). `None` if no
+    /// `<p>` exists.
+    pub first_paragraph_excerpt: Option<String>,
+    /// Eagerly-captured `this._serializer(articleContent)` for the
+    /// `Options.include_html` path (`Readability.js:2772`). `None` when
+    /// `include_html` was `false` (avoid the serialization cost when not
+    /// requested — Stage 4 acceptance: default behaviour byte-identical).
+    pub serialized_html: Option<String>,
+    /// `this._articleDir` (`Readability.js:1587-1592`) — captured eagerly
+    /// regardless of `parseSuccessful` so the retry driver can decide whether
+    /// to keep it (JS only keeps on parseSuccessful, line 1578).
+    pub article_dir: Option<String>,
 }
 
 /// `_grabArticle`'s outer retry/flag-sieve/fallback loop (`Readability.js:1043`
@@ -886,6 +1032,9 @@ where
             attempts.push(Attempt {
                 inner_text_len: text_length,
                 text_content: outcome.text_content,
+                first_paragraph_excerpt: outcome.first_paragraph_excerpt,
+                serialized_html: outcome.serialized_html,
+                article_dir: outcome.article_dir,
             });
 
             // 1556-1561 the flag sieve, IN JS ORDER.
@@ -914,15 +1063,27 @@ where
                 // 1568-1571 `if (!_attempts[0].textLength) return null;`
                 // (`_attempts` is non-empty here: at least this attempt was
                 // just pushed). `!textLength` is JS falsy ⇒ exactly `== 0`.
-                let best = &attempts[0];
+                let best = attempts.remove(0);
                 if best.inner_text_len == 0 {
                     return None;
                 }
 
                 // 1573-1574 `articleContent = _attempts[0].articleContent;
                 // parseSuccessful = true;` then 1578 returns it.
+                //
+                // Stage 4: the JS `if (parseSuccessful)` test at line 1578 IS
+                // true on this path (1574 set it back), so the `_articleDir`
+                // ancestor walk (1579-1593) runs on the WINNING attempt's
+                // `topCandidate`. We pre-captured each attempt's dir into
+                // `Attempt.article_dir` (ABA-safe — owned String, not a
+                // Dom-borrowed node), so the fallback path faithfully
+                // returns the chosen attempt's dir without re-walking a
+                // dropped Dom.
                 return Some(RetryResult {
-                    text_content: best.text_content.clone(),
+                    text_content: best.text_content,
+                    first_paragraph_excerpt: best.first_paragraph_excerpt,
+                    serialized_html: best.serialized_html,
+                    article_dir: best.article_dir,
                 });
             }
 
@@ -931,9 +1092,15 @@ where
             continue;
         }
 
-        // 1578 `if (parseSuccessful) ... return articleContent;`
+        // 1578 `if (parseSuccessful) ... return articleContent;` — and the
+        // ancestor walk at 1579-1593 sets `_articleDir`. The per-attempt
+        // closure pre-captured `outcome.article_dir`; on this success path
+        // we propagate it (faithful).
         return Some(RetryResult {
             text_content: outcome.text_content,
+            first_paragraph_excerpt: outcome.first_paragraph_excerpt,
+            serialized_html: outcome.serialized_html,
+            article_dir: outcome.article_dir,
         });
     }
 }
@@ -974,7 +1141,16 @@ mod tests {
         let body = dom.body().unwrap();
         let flags = Flags::default();
         let mut byline_found = false;
-        let r = grab_article(&mut dom, &root, &body, title, &flags, &mut byline_found)?;
+        let mut byline_text = None;
+        let r = grab_article(
+            &mut dom,
+            &root,
+            &body,
+            title,
+            &flags,
+            &mut byline_found,
+            &mut byline_text,
+        )?;
         Some((dom, r.article_content))
     }
 
@@ -1525,6 +1701,7 @@ mod tests {
             Some(AttemptOutcome {
                 text_content: "x".repeat(500),
                 inner_text_len: 500, // exactly the threshold: 500 < 500 is FALSE
+                ..AttemptOutcome::default()
             })
         });
         assert_eq!(
@@ -1564,6 +1741,7 @@ mod tests {
             Some(AttemptOutcome {
                 text_content: "z".to_string(),
                 inner_text_len: 1,
+                ..AttemptOutcome::default()
             })
         });
         assert_eq!(
@@ -1604,6 +1782,7 @@ mod tests {
             Some(AttemptOutcome {
                 text_content: txt.to_string(),
                 inner_text_len: len,
+                ..AttemptOutcome::default()
             })
         });
         assert_eq!(
@@ -1626,6 +1805,7 @@ mod tests {
             Some(AttemptOutcome {
                 text_content: String::new(),
                 inner_text_len: 0,
+                ..AttemptOutcome::default()
             })
         });
         assert!(
@@ -1659,6 +1839,7 @@ mod tests {
             Some(AttemptOutcome {
                 text_content: txt.to_string(),
                 inner_text_len: len,
+                ..AttemptOutcome::default()
             })
         });
         assert_eq!(

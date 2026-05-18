@@ -11,17 +11,29 @@
 //!
 //! Mirrors the oracle tri-state philosophy, the anti-Bug-E2 doctrine:
 //!
-//! | `mdrcel::extract` result                | [`CrateStatus`]                              |
-//! |-----------------------------------------|----------------------------------------------|
-//! | `Ok(Extracted)` — **even if `text` is `""`** | [`Ok`](CrateStatus::Ok) (carries it)     |
-//! | `Err(ExtractError::NotImplemented)`     | [`NotImplemented`](CrateStatus::NotImplemented) |
-//! | a **panic** inside `extract`            | [`CrateError`](CrateStatus::CrateError) (`"panic: …"`) |
+//! | `mdrcel::extract` result                       | [`CrateStatus`]                                         |
+//! |------------------------------------------------|---------------------------------------------------------|
+//! | `Ok(Extracted)` — **even if `text` is `""`**   | [`Ok`](CrateStatus::Ok) (carries it)                    |
+//! | `Err(ExtractError::NotImplemented)`            | [`NotImplemented`](CrateStatus::NotImplemented)         |
+//! | `Err(ExtractError::ContentTooShort{..})` (NEW) | [`CrateError`](CrateStatus::CrateError) (`"content_too_short: …"`) |
+//! | a **panic** inside `extract`                   | [`CrateError`](CrateStatus::CrateError) (`"panic: …"`)  |
 //!
-//! At M1 `ExtractError::NotImplemented` is the *only* error variant, so the
-//! two non-panic rows above are the *entire* error space and the mapping
-//! `match` is exhaustive with no wildcard. There is **no** "any other
-//! `Err(_)` → `CrateError`" row by design — see the compile-fence note
-//! below.
+//! At Stage 4 (M2, HLD §7.6) the M1 `ExtractError::NotImplemented` is **no
+//! longer** the only variant: the long-anticipated
+//! [`ExtractError::ContentTooShort`](mdrcel::ExtractError::ContentTooShort)
+//! variant has landed and **the compile-fence below fired** — a conscious
+//! match arm was added per its doctrine. The match remains **exhaustive,
+//! WITHOUT a wildcard**, so the next future variant will fire the fence
+//! again. `ContentTooShort` is mapped to `CrateError` with the reason string
+//! `content_too_short: <wc> < <threshold>` because (a) it is a CONFIGURED
+//! threshold failure — the harness path uses `Options::default()` so
+//! `min_word_count == 0` and this variant CANNOT fire on the harness corpus
+//! run; the mapping exists for forward-callers that pass non-zero, not the
+//! harness; (b) folding it into the existing `CrateError` channel keeps the
+//! Bug-E2 status partition stable: error reason is what differentiates,
+//! never the status discriminant. (Future-proofing: if a corpus run ever
+//! configures `min_word_count > 0`, the per-status BTreeMap surfaces
+//! `crate_error` with the reason intact — exactly the anti-Bug-E2 design.)
 //!
 //! `Ok` with empty `text` is **success**, not an error and not
 //! `not_implemented`: "found little" is a valid extraction (the exact
@@ -33,24 +45,20 @@
 //! does not exist yet" is visibly different from "the algorithm ran and
 //! failed/found nothing".
 //!
-//! # `ExtractError` compile-fence (anti-Bug-E2 — intentional, not a TODO)
+//! # `ExtractError` compile-fence — **FIRED AND RESOLVED at M2 Stage 4**
 //!
 //! `ExtractError` is matched **exhaustively, WITHOUT a wildcard**. At M1 it
-//! has only `NotImplemented`, so `Ok(extracted)` + `Err(NotImplemented)` is
-//! already an exhaustive match and this compiles today. There is deliberately
-//! **no** catch-all `Err(_) => CrateError` "for forward-compat", and
-//! `ExtractError` is deliberately **not** `#[non_exhaustive]` (that would
-//! defeat the fence — the harness lives in the same workspace as the
-//! library). When a future variant lands — the parent brief commits to e.g.
-//! `ContentTooShort` — this match stops being exhaustive and **the harness
-//! build breaks right here, on purpose**. That build break IS the feature:
-//! it forces a conscious tri-state decision at the exact Bug-E2 site (does
-//! the new variant become a `CrateError`, a brand-new `CrateStatus`, or a
-//! known-empty `Ok`?) rather than letting a silent wildcard launder it into
-//! `crate_error` — the precise conflation Bug E2 was about. Do **not**
-//! reintroduce a catch-all to "unbreak" a future build; add the new arm
-//! deliberately. (The `panic` arm is the *outer* `catch_unwind` `Result`,
-//! not an `ExtractError` variant — it is unrelated to this fence.)
+//! had only `NotImplemented`. At M2 Stage 4 (HLD §7.6) `ContentTooShort`
+//! arrived as the *first* deliberate non-floor error variant, the build
+//! broke RIGHT HERE on purpose, and the resolution was a conscious arm
+//! added below (with this comment as the audit trail). `ExtractError` is
+//! still deliberately **not** `#[non_exhaustive]` (that would defeat the
+//! fence). When the NEXT variant lands, this match will stop being
+//! exhaustive again and the harness build will break RIGHT HERE again —
+//! that is the feature, do **not** reintroduce a wildcard to "unbreak" it.
+//! Add the new arm deliberately. (The `panic` arm is the *outer*
+//! `catch_unwind` `Result`, not an `ExtractError` variant — it is unrelated
+//! to this fence.)
 //!
 //! # Panic isolation (forward-looking robustness)
 //!
@@ -241,21 +249,50 @@ where
             // The M1 floor — a DISTINCT first-class status, never folded into
             // CrateError nor an empty Ok.
             //
-            // INTENTIONAL COMPILE-FENCE (anti-Bug-E2): the match on the inner
-            // `Result<Extracted, ExtractError>` is EXHAUSTIVE *without* a
-            // wildcard. At M1 `ExtractError` has only `NotImplemented`, so the
-            // `Ok(extracted)` arm above and this arm already cover it and the
-            // crate compiles. There is deliberately NO catch-all
-            // `Ok(Err(_)) => CrateError` "for forward-compat": when a future
-            // variant lands (the parent brief commits to e.g.
-            // `ContentTooShort`), this stops being exhaustive and the harness
-            // build BREAKS right here. That build break IS the feature — it
-            // forces a conscious tri-state decision at the exact Bug-E2 site
-            // (is the new variant a `CrateError`? a brand-new `CrateStatus`?
-            // a known-empty `Ok`?) instead of silently laundering it into
-            // `crate_error`. Do NOT "fix" a future non-exhaustive error by
-            // reintroducing a wildcard — add the variant deliberately.
+            // The INTENTIONAL COMPILE-FENCE (anti-Bug-E2 — see module-level
+            // doc) keeps this match exhaustive WITHOUT a wildcard. M2 Stage 4
+            // ADDED a conscious arm below for the new `ContentTooShort`
+            // variant — that was the documented fence-firing event (HLD
+            // §7.6 / brief Stage-4 §C). The fence persists; the *next* new
+            // variant will break the build right here again on purpose.
+            // Do NOT reintroduce a wildcard.
             CrateStatus::NotImplemented
+        }
+        Ok(Err(ExtractError::ContentTooShort {
+            word_count,
+            threshold,
+        })) => {
+            // M2 Stage 4 (HLD §7.6) — **DELIBERATE FENCE-FIRING ARM**.
+            //
+            // The new `ContentTooShort` variant arrived; the no-wildcard match
+            // above stopped being exhaustive; the harness build broke right
+            // here on purpose; this arm is the conscious resolution
+            // documented in the brief (Stage-4 §C — "Resolve the fence BY
+            // ADDING A CONSCIOUS, REVIEWED ARM").
+            //
+            // **Tri-state decision: map to CrateError with a precise reason
+            // string, NOT to NotImplemented and NOT to a new CrateStatus.**
+            //
+            // - NOT NotImplemented: the algorithm DID run successfully — a
+            //   threshold check failed, not the floor; conflating them would
+            //   relitigate exactly the M1-floor distinction.
+            // - NOT a new CrateStatus variant: the harness uses
+            //   `Options::default()` (min_word_count == 0) on every URL of
+            //   the corpus run, so this arm CANNOT fire on the harness path;
+            //   creating a first-class status the harness never observes
+            //   would be premature abstraction (the reason channel already
+            //   surfaces *why* via the per-URL `crate_error_reason` field).
+            // - The reason string `"content_too_short: <wc> < <threshold>"`
+            //   gives downstream consumers (`results.json`,
+            //   `crate_status_detail`) the numbers without re-derivation.
+            //
+            // **No harness behaviour change at M2 Stage 4**: every default-
+            // Options corpus call still maps to `CrateStatus::Ok(_)`;
+            // `crate ok:51` is preserved exactly. This arm exists for
+            // (a) the fence's documented resolution; (b) consumers that
+            // configure `min_word_count > 0` (out-of-harness use), so the
+            // mapping is correct for them too.
+            CrateStatus::CrateError(format!("content_too_short: {word_count} < {threshold}"))
         }
         // A panic unwound out of `f`. This is the *outer* catch_unwind
         // `Result`, NOT an `ExtractError` variant — it is unrelated to the
@@ -290,6 +327,11 @@ mod tests {
 
     /// Build a fully-populated [`Extracted`] with a given body text, so the
     /// `Ok` arms can assert the payload is carried through verbatim.
+    ///
+    /// M2 Stage 4: `..Extracted::default()` fills the new metadata fields
+    /// added to the public API (HLD §7.6) — same shape as the score.rs test
+    /// helper; only the struct-literal grew. The mapping logic in this file
+    /// is unchanged.
     fn extracted_with_text(text: &str) -> Extracted {
         Extracted {
             title: Some("Title".to_string()),
@@ -298,6 +340,7 @@ mod tests {
             word_count: text.split_whitespace().count(),
             canonical_url: None,
             language: Some("en".to_string()),
+            ..Extracted::default()
         }
     }
 
@@ -379,25 +422,110 @@ mod tests {
     }
 
     /// End-to-end: the **production** path (real `mdrcel::extract`, not an
-    /// injected closure) must yield [`CrateStatus::NotImplemented`] at M1 —
-    /// the documented floor the baseline run records for every URL.
+    /// injected closure) on a page that yields a readable article surfaces
+    /// as [`CrateStatus::Ok`] carrying the extracted body.
+    ///
+    /// **History.** This test used to assert `CrateStatus::NotImplemented` —
+    /// the M1 floor every URL produced. The floor was retired at M2 Stage 1a
+    /// (`d426df1`): `mdrcel::extract` now runs a real Readability port and
+    /// returns a populated `Ok` for an article-bearing page. The original
+    /// "yields_not_implemented_at_m1" assertion has been faithfully retired
+    /// at M2 Stage 4 in line with that reality.
     #[test]
-    fn production_run_crate_yields_not_implemented_at_m1() {
+    fn production_run_crate_yields_ok_for_real_article_post_m1_floor() {
         let html = "<html><body><article><p>hello world</p></article></body></html>";
         let status = run_crate(html, Some("https://example.com/"));
-        assert!(
-            matches!(status, CrateStatus::NotImplemented),
-            "at M1 the real mdrcel::extract must surface as NotImplemented, got {status:?}"
-        );
+        match status {
+            CrateStatus::Ok(e) => {
+                assert!(
+                    e.text.contains("hello world"),
+                    "production path must extract the article body now that the \
+                     M1 NotImplemented floor was retired at M2 Stage 1a (`d426df1`); \
+                     got text {:?}",
+                    e.text
+                );
+            }
+            other => panic!(
+                "production path on an article-bearing page must be Ok post-M1; \
+                 got {other:?} — see new tests in this module for the M1-floor \
+                 retirement"
+            ),
+        }
     }
 
+    /// Production path on an EMPTY document remains an `Ok` with empty text
+    /// — Bug-E2 doctrine (an empty extraction is a valid result, not an
+    /// error and not `NotImplemented`). Replaces the M1-era
+    /// `..._not_implemented_regardless_of_base_url` test (which asserted
+    /// `NotImplemented` for any base_url and is no longer true post-Stage-1a).
     #[test]
-    fn production_run_crate_not_implemented_regardless_of_base_url() {
-        // base_url None vs Some must not change the M1 floor.
-        assert!(matches!(run_crate("", None), CrateStatus::NotImplemented));
-        assert!(matches!(
-            run_crate("<p>x</p>", Some("https://x/")),
-            CrateStatus::NotImplemented
-        ));
+    fn production_run_crate_ok_with_empty_text_on_empty_document_bug_e2() {
+        // base_url None: an empty document → faithful Readability null →
+        // crate maps to empty Ok per Bug-E2 (lib.rs::extract_with `None =>`
+        // arm).
+        match run_crate("", None) {
+            CrateStatus::Ok(e) => assert_eq!(
+                e.text, "",
+                "empty document ⇒ Ok with empty text (Bug-E2); got {:?}",
+                e.text
+            ),
+            other => panic!("empty doc must be Ok(empty) per Bug-E2, got {other:?}"),
+        }
+        // base_url Some: the base_url is informational and must not change
+        // the outcome. A tiny page with under-25-char paragraphs yields an
+        // empty extraction (none qualify), also Ok(empty) per Bug-E2.
+        match run_crate("<p>x</p>", Some("https://x/")) {
+            CrateStatus::Ok(e) => {
+                // The text may be empty or contain "x"; either way it is
+                // OK and not NotImplemented — that is the point.
+                assert!(
+                    e.text.len() < 100,
+                    "tiny doc ⇒ short Ok body; got {:?}",
+                    e.text
+                );
+            }
+            other => panic!("tiny doc must be Ok per Bug-E2, got {other:?}"),
+        }
+    }
+
+    /// M2 Stage 4 (HLD §7.6) — the deliberate-fence-firing arm.
+    /// `ExtractError::ContentTooShort` maps to `CrateError` with a
+    /// well-formed reason string the report can surface.
+    #[test]
+    fn content_too_short_maps_to_crate_error_with_reason_string() {
+        let status = run_extraction(|| {
+            Err(mdrcel::ExtractError::ContentTooShort {
+                word_count: 3,
+                threshold: 50,
+            })
+        });
+        match status {
+            CrateStatus::CrateError(reason) => {
+                assert!(
+                    reason.starts_with("content_too_short: "),
+                    "reason must be prefixed for the report; got {reason:?}"
+                );
+                assert!(
+                    reason.contains('3') && reason.contains("50"),
+                    "reason must carry both numbers; got {reason:?}"
+                );
+            }
+            other => panic!("ContentTooShort must map to CrateError, got {other:?}"),
+        }
+    }
+
+    /// The harness's actual corpus path (`Options::default()`, so
+    /// `min_word_count == 0`) never fires `ContentTooShort` — confirming
+    /// the "no harness-observable behaviour change" Stage-4 invariant
+    /// (HLD §7.6 exit condition).
+    #[test]
+    fn run_crate_default_options_never_produces_content_too_short() {
+        // A wholly empty document: at default options this is the canonical
+        // Bug-E2 empty Ok, NOT ContentTooShort (the threshold is 0).
+        let status = run_crate("", None);
+        assert!(
+            !matches!(status, CrateStatus::CrateError(ref r) if r.starts_with("content_too_short:")),
+            "default-Options path must NEVER produce ContentTooShort; got {status:?}"
+        );
     }
 }

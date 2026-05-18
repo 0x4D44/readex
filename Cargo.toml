@@ -132,7 +132,70 @@ name = "mdrcel"
 # preserved. The public-observable default `extract` does NOT shift its
 # token output on any scored URL (zero `crate_wc` changes); only raw-byte
 # `textContent` whitespace normalises. PATCH is correct.
-version = "0.3.4"
+#
+# M2 Stage 4 (2026-05-18): 0.3.4 -> 0.4.0 MINOR. Stage 4 (HLD §7.6) lands
+# the **last** scheduled M2 implementation work: full faithful port of
+# `_getArticleMetadata` (`Readability.js:1757-1863`) + `_getJSONLD`
+# (`Readability.js:1632-1747`, incl. the `@graph` resolution `:1674-1678`
+# that Stage 1a deferred); wiring `Options.include_html` to the JS
+# `_serializer(articleContent)` (`Readability.js:2772`); wiring
+# `Options.min_word_count` as a threshold check that fires a NEW
+# `ExtractError::ContentTooShort { word_count, threshold }` variant. The
+# `Extracted` struct gains five additive metadata fields
+# (`byline`/`excerpt`/`site_name`/`published_time`/`dir`), all `Option`-
+# valued and defaulted via `#[derive(Default)]` so any consumer using
+# `..Default::default()` struct-literal upgrade-paths compiles without
+# explicit field listings.
+#
+# Per semver (CLAUDE.md "Version management") this is a **MINOR** bump:
+# - **New public API** (additive only): a new `ExtractError::
+#   ContentTooShort` variant; five new `Extracted` fields with `Option`
+#   default values; a `Readability::include_html` builder method on the
+#   `#[doc(hidden)] pub mod readability` infrastructure surface.
+# - **Backward-compatible**: every previously-`None` field stays `None`
+#   under default `Options`; `extract == extract_with(&Options::default())`
+#   pinned and preserved (`min_word_count == 0` short-circuits the new
+#   threshold check so the default path never produces the new
+#   ExtractError variant — `extract()` cannot return an error on the
+#   default path); Bug-E2 preserved (an empty extraction is still
+#   `Ok(text: "")` on default-Options).
+# - **Honest non-additive aspect** (the Rust-mechanical one): adding fields
+#   to `pub struct Extracted` is **structurally additive** at the type
+#   level (matches with `..` still work, methods still work) but **breaks
+#   external struct-literal construction** that listed all fields. The
+#   only known external construction sites are the in-workspace
+#   `benchmark/` test helpers, which Stage 4 minimally updated to use
+#   `..Extracted::default()` — a mechanical one-line change per site that
+#   keeps their original semantics intact. Documented in the test helper
+#   doc-comments themselves.
+# - **No `ExtractError` variant was REMOVED** (the existing
+#   `NotImplemented` is retained for forward-compatibility, just as Stage
+#   1a kept it after extraction landed); a removal would have been MAJOR.
+#
+# The harness's compile-fence (anti-Bug-E2; `benchmark/src/crate_run.rs:
+# 240-259`) was the documented Stage-4 fence-firing event — adding the
+# new `ContentTooShort` variant broke its no-wildcard exhaustive match,
+# and a conscious arm was added per its doctrine. The new arm maps to
+# `CrateStatus::CrateError("content_too_short: …")` (justified inline in
+# `crate_run.rs`; the harness corpus path uses `Options::default()` so
+# this variant CANNOT fire on the corpus run, but consumers configuring
+# `min_word_count > 0` get a well-formed error reason). The harness
+# `crate ok:51` is unchanged on the corpus run.
+#
+# **No scored-text shift on default path** — `extract` / `extract_with(
+# default)` behaviour is byte-identical for `Extracted.text` /
+# `Extracted.word_count` versus Stage 3 across the 51-URL corpus (50/51
+# RJS word-count parity preserved; bankofengland 4-word residual
+# unchanged). The new metadata fields populate where the source HTML
+# carries the relevant `<meta>` / JSON-LD / `<link>` / `<html lang>`
+# nodes, and stay `None` otherwise.
+#
+# JSON-LD parsing requires a JSON parser (`JSON.parse` analogue). The
+# `serde_json` dependency is pinned EXACTLY at `1.0.149` (already in
+# workspace `Cargo.lock` via `benchmark`), pure-algorithm, no I/O —
+# faithful per HLD §3 "deferred until the algorithm needs them" /
+# DEC-3 reasoning, mirroring the `regex` Stage-1a precedent.
+version = "0.4.0"
 edition = "2024"
 
 [dependencies]
@@ -192,6 +255,23 @@ tendril = "=0.5.0"
 # under the HLD §3.1 parser-equivalence version-bump fence (that fence governs
 # only html5ever / markup5ever_rcdom / tendril).
 regex = "=1.12.3"
+
+# M2 Stage 4 (2026-05-18): full `_getArticleMetadata` (`Readability.js:1757-
+# 1863`) calls `_getJSONLD` (`Readability.js:1632-1747`), which does
+# `JSON.parse(textContent)` on every `<script type="application/ld+json">`. We
+# need to faithfully parse arbitrary JSON, the SAME data shape JS `JSON.parse`
+# produces (numbers, strings, booleans, null, arrays, objects), and walk it
+# (`parsed["@type"]`, `parsed["@context"]["@vocab"]`, `parsed["@graph"]`,
+# `parsed.author.name`, `parsed.publisher.name`, …). Hand-rolling a JSON parser
+# would be **more** code and a fresh correctness-divergence surface than a
+# pinned, audited dependency — same reasoning DEC-3 applied to `html5ever`
+# and Stage 1a applied to `regex`. `serde_json` is pure-algorithm (no I/O),
+# already in the workspace `Cargo.lock` via the `benchmark` crate, and is the
+# obvious idiomatic choice. Pinned EXACTLY per project new-dependency
+# discipline; `serde_json 1.0.149` is consistent with the version already in
+# `Cargo.lock`. The brief-mandated "no I/O in the crate" property is
+# preserved (parsing JSON in-memory is computation, not I/O).
+serde_json = "=1.0.149"
 
 [dev-dependencies]
 # Test-scaffolding ONLY (never linked into the shipped library — CLAUDE.md

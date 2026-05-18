@@ -1,15 +1,23 @@
-//! `metadata.rs` — title resolution, pulled forward to Stage 1a (HLD §7.1 /
-//! supervisor M-4) because `_grabArticle`'s `_headerDuplicatesTitle`
-//! (`Readability.js:1105`) deletes headings via
-//! `_textSimilarity(this._articleTitle, heading) > 0.75` and so the article
-//! title **directly changes the scored body text** (`_articleTitle` is set at
-//! `Readability.js:2745`, before `_grabArticle` at `2747`).
+//! `metadata.rs` — title resolution + non-body metadata (HLD §7.1 / §7.6).
 //!
-//! Stage-1a scope: `_getArticleTitle` (`Readability.js:572-651`) + the
-//! **title half** of `_getArticleMetadata` (`Readability.js:1803-1816`). The
-//! rest of `_getArticleMetadata` / `_getJSONLD` is Stage 4 (HLD §7.6) — JSON-LD
-//! is `{}` here (Stage-1a `parse()` does not call `_getJSONLD`), so the
-//! `jsonld.title` term is absent.
+//! **Stage 1a** pulled forward title resolution because `_grabArticle`'s
+//! `_headerDuplicatesTitle` (`Readability.js:1105`) deletes headings via
+//! `_textSimilarity(this._articleTitle, heading) > 0.75` — so the article
+//! title **directly changes the scored body text**. The Stage-1a slice was
+//! `_getArticleTitle` (`Readability.js:572-651`) + the title-only half of
+//! `_getArticleMetadata` (`Readability.js:1803-1816`); JSON-LD was deferred
+//! (`jsonld = {}` per `Readability.js:2736` when `_disableJSONLD = true`).
+//!
+//! **Stage 4** (this file's extension; HLD §7.6) ports the *rest* of
+//! `_getArticleMetadata` (`Readability.js:1757-1863`) — byline, excerpt, site
+//! name, published time — and the full `_getJSONLD`
+//! (`Readability.js:1632-1747`, **including** the `@graph` resolution
+//! (`:1674-1678`) that Stage 1a deferred). These fields are **NOT scored**
+//! (HLD §2 score-invisible partition), so they cannot move corpus-level
+//! Coverage/Precision; their inclusion is API-completeness ahead of the M5
+//! the consumer shim (supervisor M-4) and is byte-additive — every previously-
+//! `None` field stays `None` on every input that did not produce a hit
+//! (faithful to JS `undefined`).
 //!
 //! Faithful transcription with `Readability.js:<line>` citations
 //! (anti-inversion, HLD §4.3(a)).
@@ -210,7 +218,13 @@ fn byte_substring(s: &str, start: usize, end: usize) -> String {
 /// is built from `<meta>` tags exactly as `Readability.js:1771-1800`.
 ///
 /// This is the value assigned to `this._articleTitle` (`Readability.js:2745`)
-/// and consumed by `_headerDuplicatesTitle` on the scored path.
+/// and consumed by `_headerDuplicatesTitle` on the scored path. **Stage 4**
+/// still calls this from the pre-grab pipeline (title alone is sufficient to
+/// drive `_headerDuplicatesTitle` — the score-affecting hook), so this
+/// title-only entry point is preserved. Stage 4's [`get_article_metadata`]
+/// computes the same title plus the other (non-scored) metadata fields; the
+/// titles ARE byte-identical by construction (the title precedence in
+/// `Readability.js:1803-1816` is unchanged when `jsonld.title` is unset).
 pub fn get_article_metadata_title(doc_root: &NodeRef) -> String {
     let values = collect_meta_values(doc_root);
 
@@ -233,6 +247,617 @@ pub fn get_article_metadata_title(doc_root: &NodeRef) -> String {
     }
     // if (!metadata.title) metadata.title = this._getArticleTitle();
     get_article_title(doc_root)
+}
+
+// ---------------------------------------------------------------------------
+// Stage 4 (HLD §7.6) — full `_getArticleMetadata` + `_getJSONLD`.
+// ---------------------------------------------------------------------------
+
+/// `metadata = {...}` (`Readability.js:1757-1863` + JSON-LD merge),
+/// **score-invisible** non-body metadata.
+///
+/// Fields:
+/// * `title` — the same value `get_article_metadata_title` returns (the
+///   title-only precedence; JSON-LD `headline`/`name` wins if present, exactly
+///   as `Readability.js:1690-1713` decides).
+/// * `byline` — author (`jsonld.byline || values["dc:creator"] || …`,
+///   `Readability.js:1825-1831`).
+/// * `excerpt` — description (`jsonld.excerpt || values["og:description"] ||
+///   …`, `Readability.js:1834-1842`).
+/// * `site_name` — publisher (`jsonld.siteName || values["og:site_name"]`,
+///   `Readability.js:1845`).
+/// * `published_time` — date (`jsonld.datePublished ||
+///   values["article:published_time"] || values["parsely-pub-date"]`,
+///   `Readability.js:1848-1852`).
+///
+/// All non-title fields default to `None` (JS `undefined`), faithfully — the
+/// JS `metadata.byline = ... || ... || articleAuthor` may land on `undefined`
+/// when every alternative is undefined.
+///
+/// Every string is `_unescapeHtmlEntities`-decoded
+/// (`Readability.js:1856-1860`) faithfully via [`unescape_html_entities`].
+#[derive(Debug, Default, Clone)]
+pub struct Metadata {
+    /// `metadata.title` — never empty after this function (final fallback is
+    /// `_getArticleTitle()` per `Readability.js:1814-1816`).
+    pub title: String,
+    /// `metadata.byline` — `undefined` ⇒ `None`. Note the JS `parse()`
+    /// (`Readability.js:2769`) falls back to `this._articleByline` (set by
+    /// `_grabArticle` when it finds a `<address>` / `[rel=author]` etc. in
+    /// the tree); that fallback happens in the caller (`lib.rs` /
+    /// `Readability::parse`), not here.
+    pub byline: Option<String>,
+    /// `metadata.excerpt` — JS path `Readability.js:2759-2763` ALSO has a
+    /// final fallback to the first `<p>` of `articleContent`. The caller
+    /// (`Readability::parse`) applies that fallback because it has the
+    /// articleContent in hand; this function returns only the metadata-only
+    /// excerpt.
+    pub excerpt: Option<String>,
+    /// `metadata.siteName` — falls back to `this._articleSiteName` in JS
+    /// `parse()` (`Readability.js:2776`); we keep the metadata-only value
+    /// here.
+    pub site_name: Option<String>,
+    /// `metadata.publishedTime` — JS lets this be `null` (`:1852`); `None`
+    /// here means "no metadata source set it" (faithfully equivalent: a
+    /// `null` JS value flows to the return object's `publishedTime` as
+    /// `null`).
+    pub published_time: Option<String>,
+}
+
+/// Full `_getArticleMetadata(jsonld)` (`Readability.js:1757-1863`) — Stage 4
+/// (HLD §7.6).
+///
+/// `jsonld` is the value returned by [`get_json_ld`]; pass an empty
+/// [`JsonLd`] to faithfully reproduce the `_disableJSONLD = true` branch.
+pub fn get_article_metadata(doc_root: &NodeRef, jsonld: &JsonLd) -> Metadata {
+    let values = collect_meta_values(doc_root);
+
+    // 1803-1812 metadata.title precedence (jsonld.title wins if present).
+    let mut title = jsonld
+        .title
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            for key in [
+                "dc:title",
+                "dcterm:title",
+                "og:title",
+                "weibo:article:title",
+                "weibo:webpage:title",
+                "title",
+                "twitter:title",
+                "parsely-title",
+            ] {
+                if let Some(v) = values.get(key)
+                    && !v.is_empty()
+                {
+                    return v.clone();
+                }
+            }
+            String::new()
+        });
+    if title.is_empty() {
+        // 1814-1816 if (!metadata.title) metadata.title = this._getArticleTitle()
+        title = get_article_title(doc_root);
+    }
+
+    // 1818-1822 articleAuthor — the article:author meta value, BUT only if
+    // it does not look like a URL.
+    let article_author = values
+        .get("article:author")
+        .filter(|s| !is_url_like(s))
+        .cloned();
+
+    // 1824-1831 metadata.byline precedence.
+    let byline = jsonld
+        .byline
+        .clone()
+        .or_else(|| values.get("dc:creator").cloned())
+        .or_else(|| values.get("dcterm:creator").cloned())
+        .or_else(|| values.get("author").cloned())
+        .or_else(|| values.get("parsely-author").cloned())
+        .or(article_author);
+
+    // 1833-1842 metadata.excerpt precedence.
+    let excerpt = jsonld
+        .excerpt
+        .clone()
+        .or_else(|| values.get("dc:description").cloned())
+        .or_else(|| values.get("dcterm:description").cloned())
+        .or_else(|| values.get("og:description").cloned())
+        .or_else(|| values.get("weibo:article:description").cloned())
+        .or_else(|| values.get("weibo:webpage:description").cloned())
+        .or_else(|| values.get("description").cloned())
+        .or_else(|| values.get("twitter:description").cloned());
+
+    // 1844-1845 metadata.siteName.
+    let site_name = jsonld
+        .site_name
+        .clone()
+        .or_else(|| values.get("og:site_name").cloned());
+
+    // 1847-1852 metadata.publishedTime (defaults to null in JS; None here).
+    let published_time = jsonld
+        .date_published
+        .clone()
+        .or_else(|| values.get("article:published_time").cloned())
+        .or_else(|| values.get("parsely-pub-date").cloned());
+
+    // 1854-1860 entity-unescape every string.
+    Metadata {
+        title: unescape_html_entities(&title),
+        byline: byline.map(|s| unescape_html_entities(&s)),
+        excerpt: excerpt.map(|s| unescape_html_entities(&s)),
+        site_name: site_name.map(|s| unescape_html_entities(&s)),
+        published_time: published_time.map(|s| unescape_html_entities(&s)),
+    }
+}
+
+/// The JSON-LD subset `_getJSONLD` (`Readability.js:1632-1747`) lifts off the
+/// `<script type="application/ld+json">` payload.
+///
+/// All fields are `Option<String>` mirroring JS `undefined` exactly.
+#[derive(Debug, Default, Clone)]
+pub struct JsonLd {
+    /// `metadata.title` — `:1690-1713`. Note JS sometimes chooses `name` vs
+    /// `headline` based on `_textSimilarity` to the article title; that
+    /// choice is made INSIDE [`get_json_ld`] because the JS path has
+    /// `this._getArticleTitle()` available.
+    pub title: Option<String>,
+    /// `metadata.byline` — `:1714-1731`.
+    pub byline: Option<String>,
+    /// `metadata.excerpt` — `:1732-1734`.
+    pub excerpt: Option<String>,
+    /// `metadata.siteName` — `:1735-1737`.
+    pub site_name: Option<String>,
+    /// `metadata.datePublished` — `:1738-1740`.
+    pub date_published: Option<String>,
+}
+
+/// `_getJSONLD(doc)` (`Readability.js:1632-1747`) — Stage 4 (HLD §7.6),
+/// including the `@graph` resolution (`:1674-1678`) that Stage 1a deferred.
+///
+/// Walks every `<script type="application/ld+json">` in tree order; the
+/// **first** that parses to a Schema.org Article-class object wins (JS uses
+/// `if (!metadata)` — first hit, then later hits are ignored). Returns an
+/// empty [`JsonLd`] if nothing qualifies (JS `metadata ? metadata : {}` —
+/// `:1746`).
+///
+/// `JSON.parse` failures are silently swallowed (JS `catch (err)
+/// this.log(err.message)` — `:1741-1743`); a single malformed JSON-LD does
+/// not stop later scripts from being considered.
+pub fn get_json_ld(doc_root: &NodeRef) -> JsonLd {
+    // 1633 var scripts = this._getAllNodesWithTag(doc, ["script"]);
+    let scripts = get_all_nodes_with_tag(doc_root, &["script"]);
+
+    for script in &scripts {
+        // 1639-1641 if (!metadata && type === "application/ld+json")
+        if get_attribute(script, "type").as_deref() != Some("application/ld+json") {
+            continue;
+        }
+
+        // 1644-1647 Strip CDATA markers, faithfully.
+        let raw = text_content(script);
+        let stripped = strip_cdata_markers(&raw);
+
+        // 1648 JSON.parse — failure ⇒ catch ⇒ continue to next script.
+        let Ok(parsed_val): serde_json::Result<serde_json::Value> = serde_json::from_str(&stripped)
+        else {
+            continue;
+        };
+
+        // 1650-1660 if Array.isArray: pick the first @type matching
+        // jsonLdArticleTypes. If none, skip (`return` in JS, meaning continue
+        // to next script — `forEachNode` callback).
+        let parsed = match parsed_val {
+            serde_json::Value::Array(arr) => {
+                let Some(found) = arr.into_iter().find(|it| {
+                    it.get("@type")
+                        .and_then(|t| t.as_str())
+                        .map(json_ld_article_type_matches)
+                        .unwrap_or(false)
+                }) else {
+                    continue;
+                };
+                found
+            }
+            other => other,
+        };
+
+        // 1662-1672 @context must match schema.org (string OR object with
+        // @vocab string), else skip.
+        let context_matches = match parsed.get("@context") {
+            Some(serde_json::Value::String(s)) => schema_dot_org_matches(s),
+            Some(serde_json::Value::Object(obj)) => obj
+                .get("@vocab")
+                .and_then(|v| v.as_str())
+                .map(schema_dot_org_matches)
+                .unwrap_or(false),
+            _ => false,
+        };
+        if !context_matches {
+            continue;
+        }
+
+        // 1674-1678 `@graph` resolution: if no top-level @type but a @graph
+        // array, scan the graph for the first Article-type entry.
+        let parsed = if parsed.get("@type").is_none() {
+            if let Some(graph) = parsed.get("@graph").and_then(|g| g.as_array()) {
+                match graph.iter().find(|it| {
+                    it.get("@type")
+                        .map(json_ld_at_type_matches_loose)
+                        .unwrap_or(false)
+                }) {
+                    Some(found) => found.clone(),
+                    // 1678 If find returns undefined ⇒ `parsed` becomes
+                    // undefined ⇒ the next `if (!parsed || …)` returns. We
+                    // continue to next script (faithful to forEachNode's
+                    // `return`).
+                    None => continue,
+                }
+            } else {
+                parsed
+            }
+        } else {
+            parsed
+        };
+
+        // 1680-1686 if (!parsed || !parsed["@type"] || !parsed["@type"].match
+        //   (jsonLdArticleTypes)) return;
+        let at_type_ok = parsed
+            .get("@type")
+            .and_then(|t| t.as_str())
+            .map(json_ld_article_type_matches)
+            .unwrap_or(false);
+        if !at_type_ok {
+            continue;
+        }
+
+        // 1688 metadata = {} — start a fresh JsonLd to populate.
+        let mut md = JsonLd::default();
+
+        // 1690-1713 title resolution (name vs headline, with similarity
+        // tie-break against _getArticleTitle()).
+        let parsed_name = parsed.get("name").and_then(|v| v.as_str());
+        let parsed_headline = parsed.get("headline").and_then(|v| v.as_str());
+        match (parsed_name, parsed_headline) {
+            // both present AND differ ⇒ similarity tie-break (`:1690-1708`).
+            (Some(n), Some(h)) if n != h => {
+                // `_getArticleTitle` is what JS calls; we already have a
+                // ported version, so use it.
+                let title = get_article_title(doc_root);
+                let name_matches = crate::readability::scoring::text_similarity(n, &title) > 0.75;
+                let headline_matches =
+                    crate::readability::scoring::text_similarity(h, &title) > 0.75;
+                if headline_matches && !name_matches {
+                    md.title = Some(h.to_string());
+                } else {
+                    md.title = Some(n.to_string());
+                }
+            }
+            // only `name`.
+            (Some(n), _) => md.title = Some(js_trim(n).to_string()),
+            // only `headline`.
+            (_, Some(h)) => md.title = Some(js_trim(h).to_string()),
+            _ => {}
+        }
+
+        // 1714-1731 author/byline.
+        if let Some(author) = parsed.get("author") {
+            if let Some(name) = author.get("name").and_then(|v| v.as_str()) {
+                md.byline = Some(js_trim(name).to_string());
+            } else if let Some(arr) = author.as_array()
+                && let Some(first) = arr.first()
+                && first.get("name").and_then(|v| v.as_str()).is_some()
+            {
+                // .filter(author => typeof author.name === "string")
+                // .map(author => author.name.trim()).join(", ")
+                let names: Vec<String> = arr
+                    .iter()
+                    .filter_map(|a| a.get("name").and_then(|v| v.as_str()))
+                    .map(|n| js_trim(n).to_string())
+                    .collect();
+                md.byline = Some(names.join(", "));
+            }
+        }
+
+        // 1732-1734 metadata.excerpt = parsed.description.trim().
+        if let Some(desc) = parsed.get("description").and_then(|v| v.as_str()) {
+            md.excerpt = Some(js_trim(desc).to_string());
+        }
+
+        // 1735-1737 metadata.siteName = parsed.publisher.name.trim().
+        if let Some(name) = parsed
+            .get("publisher")
+            .and_then(|p| p.get("name"))
+            .and_then(|v| v.as_str())
+        {
+            md.site_name = Some(js_trim(name).to_string());
+        }
+
+        // 1738-1740 metadata.datePublished = parsed.datePublished.trim().
+        if let Some(dp) = parsed.get("datePublished").and_then(|v| v.as_str()) {
+            md.date_published = Some(js_trim(dp).to_string());
+        }
+
+        // 1746 return metadata ? metadata : {} — first script with a metadata
+        // object wins.
+        return md;
+    }
+
+    // No qualifying JSON-LD ⇒ {}.
+    JsonLd::default()
+}
+
+/// `/^\s*<!\[CDATA\[|\]\]>\s*$/g` (`Readability.js:1645`) — strip a leading
+/// `<![CDATA[` (after JS-whitespace) and a trailing `]]>` (before JS-
+/// whitespace). The `/g` form would replace **every** match anywhere; in
+/// practice the only sane JSON-LD wrapping is one leading + one trailing
+/// marker, and the JS regex is anchored at both ends per occurrence (the
+/// alternation matches either anchor).
+fn strip_cdata_markers(s: &str) -> String {
+    static R: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = R.get_or_init(|| {
+        regex::Regex::new(&format!(
+            "(?:^[{cls}]*<!\\[CDATA\\[)|(?:\\]\\]>[{cls}]*$)",
+            cls = regexps::JS_SPACE_CLASS
+        ))
+        .expect("cdata regex")
+    });
+    re.replace_all(s, "").into_owned()
+}
+
+/// `REGEXPS.jsonLdArticleTypes` (`Readability.js:168-169`):
+/// `/^Article|AdvertiserContentArticle|…|APIReference$/` — note the JS regex
+/// **only anchors the first alternative `Article` and the last alternative
+/// `APIReference`**; every middle alternative is unanchored, so they match
+/// anywhere in the string. This is a JS regex quirk (precedence: `^A|B|C$`
+/// parses as `(^A)|B|(C$)`), and Readability sees it as faithfully matching
+/// any of the listed types either anchored or as substrings. We replicate
+/// EXACTLY: try each alternative, anchored or substring per the JS parse.
+fn json_ld_article_type_matches(s: &str) -> bool {
+    // The first alternative `Article` is anchored at start; the last
+    // `APIReference` is anchored at end; everything in between is unanchored.
+    // We reproduce that exactly to be JS-faithful.
+    if s.starts_with("Article") {
+        return true;
+    }
+    if s.ends_with("APIReference") {
+        return true;
+    }
+    for t in [
+        "AdvertiserContentArticle",
+        "NewsArticle",
+        "AnalysisNewsArticle",
+        "AskPublicNewsArticle",
+        "BackgroundNewsArticle",
+        "OpinionNewsArticle",
+        "ReportageNewsArticle",
+        "ReviewNewsArticle",
+        "Report",
+        "SatiricalArticle",
+        "ScholarlyArticle",
+        "MedicalScholarlyArticle",
+        "SocialMediaPosting",
+        "BlogPosting",
+        "LiveBlogPosting",
+        "DiscussionForumPosting",
+        "TechArticle",
+    ] {
+        if s.contains(t) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The `@graph` filter at `Readability.js:1676` uses `(it["@type"] || "")
+/// .match(...)`. `it["@type"]` may be a string OR an array of strings — JS
+/// coerces with `||` (only "" string is falsy among those shapes, but a
+/// missing key is `undefined` so `|| ""`). If it is an array, `Array.match`
+/// is undefined and would throw — Readability silently accepts that as a
+/// no-match. Faithful: only treat as a match when `@type` is a string that
+/// passes [`json_ld_article_type_matches`].
+fn json_ld_at_type_matches_loose(v: &serde_json::Value) -> bool {
+    v.as_str().is_some_and(json_ld_article_type_matches)
+}
+
+/// `Readability.js:1662` `schemaDotOrgRegex = /^https?\:\/\/schema\.org\/?$/`.
+fn schema_dot_org_matches(s: &str) -> bool {
+    // Tiny pattern; no regex needed.
+    let s = s.strip_suffix('/').unwrap_or(s);
+    s == "http://schema.org" || s == "https://schema.org"
+}
+
+/// `_isUrl(str)` (`Readability.js:441-448`): `try new URL(str); return true;
+/// catch return false;`.
+///
+/// JS `new URL(str)` is the **WHATWG URL parser**; absolute URLs only (no
+/// base). Faithful predicate: accept the very narrow shape Readability cares
+/// about — `<scheme>:<scheme-specific-part>` where scheme starts with an
+/// ASCII letter then `[A-Za-z0-9+\-.]*`. The only context that calls this is
+/// `metadata.byline`'s `article:author` ladder (`Readability.js:1818-1822`):
+/// if the meta value looks like a URL, skip it (a profile URL is not a name).
+/// A tighter parser is unnecessary — a benign false-negative would just keep
+/// a value JS would have rejected; a false-positive would only happen on a
+/// string with a scheme prefix, which is exactly what the JS check rejects.
+fn is_url_like(s: &str) -> bool {
+    // WHATWG URL parser requires `<scheme>:<rest>` with the scheme matching
+    // `[A-Za-z][A-Za-z0-9+\-.]*`. That is what `new URL(str)` accepts as
+    // absolute; relative URLs without a base throw. So `_isUrl` is roughly
+    // "starts with a scheme:".
+    let bytes = s.as_bytes();
+    let Some(colon) = bytes.iter().position(|&b| b == b':') else {
+        return false;
+    };
+    if colon == 0 {
+        return false;
+    }
+    if !bytes[0].is_ascii_alphabetic() {
+        return false;
+    }
+    bytes[1..colon]
+        .iter()
+        .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+}
+
+/// `_unescapeHtmlEntities(str)` (`Readability.js:1605-1625`).
+///
+/// Faithful decoding for the **named** entities `&quot;`/`&amp;`/`&apos;`/
+/// `&lt;`/`&gt;` (Readability's HTML_ESCAPE_MAP — `:267-273`) plus numeric
+/// `&#NN;` / `&#xHH;`. Code points 0, > 0x10FFFF, or in the surrogate range
+/// 0xD800..=0xDFFF are replaced by U+FFFD (`:1619-1620`). Returns the input
+/// unchanged when it is empty (JS `if (!str) return str;` — `:1606`).
+///
+/// Operates over `char` iteration via `.chars()` so multi-byte UTF-8 is
+/// preserved verbatim outside entity sequences.
+pub fn unescape_html_entities(s: &str) -> String {
+    if s.is_empty() {
+        return s.to_string();
+    }
+
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        if bytes[i] != b'&' {
+            // Step by one UTF-8 char. `s.as_bytes()` is valid UTF-8 because
+            // `s: &str`, so the leading byte tells us the char length.
+            let len = utf8_char_len(bytes[i]);
+            out.push_str(&s[i..i + len]);
+            i += len;
+            continue;
+        }
+
+        // Try named entities (`Readability.js:1612` — the HTML_ESCAPE_MAP).
+        if let Some(hit) = try_named_entity(&bytes[i..]) {
+            out.push(hit.ch);
+            i += hit.len;
+            continue;
+        }
+
+        // Numeric entity `&#NN;` / `&#xHH;` (`Readability.js:1615-1623`).
+        if let Some(hit) = try_numeric_entity(&bytes[i..]) {
+            out.push(hit.ch);
+            i += hit.len;
+            continue;
+        }
+
+        // Not a recognised entity — copy `&` verbatim and continue.
+        out.push('&');
+        i += 1;
+    }
+    out
+}
+
+struct EntityHit {
+    ch: char,
+    len: usize,
+}
+
+fn try_named_entity(b: &[u8]) -> Option<EntityHit> {
+    for (name, ch) in [
+        ("&quot;", '"'),
+        ("&amp;", '&'),
+        ("&apos;", '\''),
+        ("&lt;", '<'),
+        ("&gt;", '>'),
+    ] {
+        if b.starts_with(name.as_bytes()) {
+            return Some(EntityHit {
+                ch,
+                len: name.len(),
+            });
+        }
+    }
+    None
+}
+
+fn try_numeric_entity(b: &[u8]) -> Option<EntityHit> {
+    if b.len() < 4 || b[0] != b'&' || b[1] != b'#' {
+        return None;
+    }
+    let (radix, digit_start) = if b[2] == b'x' || b[2] == b'X' {
+        (16u32, 3usize)
+    } else {
+        (10u32, 2usize)
+    };
+
+    // Consume the digit run.
+    let mut p = digit_start;
+    let is_digit = |c: u8| match radix {
+        16 => c.is_ascii_hexdigit(),
+        _ => c.is_ascii_digit(),
+    };
+    while p < b.len() && is_digit(b[p]) {
+        p += 1;
+    }
+    if p == digit_start || p >= b.len() || b[p] != b';' {
+        return None;
+    }
+
+    // Parse the digit prefix.
+    let digits = std::str::from_utf8(&b[digit_start..p]).ok()?;
+    let mut num = u32::from_str_radix(digits, radix).unwrap_or(0xFFFD);
+
+    // `:1619-1620` invalid code points -> U+FFFD.
+    if num == 0 || num > 0x10FFFF || (0xD800..=0xDFFF).contains(&num) {
+        num = 0xFFFD;
+    }
+    let ch = char::from_u32(num).unwrap_or('\u{FFFD}');
+    Some(EntityHit {
+        ch,
+        len: p + 1, // include the trailing ';'
+    })
+}
+
+/// UTF-8 character byte-length from the leading byte. Assumes `b` is the
+/// first byte of a valid UTF-8 code point (true when iterating over the
+/// bytes of a `&str` at code-point boundaries).
+fn utf8_char_len(b: u8) -> usize {
+    if b < 0x80 {
+        1
+    } else if b < 0xC0 {
+        // Continuation byte — should not appear at a code-point boundary in
+        // valid UTF-8; defensively step by 1.
+        1
+    } else if b < 0xE0 {
+        2
+    } else if b < 0xF0 {
+        3
+    } else {
+        4
+    }
+}
+
+/// HTML `<html lang="...">` for `_articleLang` (`Readability.js:1060-1062`).
+/// `None` when missing.
+pub fn html_lang(doc_root: &NodeRef) -> Option<String> {
+    let html = get_elements_by_tag_name(doc_root, "html");
+    html.first().and_then(|h| get_attribute(h, "lang"))
+}
+
+/// `<link rel="canonical" href=...>` href, if any (the canonical URL
+/// surfaced to consumers — not a Readability-spec field per se but an
+/// `Extracted.canonical_url` slot that was always declared and never
+/// populated; Stage 4 finally fills it from the obvious metadata source).
+///
+/// **NOT a `Readability.js` line cite** — this is `Extracted.canonical_url`
+/// (the crate's API), not Readability metadata. Readability does not surface
+/// a canonical URL; the crate's brief declares the field (and `language`)
+/// as best-effort metadata the library decoded itself.
+pub fn canonical_url(doc_root: &NodeRef) -> Option<String> {
+    let links = get_elements_by_tag_name(doc_root, "link");
+    for link in &links {
+        // Match `<link rel="canonical">` (case-insensitive `rel`).
+        if let Some(rel) = get_attribute(link, "rel")
+            && rel.eq_ignore_ascii_case("canonical")
+        {
+            return get_attribute(link, "href").filter(|s| !s.is_empty());
+        }
+    }
+    None
 }
 
 /// Build the `values` map from `<meta>` elements
@@ -437,5 +1062,406 @@ mod tests {
             r#"<html><head><meta property="og:title" content=""><title>Real Title Goes Here</title></head><body></body></html>"#,
         );
         assert_eq!(get_article_metadata_title(&r), "Real Title Goes Here");
+    }
+
+    // ====== Stage 4 tests (HLD §7.6 — full `_getArticleMetadata` + JSON-LD).
+    // Expected values hand-derived from `Readability.js:1632-1863`.
+
+    // ---- full `_getArticleMetadata` (Readability.js:1757-1863) ----
+
+    #[test]
+    fn metadata_full_collects_og_byline_excerpt_site_name_published_time() {
+        // <meta property> matches `propertyPattern`; values map keys are the
+        // matched substring lowercased and stripped of JS-`\s`. Faithful keys:
+        //   "article:author", "og:description", "og:site_name",
+        //   "article:published_time"
+        let (_d, r) = doc(r#"<html><head>
+                <meta property="og:title" content="The Headline">
+                <meta property="article:author" content="Jane Doe">
+                <meta property="og:description" content="A short excerpt.">
+                <meta property="og:site_name" content="Example News">
+                <meta property="article:published_time" content="2024-01-02T03:04:05Z">
+                <title>Doc</title>
+               </head><body></body></html>"#);
+        let md = get_article_metadata(&r, &JsonLd::default());
+        assert_eq!(md.title, "The Headline");
+        assert_eq!(md.byline.as_deref(), Some("Jane Doe"));
+        assert_eq!(md.excerpt.as_deref(), Some("A short excerpt."));
+        assert_eq!(md.site_name.as_deref(), Some("Example News"));
+        assert_eq!(md.published_time.as_deref(), Some("2024-01-02T03:04:05Z"));
+    }
+
+    #[test]
+    fn metadata_full_byline_article_author_url_is_rejected() {
+        // `Readability.js:1818-1822`: articleAuthor only set when article:author
+        // is NOT a URL. A URL-shaped article:author is skipped and the byline
+        // ladder falls through to the next alternative; with no others present
+        // the byline ends up `undefined` (None).
+        let (_d, r) = doc(r#"<html><head>
+                <meta property="article:author" content="https://example.com/jane">
+                <title>X</title>
+               </head><body></body></html>"#);
+        let md = get_article_metadata(&r, &JsonLd::default());
+        assert!(md.byline.is_none(), "got {:?}", md.byline);
+    }
+
+    #[test]
+    fn metadata_full_byline_dc_creator_precedence() {
+        // Readability.js:1825-1831: byline = dc:creator || dcterm:creator ||
+        // author || parsely-author || articleAuthor.
+        let (_d, r) = doc(r#"<html><head>
+                <meta name="dc.creator" content="DC Creator">
+                <meta name="author" content="Plain Author">
+                <meta property="article:author" content="Article Author">
+                <title>X</title>
+               </head><body></body></html>"#);
+        let md = get_article_metadata(&r, &JsonLd::default());
+        // dc:creator wins (`.` → `:` per `:1796`).
+        assert_eq!(md.byline.as_deref(), Some("DC Creator"));
+    }
+
+    #[test]
+    fn metadata_full_jsonld_byline_beats_meta() {
+        // JsonLd.byline wins over every <meta> alternative.
+        let jsonld = JsonLd {
+            byline: Some("JSON Author".to_string()),
+            ..JsonLd::default()
+        };
+        let (_d, r) = doc(r#"<html><head>
+                <meta name="author" content="Plain Author">
+                <title>X</title>
+               </head><body></body></html>"#);
+        let md = get_article_metadata(&r, &jsonld);
+        assert_eq!(md.byline.as_deref(), Some("JSON Author"));
+    }
+
+    #[test]
+    fn metadata_full_excerpt_precedence_og_description_beats_description() {
+        // og:description should win over plain description.
+        let (_d, r) = doc(r#"<html><head>
+                <meta name="description" content="Plain description">
+                <meta property="og:description" content="OG description wins">
+                <title>X</title>
+               </head><body></body></html>"#);
+        let md = get_article_metadata(&r, &JsonLd::default());
+        // dc:description / dcterm:description absent; og:description wins.
+        assert_eq!(md.excerpt.as_deref(), Some("OG description wins"));
+    }
+
+    #[test]
+    fn metadata_full_unescapes_html_entities_on_strings() {
+        // Readability.js:1856-1860 _unescapeHtmlEntities on every metadata
+        // string field.
+        let (_d, r) = doc(r#"<html><head>
+                <meta property="og:title" content="Tom &amp; Jerry">
+                <meta name="author" content="A &lt;B&gt;">
+                <meta property="og:description" content="A &quot;quote&quot;">
+                <meta property="og:site_name" content="Foo &#38; Bar">
+                <title>X</title>
+               </head><body></body></html>"#);
+        let md = get_article_metadata(&r, &JsonLd::default());
+        assert_eq!(md.title, "Tom & Jerry");
+        assert_eq!(md.byline.as_deref(), Some("A <B>"));
+        assert_eq!(md.excerpt.as_deref(), Some(r#"A "quote""#));
+        assert_eq!(md.site_name.as_deref(), Some("Foo & Bar"));
+    }
+
+    #[test]
+    fn metadata_full_default_path_returns_only_title_when_no_meta() {
+        // No <meta>; title falls back to _getArticleTitle. Other fields stay
+        // None — faithful "undefined".
+        let (_d, r) = doc(
+            "<html><head><title>A Plain Doc Heading Word Five</title></head>\
+             <body></body></html>",
+        );
+        let md = get_article_metadata(&r, &JsonLd::default());
+        assert_eq!(md.title, "A Plain Doc Heading Word Five");
+        assert!(md.byline.is_none());
+        assert!(md.excerpt.is_none());
+        assert!(md.site_name.is_none());
+        assert!(md.published_time.is_none());
+    }
+
+    // ---- `_getJSONLD` (Readability.js:1632-1747) ----
+
+    #[test]
+    fn jsonld_picks_first_article_object() {
+        // First script that parses to an Article-class object wins; later
+        // scripts are ignored.
+        let html = r#"<html><head>
+            <script type="application/ld+json">
+                {"@context":"https://schema.org","@type":"Article",
+                 "name":"First","author":{"name":"Alice"},
+                 "description":"desc",
+                 "publisher":{"name":"Pub"},
+                 "datePublished":"2024-01-01"}
+            </script>
+            <script type="application/ld+json">
+                {"@context":"https://schema.org","@type":"Article",
+                 "name":"Second"}
+            </script>
+            </head><body></body></html>"#;
+        let (_d, r) = doc(html);
+        let ld = get_json_ld(&r);
+        assert_eq!(ld.title.as_deref(), Some("First"));
+        assert_eq!(ld.byline.as_deref(), Some("Alice"));
+        assert_eq!(ld.excerpt.as_deref(), Some("desc"));
+        assert_eq!(ld.site_name.as_deref(), Some("Pub"));
+        assert_eq!(ld.date_published.as_deref(), Some("2024-01-01"));
+    }
+
+    #[test]
+    fn jsonld_at_graph_resolution_finds_article_in_graph() {
+        // The @graph case: top-level has no @type but a @graph array — find
+        // the first Article in the graph (`Readability.js:1674-1678`).
+        let html = r#"<html><head>
+            <script type="application/ld+json">
+            {"@context":"https://schema.org",
+             "@graph":[
+                {"@type":"WebSite","name":"site"},
+                {"@type":"NewsArticle","name":"From Graph",
+                 "author":{"name":"Bob"}}
+             ]}
+            </script></head><body></body></html>"#;
+        let (_d, r) = doc(html);
+        let ld = get_json_ld(&r);
+        assert_eq!(ld.title.as_deref(), Some("From Graph"));
+        assert_eq!(ld.byline.as_deref(), Some("Bob"));
+    }
+
+    #[test]
+    fn jsonld_at_graph_no_article_skips_to_next_script() {
+        // First script's @graph has no Article-type entry — JS would `return`
+        // from the forEachNode callback (continue to next script). Next script
+        // provides an Article.
+        let html = r#"<html><head>
+            <script type="application/ld+json">
+            {"@context":"https://schema.org","@graph":[{"@type":"WebSite","name":"site"}]}
+            </script>
+            <script type="application/ld+json">
+            {"@context":"https://schema.org","@type":"BlogPosting","name":"Recovered"}
+            </script>
+            </head><body></body></html>"#;
+        let (_d, r) = doc(html);
+        let ld = get_json_ld(&r);
+        assert_eq!(ld.title.as_deref(), Some("Recovered"));
+    }
+
+    #[test]
+    fn jsonld_context_object_with_at_vocab_schema_org() {
+        // @context can be an object with @vocab: schema.org — accepted per
+        // Readability.js:1666-1668.
+        let html = r#"<html><head>
+            <script type="application/ld+json">
+            {"@context":{"@vocab":"https://schema.org/"},"@type":"Article",
+             "name":"Vocab-Ctx Article"}
+            </script></head><body></body></html>"#;
+        let (_d, r) = doc(html);
+        let ld = get_json_ld(&r);
+        assert_eq!(ld.title.as_deref(), Some("Vocab-Ctx Article"));
+    }
+
+    #[test]
+    fn jsonld_array_root_finds_article_inside() {
+        // Top-level array — Readability.js:1650-1660. find() picks the first
+        // Article-class object.
+        let html = r#"<html><head>
+            <script type="application/ld+json">
+            [{"@type":"WebSite","@context":"https://schema.org"},
+             {"@context":"https://schema.org","@type":"Article","name":"In Array"}]
+            </script></head><body></body></html>"#;
+        let (_d, r) = doc(html);
+        let ld = get_json_ld(&r);
+        assert_eq!(ld.title.as_deref(), Some("In Array"));
+    }
+
+    #[test]
+    fn jsonld_non_schema_org_context_skipped() {
+        // Readability.js:1670-1672: non-schema.org context => return (skip).
+        // No qualifying JSON-LD => empty JsonLd.
+        let html = r#"<html><head>
+            <script type="application/ld+json">
+            {"@context":"http://example.com/ns","@type":"Article","name":"Should be ignored"}
+            </script></head><body></body></html>"#;
+        let (_d, r) = doc(html);
+        let ld = get_json_ld(&r);
+        assert!(ld.title.is_none(), "got {:?}", ld.title);
+    }
+
+    #[test]
+    fn jsonld_malformed_json_swallowed_does_not_block_subsequent() {
+        // Readability.js:1741-1743 catches errors silently. Malformed JSON-LD
+        // in one script does not prevent a valid one later from winning.
+        let html = r#"<html><head>
+            <script type="application/ld+json">{not valid json</script>
+            <script type="application/ld+json">
+              {"@context":"https://schema.org","@type":"Article","name":"Recovered"}
+            </script></head><body></body></html>"#;
+        let (_d, r) = doc(html);
+        let ld = get_json_ld(&r);
+        assert_eq!(ld.title.as_deref(), Some("Recovered"));
+    }
+
+    #[test]
+    fn jsonld_strips_cdata_markers() {
+        // Readability.js:1644-1647 — strip `<![CDATA[` / `]]>` markers.
+        let html = "<html><head><script type=\"application/ld+json\"><![CDATA[\n\
+            {\"@context\":\"https://schema.org\",\"@type\":\"Article\",\"name\":\"CDATAd\"}\n\
+            ]]></script></head><body></body></html>";
+        let (_d, r) = doc(html);
+        let ld = get_json_ld(&r);
+        assert_eq!(ld.title.as_deref(), Some("CDATAd"));
+    }
+
+    #[test]
+    fn jsonld_authors_array_joined_with_comma() {
+        // Readability.js:1717-1729: author array of {name} -> "n1, n2, n3".
+        let html = r#"<html><head>
+            <script type="application/ld+json">
+            {"@context":"https://schema.org","@type":"Article",
+             "author":[{"name":"Alice"},{"name":"Bob"},{"name":"Carol"}],
+             "name":"Co-Authored"}
+            </script></head><body></body></html>"#;
+        let (_d, r) = doc(html);
+        let ld = get_json_ld(&r);
+        assert_eq!(ld.byline.as_deref(), Some("Alice, Bob, Carol"));
+    }
+
+    #[test]
+    fn jsonld_name_and_headline_differ_similarity_picks_one() {
+        // Readability.js:1690-1708: when both present and differ, do
+        // similarity tie-break vs _getArticleTitle. doc.title is "Real
+        // Headline Goes Long Enough" (5 words, >4). With the headline JSON-LD
+        // matching it closely and name differing, we expect headline wins.
+        let html = r#"<html><head>
+            <title>Real Headline Goes Long Enough</title>
+            <script type="application/ld+json">
+            {"@context":"https://schema.org","@type":"Article",
+             "name":"Site Brand Name Here Now",
+             "headline":"Real Headline Goes Long Enough"}
+            </script></head><body></body></html>"#;
+        let (_d, r) = doc(html);
+        let ld = get_json_ld(&r);
+        // Both present, differ. Similarity(name, title) low; similarity
+        // (headline, title) 1.0 > 0.75; so headlineMatches && !nameMatches
+        // => metadata.title = parsed.headline (`:1704-1705`).
+        assert_eq!(
+            ld.title.as_deref(),
+            Some("Real Headline Goes Long Enough"),
+            "got {:?}",
+            ld.title
+        );
+    }
+
+    #[test]
+    fn jsonld_empty_or_no_script_returns_empty() {
+        let (_d, r) = doc("<html><head></head><body></body></html>");
+        let ld = get_json_ld(&r);
+        assert!(ld.title.is_none());
+        assert!(ld.byline.is_none());
+    }
+
+    // ---- `_unescapeHtmlEntities` (Readability.js:1605-1625) ----
+
+    #[test]
+    fn unescape_named_entities() {
+        assert_eq!(unescape_html_entities("a &amp; b"), "a & b");
+        assert_eq!(unescape_html_entities("&lt;tag&gt;"), "<tag>");
+        assert_eq!(unescape_html_entities("&quot;hi&quot;"), r#""hi""#);
+        assert_eq!(unescape_html_entities("&apos;"), "'");
+    }
+
+    #[test]
+    fn unescape_numeric_decimal_and_hex() {
+        assert_eq!(unescape_html_entities("&#65;"), "A"); // 65 = 'A'
+        assert_eq!(unescape_html_entities("&#x41;"), "A");
+        assert_eq!(unescape_html_entities("&#x1F600;"), "\u{1F600}"); // 😀
+    }
+
+    #[test]
+    fn unescape_invalid_codepoints_replaced_by_fffd() {
+        // 0, surrogate, and >0x10FFFF map to U+FFFD per :1619-1620.
+        assert_eq!(unescape_html_entities("&#0;"), "\u{FFFD}");
+        assert_eq!(unescape_html_entities("&#xD800;"), "\u{FFFD}");
+        assert_eq!(unescape_html_entities("&#x110000;"), "\u{FFFD}");
+    }
+
+    #[test]
+    fn unescape_lone_ampersand_left_alone() {
+        // No recognised name/numeric form -> verbatim '&'.
+        assert_eq!(unescape_html_entities("a & b"), "a & b");
+        assert_eq!(unescape_html_entities("&notreal;"), "&notreal;");
+    }
+
+    #[test]
+    fn unescape_empty_input_unchanged() {
+        assert_eq!(unescape_html_entities(""), "");
+    }
+
+    #[test]
+    fn unescape_preserves_utf8_multibyte() {
+        // Naïve byte iteration would corrupt multibyte UTF-8. Test passes
+        // through verbatim.
+        assert_eq!(unescape_html_entities("héllo &amp; wörld"), "héllo & wörld");
+        assert_eq!(
+            unescape_html_entities("中文 &lt;a&gt; 中文"),
+            "中文 <a> 中文"
+        );
+    }
+
+    // ---- `_isUrl` (Readability.js:441-448) ----
+
+    #[test]
+    fn is_url_like_recognises_schemes() {
+        assert!(is_url_like("https://example.com"));
+        assert!(is_url_like("http://example.com"));
+        assert!(is_url_like("mailto:a@b"));
+        // No scheme -> false.
+        assert!(!is_url_like("just a name"));
+        assert!(!is_url_like("Jane Doe"));
+        // Leading non-letter -> false (URL scheme must start with letter).
+        assert!(!is_url_like("1http://x"));
+    }
+
+    // ---- canonical_url ----
+
+    #[test]
+    fn canonical_url_picks_link_rel_canonical_href() {
+        let (_d, r) = doc(r#"<html><head>
+                <link rel="canonical" href="https://example.com/canon">
+               </head><body></body></html>"#);
+        assert_eq!(
+            canonical_url(&r).as_deref(),
+            Some("https://example.com/canon")
+        );
+    }
+
+    #[test]
+    fn canonical_url_none_when_absent_or_empty() {
+        let (_d, r) = doc("<html><head></head><body></body></html>");
+        assert!(canonical_url(&r).is_none());
+
+        let (_d, r) =
+            doc(r#"<html><head><link rel="canonical" href=""></head><body></body></html>"#);
+        assert!(canonical_url(&r).is_none());
+    }
+
+    // ---- html_lang ----
+
+    #[test]
+    fn html_lang_returns_html_element_lang_attr() {
+        // Production calls `html_lang(&doc.document())` (the Document, not
+        // the <html> element — see `Readability::parse`); `doc()` returns
+        // `root_element()` = the <html> itself, so a descendant search for
+        // "html" returns []. Use `dom.document()` for the production-shape
+        // root in this test.
+        let dom = Dom::parse(r#"<html lang="en-GB"><head></head><body></body></html>"#);
+        assert_eq!(html_lang(&dom.document()).as_deref(), Some("en-GB"));
+    }
+
+    #[test]
+    fn html_lang_none_when_attr_absent() {
+        let dom = Dom::parse("<html><head></head><body></body></html>");
+        assert!(html_lang(&dom.document()).is_none());
     }
 }

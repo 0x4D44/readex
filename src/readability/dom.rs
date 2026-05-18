@@ -721,6 +721,38 @@ const _HTML_DIV: &() = {
     &()
 };
 
+/// Serialize an element subtree to HTML — the analogue of
+/// `this._serializer(articleContent)` (`Readability.js:2772`).
+///
+/// Used by `Options.include_html` only (the default path does not request
+/// it; the serialization is NOT scored). Delegates to `html5ever::serialize`
+/// over `markup5ever_rcdom::SerializableHandle`, with `IncludeNode` so the
+/// root element appears in the output (matching the JS `_serializer` ⇒
+/// `innerHTML` shape per `Readability.js:90-99` which defaults to
+/// `el => el.innerHTML`).
+///
+/// Actually the JS default `_serializer = el => el.innerHTML` returns
+/// **children-only**, NOT the root. We mirror that with `ChildrenOnly(None)`
+/// for consistency with the JS default.
+pub fn serialize_html(node: &NodeRef) -> String {
+    use html5ever::serialize::{SerializeOpts, TraversalScope, serialize};
+    use markup5ever_rcdom::SerializableHandle;
+
+    let mut buf: Vec<u8> = Vec::new();
+    let handle: SerializableHandle = node.clone().into();
+    let opts = SerializeOpts {
+        scripting_enabled: false,
+        traversal_scope: TraversalScope::ChildrenOnly(None),
+        create_missing_parent: false,
+    };
+    // `serialize` never fails for an in-memory `Vec<u8>`; if it ever does
+    // (a downstream regression), surface a debug-only empty string and let
+    // tests catch it loudly. The serialized HTML is NOT scored, so a runtime
+    // panic here would be worse than an empty string.
+    let _ = serialize(&mut buf, &handle, opts);
+    String::from_utf8(buf).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

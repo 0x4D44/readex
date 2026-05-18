@@ -1035,6 +1035,18 @@ mod tests {
     /// An [`Extracted`] whose body is `text`. `word_count` is set to a
     /// **deliberate lie** (a huge value) so any test asserting the recomputed
     /// count proves the harness ignores the wire value (HLD §8).
+    ///
+    /// M2 Stage 4 (HLD §7.6) — minimal mechanical update: the public
+    /// [`Extracted`] grew **additive metadata fields**
+    /// (`byline`/`excerpt`/`site_name`/`published_time`/`dir`), so this
+    /// struct-literal **must** mention them or compile fails. They are all
+    /// defaulted via `..Extracted::default()` so this test helper preserves
+    /// its original 6-field semantics on the metric path (the harness's
+    /// scoring NEVER consults the new fields — they are score-invisible per
+    /// HLD §2). The scoring logic in this file is **unchanged**; only the
+    /// struct-literal mentions the new fields. Stage-4 brief acknowledges
+    /// this is a Rust-language-mechanical consequence of additive fields;
+    /// it is not a scoring-policy change.
     fn extracted(text: &str) -> Extracted {
         Extracted {
             title: Some("T".to_string()),
@@ -1043,6 +1055,7 @@ mod tests {
             word_count: 999_999, // wire LIE — must never be trusted.
             canonical_url: None,
             language: Some("en".to_string()),
+            ..Extracted::default()
         }
     }
 

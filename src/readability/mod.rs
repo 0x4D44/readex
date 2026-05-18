@@ -38,21 +38,54 @@ pub mod scoring;
 use dom::{Dom, NodeRef, text_content};
 use helpers::Flags;
 
-/// The article produced by [`Readability::parse`] — the Stage-1a subset of
-/// Readability's return object (`Readability.js:2767-2778`).
+/// The article produced by [`Readability::parse`] — Readability's return
+/// object (`Readability.js:2767-2778`), Stage-4 populated.
 ///
-/// Stage 1a populates `title` (`this._articleTitle`) and `text_content`
-/// (`articleContent.textContent`, the harness-scored field — HLD §2). The
-/// other metadata fields (`byline`, `dir`, `lang`, `excerpt`, `siteName`,
-/// `publishedTime`, serialized `content`) are **Stage 4** (HLD §7.6) and are
-/// deliberately absent here, not stubbed with speculative values.
+/// Stage 1a populated `title` + `text_content`. Stage 4 (HLD §7.6) adds the
+/// remaining non-body metadata (`byline`, `excerpt`, `site_name`,
+/// `published_time`, `dir`, `lang`, optionally the serialized `content`) —
+/// **NOT scored** (HLD §2 score-invisible partition) but mandatory API per the
+/// brief. Every field is `Option<String>` except `title` and `text_content`
+/// which are always present (faithful to JS where `_articleTitle` is always a
+/// string and `textContent` is always defined).
 pub struct Article {
-    /// `this._articleTitle` (`Readability.js:2768`).
+    /// `this._articleTitle` (`Readability.js:2768`). Always present (the
+    /// final `_getArticleTitle` fallback at `Readability.js:1815` ensures
+    /// non-empty `metadata.title`).
     pub title: String,
     /// `articleContent.textContent` (`Readability.js:2766` / `:2773`) — the
     /// raw WHATWG `Node.textContent` of the final article node. **This is the
     /// field the differential harness scores** (HLD §2).
     pub text_content: String,
+    /// `metadata.byline || this._articleByline` (`Readability.js:2769`).
+    /// `None` when both are `undefined`.
+    pub byline: Option<String>,
+    /// `this._articleDir` (`Readability.js:2770`) — the `dir` attribute from
+    /// an ancestor of the final top candidate (`Readability.js:1579-1593`).
+    /// `None` when none of the ancestors carry `dir`.
+    pub dir: Option<String>,
+    /// `this._articleLang` (`Readability.js:2771`) — the `<html lang>`
+    /// attribute. `None` when absent.
+    pub lang: Option<String>,
+    /// `metadata.excerpt` (`Readability.js:2775`) with the JS-side
+    /// first-`<p>` fallback (`Readability.js:2759-2763`). `None` when both
+    /// the metadata source and the first-paragraph fallback yield nothing.
+    pub excerpt: Option<String>,
+    /// `metadata.siteName || this._articleSiteName` (`Readability.js:2776`).
+    /// `_articleSiteName` is constructor-defaulted to `null` and never
+    /// reassigned in the spec (`Readability.js:44`), so this is purely the
+    /// metadata-side value.
+    pub site_name: Option<String>,
+    /// `metadata.publishedTime` (`Readability.js:2777`).
+    pub published_time: Option<String>,
+    /// `<link rel="canonical">` href — not a Readability metadata field per
+    /// se but the crate's `Extracted.canonical_url` slot (declared and
+    /// previously un-populated; Stage 4 fills it from the obvious source).
+    pub canonical_url: Option<String>,
+    /// Serialized `articleContent` HTML — populated only when the caller
+    /// asked for it via `Options.include_html`. `None` otherwise (faithful
+    /// to the opt-in shape).
+    pub content_html: Option<String>,
 }
 
 /// The `Readability` instance (`Readability.js:27-109` constructor +
@@ -73,6 +106,11 @@ pub struct Readability {
     /// (`Readability.js`'s `pageCacheHtml` analogue under the HLD §m-3
     /// re-parse decision).
     html: String,
+    /// Stage-4 (HLD §7.6) opt-in: when `true`, eagerly serialize each
+    /// attempt's `articleContent` for [`Article::content_html`]. Default
+    /// `false` so the harness path and existing consumers see no extra work
+    /// (the default-`extract` byte-identity invariant).
+    include_html: bool,
 }
 
 impl Readability {
@@ -91,7 +129,18 @@ impl Readability {
     pub fn new_from_html(html: &str) -> Self {
         Readability {
             html: html.to_string(),
+            include_html: false,
         }
+    }
+
+    /// Stage 4 (HLD §7.6) — opt-in `include_html` builder. When `true` the
+    /// per-attempt closure eagerly serializes `articleContent` so the
+    /// `Article.content_html` can carry the JS `_serializer(articleContent)`
+    /// analogue (`Readability.js:2772`). Default is `false`; the harness path
+    /// uses the default and is therefore byte-identical to Stage 3.
+    pub fn include_html(mut self, on: bool) -> Self {
+        self.include_html = on;
+        self
     }
 
     /// `parse()` (`Readability.js:2721-2779`) — **Stage-1a/1b/1c slice**.
@@ -130,42 +179,68 @@ impl Readability {
     /// caller maps `None` to an empty `Ok` (Bug-E2 — HLD §7.1).
     pub fn parse(self) -> Option<Article> {
         let html = self.html;
+        let include_html = self.include_html;
 
-        // The metadata title is **attempt-invariant**: `_getArticleMetadata`/
-        // `_getArticleTitle` read `<title>`/`<meta>`, which the pre-grab
-        // pipeline does NOT remove (`_removeScripts` drops `<script>`/
-        // `<noscript>`; `_prepDocument` strips `<style>`, retags `<font>`,
-        // replaces `<br>` runs — none touch `<head>`/`<title>`/`<meta>`).
-        // Re-parse is deterministic, so every attempt computes the SAME
-        // title. Compute it once here for `Article.title`, running the SAME
-        // pre-title pipeline the JS runs before `_getArticleMetadata`
-        // (`Readability.js:2739` `_removeScripts` → `:2741` `_prepDocument`
-        // → `:2743` `_getArticleMetadata`) so this is byte-identical to each
-        // attempt's internal title BY CONSTRUCTION, not merely by argument.
-        // Each attempt still recomputes it (identical value) for
-        // `_headerDuplicatesTitle` on its own fresh tree.
-        let article_title = {
+        // Stage 4 (HLD §7.6) — full pre-grab metadata (JSON-LD +
+        // `_getArticleMetadata`). The JS does this ONCE before
+        // `_grabArticle` (`Readability.js:2733-2745`); the retry loop does
+        // not re-compute it (the pre-grab pipeline does not mutate
+        // `<title>`/`<meta>`/`<script type="application/ld+json">`, so
+        // re-computing each attempt is identical anyway).
+        //
+        // The same pre-grab pipeline used by each attempt must run BEFORE
+        // metadata (RJS line ordering: unwrap noscript → JSON-LD → remove
+        // scripts → prep document → metadata). JSON-LD reads `<script
+        // type="application/ld+json">` so it MUST happen before
+        // `_removeScripts`.
+        let metadata_pre = {
             let mut doc = Dom::parse(&html);
             let doc_root = doc.document();
-            // _unwrapNoscriptImages(this._doc)  (Readability.js:2733) — must
-            // run BEFORE _removeScripts (`:2739`) drops `<noscript>` and
-            // BEFORE _prepDocument (`:2741`). The title path runs the same
-            // pre-grab pipeline as the attempt closure (HLD §m-3); inserting
-            // this call here is title-invariant (the function only touches
-            // `<img>`/`<noscript>` subtrees, never `<title>`/`<meta>`) but
-            // kept BY CONSTRUCTION identical to the attempt closure so any
-            // future divergence is structurally visible.
             prep::unwrap_noscript_images(&doc_root);
+            // 2736 jsonLd = _getJSONLD(doc) BEFORE _removeScripts at 2739.
+            let jsonld = metadata::get_json_ld(&doc_root);
+            // 2739 _removeScripts (now safe — JSON-LD already read).
             prep::remove_scripts(&doc_root);
+            // 2741 _prepDocument().
             let body = doc.body();
             prep::prep_document(&mut doc, &doc_root, body.as_ref());
-            metadata::get_article_metadata_title(&doc_root)
+            // 2743 metadata = _getArticleMetadata(jsonLd).
+            let md = metadata::get_article_metadata(&doc_root, &jsonld);
+            // Crate-specific (NOT a Readability return field): canonical
+            // URL + html-lang. Read from the same post-prep tree so the
+            // single pre-grab pass produces all of them.
+            let canonical = metadata::canonical_url(&doc_root);
+            let lang = metadata::html_lang(&doc_root);
+            PreGrabMetadata {
+                title: md.title.clone(),
+                byline: md.byline,
+                excerpt: md.excerpt,
+                site_name: md.site_name,
+                published_time: md.published_time,
+                canonical_url: canonical,
+                lang,
+            }
         };
+        let article_title = metadata_pre.title.clone();
+
+        // Stage 4 (HLD §7.6): byline detection's JS gate is
+        // `!_articleByline && !_metadata.byline` (`Readability.js:1082-1085`).
+        // Pre-seeding `byline_found = true` when metadata.byline is already
+        // populated SHORT-CIRCUITS the in-tree byline-detect — score-
+        // affecting, faithful to the JS double-gate. The same flag is
+        // threaded across retry attempts (mirrors `this._articleByline`
+        // persisting across the retry — it's instance state, not per-attempt).
+        let metadata_byline = metadata_pre.byline.clone();
+        let mut byline_found_state = metadata_byline.is_some();
+        let mut byline_text_state: Option<String> = metadata_byline.clone();
 
         // One attempt = the JS `while (true)` body (Readability.js:1045-1545):
         // re-parse → _removeScripts → _prepDocument → title → _grabArticle →
         // _prepArticle → capture textContent + _getInnerText length.
-        let attempt = |flags: &Flags| -> Option<grab_article::AttemptOutcome> {
+        let attempt = |flags: &Flags,
+                       byline_found: &mut bool,
+                       byline_text: &mut Option<String>|
+         -> Option<grab_article::AttemptOutcome> {
             // re-parse the ORIGINAL bytes (HLD §m-3). A fresh Dom ⇒ fresh
             // tree + fresh empty Rc-keyed side tables (ABA-safe — HLD §5.1).
             let mut doc = Dom::parse(&html);
@@ -191,70 +266,110 @@ impl Readability {
 
             // metadata.title (Readability.js:2743-2745) — feeds
             // _headerDuplicatesTitle on the scored path (HLD §7.1 / M-4).
-            let article_title = metadata::get_article_metadata_title(&doc_root);
+            let article_title_local = metadata::get_article_metadata_title(&doc_root);
 
-            // articleContent = this._grabArticle()  (Readability.js:2747).
-            // No <body> ⇒ _grabArticle returns null ⇒ parse() returns null
-            // (Readability.js:2748-2750) — propagated as None (NOT an
-            // _attempts push; 1551 is only reached when articleContent exists
-            // but is too short).
-            //
-            // **Stage 2 ORDER**: `grab_article` now runs `_prepArticle`
-            // INTERNALLY (Readability.js:1512) **before** the page-wrap
-            // (`Readability.js:1517-1532`) — the JS order. Stage 1c's swap
-            // (page-wrap → `_prepArticle` in this closure) was retired
-            // because the full Stage-2 `_cleanConditionally`'s
-            // `_hasAncestorTag(node, "code", maxDepth=3)` is no longer
-            // ancestor-level-invariant under the extra page-wrap div (see
-            // the order-fidelity note in `grab_article`).
             let body = doc.body()?;
-            let mut byline_found = false;
             let grab = grab_article::grab_article(
                 &mut doc,
                 &doc_root,
                 &body,
-                &article_title,
+                &article_title_local,
                 flags,
-                &mut byline_found,
+                byline_found,
+                byline_text,
             )?;
             let article_content = grab.article_content;
+            // grab.article_byline is whatever the in-tree detector set THIS
+            // attempt; it has already been folded into `*byline_text` via
+            // the &mut borrow on the byline-detect arm. We do NOT re-assign
+            // here (an attempt's byline-detect may not fire on retry; that
+            // is faithful — the JS keeps the first attempt's byline).
+            let attempt_dir = grab.article_dir;
 
             // Readability.js:2754 _postProcessContent(articleContent) — the
-            // text-affecting portion ported at Stage 3 (HLD §7.5). The JS body
-            // is (a) _fixRelativeUris (attribute-only, score-invisible), (b)
-            // _simplifyNestedElements (structural — text_content-invariant
-            // because it only moves children up; see prep::simplify_nested_elements
-            // doc), (c) _cleanClasses (attribute-only, score-invisible). The
-            // attribute halves remain deferred (HLD §2); the structural half
-            // is run here. Calling this is text_content-invariant by
-            // construction but the SHAPE of the article tree converges to
-            // RJS's, which matters for any future stage that reads the tree
-            // (Stage 4 metadata excerpt etc.).
+            // text-affecting portion ported at Stage 3 (HLD §7.5).
             prep::post_process_content(&article_content);
 
             // 1545 textLength = _getInnerText(articleContent, true).length;
-            // 2766 textContent = articleContent.textContent. Capture BOTH
+            // 2766 textContent = articleContent.textContent. Capture
             // eagerly as owned values (this attempt's `doc` drops at closure
             // return; the retry driver must not hold a node from it — HLD
             // §m-3 ABA).
             let inner_text_len = scoring::inner_text_len(&article_content);
             let text_content = text_content(&article_content);
+
+            // Stage 4 metadata captures, eagerly while the tree is alive:
+            // (a) first <p>'s textContent.trim() for excerpt fallback
+            //     (`Readability.js:2759-2763`);
+            // (b) `_serializer(articleContent)` when `include_html`
+            //     requested (`Readability.js:2772`).
+            let first_paragraph_excerpt = {
+                use crate::readability::dom::get_elements_by_tag_name;
+                let ps = get_elements_by_tag_name(&article_content, "p");
+                ps.first().and_then(|p| {
+                    let t = dom::text_content(p);
+                    let t = t.trim().to_string();
+                    if t.is_empty() { None } else { Some(t) }
+                })
+            };
+            let serialized_html = if include_html {
+                Some(dom::serialize_html(&article_content))
+            } else {
+                None
+            };
+
             Some(grab_article::AttemptOutcome {
                 text_content,
                 inner_text_len,
+                first_paragraph_excerpt,
+                serialized_html,
+                article_dir: attempt_dir,
             })
         };
 
         // The Stage-1c retry/flag-sieve/fallback loop (Readability.js:1043,
         // 1546-1576) drives `attempt`. Returns the chosen articleContent's
-        // textContent, or None (every attempt empty / no <body>).
-        let result = grab_article::grab_article_with_retry(attempt)?;
+        // captured metadata, or None (every attempt empty / no <body>).
+        let result = grab_article::grab_article_with_retry(|flags| {
+            attempt(flags, &mut byline_found_state, &mut byline_text_state)
+        })?;
+
+        // 2759-2763 metadata.excerpt = metadata.excerpt || first_paragraph.
+        let final_excerpt = metadata_pre.excerpt.or(result.first_paragraph_excerpt);
+
+        // 2769 byline: metadata.byline || this._articleByline.
+        // - metadata_byline is the pre-grab metadata byline (if any);
+        // - byline_text_state is what the in-tree byline-detect captured
+        //   (only fires when metadata.byline was None — gated above);
+        //   it is also pre-seeded to metadata_byline so the simpler
+        //   "first non-None" reduces to the JS precedence.
+        let final_byline = metadata_byline.or(byline_text_state);
 
         Some(Article {
             title: article_title,
             text_content: result.text_content,
+            byline: final_byline,
+            dir: result.article_dir,
+            lang: metadata_pre.lang,
+            excerpt: final_excerpt,
+            site_name: metadata_pre.site_name,
+            published_time: metadata_pre.published_time,
+            canonical_url: metadata_pre.canonical_url,
+            content_html: result.serialized_html,
         })
     }
+}
+
+/// The pre-grab metadata bundle (`_getArticleMetadata` + crate-specific
+/// canonical/lang) computed once before the retry loop.
+struct PreGrabMetadata {
+    title: String,
+    byline: Option<String>,
+    excerpt: Option<String>,
+    site_name: Option<String>,
+    published_time: Option<String>,
+    canonical_url: Option<String>,
+    lang: Option<String>,
 }
 
 #[cfg(test)]
