@@ -17,10 +17,12 @@
 //! | [`helpers`] | `_isProbablyVisible` / `_isPhrasingContent` / `_getNextNode` / … | **Stage 1a** |
 //! | [`metadata`] | `_getArticleTitle` + title half of `_getArticleMetadata` | **Stage 1a** |
 //!
-//! Stage 1a wires `extract_with` → parse → [`Readability::new`]`.`[`parse`](Readability::parse)
-//! → `Option<Article>` → `Result<Extracted, _>` (HLD §7.1). Later-stage
-//! functions (sibling-append, `_cleanConditionally`, full metadata, …) remain
-//! unported and are added in their scheduled stages.
+//! `extract_with` wires → parse →
+//! [`Readability::new_from_html`]`.`[`parse`](Readability::parse) →
+//! `Option<Article>` → `Result<Extracted, _>` (HLD §7.1/§7.3). Sibling-append
+//! (Stage 1b) and the retry/flag-sieve loop (Stage 1c) are ported;
+//! `_cleanConditionally`/`_markDataTables` (Stage 2) and full non-body
+//! metadata (Stage 4) remain unported and are added in their scheduled stages.
 
 pub mod dom;
 pub mod grab_article;
@@ -51,107 +53,188 @@ pub struct Article {
 }
 
 /// The `Readability` instance (`Readability.js:27-109` constructor +
-/// `Readability.prototype`). Stage-1a fields only.
+/// `Readability.prototype`).
 ///
-/// `_doc` is the parsed [`Dom`]; `_articleTitle` is resolved before
-/// `_grabArticle` (HLD §7.1 / supervisor M-4). `_flags` starts with all flags
-/// set (`Readability.js:69-72`). The Stage-1a `parse()` runs **one** grab pass
-/// (no retry/flag-sieve loop — that is Stage 1c, HLD §7.3).
+/// Holds the **original HTML bytes** because Stage-1c's retry loop re-parses
+/// them per attempt (HLD §m-3): the JS resets `page.innerHTML = pageCacheHtml`
+/// (`Readability.js:1043`/`1549`, the *post-`_prepDocument`* body) and re-runs
+/// `_grabArticle`; re-parsing the original bytes and re-running the
+/// deterministic pre-grab pipeline (`_removeScripts` + `_prepDocument`)
+/// reconstructs the identical post-prep tree without deep-cloning the
+/// `Rc`-keyed score side-tables (a fresh ABA surface — HLD §5.1). `_doc` /
+/// `_flags` / `_articleByline` are therefore **per-attempt** state (a fresh
+/// `Dom` + freshly-cleared `Flags` each attempt), owned inside the attempt
+/// closure, not on this struct.
 pub struct Readability {
-    doc: Dom,
-    article_title: String,
-    flags: Flags,
-    /// `this._articleByline` "found?" — Readability-instance state
-    /// (`Readability.js:42`), threaded into `_grabArticle` (the byline-node
-    /// removal is score-affecting; the stored string is Stage-4 metadata).
-    article_byline_found: bool,
+    /// The original HTML, owned so each retry attempt can re-parse it
+    /// (`Readability.js`'s `pageCacheHtml` analogue under the HLD §m-3
+    /// re-parse decision).
+    html: String,
 }
 
 impl Readability {
     /// `new Readability(doc, options)` (`Readability.js:27-109`).
     ///
-    /// Stage 1a uses default options only (`Options` knobs like
-    /// `nbTopCandidates` / `charThreshold` are Stage-4 additive — HLD §7.6),
-    /// so this takes just the parsed document. `_flags` = all set
-    /// (`Readability.js:69-72`).
-    pub fn new(doc: Dom) -> Self {
+    /// Stage 1a/1b took a pre-parsed [`Dom`]; Stage 1c needs to re-parse per
+    /// retry attempt (HLD §m-3), so it takes the original HTML and parses
+    /// internally (each attempt re-parses it). Kept as the same one-argument
+    /// constructor shape via [`Readability::new_from_html`]; the old
+    /// `new(Dom)` form is retained for the existing in-crate test call sites
+    /// (it re-serialises is unnecessary — those tests parse then hand the
+    /// `Dom` straight in; Stage 1c re-parses from the HTML string instead, so
+    /// the public crate entry is [`new_from_html`](Self::new_from_html)).
+    /// Default `Options` only (`charThreshold` etc. are Stage-4 additive — HLD
+    /// §7.6); flags start all-set per attempt (`Readability.js:69-72`).
+    pub fn new_from_html(html: &str) -> Self {
         Readability {
-            doc,
-            article_title: String::new(),
-            flags: Flags::default(),
-            article_byline_found: false,
+            html: html.to_string(),
         }
     }
 
-    /// `parse()` (`Readability.js:2721-2779`) — **Stage-1a slice (HLD §7.1)**.
+    /// `parse()` (`Readability.js:2721-2779`) — **Stage-1a/1b/1c slice**.
     ///
-    /// Ported steps, in `Readability.js` order:
-    /// * `_removeScripts(this._doc)` (`:2739`);
-    /// * `_prepDocument()` (`:2741`) — `<style>` strip, `font`→`span`,
-    ///   `_replaceBrs`;
-    /// * `this._articleTitle = metadata.title` (`:2745`) via the title half of
-    ///   `_getArticleMetadata` (`:2743`) — pulled forward (supervisor M-4)
-    ///   because it feeds `_headerDuplicatesTitle` on the scored path;
-    /// * `articleContent = this._grabArticle()` (`:2747`), Stage-1a single-pass
-    ///   (no sibling-append, no retry loop);
-    /// * the safe `_prepArticle` slice on `articleContent`
-    ///   (`Readability.js:795-799`, `:835-850` — object/embed/footer/link/
-    ///   aside `_clean` + empty-`<p>`);
-    /// * `textContent = articleContent.textContent` (`:2766`).
+    /// Ported steps, in `Readability.js` order. The pre-grab pipeline
+    /// (`_removeScripts` `:2739`, `_prepDocument` `:2741`, the title half of
+    /// `_getArticleMetadata` `:2743-2745`) plus one `_grabArticle` attempt
+    /// (`:2747`) plus the Stage-1a safe `_prepArticle` slice
+    /// (`Readability.js:795-799`, `:835-850`) plus `articleContent.textContent`
+    /// (`:2766`) form **one attempt**, run by the [`attempt`](Self::attempt)
+    /// closure. Stage-1c's [`grab_article_with_retry`] drives it: the
+    /// `textLength < _charThreshold` retry, the
+    /// `FLAG_STRIP_UNLIKELYS`→`FLAG_WEIGHT_CLASSES`→`FLAG_CLEAN_CONDITIONALLY`
+    /// flag sieve, `_attempts` bookkeeping, and the longest-attempt fallback
+    /// (`Readability.js:1043`, `1546-1576`).
     ///
-    /// **Deliberately NOT ported at Stage 1a** (HLD §7): `_unwrapNoscriptImages`
-    /// (`:2733`), `_getJSONLD` (`:2736` — so JSON-LD is `{}`),
+    /// **Re-parse per attempt (HLD §m-3).** Each attempt re-parses
+    /// `self.html`; re-running the deterministic pre-grab pipeline
+    /// reconstructs the post-`_prepDocument` tree the JS would have via
+    /// `page.innerHTML = pageCacheHtml` (`Readability.js:1549`). The title is
+    /// recomputed per attempt (it reads `<title>`/`<meta>`, which
+    /// `_prepDocument` does not remove — so it is identical every attempt;
+    /// recomputing it is simplest and faithful, not a behaviour change).
+    ///
+    /// **Deliberately NOT ported here** (HLD §7): `_unwrapNoscriptImages`
+    /// (`:2733`), `_getJSONLD` (`:2736` — JSON-LD is `{}`),
     /// `_postProcessContent` (`:2754` — score-invisible cosmetics, HLD §2),
-    /// the excerpt/byline/dir/lang/siteName/serialized-content half of the
-    /// return object (Stage 4, HLD §7.6).
+    /// `_cleanConditionally`/`_markDataTables`/`_cleanStyles`/`_cleanHeaders`
+    /// (Stage 2, HLD §7.4), the excerpt/byline/dir/lang/siteName/serialized
+    /// half of the return object (Stage 4, HLD §7.6).
     ///
-    /// Returns `None` only when `_grabArticle` returns `null`
-    /// (`Readability.js:2748-2750`). The caller maps `None` to an empty `Ok`
-    /// extraction (Bug-E2: "found nothing" is success, not error — HLD §7.1).
-    pub fn parse(mut self) -> Option<Article> {
-        // documentElement guard: `Readability.js` constructor requires
-        // `doc.documentElement`. html5ever always synthesises <html> for a
-        // full-document parse, so this is Some for every real input.
-        let doc_root: NodeRef = self.doc.document();
+    /// Returns `None` only when every attempt's `_grabArticle` returns `null`
+    /// (no `<body>` — `Readability.js:2748-2750`) or the flag sieve is
+    /// exhausted with zero text in every attempt (`Readability.js:1570`). The
+    /// caller maps `None` to an empty `Ok` (Bug-E2 — HLD §7.1).
+    pub fn parse(self) -> Option<Article> {
+        let html = self.html;
 
-        // _removeScripts(this._doc)  (Readability.js:2739)
-        prep::remove_scripts(&doc_root);
+        // The metadata title is **attempt-invariant**: `_getArticleMetadata`/
+        // `_getArticleTitle` read `<title>`/`<meta>`, which the pre-grab
+        // pipeline does NOT remove (`_removeScripts` drops `<script>`/
+        // `<noscript>`; `_prepDocument` strips `<style>`, retags `<font>`,
+        // replaces `<br>` runs — none touch `<head>`/`<title>`/`<meta>`).
+        // Re-parse is deterministic, so every attempt computes the SAME
+        // title. Compute it once here for `Article.title`, running the SAME
+        // pre-title pipeline the JS runs before `_getArticleMetadata`
+        // (`Readability.js:2739` `_removeScripts` → `:2741` `_prepDocument`
+        // → `:2743` `_getArticleMetadata`) so this is byte-identical to each
+        // attempt's internal title BY CONSTRUCTION, not merely by argument.
+        // Each attempt still recomputes it (identical value) for
+        // `_headerDuplicatesTitle` on its own fresh tree.
+        let article_title = {
+            let mut doc = Dom::parse(&html);
+            let doc_root = doc.document();
+            prep::remove_scripts(&doc_root);
+            let body = doc.body();
+            prep::prep_document(&mut doc, &doc_root, body.as_ref());
+            metadata::get_article_metadata_title(&doc_root)
+        };
 
-        // _prepDocument()  (Readability.js:2741)
-        let body = self.doc.body();
-        prep::prep_document(&mut self.doc, &doc_root, body.as_ref());
+        // One attempt = the JS `while (true)` body (Readability.js:1045-1545):
+        // re-parse → _removeScripts → _prepDocument → title → _grabArticle →
+        // _prepArticle → capture textContent + _getInnerText length.
+        let attempt = |flags: &Flags| -> Option<grab_article::AttemptOutcome> {
+            // re-parse the ORIGINAL bytes (HLD §m-3). A fresh Dom ⇒ fresh
+            // tree + fresh empty Rc-keyed side tables (ABA-safe — HLD §5.1).
+            let mut doc = Dom::parse(&html);
+            let doc_root: NodeRef = doc.document();
 
-        // metadata = _getArticleMetadata(jsonLd={}); this._articleTitle =
-        // metadata.title  (Readability.js:2743-2745). Title pulled forward
-        // (HLD §7.1 / M-4): it feeds _headerDuplicatesTitle on the scored path.
-        self.article_title = metadata::get_article_metadata_title(&doc_root);
+            // _removeScripts(this._doc)  (Readability.js:2739)
+            prep::remove_scripts(&doc_root);
 
-        // articleContent = this._grabArticle()  (Readability.js:2747)
-        let body = self.doc.body()?; // no <body> ⇒ no article (return null)
-        let grab = grab_article::grab_article(
-            &mut self.doc,
-            &doc_root,
-            &body,
-            &self.article_title,
-            &self.flags,
-            &mut self.article_byline_found,
-        )?;
-        let article_content = grab.article_content;
+            // _prepDocument()  (Readability.js:2741). Re-running this on the
+            // re-parsed bytes reconstructs the post-prep tree the JS would
+            // have after `page.innerHTML = pageCacheHtml` (HLD §m-3).
+            let body = doc.body();
+            prep::prep_document(&mut doc, &doc_root, body.as_ref());
 
-        // _prepArticle(articleContent) — Stage-1a safe slice only
-        // (Readability.js:795-799 + 835-850; NOT _cleanConditionally /
-        // _markDataTables / _cleanStyles / _cleanHeaders — Stage 2, HLD §7.4).
-        prep::prep_article_stage1a(&article_content);
+            // metadata.title (Readability.js:2743-2745) — feeds
+            // _headerDuplicatesTitle on the scored path (HLD §7.1 / M-4).
+            let article_title = metadata::get_article_metadata_title(&doc_root);
 
-        // (Readability.js:2754 _postProcessContent is score-invisible cosmetics
-        // — HLD §2 score-invisible partition — and is NOT run at Stage 1a.)
+            // articleContent = this._grabArticle()  (Readability.js:2747).
+            // No <body> ⇒ _grabArticle returns null ⇒ parse() returns null
+            // (Readability.js:2748-2750) — propagated as None (NOT an
+            // _attempts push; 1551 is only reached when articleContent exists
+            // but is too short).
+            let body = doc.body()?;
+            let mut byline_found = false;
+            let grab = grab_article::grab_article(
+                &mut doc,
+                &doc_root,
+                &body,
+                &article_title,
+                flags,
+                &mut byline_found,
+            )?;
+            let article_content = grab.article_content;
 
-        // textContent = articleContent.textContent  (Readability.js:2766)
-        let tc = text_content(&article_content);
+            // _prepArticle(articleContent) — Stage-1a safe slice
+            // (Readability.js:795-799 + 835-850). The JS runs this at 1512,
+            // INSIDE the loop, BEFORE the 1545 `_getInnerText` length test —
+            // so it must run here, per attempt, before we measure.
+            //
+            // FIDELITY NOTE — `_prepArticle` vs page-wrap order. JS order is
+            // sibling-append → `_prepArticle` (1512) → page-wrap (1517-1532) →
+            // textLength (1545). `grab_article` already applied the page-wrap
+            // (1517-1532) before returning, so here the order is
+            // sibling-append → page-wrap → `_prepArticle` → textLength — the
+            // `_prepArticle`/page-wrap pair is SWAPPED vs the JS. This is
+            // observationally identical: `prep_article_stage1a` is purely
+            // `get_all_nodes_with_tag(articleContent, …)` descendant searches
+            // (`_clean` of object/embed/footer/link/aside + empty-`<p>`
+            // removal). The page-wrap only interposes ONE extra `<div>`; it
+            // does NOT change the SET of `articleContent` descendants (same
+            // elements, one level deeper) and adds zero `#text`. So the
+            // descendant set `_prepArticle` operates on, and the resulting
+            // `text_content`, are identical regardless of which side of the
+            // page-wrap `_prepArticle` runs. (Pinned by
+            // `grab_article::tests::page_wrap_prep_article_order_invariant`.)
+            prep::prep_article_stage1a(&article_content);
+
+            // (Readability.js:2754 _postProcessContent — score-invisible
+            // cosmetics, HLD §2 — NOT run here.)
+
+            // 1545 textLength = _getInnerText(articleContent, true).length;
+            // 2766 textContent = articleContent.textContent. Capture BOTH
+            // eagerly as owned values (this attempt's `doc` drops at closure
+            // return; the retry driver must not hold a node from it — HLD
+            // §m-3 ABA).
+            let inner_text_len = scoring::inner_text_len(&article_content);
+            let text_content = text_content(&article_content);
+            Some(grab_article::AttemptOutcome {
+                text_content,
+                inner_text_len,
+            })
+        };
+
+        // The Stage-1c retry/flag-sieve/fallback loop (Readability.js:1043,
+        // 1546-1576) drives `attempt`. Returns the chosen articleContent's
+        // textContent, or None (every attempt empty / no <body>).
+        let result = grab_article::grab_article_with_retry(attempt)?;
 
         Some(Article {
-            title: self.article_title,
-            text_content: tc,
+            title: article_title,
+            text_content: result.text_content,
         })
     }
 }
@@ -164,7 +247,7 @@ mod tests {
     use super::*;
 
     fn parse(html: &str) -> Option<Article> {
-        Readability::new(Dom::parse(html)).parse()
+        Readability::new_from_html(html).parse()
     }
 
     #[test]
@@ -213,13 +296,30 @@ mod tests {
     }
 
     #[test]
-    fn parse_empty_document_returns_some_with_empty_text() {
-        // Bug-E2: a document with no content still parses to an Article whose
-        // text is empty (the body-fallback path) — "found nothing" is a valid
-        // result, NOT None/error. `parse()` returns None only on a genuine
-        // `_grabArticle` null (no <body>); a present-but-empty <body> yields
-        // the fake-div fallback ⇒ Some with empty text.
-        let a = parse("<html><body>   </body></html>").expect("Some (empty ok)");
-        assert_eq!(a.text_content.trim(), "");
+    fn parse_empty_document_returns_none_faithful_stage1c_retry_exhaustion() {
+        // FAITHFUL Stage-1c behaviour (changed from the Stage-1a/1b
+        // STOP-before-retry interim). An empty `<body>` → fake-div fallback →
+        // articleContent text length 0 < `_charThreshold` (500,
+        // `Readability.js:1546`) → push attempt + clear a flag, repeated until
+        // the flag sieve is exhausted; then `Readability.js:1564-1571` sorts
+        // `_attempts` by `textLength` desc and `if (!_attempts[0].textLength)
+        // return null;` — every attempt produced 0 chars, so `_grabArticle`
+        // returns **null**, and `parse()` returns null
+        // (`Readability.js:2748-2750`). Stage 1a/1b returned `Some("")` ONLY
+        // because they deliberately STOPPED before this retry loop; the
+        // faithful loop converges to the JS `null`. This is NOT a Bug-E2
+        // violation: Bug-E2 ("found nothing is a valid empty Ok, never an
+        // error") is defined and preserved at the `lib.rs` layer, which maps
+        // `parse() == None` → `Ok(Extracted { text: "" , .. })` (see
+        // `lib.rs::extract_with` `None =>` arm and the
+        // `extract_empty_extraction_is_ok_not_error_bug_e2` test). The
+        // `Article`/`None` boundary is internal; the public `extract` contract
+        // is unchanged.
+        assert!(
+            parse("<html><body>   </body></html>").is_none(),
+            "faithful Readability.js: empty doc → all attempts 0 chars → \
+             _grabArticle null → parse() None (Readability.js:1569-1571, \
+             2748-2750)"
+        );
     }
 }

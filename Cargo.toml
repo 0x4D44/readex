@@ -28,7 +28,34 @@ name = "mdrcel"
 # already-public capability, nothing added to or removed from the API (Stage
 # 1a was MINOR because it introduced the *first* real extraction; 1b only
 # extends that same already-public behaviour, so it is a PATCH not a MINOR).
-version = "0.3.1"
+#
+# M2 Stage 1c (2026-05-18): 0.3.1 -> 0.3.2 PATCH. `_grabArticle` now completes
+# the outer `while (true)` retry/flag-sieve machinery it deliberately STOPPED
+# before at Stage 1b: the `textLength < _charThreshold` trigger
+# (`Readability.js:1546`, threshold 500 per `:133`/`:54`), the
+# `FLAG_STRIP_UNLIKELYS`→`FLAG_WEIGHT_CLASSES`→`FLAG_CLEAN_CONDITIONALLY` flag
+# sieve (`:1556-1561`), `_attempts` bookkeeping + the longest-text fallback
+# (`:1562-1575`), and the `neededToCreateTopCandidate` page-wrap
+# (`:1517-1532`, deferred at 1b as text_content-invariant — now ported, still
+# text_content-invariant). Per HLD §m-3 each retry attempt **re-parses the
+# original HTML bytes** (the JS `page.innerHTML = pageCacheHtml` reset; faithful
+# because re-running the deterministic pre-grab pipeline reconstructs the
+# identical post-`_prepDocument` tree, while avoiding deep-cloning the
+# `Rc`-keyed score side-tables — a fresh ABA surface, HLD §5.1). This MATURES
+# the already-shipped extraction behaviour behind the SAME frozen public
+# surface: NO new public type/function/signature, `ExtractError` unchanged,
+# `extract == extract_with(&Options::default())` preserved, an empty
+# extraction still a valid `Ok` (Bug-E2 — the `parse() == None` boundary moved
+# to faithful RJS parity, but `lib.rs` still maps `None` → empty `Ok`, so the
+# PUBLIC `extract` contract is byte-unchanged). The retry fires ONLY when an
+# attempt's text < 500 chars and then converges toward Readability-JS (the JS
+# sieve's designed purpose) — same observable output on the overwhelming
+# majority of docs (their attempt-0 text is far over 500). Per semver
+# (CLAUDE.md) that is a PATCH — an internal behaviour refinement / completion
+# of an already-public capability, nothing added to or removed from the API
+# (1a MINOR = first real extraction; 1b/1c extend that same already-public
+# behaviour → PATCH).
+version = "0.3.2"
 edition = "2024"
 
 [dependencies]

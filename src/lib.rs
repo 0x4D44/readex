@@ -212,8 +212,10 @@ pub fn extract_with(
     base_url: Option<&str>,
     opts: &Options,
 ) -> Result<Extracted, ExtractError> {
-    // M2 Stage 1a (HLD §7.1): parse → Readability::new(doc).parse() → map
-    // Option<Article> to Result<Extracted, _>.
+    // M2 Stage 1a/1c (HLD §7.1/§7.3): parse → Readability::new_from_html(html)
+    // .parse() → map Option<Article> to Result<Extracted, _>. Stage 1c takes
+    // the HTML string (not a pre-parsed Dom) because the retry/flag-sieve loop
+    // re-parses the original bytes per attempt (HLD §m-3).
     //
     // `base_url` / `opts` are intentionally still unused: relative-URL
     // resolution and `include_html` / `min_word_count` are Stage-4 additive
@@ -221,8 +223,7 @@ pub fn extract_with(
     // contract. The frozen signature is unchanged; only the body grows.
     let _ = (base_url, opts);
 
-    let doc = readability::dom::Dom::parse(html);
-    match readability::Readability::new(doc).parse() {
+    match readability::Readability::new_from_html(html).parse() {
         // An article was produced — a real `Ok`. `text` is the article node's
         // raw `text_content` (`Readability.js:2766` `articleContent.textContent`
         // — the field the differential harness scores, HLD §2; the harness

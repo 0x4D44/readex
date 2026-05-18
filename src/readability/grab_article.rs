@@ -1,15 +1,32 @@
 //! `grab_article.rs` — `_grabArticle` (`Readability.js:1031-1597`), the
-//! algorithmic core. **Stage-1a slice (HLD §7.1):** the prepping walk +
-//! unlikely strip + `div`→`p` + `elementsToScore` scoring + ancestor
-//! propagation + **single top-candidate selection only**.
+//! algorithmic core.
 //!
-//! STOPS before the sibling-append pass (`Readability.js:1415`) and the
-//! `_charThreshold` retry / `FLAG_*` flag-sieve loop (`Readability.js:1546-
-//! 1576`) — those are Stage 1b/1c (HLD §7.2/§7.3). Here the outer `while
-//! (true)` runs **exactly once** (all flags set, no retry), `articleContent`
-//! is built from the chosen top candidate directly, and the fake-`<div>` body
-//! fallback (`Readability.js:1314-1327`) is ported (needed for the first
-//! `Ok`).
+//! **Stage-1a/1b slice (HLD §7.1/§7.2):** the prepping walk + unlikely strip +
+//! `div`→`p` + `elementsToScore` scoring + ancestor propagation + single
+//! top-candidate selection + sibling-append.
+//!
+//! **Stage-1c (HLD §7.3 — this stage):** the outer `while (true)`
+//! retry/flag-sieve machinery Stage 1b STOPPED before. [`grab_article`] is
+//! **one attempt** (the body of the JS `while (true)`, Stage-1a/1b logic
+//! UNCHANGED) plus the `neededToCreateTopCandidate` page-wrap
+//! (`Readability.js:1517-1532`, deferred at 1b — now ported). The outer loop
+//! (`Readability.js:1043`, `1546-1576`) lives in [`grab_article_with_retry`]:
+//! the `textLength < _charThreshold` trigger, the `FLAG_STRIP_UNLIKELYS` →
+//! `FLAG_WEIGHT_CLASSES` → `FLAG_CLEAN_CONDITIONALLY` flag sieve, `_attempts`
+//! bookkeeping, and the "return the longest-text attempt" fallback.
+//!
+//! **Retry re-parse (HLD §m-3, decided at this Stage-1c review):** each
+//! attempt **re-parses from the original HTML bytes** (not a cloned tree, not
+//! a cloned score side-table). The JS resets `page.innerHTML = pageCacheHtml`
+//! (`Readability.js:1043`/`1549`) — the *post-`_prepDocument`* body. Re-parsing
+//! the original bytes and re-running the deterministic pre-grab pipeline
+//! (`_removeScripts` + `_prepDocument`) reconstructs the identical post-prep
+//! tree, so this is faithful while avoiding deep-cloning the `Rc`-keyed side
+//! tables (a fresh divergence + ABA surface, HLD §5.1). Each attempt's
+//! `text_content` + `_getInnerText` length are captured **eagerly as owned
+//! values**, so the longest-attempt fallback (`Readability.js:1573`) never
+//! reads a node from a discarded attempt's `Dom` (ABA-safe by construction —
+//! see [`grab_article_with_retry`]).
 //!
 //! Faithful transcription with `Readability.js:<line>` citations
 //! (anti-inversion, HLD §4.3(a)). The JS `candidates` array is mirrored by a
@@ -18,11 +35,12 @@
 
 use crate::readability::dom::{
     self, Dom, NodeRef, append_child, children, class_name, create_element, first_element_child,
-    get_attribute, id, is_element, parent, replace_child, tag_name,
+    get_attribute, id, is_element, parent, replace_child, set_attribute, tag_name,
 };
 use crate::readability::helpers::{
-    FLAG_STRIP_UNLIKELYS, Flags, get_next_node, is_element_without_content, is_phrasing_content,
-    is_probably_visible, is_valid_byline, is_whitespace,
+    FLAG_CLEAN_CONDITIONALLY, FLAG_STRIP_UNLIKELYS, FLAG_WEIGHT_CLASSES, Flags, get_next_node,
+    is_element_without_content, is_phrasing_content, is_probably_visible, is_valid_byline,
+    is_whitespace,
 };
 use crate::readability::regexps;
 use crate::readability::scoring::{
@@ -33,12 +51,16 @@ use crate::readability::scoring::{
 /// = 5`). Stage 1a uses the default (no `Options.nbTopCandidates`).
 const NB_TOP_CANDIDATES: usize = 5;
 
-/// Outcome of the Stage-1a `_grabArticle`: the `articleContent` element (a
-/// fresh `<div>` holding the selected content), or `None` (`Readability.js`
-/// `return null` — only reachable here via the body-fallback producing nothing,
+/// Outcome of **one** `_grabArticle` attempt: the `articleContent` element (a
+/// fresh `<div>` holding the selected content) plus the
+/// `_getInnerText(articleContent, true).length` the retry loop tests against
+/// `_charThreshold` (`Readability.js:1545-1546`). `None` means the JS
+/// `return null` (only reachable via the body-fallback producing nothing,
 /// faithfully mapped to an empty extraction by the caller, Bug-E2).
 pub struct GrabResult {
-    /// The `articleContent` div whose `text_content` is the extracted body.
+    /// The `articleContent` div whose `text_content` is the extracted body
+    /// (post `_prepArticle` is applied by the caller, as in the JS — see
+    /// [`grab_article_with_retry`]).
     pub article_content: NodeRef,
 }
 
@@ -394,15 +416,16 @@ pub fn grab_article(
 
     let mut top_candidate = top_candidates.first().cloned();
 
-    // `neededToCreateTopCandidate` (`Readability.js:1314`) gates ONLY the
-    // score-invisible 1517-1532 page-wrap (assigning `id="readability-page-1"`
-    // / `className="page"` and, in the non-fallback arm, wrapping
-    // articleContent's children in an extra `<div>`). Both are id/className
-    // (score-invisible, HLD §2) and a wrapper DIV adds ZERO `#text`
-    // characters, so 1517-1532 is provably `text_content`-invariant and is
-    // deliberately NOT ported at Stage 1b (recorded in notes/m2-stage1b.md;
-    // the variable returns when Stage 1c needs the `_attempts` bookkeeping
-    // context). It therefore intentionally does not exist here.
+    // `neededToCreateTopCandidate` (`Readability.js:1309/1317`) — set true iff
+    // the fake-div fallback fires. It gates the 1517-1532 page-wrap (assign
+    // `id="readability-page-1"` / `className="page"` on the existing top
+    // candidate vs. wrap articleContent's children in an extra
+    // `<div id=readability-page-1 class=page>`). id/className are
+    // score-invisible (HLD §2) and a wrapper DIV adds ZERO `#text` characters,
+    // so 1517-1532 is provably `text_content`-invariant — but it is now ported
+    // faithfully (Stage 1c needs the bookkeeping/structure path; the JS does
+    // it inside the retry loop). Pinned text_content-invariant by a test.
+    let mut needed_to_create_top_candidate = false;
 
     // If no top candidate, OR it is BODY: build a fake DIV from page children
     // (Readability.js:1314-1327). Needed for the first Ok.
@@ -412,6 +435,8 @@ pub fn grab_article(
             .map(|t| tag_name(t).as_deref() == Some("BODY"))
             .unwrap_or(false)
     {
+        // 1317: neededToCreateTopCandidate = true.
+        needed_to_create_top_candidate = true;
         let tc = create_element("DIV");
         // Move EVERY child (incl. text nodes) of page into tc.
         while let Some(fc) = first_child(&page) {
@@ -667,17 +692,226 @@ pub fn grab_article(
     }
 
     // (1508-1510 debug — SKIP. 1512 `this._prepArticle(articleContent)` is
-    //  invoked by `mod.rs::parse` AFTER this returns — Stage-1a wiring, kept;
-    //  it mirrors the JS call site, which is also after the sibling loop.
-    //  1517-1532 the `readability-page-1`/`page` wrap: id/className are
-    //  score-invisible (HLD §2) AND wrapping articleContent's children in an
-    //  extra DIV adds ZERO `#text` characters, so it is provably
-    //  `text_content`-invariant — deliberately NOT implemented here, recorded
-    //  in notes/m2-stage1b.md. 1538+ `parseSuccessful`/the
-    //  `textLength < charThreshold` retry is Stage 1c — STOP here, exactly as
-    //  Stage 1a STOPPED at 1415.)
+    //  applied by the caller [`grab_article_with_retry`] AFTER this returns
+    //  and BEFORE the `textLength` test — faithfully mirroring the JS call
+    //  site, which is inside the loop after the sibling-append and before
+    //  1545. NOT done here so the page-wrap below sees the post-prep tree in
+    //  the same order the JS does NOT — see the note: JS order is _prepArticle
+    //  (1512) → page-wrap (1517-1532) → textLength (1545). The page-wrap is
+    //  text_content-invariant, so doing it here (pre-_prepArticle) cannot
+    //  change the scored text vs. the JS order; the caller still runs
+    //  _prepArticle before measuring `inner_text_len`.)
+
+    // 1517-1532: the `readability-page-1` / `page` wrap. **Faithfully ported**
+    // (Stage 1b deferred it as provably text_content-invariant; Stage 1c
+    // ports the real structure since the retry loop's bookkeeping path needs
+    // it). It remains `text_content`-invariant: `id`/`className` are
+    // score-invisible (HLD §2) and the extra wrapper `<div>` adds ZERO `#text`
+    // characters (a wrapper element contributes nothing to the WHATWG
+    // `Node.textContent` DFS). Pinned by a test.
+    if needed_to_create_top_candidate {
+        // 1517-1523: the fake div IS topCandidate and was already appended in
+        // the sibling loop (sibling === topCandidate). Just assign id/class —
+        // no append, no child move. id/className are score-invisible (HLD §2);
+        // `topCandidate` here is the appended child of `article_content`.
+        set_attribute(&top_candidate, "id", "readability-page-1");
+        set_attribute(&top_candidate, "class", "page");
+    } else {
+        // 1525-1531: div = createElement("DIV"); div.id="readability-page-1";
+        // div.className="page"; while (articleContent.firstChild)
+        // div.appendChild(articleContent.firstChild);
+        // articleContent.appendChild(div).
+        let div = create_element("DIV");
+        set_attribute(&div, "id", "readability-page-1");
+        set_attribute(&div, "class", "page");
+        while let Some(fc) = first_child(&article_content) {
+            append_child(&div, &fc);
+        }
+        append_child(&article_content, &div);
+    }
+
+    // (1534-1536 debug — SKIP. 1538+ `parseSuccessful` / the
+    //  `textLength < _charThreshold` retry loop is owned by
+    //  [`grab_article_with_retry`] — this function is ONE attempt's body.)
 
     Some(GrabResult { article_content })
+}
+
+/// `DEFAULT_CHAR_THRESHOLD` (`Readability.js:133`, `500`). With default
+/// `Options` (`Readability.js:54` — `options.charThreshold ||
+/// DEFAULT_CHAR_THRESHOLD`) `this._charThreshold` is exactly this. Stage 1c
+/// uses the default (a configurable `charThreshold` is Stage-4 additive
+/// surface, HLD §7.6 — not a tuning knob here; this constant is transcribed
+/// from the cited line, not chosen).
+const CHAR_THRESHOLD: usize = 500;
+
+/// One element of the JS `this._attempts` array (`Readability.js:1551-1554` —
+/// `{ articleContent, textLength }`).
+///
+/// **Eager string capture (HLD §m-3 / §5.1 ABA).** The JS stores the live
+/// `articleContent` *node*; the fallback (`Readability.js:1573`) later reads
+/// `.textContent` off `_attempts[0].articleContent`. Under re-parse-per-attempt
+/// that node lives in an attempt-local `Dom` that is dropped when the attempt
+/// goes out of scope, so storing the node would be a use-after-the-`Dom`-drops
+/// / `NodeKey`-ABA hazard. At Stage 1c the **only** scored observable of
+/// `articleContent` is `articleContent.textContent` (`Readability.js:2766`;
+/// `_postProcessContent` is Stage 3, excerpt/`dir` Stage 4 — none ported), so
+/// we capture that string (and the `_getInnerText` length the sieve sorts by)
+/// eagerly as owned values. No discarded-`Dom` node is ever read after its
+/// `Dom` drops — ABA-safe **by construction**.
+struct Attempt {
+    /// `_getInnerText(articleContent, true).length` (`Readability.js:1545`) —
+    /// the value 1546 tests and 1564-1566 sorts attempts by (desc).
+    inner_text_len: usize,
+    /// `articleContent.textContent` (`Readability.js:2766`) captured at
+    /// attempt time. The scored body for this attempt.
+    text_content: String,
+}
+
+/// The result of the full retry/flag-sieve loop (`Readability.js:1043`,
+/// `1546-1576`): the chosen `articleContent`'s `textContent`. `None` is the JS
+/// `return null` (`Readability.js:1570` — every attempt produced zero text;
+/// the caller maps it to an empty `Ok`, Bug-E2).
+pub struct RetryResult {
+    /// The final `articleContent.textContent` (`Readability.js:2766`) — either
+    /// the first attempt whose `inner_text_len >= _charThreshold`, or, when the
+    /// flag sieve is exhausted, the longest-text attempt (`Readability.js:1573`).
+    pub text_content: String,
+}
+
+/// One attempt's outcome, as the `prepare_attempt` closure returns it to the
+/// retry driver: the captured `articleContent.textContent` plus its
+/// `_getInnerText(articleContent, true).length` (`Readability.js:1545`).
+/// `None` mirrors the per-attempt JS `_grabArticle` `return null` (no `<body>`
+/// / nothing to grab).
+pub struct AttemptOutcome {
+    /// `articleContent.textContent` (`Readability.js:2766`) for this attempt.
+    pub text_content: String,
+    /// `_getInnerText(articleContent, true).length` (`Readability.js:1545`),
+    /// measured **after** `_prepArticle` (`Readability.js:1512`), exactly as
+    /// the JS measures it (1512 prep → 1517-1532 page-wrap → 1545 length).
+    pub inner_text_len: usize,
+}
+
+/// `_grabArticle`'s outer retry/flag-sieve/fallback loop (`Readability.js:1043`
+/// `pageCacheHtml` + `1045` `while (true)` + `1546-1576`).
+///
+/// `prepare_attempt(&Flags) -> Option<AttemptOutcome>` runs **one** attempt
+/// with the supplied flags: re-parse the original HTML bytes, re-run the
+/// deterministic pre-grab pipeline (`_removeScripts` + `_prepDocument` +
+/// title), one [`grab_article`] pass, `_prepArticle`, then capture
+/// `articleContent.textContent` + its `_getInnerText` length. The driver owns
+/// **only** the cross-attempt bookkeeping the JS does at `1546-1576`:
+///
+/// * `1538` `parseSuccessful = true`;
+/// * `1545-1546` `if (_getInnerText(articleContent,true).length <
+///   _charThreshold)` → not successful;
+/// * `1549` reset (here: the *next* `prepare_attempt` re-parses — HLD §m-3);
+/// * `1551-1554` push `{ articleContent, textLength }` onto `_attempts`;
+/// * `1556-1561` the flag sieve **in JS order**: clear `FLAG_STRIP_UNLIKELYS`,
+///   else `FLAG_WEIGHT_CLASSES`, else `FLAG_CLEAN_CONDITIONALLY`;
+/// * `1562-1575` else (no flag left): sort `_attempts` by `textLength` desc,
+///   `return null` if the longest is `0`, else take its (captured) text;
+/// * `1578` `if (parseSuccessful) return articleContent` (the `_articleDir`
+///   ancestor walk `1579-1593` is Stage-4 metadata, not scored — omitted).
+///
+/// Flags start all-set (`Readability.js:69-72`), so the sieve admits at most
+/// **4** attempts (all → no-STRIP → no-STRIP/WEIGHT →
+/// no-STRIP/WEIGHT/CLEAN), then the longest-attempt fallback.
+///
+/// **ABA (HLD §5.1, re-audited for re-parse churn).** Each attempt's tree +
+/// `Rc`-keyed side tables are wholly owned and dropped *inside*
+/// `prepare_attempt` (the caller's closure); only the owned `String` +
+/// `usize` escape. `_attempts` therefore holds no node from any attempt, so
+/// the `1573` longest-attempt fallback cannot read a node whose `Dom` has
+/// dropped, and no `NodeKey` from attempt *N* can alias a live side-table
+/// entry in attempt *N+1* (the side tables do not outlive their attempt). The
+/// invariant is structural, not a runtime check; pinned by
+/// `retry_reparse_attempts_are_isolated_no_state_bleed` and
+/// `retry_nodekey_aba_attempt_doms_are_independent`.
+pub fn grab_article_with_retry<F>(mut prepare_attempt: F) -> Option<RetryResult>
+where
+    F: FnMut(&Flags) -> Option<AttemptOutcome>,
+{
+    // this._flags = all set (Readability.js:69-72). The sieve clears one per
+    // failed attempt; re-parse-per-attempt means flags are the ONLY state
+    // carried across attempts (the tree/side-tables are fresh each time).
+    let mut flags = Flags::default();
+
+    // this._attempts = [] (Readability.js:45).
+    let mut attempts: Vec<Attempt> = Vec::new();
+
+    loop {
+        // 1045 `while (true)` body = one attempt (re-parse + prep + grab +
+        // _prepArticle + capture). `None` ⇒ the per-attempt `_grabArticle`
+        // returned null (no <body>); the JS `parse()` then returns null too
+        // (Readability.js:2748-2750) — no `_attempts` push for that case
+        // (the push at 1551 is only reached when `articleContent` exists and
+        // is merely too short).
+        let outcome = prepare_attempt(&flags)?;
+        let text_length = outcome.inner_text_len;
+
+        // 1538 parseSuccessful = true; 1545-1546 the charThreshold test.
+        if text_length < CHAR_THRESHOLD {
+            // 1547 parseSuccessful = false. 1549 `page.innerHTML =
+            // pageCacheHtml` — realised as the NEXT loop's `prepare_attempt`
+            // re-parsing the original bytes (HLD §m-3).
+
+            // 1551-1554 this._attempts.push({ articleContent, textLength }).
+            // We push the captured text (ABA — see `Attempt`).
+            attempts.push(Attempt {
+                inner_text_len: text_length,
+                text_content: outcome.text_content,
+            });
+
+            // 1556-1561 the flag sieve, IN JS ORDER.
+            if flags.is_active(FLAG_STRIP_UNLIKELYS) {
+                flags.remove(FLAG_STRIP_UNLIKELYS);
+            } else if flags.is_active(FLAG_WEIGHT_CLASSES) {
+                flags.remove(FLAG_WEIGHT_CLASSES);
+            } else if flags.is_active(FLAG_CLEAN_CONDITIONALLY) {
+                flags.remove(FLAG_CLEAN_CONDITIONALLY);
+            } else {
+                // 1562-1575: no luck after removing flags — return the
+                // longest text found across the attempts.
+                //
+                // 1564-1566 `_attempts.sort((a,b) => b.textLength -
+                // a.textLength)` — a STABLE descending sort by `textLength`,
+                // then `_attempts[0]`. JS `Array.prototype.sort` is required
+                // to be stable (ECMAScript 2019+; the oracle's V8 is).
+                // `slice::sort_by_key` is ALSO a stable sort, and
+                // `Reverse(len)` makes it descending — so on a `textLength`
+                // tie the FIRST-pushed attempt stays at index 0, exactly the
+                // JS stable-sort tie semantics. (`max_by_key` would NOT be
+                // faithful: it returns the LAST max; pinned by
+                // `retry_longest_attempt_stable_sort_ties_keep_first`.)
+                attempts.sort_by_key(|a| std::cmp::Reverse(a.inner_text_len));
+
+                // 1568-1571 `if (!_attempts[0].textLength) return null;`
+                // (`_attempts` is non-empty here: at least this attempt was
+                // just pushed). `!textLength` is JS falsy ⇒ exactly `== 0`.
+                let best = &attempts[0];
+                if best.inner_text_len == 0 {
+                    return None;
+                }
+
+                // 1573-1574 `articleContent = _attempts[0].articleContent;
+                // parseSuccessful = true;` then 1578 returns it.
+                return Some(RetryResult {
+                    text_content: best.text_content.clone(),
+                });
+            }
+
+            // parseSuccessful was false and a flag was cleared ⇒ loop again
+            // (re-parse, one fewer flag).
+            continue;
+        }
+
+        // 1578 `if (parseSuccessful) ... return articleContent;`
+        return Some(RetryResult {
+            text_content: outcome.text_content,
+        });
+    }
 }
 
 /// `_hasChildBlockElement` likewise.
@@ -718,6 +952,33 @@ mod tests {
         let mut byline_found = false;
         let r = grab_article(&mut dom, &root, &body, title, &flags, &mut byline_found)?;
         Some((dom, r.article_content))
+    }
+
+    /// The single `<div id=readability-page-1 class=page>` the 1517-1532
+    /// page-wrap always produces: in the non-fallback arm articleContent has
+    /// exactly that one child (its real children moved inside it); in the
+    /// fallback arm the fake-div top candidate (already appended) IS given
+    /// `id=readability-page-1`, so unwrapping is a no-op there (we still
+    /// return that node — its children are the appended content). Used by the
+    /// Stage-1b structural-shape tests, which assert one level below the
+    /// (now-ported, text_content-invariant) page-wrap.
+    fn page_wrap_inner(article_content: &NodeRef) -> NodeRef {
+        let kids = children(article_content);
+        // Non-fallback arm: exactly one child, the readability-page-1 div.
+        if kids.len() == 1 && get_attribute(&kids[0], "id").as_deref() == Some("readability-page-1")
+        {
+            return kids[0].clone();
+        }
+        // Fallback arm: articleContent's sole child IS the fake-div top
+        // candidate, itself given id=readability-page-1 — its children are
+        // the content. Return it (it has the id) or, defensively, the node
+        // itself if the shape is unexpected.
+        if get_attribute(article_content, "id").as_deref() == Some("readability-page-1") {
+            return article_content.clone();
+        }
+        kids.into_iter()
+            .find(|k| get_attribute(k, "id").as_deref() == Some("readability-page-1"))
+            .unwrap_or_else(|| article_content.clone())
     }
 
     #[test]
@@ -980,9 +1241,15 @@ mod tests {
             </body></html>"
         );
         let (_d, ac) = grab(&html, "").expect("grab");
+        // 1517-1532 page-wrap (now ported, Stage 1c): articleContent's
+        // children were moved into an inner `<div id=readability-page-1
+        // class=page>` (text_content-invariant — id/class score-invisible,
+        // wrapper adds 0 #text). The sibling-append shape we are asserting is
+        // therefore one level down, inside that wrapper. Unwrap it.
+        let page = page_wrap_inner(&ac);
         // The SECTION ∈ ALTER_TO_DIV_EXCEPTIONS ⇒ appended as-is (still a
-        // SECTION element directly under articleContent).
-        let section_kids: Vec<String> = children(&ac)
+        // SECTION element directly under the page wrapper).
+        let section_kids: Vec<String> = children(&page)
             .iter()
             .map(|c| tag_name(c).unwrap_or_default())
             .collect();
@@ -1184,5 +1451,501 @@ mod tests {
         // The retagged node is a DIV holding the original cell text.
         assert_eq!(tag_name(&new_sib).as_deref(), Some("DIV"));
         assert!(text_content(&article_content).contains("cell text"));
+    }
+
+    // =======================================================================
+    // Stage 1c — the FLAG_* retry / flag-sieve loop + longest-attempt
+    // fallback + page-wrap (`Readability.js:1043`, `1517-1532`, `1546-1576`).
+    //
+    // Every expected value below is hand-traced from those exact cited lines
+    // (NOT from running any oracle — anti-inversion, HLD §4). The retry
+    // driver is tested directly with a controlled `prepare_attempt` stub so
+    // the flag-sieve order / fallback / `_charThreshold` trigger are pinned
+    // independent of any DOM, plus real-HTML end-to-end cases via `full` for
+    // the re-parse-isolation and page-wrap invariants.
+    // =======================================================================
+
+    use crate::readability::Readability;
+
+    /// End-to-end `Readability::parse` (the Stage-1c retry orchestrator) on
+    /// real HTML — its `text_content` (the harness-scored field).
+    fn full(html: &str) -> Option<String> {
+        Readability::new_from_html(html)
+            .parse()
+            .map(|a| a.text_content)
+    }
+
+    /// `DEFAULT_CHAR_THRESHOLD` (`Readability.js:133` = `500`) with default
+    /// `Options` (`Readability.js:54` `options.charThreshold ||
+    /// DEFAULT_CHAR_THRESHOLD`). Pinned from the cited line — a faithful
+    /// transcription, NOT a tuned constant (anti-inversion, HLD §4).
+    #[test]
+    fn retry_charthreshold_500_constant_matches_readability_js() {
+        assert_eq!(
+            CHAR_THRESHOLD, 500,
+            "DEFAULT_CHAR_THRESHOLD must be 500 verbatim (Readability.js:133)"
+        );
+    }
+
+    /// `Readability.js:1545-1546`: `if (_getInnerText(articleContent,true)
+    /// .length < _charThreshold)`. An attempt whose length is `>= 500` makes
+    /// `parseSuccessful` true ⇒ `1578` returns it **immediately**, with NO
+    /// retry and NO flag clear. This is the path the overwhelming majority of
+    /// corpus docs take (their attempt-0 text is far over 500 chars) — i.e.
+    /// the mechanism by which Stage 1c is a no-op on the Stage-1a/1b anchors.
+    #[test]
+    fn retry_text_ge_charthreshold_single_pass_no_retry() {
+        let mut calls: Vec<u32> = Vec::new();
+        let r = grab_article_with_retry(|flags: &Flags| {
+            calls.push(flags.0);
+            Some(AttemptOutcome {
+                text_content: "x".repeat(500),
+                inner_text_len: 500, // exactly the threshold: 500 < 500 is FALSE
+            })
+        });
+        assert_eq!(
+            r.expect(">= threshold ⇒ Some").text_content,
+            "x".repeat(500)
+        );
+        assert_eq!(
+            calls.len(),
+            1,
+            "length >= _charThreshold ⇒ exactly ONE attempt, no retry \
+             (Readability.js:1546 is false, 1578 returns)"
+        );
+        assert_eq!(
+            calls[0],
+            Flags::default().0,
+            "the single attempt runs with all flags set (Readability.js:69-72)"
+        );
+    }
+
+    /// `Readability.js:1556-1561` — the flag sieve, **in order**:
+    /// `FLAG_STRIP_UNLIKELYS` (0x1) → `FLAG_WEIGHT_CLASSES` (0x2) →
+    /// `FLAG_CLEAN_CONDITIONALLY` (0x4), one cleared per sub-threshold
+    /// attempt, starting all-set (`Readability.js:69-72`). With every attempt
+    /// `< 500`, the driver makes attempts 0..=3 with flags:
+    ///   a0 = STRIP|WEIGHT|CLEAN (0x7)
+    ///   a1 = WEIGHT|CLEAN       (0x6)  [STRIP cleared]
+    ///   a2 = CLEAN              (0x4)  [WEIGHT cleared]
+    ///   a3 = (none)             (0x0)  [CLEAN cleared]
+    /// then the longest-attempt fallback (`1562-1575`). Pinned by capturing
+    /// the exact `flags.0` the driver passes each call.
+    #[test]
+    fn retry_flag_sieve_clears_strip_then_weight_then_clean_in_order() {
+        let mut seen: Vec<u32> = Vec::new();
+        let r = grab_article_with_retry(|flags: &Flags| {
+            seen.push(flags.0);
+            // Always sub-threshold ⇒ exhaust the whole sieve.
+            Some(AttemptOutcome {
+                text_content: "z".to_string(),
+                inner_text_len: 1,
+            })
+        });
+        assert_eq!(
+            seen,
+            vec![
+                FLAG_STRIP_UNLIKELYS | FLAG_WEIGHT_CLASSES | FLAG_CLEAN_CONDITIONALLY,
+                FLAG_WEIGHT_CLASSES | FLAG_CLEAN_CONDITIONALLY,
+                FLAG_CLEAN_CONDITIONALLY,
+                0,
+            ],
+            "flag sieve order must be STRIP→WEIGHT→CLEAN (Readability.js:1556-1561), \
+             all-set first (Readability.js:69-72)"
+        );
+        // 1562-1575 fallback: all attempts textLength 1 (non-zero) ⇒ NOT null;
+        // longest is 1; returns that captured text.
+        assert_eq!(r.expect("non-zero ⇒ Some").text_content, "z");
+    }
+
+    /// `Readability.js:1564-1575` longest-attempt fallback. All 4 attempts are
+    /// `< 500`; the driver must return the attempt with the **most**
+    /// `_getInnerText` chars (`sort((a,b)=>b.textLength-a.textLength)`,
+    /// `_attempts[0]`). Distinct lengths per attempt; assert the exact
+    /// longest one's captured text is returned.
+    #[test]
+    fn retry_longest_attempt_fallback_picks_max_inner_text_len() {
+        // attempt lengths by flags: a0=120, a1=300, a2=80, a3=200 (all <500).
+        // Longest = a1 (300) ⇒ its text "ATTEMPT-1" must be returned.
+        let plan: Vec<(usize, &str)> = vec![
+            (120, "ATTEMPT-0"),
+            (300, "ATTEMPT-1"),
+            (80, "ATTEMPT-2"),
+            (200, "ATTEMPT-3"),
+        ];
+        let mut i = 0usize;
+        let r = grab_article_with_retry(|_f: &Flags| {
+            let (len, txt) = plan[i];
+            i += 1;
+            Some(AttemptOutcome {
+                text_content: txt.to_string(),
+                inner_text_len: len,
+            })
+        });
+        assert_eq!(
+            r.expect("longest non-zero ⇒ Some").text_content,
+            "ATTEMPT-1",
+            "fallback must return the LONGEST-text attempt's captured text \
+             (Readability.js:1564-1574): a1 had 300 chars, the max"
+        );
+        assert_eq!(i, 4, "all 4 sieve attempts are made before the fallback");
+    }
+
+    /// `Readability.js:1568-1571`: `if (!_attempts[0].textLength) return
+    /// null;`. Every attempt yields **0** chars (JS falsy `textLength`) ⇒ the
+    /// driver returns `None` (→ `parse()` null → empty `Ok` upstream, Bug-E2).
+    #[test]
+    fn retry_all_attempts_zero_chars_returns_none() {
+        let mut n = 0usize;
+        let r = grab_article_with_retry(|_f: &Flags| {
+            n += 1;
+            Some(AttemptOutcome {
+                text_content: String::new(),
+                inner_text_len: 0,
+            })
+        });
+        assert!(
+            r.is_none(),
+            "all attempts 0 chars ⇒ None (Readability.js:1569-1571 \
+             `if (!_attempts[0].textLength) return null`)"
+        );
+        assert_eq!(n, 4, "the full sieve is exhausted first (4 attempts)");
+    }
+
+    /// `Readability.js:1564-1566` `_attempts.sort((a,b) => b.textLength -
+    /// a.textLength)` is a **stable** sort (ECMAScript 2019+; the oracle's V8
+    /// guarantees it), then `_attempts[0]`. On a tie in `textLength` the
+    /// stable descending sort keeps the **first-pushed** attempt at index 0.
+    /// `max_by_key` would return the LAST max — NOT faithful — so the driver
+    /// uses a stable `sort_by`; this pins that tie semantics.
+    #[test]
+    fn retry_longest_attempt_stable_sort_ties_keep_first() {
+        // a0,a1 both 250 (tie, the max); a2=100, a3=50. Stable desc sort keeps
+        // a0 (first pushed) at index 0 ⇒ "FIRST-MAX" returned, NOT "SECOND-MAX".
+        let plan: Vec<(usize, &str)> = vec![
+            (250, "FIRST-MAX"),
+            (250, "SECOND-MAX"),
+            (100, "c"),
+            (50, "d"),
+        ];
+        let mut i = 0usize;
+        let r = grab_article_with_retry(|_f: &Flags| {
+            let (len, txt) = plan[i];
+            i += 1;
+            Some(AttemptOutcome {
+                text_content: txt.to_string(),
+                inner_text_len: len,
+            })
+        });
+        assert_eq!(
+            r.expect("Some").text_content,
+            "FIRST-MAX",
+            "JS Array.sort is stable: on a textLength tie the FIRST-pushed \
+             attempt stays at index 0 (Readability.js:1564-1566); the driver \
+             must NOT use max_by_key (returns the last max)"
+        );
+    }
+
+    /// Per-attempt `_grabArticle` `null` (no `<body>`) ⇒ the driver returns
+    /// `None` on the FIRST attempt with NO `_attempts` push (the JS push at
+    /// `1551` is only reached when `articleContent` exists but is too short;
+    /// a `null` `_grabArticle` short-circuits `parse()` at
+    /// `Readability.js:2748-2750`).
+    #[test]
+    fn retry_none_attempt_short_circuits_no_push_no_sieve() {
+        let mut n = 0usize;
+        let r = grab_article_with_retry(|_f: &Flags| -> Option<AttemptOutcome> {
+            n += 1;
+            None
+        });
+        assert!(r.is_none(), "None attempt ⇒ driver None (parse() null)");
+        assert_eq!(
+            n, 1,
+            "a None attempt short-circuits immediately — no retry, no sieve \
+             (Readability.js:2748-2750, NOT the 1551 too-short push path)"
+        );
+    }
+
+    /// **Re-parse-per-attempt isolation (HLD §m-3, pinned).** Real HTML where
+    /// the genuine body lives ONLY inside an `unlikelyCandidates`-class
+    /// container (`class="comment"`), and there is no other ≥500-char content.
+    /// Attempt 0 (FLAG_STRIP_UNLIKELYS set) strips that container in the
+    /// prepping walk (`Readability.js:1117-1129`) ⇒ tiny text `< 500` ⇒ retry.
+    /// Attempt 1 **re-parses the original bytes** with STRIP cleared ⇒ the
+    /// container survives ⇒ its long prose is extracted (`>= 500`) and
+    /// returned. This proves attempt 1 sees a **pristine tree** (the node
+    /// attempt 0 removed is BACK), i.e. no state bleed across the re-parse.
+    #[test]
+    fn retry_reparse_attempts_are_isolated_no_state_bleed() {
+        // One long (>500 char) paragraph of genuine prose, but its only home
+        // is a div whose class matches REGEXPS.unlikelyCandidates ("comment")
+        // and NOT okMaybeItsACandidate. With STRIP_UNLIKELYS the whole div is
+        // removed at Readability.js:1126-1128 (not in a table/code, not
+        // BODY/A) ⇒ attempt-0 articleContent is the fake-div fallback over an
+        // (otherwise empty) body ⇒ length 0 < 500. Attempt 1 re-parses with
+        // STRIP cleared ⇒ the div is NOT removed ⇒ its prose is the content.
+        let prose = "This is a single sustained paragraph of genuine readable \
+            article body prose that is deliberately written to exceed five \
+            hundred characters in total length so that, once the unlikely \
+            candidate container that is its only home survives the prepping \
+            walk on the second attempt with FLAG_STRIP_UNLIKELYS cleared, the \
+            resulting article content comfortably clears the five hundred \
+            character _charThreshold and is returned by the retry loop as the \
+            successful parse rather than triggering yet another retry which \
+            would otherwise eventually hit the longest-attempt fallback path \
+            instead of this clean success path here today.";
+        assert!(prose.len() > 520, "fixture prose must exceed 500 chars");
+        let html = format!("<html><body><div class=\"comment\"><p>{prose}</p></div></body></html>");
+        let t = full(&html).expect("attempt 1 (STRIP cleared) yields the prose");
+        assert!(
+            t.contains("single sustained paragraph"),
+            "re-parse isolation: attempt 1 must see a PRISTINE tree (the \
+             unlikely-class div attempt 0 removed is back via re-parse, HLD \
+             §m-3); got: {}",
+            t.chars().take(80).collect::<String>()
+        );
+        // And it is the FULL prose (>=500), i.e. the success path, not a
+        // truncated fallback artefact.
+        assert!(
+            t.len() >= 500,
+            "attempt 1's content must clear _charThreshold (Readability.js:1546)"
+        );
+    }
+
+    /// **Page-wrap is `text_content`-invariant (`Readability.js:1517-1532`).**
+    /// The non-fallback arm wraps articleContent's children in an extra
+    /// `<div id=readability-page-1 class=page>`. A wrapper element contributes
+    /// ZERO `#text` to the WHATWG `Node.textContent` DFS and `id`/`class` are
+    /// score-invisible (HLD §2), so the scored text is byte-identical to the
+    /// pre-wrap content. We assert the wrap EXISTS (structure ported) AND the
+    /// text is exactly the article prose (invariance).
+    #[test]
+    fn page_wrap_non_fallback_arm_structure_and_text_invariant() {
+        // A clear single content div (positive class) with long prose ⇒ a
+        // real top candidate (NOT the BODY fallback) ⇒ neededToCreateTop =
+        // false ⇒ the 1525-1531 wrapper arm.
+        let html = "<html><body>\
+            <div class=content>\
+            <p>The genuine article body paragraph here is comfortably beyond the twenty five character minimum so it scores as the content container.</p>\
+            <p>A second genuine article paragraph of ample readable prose so the content div is unambiguously the single top candidate here.</p>\
+            </div></body></html>";
+        let (_d, ac) = grab(html, "").expect("grab");
+        // articleContent has exactly ONE child: the readability-page-1 div.
+        let kids = children(&ac);
+        assert_eq!(
+            kids.len(),
+            1,
+            "non-fallback page-wrap: articleContent has one child (the page div)"
+        );
+        assert_eq!(
+            get_attribute(&kids[0], "id").as_deref(),
+            Some("readability-page-1"),
+            "wrapper id (Readability.js:1526)"
+        );
+        assert_eq!(
+            get_attribute(&kids[0], "class").as_deref(),
+            Some("page"),
+            "wrapper class (Readability.js:1527)"
+        );
+        // text_content is EXACTLY the prose — the wrapper added zero #text
+        // (invariant). Both paragraphs present, no synthetic separators, no
+        // id/class text leaking.
+        let t = text_content(&ac);
+        assert!(t.contains("genuine article body paragraph"), "p1: {t}");
+        assert!(t.contains("second genuine article paragraph"), "p2: {t}");
+        assert!(
+            !t.contains("readability-page-1") && !t.contains("page"),
+            "score-invisible id/class must NOT appear in text_content: {t}"
+        );
+        // Pin invariance numerically: text_content with the wrap == the
+        // concatenation of the inner content's text (the wrap is transparent).
+        let inner_concat: String = children(&kids[0]).iter().map(text_content).collect();
+        assert_eq!(
+            t, inner_concat,
+            "page-wrap MUST be text_content-invariant (wrapper contributes 0 #text)"
+        );
+    }
+
+    /// Page-wrap **fallback arm** (`Readability.js:1517-1523`): when the
+    /// fake-div fallback fired (`neededToCreateTopCandidate`), the fake div IS
+    /// the top candidate (already appended in the sibling loop) and is merely
+    /// given `id=readability-page-1` / `class=page` — NO new wrapper, NO child
+    /// move. Still `text_content`-invariant (id/class score-invisible).
+    #[test]
+    fn page_wrap_fallback_arm_assigns_id_class_only_text_invariant() {
+        // No scorable container (all short, link-y) ⇒ topCandidate is null/
+        // BODY ⇒ fake-div fallback ⇒ neededToCreateTopCandidate = true. Use
+        // raw body text + a short nav so no element scores >= the candidate.
+        let html = "<html><body>Loose body text directly under body element here.\
+            <nav><a href=/a>A</a><a href=/b>B</a></nav></body></html>";
+        let (_d, ac) = grab(html, "").expect("grab (fallback)");
+        // The fallback arm does NOT add a second wrapper div: articleContent's
+        // sole child is the fake-div top candidate, which now carries the id.
+        let kids = children(&ac);
+        assert_eq!(
+            kids.len(),
+            1,
+            "fallback: one child (the fake-div top candidate)"
+        );
+        assert_eq!(
+            get_attribute(&kids[0], "id").as_deref(),
+            Some("readability-page-1"),
+            "fallback arm assigns id to the EXISTING fake div (Readability.js:1522)"
+        );
+        assert_eq!(
+            get_attribute(&kids[0], "class").as_deref(),
+            Some("page"),
+            "fallback arm assigns class to the EXISTING fake div (Readability.js:1523)"
+        );
+        // text_content still contains the loose body text, no id/class leak.
+        let t = text_content(&ac);
+        assert!(
+            t.contains("Loose body text directly under body"),
+            "body text: {t}"
+        );
+        assert!(
+            !t.contains("readability-page-1"),
+            "id must not leak into text_content: {t}"
+        );
+    }
+
+    /// **Fidelity: `_prepArticle` ↔ page-wrap order is observationally
+    /// identical** (the swap documented in `mod.rs::parse`'s closure). JS
+    /// order is `_prepArticle` (1512) → page-wrap (1517-1532); the port does
+    /// page-wrap (inside `grab_article`) → `_prepArticle` (in the closure).
+    /// `prep_article_stage1a` is purely `get_all_nodes_with_tag(root, …)`
+    /// descendant searches, and the page-wrap only interposes one extra
+    /// `<div>` (descendant SET unchanged, zero `#text` added), so the
+    /// resulting `text_content` is identical either way. This builds the SAME
+    /// content two ways — (A) `_prepArticle` then wrap (JS order), (B) wrap
+    /// then `_prepArticle` (port order) — and asserts byte-equal
+    /// `text_content`.
+    #[test]
+    fn page_wrap_prep_article_order_invariant() {
+        use crate::readability::dom::{append_child, create_element, create_text_node};
+        use crate::readability::prep::prep_article_stage1a;
+
+        // Build an articleContent-like subtree with cleanable cruft: a real
+        // <p>, an empty-whitespace <p> (1a empty-<p> removal target), a
+        // <footer> (1a _clean target), and a kept <p>.
+        let build = || {
+            let ac = create_element("DIV");
+            let p1 = create_element("p");
+            append_child(
+                &p1,
+                &create_text_node("Genuine readable body prose sentence one."),
+            );
+            append_child(&ac, &p1);
+            let p_empty = create_element("p");
+            append_child(&p_empty, &create_text_node("   "));
+            append_child(&ac, &p_empty);
+            let foot = create_element("footer");
+            append_child(&foot, &create_text_node("site footer chrome"));
+            append_child(&ac, &foot);
+            let p2 = create_element("p");
+            append_child(
+                &p2,
+                &create_text_node("Genuine readable body prose sentence two."),
+            );
+            append_child(&ac, &p2);
+            ac
+        };
+        // Wrap articleContent's children in the page div (the 1525-1531 arm).
+        let page_wrap = |ac: &NodeRef| {
+            let div = create_element("DIV");
+            crate::readability::dom::set_attribute(&div, "id", "readability-page-1");
+            crate::readability::dom::set_attribute(&div, "class", "page");
+            while let Some(fc) = first_child(ac) {
+                append_child(&div, &fc);
+            }
+            append_child(ac, &div);
+        };
+
+        // (A) JS order: _prepArticle THEN page-wrap.
+        let a = build();
+        prep_article_stage1a(&a);
+        page_wrap(&a);
+        let text_a = dom::text_content(&a);
+
+        // (B) port order: page-wrap THEN _prepArticle.
+        let b = build();
+        page_wrap(&b);
+        prep_article_stage1a(&b);
+        let text_b = dom::text_content(&b);
+
+        assert_eq!(
+            text_a, text_b,
+            "_prepArticle ↔ page-wrap order MUST be text_content-invariant \
+             (the page-wrap preserves the descendant set _prepArticle scans \
+             and adds zero #text — see mod.rs::parse fidelity note)"
+        );
+        // And it is the expected cleaned prose (footer + empty <p> gone, no
+        // id/class leak) — i.e. the invariance is over the CORRECT result.
+        assert!(text_a.contains("prose sentence one"), "p1 kept: {text_a}");
+        assert!(text_a.contains("prose sentence two"), "p2 kept: {text_a}");
+        assert!(
+            !text_a.contains("site footer chrome"),
+            "footer must be _clean'd (Readability.js:795-799): {text_a}"
+        );
+        assert!(
+            !text_a.contains("readability-page-1") && !text_a.contains("page"),
+            "score-invisible id/class must not leak: {text_a}"
+        );
+    }
+
+    /// **NodeKey ABA re-audit under re-parse churn (mandatory, HLD §5.1 +
+    /// the DA carried-forward observation).**
+    ///
+    /// The retry re-parse churns nodes hardest: a *fresh* `Dom` (fresh tree +
+    /// fresh `Rc`-keyed side tables) per attempt, plus the page-wrap creating
+    /// nodes. Invariant: **no `NodeKey` from attempt N can alias a live
+    /// side-table entry in attempt N+1**, because each attempt's `Dom` and its
+    /// side tables are wholly owned within that attempt and dropped before the
+    /// next, and the driver keeps only the captured `String` (never a node).
+    ///
+    /// We exercise the exact churn: two independent parses of the SAME bytes
+    /// (the re-parse), score a node in each by `NodeKey`, and assert the
+    /// `Dom`s are independent — a key/score set in `Dom` A does not resolve in
+    /// the freshly re-parsed `Dom` B (distinct `Rc` allocations ⇒ distinct
+    /// `NodeKey`s ⇒ no cross-attempt aliasing). This is the structural
+    /// guarantee the driver's `Attempt`-captures-a-`String` design rests on.
+    #[test]
+    fn retry_nodekey_aba_attempt_doms_are_independent() {
+        let html = "<html><body><div id=c><p>cell body prose text here now</p></div></body></html>";
+
+        // Attempt N: parse, score the <div> by NodeKey, capture its text.
+        let captured_a: String = {
+            let mut dom_a = Dom::parse(html);
+            let div_a = get_elements_by_tag_name(&dom_a.body().unwrap(), "div")[0].clone();
+            dom_a.set_content_score(&div_a, 42.0);
+            assert_eq!(dom_a.content_score(&div_a), Some(42.0));
+            text_content(&div_a)
+            // dom_a (tree + side tables) drops HERE — exactly as an attempt's
+            // `Dom` drops at the closure boundary in `parse()`.
+        };
+
+        // Attempt N+1: a FRESH re-parse of the SAME bytes (the HLD §m-3
+        // re-parse). Its nodes are new Rc allocations ⇒ new NodeKeys.
+        let mut dom_b = Dom::parse(html);
+        let div_b = get_elements_by_tag_name(&dom_b.body().unwrap(), "div")[0].clone();
+
+        // The re-parsed div has NO score: attempt N's side table is gone with
+        // dom_a; no stale NodeKey from attempt N resolves here. (If NodeKeys
+        // aliased across the drop/realloc, this could spuriously be Some.)
+        assert_eq!(
+            dom_b.content_score(&div_b),
+            None,
+            "ABA: attempt N+1's fresh re-parse must NOT see attempt N's score \
+             side-table entry — each attempt's Dom+side-tables are wholly \
+             owned and dropped before the next (HLD §5.1/§m-3)"
+        );
+        // The captured String from attempt N is intact and independent of
+        // dom_b — the driver only ever keeps this, never a node.
+        assert_eq!(captured_a, "cell body prose text here now");
+        // Scoring dom_b is independent (does not retroactively affect the
+        // dropped dom_a — it is gone; this just confirms dom_b is a clean
+        // table).
+        dom_b.set_content_score(&div_b, 7.0);
+        assert_eq!(dom_b.content_score(&div_b), Some(7.0));
     }
 }
