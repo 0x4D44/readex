@@ -272,7 +272,24 @@ name = "mdrcel"
 # `BaselineOutput` live under `#[doc(hidden)] pub mod trafilatura::baseline`.
 # Per semver PATCH: additive infrastructure behind the same `#[doc(hidden)]`
 # surface, no observable change on the default extraction path.
-version = "0.4.5"
+#
+# M3 Stage 2a (2026-05-19): 0.4.5 -> 0.4.6 PATCH. Adds
+# `src/trafilatura/xpaths_constants.rs` — verbatim Rust vendoring of
+# `trafilatura@v2.0.0/xpaths.py:13-265` (13 constants, 37 XPath expressions
+# total: BODY/COMMENTS/REMOVE_COMMENTS/OVERALL_DISCARD/TEASER_DISCARD/
+# PRECISION_DISCARD/DISCARD_IMAGE_ELEMENTS/COMMENTS_DISCARD/AUTHOR/
+# AUTHOR_DISCARD/CATEGORIES/TAGS/TITLE). Each entry traces verbatim to the
+# cited xpaths.py line range. Engine-gap survey
+# (`tests/xpath_constants_engine_coverage.rs`) runs every vendored XPath
+# through the Stage 0b `xpath_engine::evaluate` and reports
+# accept/reject + writes a Markdown journal — result at Stage 2a is 37/37
+# accepted (the Stage 0b operator catalog already covers everything
+# xpaths.py uses, by design — the conformance harness was built against
+# these patterns). No public API change (all under `#[doc(hidden)] pub mod
+# trafilatura::xpaths_constants`). Per semver PATCH: additive
+# infrastructure behind the same `#[doc(hidden)]` surface, no observable
+# change on the default extraction path.
+version = "0.4.6"
 edition = "2024"
 
 [dependencies]

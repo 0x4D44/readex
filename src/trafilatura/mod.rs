@@ -32,3 +32,12 @@ pub mod settings_constants;
 // `trafilatura@v2.0.0/baseline.py:18-123` plus `settings.py:432-434`
 // (BASIC_CLEAN_XPATH literal) and `utils.py:340-346` (trim).
 pub mod baseline;
+
+// Stage 2a — verbatim Rust vendoring of `trafilatura@v2.0.0/xpaths.py`
+// (HLD M3 §7). Stores the 13 XPath constants (BODY_XPATH, COMMENTS_XPATH,
+// OVERALL_DISCARD_XPATH, etc.) as `&[&str]` so callers iterate them and pass
+// each expression to `xpath_engine::evaluate`. The Python `XPath(...)` wrapper
+// is a Python-side compile cache and is not vendored. Gap survey for which
+// XPaths the Stage 0b engine accepts vs needs Stage 2b extension lives in
+// `tests/xpath_constants_engine_coverage.rs`.
+pub mod xpaths_constants;
