@@ -455,6 +455,33 @@ pub fn get_attribute(node: &NodeRef, name: &str) -> Option<String> {
     }
 }
 
+/// All attributes of `node` as `(name, value)` pairs in **source order** (i.e.
+/// the order they were declared in the source HTML, as html5ever preserves
+/// them in `attrs.borrow()`'s `Vec`). Returns an empty `Vec` on non-element
+/// nodes.
+///
+/// This is the lxml-equivalent of iterating `element.items()` (which lxml
+/// documents as "in document order"). It is the foundation for libxml2's
+/// node-set-to-string coercion on attribute unions: `string(@a|@b)` returns
+/// the string value of the first node in document order, which for an
+/// element's attribute list is the first-declared attribute matching either
+/// name. The XPath engine (`src/trafilatura/xpath_engine.rs`) consumes this
+/// to implement the `contains(@id|@class, "x")` shape DA-B-1 calls out.
+///
+/// Added at M3 Stage 0b (post-review MAJOR fix — close facade-coupling
+/// where the engine was reaching into rcdom internals). The element's
+/// `attrs.borrow()` is iterated here; callers stay rcdom-agnostic.
+pub fn attributes_in_source_order(node: &NodeRef) -> Vec<(String, String)> {
+    match &node.data {
+        NodeData::Element { attrs, .. } => attrs
+            .borrow()
+            .iter()
+            .map(|a| (a.name.local.to_string(), a.value.to_string()))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// `node.setAttribute(name, value)` — set or overwrite. No-op on non-element
 /// nodes (the JS only ever sets attributes on elements).
 pub fn set_attribute(node: &NodeRef, name: &str, value: &str) {

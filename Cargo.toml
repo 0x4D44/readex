@@ -212,7 +212,29 @@ name = "mdrcel"
 # "Version management") PATCH — additive helpers behind the same
 # `#[doc(hidden)]` infrastructure surface, no observable change on the
 # default extraction path.
-version = "0.4.1"
+#
+# M3 Stage 0b (2026-05-19): 0.4.1 -> 0.4.2 PATCH. Greenfield XPath 1.0
+# evaluator + conformance harness land on the same `#[doc(hidden)] pub`
+# infrastructure surface as Stage 0a (HLD M3 §6.1, DECISION-A ratified).
+# `src/trafilatura/xpath_engine.rs` implements exactly the DA-B-1 operator
+# catalog (`descendant-or-self` / `child` / `self::` / `attribute` axes;
+# `[N]` positional, `[predicate-list][N]` ordering, `[@attr="v"]`,
+# `[@attr]` predicates; `contains` / `starts-with` / `translate` /
+# `text()` functions; `or` / `and` / `|` / `=` operators) and is exercised
+# by `tests/xpath_conformance.rs` against a Python lxml subprocess for
+# ~51 rows covering every operator + every `xpaths.py` pattern shape.
+# NO documented public API change: `extract` / `extract_with` /
+# `Extracted` / `Options` / `ExtractError` are byte-unchanged; the M2
+# parser-equivalence BLOCKER gate (`tests/parser_equivalence_gate.rs`)
+# still passes byte-identical to commit-149c686 (the engine does not
+# touch dom.rs further, only consumes its public functions). Per semver
+# (CLAUDE.md "Version management") PATCH — additive infrastructure
+# behind the same `#[doc(hidden)]` surface, no observable change on the
+# default extraction path. The engine LOC is ~1100 (well under the HLD's
+# 2000-3000 budget; the conformance discipline replaces line-cite for
+# this file, so the bar is "every supported operator has a conformance
+# row", which it does).
+version = "0.4.2"
 edition = "2024"
 
 [dependencies]

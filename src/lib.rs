@@ -89,6 +89,18 @@
 #[doc(hidden)]
 pub mod readability;
 
+// M3 Stage 0b (HLD `2026.05.19 - HLD - mdrcel Trafilatura Port (M3)` §6.1,
+// DECISION-A ratified). The greenfield XPath evaluator + conformance harness
+// lands here under the same `#[doc(hidden)] pub` infrastructure surface that
+// `readability` uses: in-workspace consumers (the `tests/xpath_conformance.rs`
+// harness; later M3 stages: `cleaning`, `main_extractor`, `baseline`) can
+// drive `trafilatura::xpath_engine::evaluate` against a Python `lxml`
+// subprocess, but the external crate API is unchanged. Subsequent M3 stages
+// fold in more sub-modules (`cleaning`, `main_extractor`, etc.) — Stage 0b is
+// the XPath floor only.
+#[doc(hidden)]
+pub mod trafilatura;
+
 /// The extracted main content of an HTML document, plus light metadata.
 ///
 /// Every field is owned so the result outlives the input `&str`. `title`,
