@@ -119,6 +119,20 @@ fn has_attribute(node: &NodeRef, name: &str) -> bool {
 /// We strip a trailing `!\s*important` suffix (CSS spec syntax — case-
 /// insensitive `!` plus any whitespace plus `important`), then lower-case and
 /// trim, faithful to how `getPropertyValue` would expose the value.
+///
+/// **Known residual (pre-existing, intentionally minimal):** this returns the
+/// **FIRST** matching declaration in source order, while the real CSS cascade
+/// is **LAST-wins** for a given property within a single `style` attribute. A
+/// faithful CSSOM port would consume the whole declaration list and use the
+/// last winning value. Corpus impact at M2 close: ONE pattern hits
+/// (Wikipedia infobox `display:block;;display:inline`), but neither value is
+/// `none`/`hidden`, so the visibility decision for `_isProbablyVisible` is
+/// unchanged — score-invisible. Tracked as an HLD §7.5 named residual; not
+/// closed because (a) zero scored impact on the current corpus and (b)
+/// porting a full CSSOM declaration list would expand the surface area
+/// without measurable benefit. Re-examine if a future URL exhibits a
+/// `display:something;display:none` pattern where last-wins flips the
+/// visibility decision.
 fn inline_style_prop(node: &NodeRef, prop: &str) -> Option<String> {
     let style = get_attribute(node, "style")?;
     for decl in style.split(';') {
