@@ -404,9 +404,9 @@ pub fn prep_article_stage1a(article_content: &NodeRef) {
 ///    HLD §2; included for full structural fidelity).
 /// 2. `_markDataTables` (`:788`) — set `_readabilityDataTable` on every
 ///    `<table>` descendant.
-/// 3. `_fixLazyImages` (`:790`) — **DEFERRED at Stage 2 (HLD §7.4 scope)**;
-///    img-attribute fiddling is score-invisible (HLD §2), no `text_content`
-///    impact.
+/// 3. `_fixLazyImages` (`:790`) — wired at Stage 3 (HLD §7.5); the score-
+///    affecting empty-`<figure>`/`<img>` create at `Readability.js:2398-2407`
+///    is included. See `fix_lazy_images` below at `:461`.
 /// 4. `_cleanConditionally("form")` (`:793`).
 /// 5. `_cleanConditionally("fieldset")` (`:794`).
 /// 6. `_clean("object")` (`:795`).

@@ -19,8 +19,9 @@
 //!   every `REGEXPS` `/i` pattern is ASCII-keyword-only so Rust `(?i)` (which
 //!   *adds* Unicode case folding) is behaviourally identical **on the inputs
 //!   these patterns see** (class/id strings, titles). `adWords`/`loadingWords`
-//!   carry `/u` in JS and contain non-ASCII alternatives — not in Stage-1a
-//!   scope, so deferred (declared, not ported, below).
+//!   carry `/u` in JS and contain non-ASCII alternatives — ported in Stage 2
+//!   at their JS line citations (`Readability.js:171-174`); see `ad_words()`
+//!   at `:322-340` and `loading_words()` at `:342-356` below.
 //!
 //! **Verified (HLD §8):** there are **no backreferences and no lookaround**
 //! anywhere in `REGEXPS`, so Rust `regex` is expressively sufficient (no
