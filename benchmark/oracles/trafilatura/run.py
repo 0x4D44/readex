@@ -168,27 +168,48 @@ def _word_count(text):
 
 
 def _parse_args(argv):
-    """Positional <abs.html> plus optional --base-url <URL>. No argparse: a
-    fixed two-shape CLI; argparse would print to stdout on error."""
+    """Positional <abs.html> plus optional --base-url <URL> plus optional
+    --convert-tags-only.
+
+    No argparse: a fixed CLI; argparse would print to stdout on error.
+
+    Returns (path, base_url, convert_tags_only, err).
+
+    `--convert-tags-only` (M3 Stage 1b additive — HLD §6.2 / Trafilatura-
+    equivalence BLOCKER gate): when set, run.py SKIPS the full
+    `bare_extraction` pipeline and instead emits the post-`tree_cleaning`
+    + post-`convert_tags` tree as canonical XML on stdout (NOT the contract
+    JSON envelope). This is the gate's Python-side oracle: Trafilatura's
+    own htmlprocessing.tree_cleaning + htmlprocessing.convert_tags run with
+    DEFAULT options (matching Rust Options::default()), output serialized
+    via lxml etree.tostring(method='xml', encoding='unicode'). The mode is
+    a Stage 1b additive surface — the harness's `bare_extraction` contract
+    is unchanged (no flag set ⇒ identical behaviour to pre-Stage-1b).
+    """
     path = None
     base_url = None
+    convert_tags_only = False
     i = 0
     while i < len(argv):
         a = argv[i]
         if a == "--base-url":
             if i + 1 >= len(argv):
-                return None, None, "--base-url requires a URL argument"
+                return None, None, False, "--base-url requires a URL argument"
             base_url = argv[i + 1]
             i += 2
+            continue
+        if a == "--convert-tags-only":
+            convert_tags_only = True
+            i += 1
             continue
         if path is None:
             path = a
             i += 1
             continue
-        return None, None, f"unexpected extra argument: {a!r}"
+        return None, None, False, f"unexpected extra argument: {a!r}"
     if path is None:
-        return None, None, "missing required <abs.html> argument"
-    return path, base_url, None
+        return None, None, False, "missing required <abs.html> argument"
+    return path, base_url, convert_tags_only, None
 
 
 def main():
@@ -201,7 +222,7 @@ def main():
     # envelope (the Bug-E2 'adapter blew up — catchable' guard).
     oracle_version = None
     try:
-        snapshot_path, base_url, arg_err = _parse_args(sys.argv[1:])
+        snapshot_path, base_url, convert_tags_only, arg_err = _parse_args(sys.argv[1:])
         if arg_err is not None:
             _emit_failure(arg_err)
 
@@ -228,6 +249,61 @@ def main():
         # (HLD section 3.1, honest framing).
         with open(snapshot_path, "rb") as fh:
             raw = fh.read()
+
+        # --- M3 Stage 1b: --convert-tags-only mode (HLD §6.2) -------------
+        # Emit the post-tree_cleaning + post-convert_tags tree as canonical
+        # XML directly to stdout (no JSON envelope) and exit. This is the
+        # Stage 0c gate's Python-side oracle.
+        if convert_tags_only:
+            # All imports needed for this branch are documented at use-site
+            # so a future maintainer sees why each is here:
+            #   - load_html: Trafilatura's HTML parser front door
+            #     (trafilatura/utils.py); same parser bare_extraction uses
+            #     (core.py:235), so the parsed tree matches gate semantics.
+            #   - tree_cleaning, convert_tags: the two Stage 1b functions
+            #     under test (trafilatura/htmlprocessing.py).
+            #   - Extractor: the options dataclass that controls
+            #     tables/images/links/formatting/focus (trafilatura/settings.py).
+            #     We instantiate with DEFAULTS (matching mdrcel Rust
+            #     cleaning::Options::default()).
+            #   - copy.copy: tree_cleaning mutates in place; in
+            #     bare_extraction the call is `tree_cleaning(copy(tree),
+            #     options)` (core.py:280) so we follow that convention.
+            #   - lxml.etree.tostring: canonical XML serialization.
+            from copy import copy
+            from trafilatura.utils import load_html
+            from trafilatura.htmlprocessing import tree_cleaning, convert_tags
+            from trafilatura.settings import Extractor
+            from lxml.etree import tostring
+
+            tree = load_html(raw)
+            if tree is None:
+                _emit_failure(
+                    "load_html returned None on the snapshot bytes "
+                    "(empty/unparsable HTML)",
+                    oracle_version,
+                )
+
+            options = Extractor(url=base_url)  # All other knobs at default.
+            cleaned_tree = tree_cleaning(copy(tree), options)
+            cleaned_tree = convert_tags(
+                cleaned_tree, options, options.url or None
+            )
+
+            # tostring with method='xml' + encoding='unicode' yields a `str`
+            # (NOT bytes); pretty_print=False keeps it byte-stable.
+            xml_str = tostring(
+                cleaned_tree,
+                method="xml",
+                encoding="unicode",
+                pretty_print=False,
+            )
+            # Single UTF-8 byte write + flush, mirroring _emit_json's
+            # stdout discipline (HLD §3.3).
+            sys.stdout.buffer.write(xml_str.encode("utf-8"))
+            sys.stdout.buffer.flush()
+            sys.exit(0)
+        # --- end --convert-tags-only branch -------------------------------
 
         # Explicit committed config, never ambient (HLD section 4).
         # EXTRACTION_TIMEOUT=0 disables the signal-based timeout: SIGALRM is

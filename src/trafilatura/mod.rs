@@ -14,3 +14,15 @@
 // DECISION-A). Operator catalog is DA-B-1 revised; see the module docs of
 // `xpath_engine` for the exact contract.
 pub mod xpath_engine;
+
+// Stage 1b — tree_cleaning + convert_tags + prune_html (HLD §7.2, DECISION-F).
+// Source of truth: `trafilatura@v2.0.0/htmlprocessing.py`. The Stage 0c
+// Trafilatura-equivalence BLOCKER gate (`tests/trafilatura_equivalence_gate.rs`)
+// activates against this module's output.
+pub mod cleaning;
+
+// Stage 1b — vendored constants for tree_cleaning + convert_tags. Each entry
+// traces verbatim to a `trafilatura@v2.0.0/settings.py` or `.../htmlprocessing.py`
+// line. Membership-test arrays, not HashSets — order is load-bearing per
+// Trafilatura's `# order could matter` comment at `settings.py:348`.
+pub mod settings_constants;

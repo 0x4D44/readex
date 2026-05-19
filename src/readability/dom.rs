@@ -1035,6 +1035,335 @@ pub fn serialize_html(node: &NodeRef) -> String {
     String::from_utf8(buf).unwrap_or_default()
 }
 
+// ---------------------------------------------------------------------------
+// M3 Stage 1b additive surface (HLD §5.1 / §7.2, DECISION-F context).
+// ---------------------------------------------------------------------------
+
+/// Free-function variant of [`Dom::delete_with_tail_preserve`] that does NOT
+/// touch the score / `_readabilityDataTable` side tables (those are M2-only;
+/// cleaning has no scoring context). Otherwise structurally identical:
+/// remove `elem` from its parent and re-anchor `elem.tail` onto the previous
+/// sibling (or parent.text if no previous sibling), matching lxml's
+/// `delete_element(elem, keep_tail=True)` (xml.py:54-70).
+///
+/// Stage 1b's `cleaning::tree_cleaning` / `prune_html` use this so they can
+/// run on a bare `NodeRef` tree without threading a `&mut Dom` through every
+/// helper.
+pub fn delete_with_tail_preserve_free(elem: &NodeRef) {
+    let Some((parent, idx)) = parent_and_index(elem) else {
+        return;
+    };
+
+    // Collect tail-run text + length (scoped borrow).
+    let (tail_text, tail_run_len) = {
+        let kids = parent.children.borrow();
+        let mut text: Option<String> = None;
+        let mut run = 0usize;
+        for sibling in kids.iter().skip(idx + 1) {
+            match &sibling.data {
+                NodeData::Text { contents } => {
+                    let data = contents.borrow();
+                    match &mut text {
+                        Some(s) => s.push_str(&data),
+                        None => text = Some(data.to_string()),
+                    }
+                    run += 1;
+                }
+                _ => break,
+            }
+        }
+        (text, run)
+    };
+
+    // Drain elem + tail Text-node run from parent.children.
+    {
+        let mut kids = parent.children.borrow_mut();
+        let drained: Vec<NodeRef> = kids.drain(idx..idx + 1 + tail_run_len).collect();
+        for n in &drained {
+            n.parent.set(None);
+        }
+    }
+
+    // Re-anchor tail.
+    let Some(text) = tail_text else { return };
+    if idx == 0 {
+        let txt = create_text_node(&text);
+        txt.parent.set(Some(Rc::downgrade(&parent)));
+        parent.children.borrow_mut().insert(0, txt);
+        return;
+    }
+    let prev_is_text = matches!(
+        parent.children.borrow()[idx - 1].data,
+        NodeData::Text { .. }
+    );
+    if prev_is_text {
+        let kids = parent.children.borrow();
+        let prev = &kids[idx - 1];
+        if let NodeData::Text { contents } = &prev.data {
+            let mut merged = contents.borrow().to_string();
+            merged.push_str(&text);
+            *contents.borrow_mut() = merged.into();
+        }
+    } else {
+        let txt = create_text_node(&text);
+        txt.parent.set(Some(Rc::downgrade(&parent)));
+        parent.children.borrow_mut().insert(idx, txt);
+    }
+}
+
+/// Unwrap `elem` in place: move every child of `elem` into `elem`'s parent at
+/// `elem`'s position, then detach `elem`. Preserves `elem`'s `.tail` Text-node
+/// run (it remains where it was, immediately after the last moved child).
+///
+/// This is the lxml `etree.strip_tags(tree, <name>)` semantic Trafilatura's
+/// `tree_cleaning` relies on (`htmlprocessing.py:64`: `strip_tags(tree,
+/// stripping_list)` over `MANUALLY_STRIPPED`). lxml docs:
+/// "Delete all elements with the given tag name from a tree or subtree.
+/// This will remove the elements and their entire subtree, including all
+/// their attributes, text content and descendants. It will not remove
+/// (or otherwise touch) the tail text." — wait, that is `strip_elements`. The
+/// `strip_tags` variant is the OPPOSITE: it removes the element WRAPPER but
+/// preserves the element's children, text, tail, attributes-of-children, …
+/// Per lxml docs on `strip_tags`: "Delete all elements with the provided tag
+/// names from a tree or subtree. This will remove the elements and their
+/// attributes, but not their text/tail content or descendants. Instead, it
+/// will merge the text content and children of the element into its parent."
+///
+/// This function implements that "merge into parent" semantic for a single
+/// element. The caller drives the tree walk (Stage 1b iterates the catalog
+/// once and calls this per element found).
+///
+/// # Tail semantics
+///
+/// `elem`'s `.tail` Text-node run (between `elem` and the next non-Text
+/// sibling) is left in place — it sits immediately after the spliced-in
+/// children, exactly as lxml's `strip_tags` produces. `elem`'s LEADING text
+/// (its first Text-node child, lxml's `.text`) flows out as the first
+/// spliced child, naturally.
+///
+/// # No-op cases
+///
+/// - `elem` is detached (no parent) → no-op.
+/// - `elem` has no children → still removes `elem` from its parent (the
+///   "empty element" case; lxml strips it the same way).
+///
+/// # Source anchor
+///
+/// HLD §7.2: `tree_cleaning(htmlprocessing.py:64)` calls lxml `strip_tags`
+/// over `MANUALLY_STRIPPED` (`settings.py:407-429`). This is the rcdom-side
+/// equivalent the Rust port calls per-element.
+pub fn strip_element(elem: &NodeRef) {
+    let Some((parent, idx)) = parent_and_index(elem) else {
+        return;
+    };
+
+    // Move `elem`'s children into `parent`'s children at position `idx`.
+    // `elem` itself is then removed (it occupies the slot AFTER its children;
+    // i.e. after the splice, `parent.children` has the children at idx..idx+k
+    // and `elem` at idx+k; we then drop `elem`).
+    let moved: Vec<NodeRef> = elem.children.borrow_mut().drain(..).collect();
+
+    {
+        let mut kids = parent.children.borrow_mut();
+        // Remove `elem` first (at idx), then insert the moved children at
+        // idx. Order preserved. Doing it in this order keeps the index math
+        // trivial: after `remove(idx)`, the slot at idx is "where elem was";
+        // inserting in reverse order puts each child at idx, ending with
+        // moved[0] at idx and moved[k-1] at idx + (k-1) — i.e. original order.
+        kids.remove(idx);
+        for child in moved.iter().rev() {
+            child.parent.set(Some(Rc::downgrade(&parent)));
+            kids.insert(idx, child.clone());
+        }
+    }
+    elem.parent.set(None);
+}
+
+/// Replace `elem`'s tag with `new_tag`, preserving the element's parent slot,
+/// attributes, and children. Returns the new `NodeRef`.
+///
+/// This is the cleaning-side analogue of `Dom::set_node_tag`: same five
+/// structural moves (create new, move children, splice into parent slot, clone
+/// attrs, return new handle) but **without** the side-table transfer
+/// (`set_node_tag` carries `content_score` + `readability_data_table` over
+/// the rename — those are M2 scoring fixtures, irrelevant to M3 `convert_tags`).
+///
+/// # DECISION-F (HLD §2.2)
+///
+/// Trafilatura's `convert_tags` (`htmlprocessing.py:381-417`) rewrites tags on
+/// potentially thousands of elements per page. We deliberately do NOT push
+/// through `Dom::set_node_tag` here because:
+///
+/// 1. Side-table transfer is meaningless on the cleaning path (no scores yet);
+/// 2. Avoiding the `&mut Dom` borrow lets `convert_tags` run over a
+///    `NodeRef` without threading the `Dom` through every helper;
+/// 3. The cost remains O(N) per element regardless — rcdom stores
+///    `NodeData::Element { name: QualName, ... }` by value (no interior
+///    mutability on `name`), so a true in-place rename without `unsafe` is
+///    not possible. The "allocate new node + reparent children" path IS the
+///    in-place rename in safe Rust against rcdom.
+///
+/// If Stage 1b's DECISION-F perf check shows EDGAR-class extraction > 2× M2
+/// equivalent, the upgrade path is to swap rcdom for a substrate that exposes
+/// `&Cell<QualName>` (or to add `unsafe` here, which the doctrine forbids).
+/// The Stage 1b measurement determines whether either is needed.
+///
+/// # Returns
+///
+/// The new `NodeRef` (the old one is detached). Callers MUST use the returned
+/// handle — the old one is no longer in the tree.
+#[must_use = "replace_element_tag detaches the old element and returns the new \
+              one; the caller must use the returned handle"]
+pub fn replace_element_tag(elem: &NodeRef, new_tag: &str) -> NodeRef {
+    // Create the replacement.
+    let replacement = create_element(new_tag);
+
+    // Move children in order.
+    let moved: Vec<NodeRef> = elem.children.borrow_mut().drain(..).collect();
+    {
+        let mut new_kids = replacement.children.borrow_mut();
+        for child in &moved {
+            child.parent.set(Some(Rc::downgrade(&replacement)));
+            new_kids.push(child.clone());
+        }
+    }
+
+    // Clone attributes (Trafilatura's convert_tags clears attrs at the call
+    // site via `elem.attrib.clear()` then sets specific ones — we faithfully
+    // copy them here, and the caller calls `clear_attributes` / `set_attribute`
+    // afterwards if needed). This preserves the "rename only" semantic.
+    if let NodeData::Element { attrs: old, .. } = &elem.data
+        && let NodeData::Element { attrs: new, .. } = &replacement.data
+    {
+        *new.borrow_mut() = old.borrow().clone();
+    }
+
+    // Splice into parent slot. If detached, leave detached (matches set_node_tag).
+    if let Some((p, pos)) = parent_and_index(elem) {
+        replacement.parent.set(Some(Rc::downgrade(&p)));
+        p.children.borrow_mut()[pos] = replacement.clone();
+        elem.parent.set(None);
+    }
+
+    replacement
+}
+
+/// Remove every attribute from `elem`. No-op on non-element nodes. Matches
+/// lxml's `elem.attrib.clear()` (`htmlprocessing.py:323, 373, 403`).
+pub fn clear_attributes(elem: &NodeRef) {
+    if let NodeData::Element { attrs, .. } = &elem.data {
+        attrs.borrow_mut().clear();
+    }
+}
+
+/// Canonical XML serialization for the M3 Stage 0c Trafilatura-equivalence
+/// gate (HLD §6.2). Emits a deterministic, ASCII-stable XML representation
+/// of `node`'s subtree:
+///
+/// - Each element opens as `<tag>` (or `<tag attr="value" ...>` for non-empty
+///   attribute lists, attributes in source order — matching
+///   `attributes_in_source_order`'s lxml-equivalent contract).
+/// - Empty elements use the long form `<tag></tag>` (NOT `<tag/>`), matching
+///   lxml's default `etree.tostring(..., method='xml')` output for elements
+///   that have NO children. This trades two extra bytes per empty element for
+///   serializer-independent equality.
+/// - Text node `data` is emitted with the five-char XML escape: `&` →
+///   `&amp;`, `<` → `&lt;`, `>` → `&gt;`, `"` → `&quot;`, `'` → `&apos;`.
+///   Attribute values use the same five-char escape.
+/// - Comments / processing instructions / doctypes are **omitted** — they
+///   are not part of `convert_tags`'s output domain (the cleaning step at
+///   `htmlprocessing.py:64` strips comments via `strip_tags` *implicitly*
+///   because `MANUALLY_STRIPPED` does not include comment nodes; but
+///   Trafilatura's downstream `xmltotxt` discards them anyway, and lxml's
+///   `tostring(method='xml', with_comments=False)` discards them too). The
+///   gate compares post-`convert_tags` trees, so suppressing comments on
+///   both sides keeps the comparison stable across html5ever and lxml.
+/// - Whitespace is preserved verbatim from Text nodes; no pretty-printing.
+///
+/// # Why not html5ever's XML serializer?
+///
+/// html5ever's `serialize::serialize` emits HTML, including void-element
+/// special-casing (`<br>` not `<br></br>`) and HTML attribute-value-quoting
+/// rules. The post-`convert_tags` tree contains TEI tags (`hi`, `list`,
+/// `item`, `head`, `quote`, `cell`, `row`, `ref`, `lb`) that html5ever has no
+/// HTML semantic for, AND we deliberately want the long-form `<tag></tag>`
+/// for byte-stability vs lxml. Hand-rolling the serializer is ~50 LOC of
+/// pure-CPU work over the rcdom tree and avoids dragging in xml5ever (which
+/// would be a new runtime dependency).
+///
+/// # Stage 0c contract
+///
+/// Pair this with `run.py --convert-tags-only`'s `etree.tostring(tree,
+/// method='xml', pretty_print=False, encoding='unicode')` output. The gate
+/// asserts byte-identity OR a documented whitespace-only delta (HLD §6.2).
+pub fn serialize_converted_tree(node: &NodeRef) -> String {
+    let mut out = String::new();
+    serialize_node(node, &mut out);
+    out
+}
+
+fn serialize_node(node: &NodeRef, out: &mut String) {
+    match &node.data {
+        NodeData::Element { name, attrs, .. } => {
+            let tag = name.local.as_ref();
+            out.push('<');
+            out.push_str(tag);
+            for a in attrs.borrow().iter() {
+                out.push(' ');
+                out.push_str(a.name.local.as_ref());
+                out.push('=');
+                out.push('"');
+                escape_xml_attr(&a.value, out);
+                out.push('"');
+            }
+            out.push('>');
+            for child in node.children.borrow().iter() {
+                serialize_node(child, out);
+            }
+            out.push_str("</");
+            out.push_str(tag);
+            out.push('>');
+        }
+        NodeData::Text { contents } => {
+            escape_xml_text(&contents.borrow(), out);
+        }
+        NodeData::Document => {
+            // The Document is opaque — only its children are emitted (matches
+            // lxml's `tostring(tree, ...)` which serialises the root element,
+            // not a Document wrapper). For an rcdom Document, children = [<html>].
+            for child in node.children.borrow().iter() {
+                serialize_node(child, out);
+            }
+        }
+        // Comments / PIs / Doctype: deliberately omitted (see fn doc).
+        _ => {}
+    }
+}
+
+fn escape_xml_text(s: &str, out: &mut String) {
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(c),
+        }
+    }
+}
+
+fn escape_xml_attr(s: &str, out: &mut String) {
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1891,5 +2220,133 @@ mod tests {
         assert_eq!(text_content(&body), "hello");
         // <title> text is in <head>, not <body>
         assert!(!text_content(&body).contains('T'));
+    }
+
+    // ---- M3 Stage 1b: strip_element / replace_element_tag / clear_attributes ----
+
+    #[test]
+    fn strip_element_unwraps_children_into_parent_slot() {
+        // <div>a<span>X<i>Y</i>Z</span>b</div>:
+        // strip the <span> -> <div>aX<i>Y</i>Zb</div>  (children in slot,
+        // tail "b" stays put as <div>'s next-text-after-span, which now sits
+        // after the moved <i> + after the moved trailing "Z").
+        let dom = Dom::parse("<div>a<span>X<i>Y</i>Z</span>b</div>");
+        let div = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let span = get_elements_by_tag_name(&div, "span")[0].clone();
+        strip_element(&span);
+        // span is detached
+        assert!(parent(&span).is_none());
+        // div.text_content = "aXYZb" (no change to total text; just unwrapped)
+        assert_eq!(text_content(&div), "aXYZb");
+        // <i> survived inside <div>
+        assert_eq!(get_elements_by_tag_name(&div, "i").len(), 1);
+        // span is gone
+        assert!(get_elements_by_tag_name(&div, "span").is_empty());
+    }
+
+    #[test]
+    fn strip_element_detached_is_noop() {
+        let e = create_element("span");
+        strip_element(&e);
+        assert!(parent(&e).is_none());
+    }
+
+    #[test]
+    fn strip_element_empty_element_removed_no_children_moved() {
+        let dom = Dom::parse("<div>a<br>b</div>");
+        let div = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let br = get_elements_by_tag_name(&div, "br")[0].clone();
+        strip_element(&br);
+        assert!(parent(&br).is_none());
+        assert_eq!(text_content(&div), "ab");
+        assert!(get_elements_by_tag_name(&div, "br").is_empty());
+    }
+
+    #[test]
+    fn replace_element_tag_keeps_attributes_and_children() {
+        let dom = Dom::parse(r#"<div><b class="x" id="y">hi<i>!</i></b></div>"#);
+        let div = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let b = get_elements_by_tag_name(&div, "b")[0].clone();
+        let hi = replace_element_tag(&b, "hi");
+        // Old detached; new is in the tree.
+        assert!(parent(&b).is_none());
+        assert!(Rc::ptr_eq(&parent(&hi).unwrap(), &div));
+        assert_eq!(tag_name(&hi).as_deref(), Some("HI"));
+        // Attrs cloned.
+        assert_eq!(get_attribute(&hi, "class").as_deref(), Some("x"));
+        assert_eq!(get_attribute(&hi, "id").as_deref(), Some("y"));
+        // Children moved.
+        assert_eq!(text_content(&hi), "hi!");
+        assert_eq!(get_elements_by_tag_name(&hi, "i").len(), 1);
+    }
+
+    #[test]
+    fn replace_element_tag_preserves_position_in_parent() {
+        let dom = Dom::parse("<div><p>1</p><b>2</b><p>3</p></div>");
+        let div = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let b = get_elements_by_tag_name(&div, "b")[0].clone();
+        let hi = replace_element_tag(&b, "hi");
+        // div now has [<p>1</p>, <hi>2</hi>, <p>3</p>] — children list order
+        let kids = children(&div);
+        assert_eq!(tag_name(&kids[0]).as_deref(), Some("P"));
+        assert_eq!(tag_name(&kids[1]).as_deref(), Some("HI"));
+        assert!(Rc::ptr_eq(&kids[1], &hi));
+        assert_eq!(tag_name(&kids[2]).as_deref(), Some("P"));
+    }
+
+    #[test]
+    fn clear_attributes_empties_attr_list() {
+        let dom = Dom::parse(r#"<p class="a" id="x" data-k="v">hi</p>"#);
+        let p = get_elements_by_tag_name(&dom.body().unwrap(), "p")[0].clone();
+        clear_attributes(&p);
+        assert_eq!(get_attribute(&p, "class"), None);
+        assert_eq!(get_attribute(&p, "id"), None);
+        assert_eq!(get_attribute(&p, "data-k"), None);
+        // Text/children preserved.
+        assert_eq!(text_content(&p), "hi");
+    }
+
+    // ---- M3 Stage 1b: serialize_converted_tree (HLD §6.2) ----
+
+    #[test]
+    fn serialize_converted_tree_simple_element_long_form_empty() {
+        let e = create_element("hi");
+        // Empty element -> long form <hi></hi> (NOT <hi/>).
+        assert_eq!(serialize_converted_tree(&e), "<hi></hi>");
+    }
+
+    #[test]
+    fn serialize_converted_tree_attrs_in_source_order_with_escape() {
+        let dom = Dom::parse(r#"<p class="a&amp;b" id="x">hi</p>"#);
+        let p = get_elements_by_tag_name(&dom.body().unwrap(), "p")[0].clone();
+        let s = serialize_converted_tree(&p);
+        // class attr value de-entitied at parse to `a&b` then re-escaped here.
+        // Attributes in source order: class first, id second.
+        assert_eq!(s, r#"<p class="a&amp;b" id="x">hi</p>"#);
+    }
+
+    #[test]
+    fn serialize_converted_tree_text_escapes_lt_gt_amp() {
+        let dom = Dom::parse("<p>a &lt; b &amp; c &gt; d</p>");
+        let p = get_elements_by_tag_name(&dom.body().unwrap(), "p")[0].clone();
+        let s = serialize_converted_tree(&p);
+        // Parse decodes; serialize re-encodes the five core chars.
+        assert_eq!(s, "<p>a &lt; b &amp; c &gt; d</p>");
+    }
+
+    #[test]
+    fn serialize_converted_tree_nested_with_mixed_content() {
+        let dom = Dom::parse("<div>a<span>b<i>c</i>d</span>e</div>");
+        let div = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let s = serialize_converted_tree(&div);
+        assert_eq!(s, "<div>a<span>b<i>c</i>d</span>e</div>");
+    }
+
+    #[test]
+    fn serialize_converted_tree_omits_comments() {
+        let dom = Dom::parse("<div>a<!-- big comment -->b</div>");
+        let div = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let s = serialize_converted_tree(&div);
+        assert_eq!(s, "<div>ab</div>");
     }
 }

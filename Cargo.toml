@@ -234,7 +234,24 @@ name = "mdrcel"
 # 2000-3000 budget; the conformance discipline replaces line-cite for
 # this file, so the bar is "every supported operator has a conformance
 # row", which it does).
-version = "0.4.3"
+# M3 Stage 1b (2026-05-19): 0.4.3 -> 0.4.4 PATCH. Adds `src/trafilatura/cleaning.rs`
+# (tree_cleaning + convert_tags + prune_html, faithful port of
+# `trafilatura@v2.0.0/htmlprocessing.py:48-417`) and
+# `src/trafilatura/settings_constants.rs` (verbatim MANUALLY_CLEANED /
+# MANUALLY_STRIPPED / CUT_EMPTY_ELEMS / PRESERVE_IMG_CLEANING /
+# REND_TAG_MAPPING vendoring from `settings.py:320-475` and
+# `htmlprocessing.py:29-45`). Extends `src/readability/dom.rs` additively
+# (HLD §5.1) with `delete_with_tail_preserve_free`, `strip_element`,
+# `replace_element_tag`, `clear_attributes`, `serialize_converted_tree`
+# — the Stage 1b cleaning surface. The M2 parser-equivalence BLOCKER gate
+# (`tests/parser_equivalence_gate.rs`) is byte-identical to commit 149c686
+# (no changes). Activates the Stage 0c BLOCKER gate
+# (`tests/trafilatura_equivalence_gate.rs`) populated with 10 fixture URLs.
+# No public API change — all surfaces are `#[doc(hidden)] pub mod
+# trafilatura::cleaning`. Per semver (CLAUDE.md "Version management") PATCH:
+# additive infrastructure behind the same `#[doc(hidden)]` surface, no
+# observable change on the default (`Extractor::Readability`) extraction path.
+version = "0.4.4"
 edition = "2024"
 
 [dependencies]
