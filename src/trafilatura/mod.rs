@@ -41,3 +41,11 @@ pub mod baseline;
 // XPaths the Stage 0b engine accepts vs needs Stage 2b extension lives in
 // `tests/xpath_constants_engine_coverage.rs`.
 pub mod xpaths_constants;
+
+// Stage 2b' — small utility helpers ported from `trafilatura@v2.0.0/utils.py`
+// (HLD §7.2 prerequisites for Stage 2c-i): `FORMATTING_PROTECTED`,
+// `SPACING_PROTECTED`, `IMAGE_EXTENSION`, `RE_FILTER`, `is_image_file`,
+// `is_image_element`, `textfilter`, `text_chars_test`, `trim`. Plus the
+// `duplicate_test` stub from `deduplication.py:243-254` (the full LRU port
+// is deferred until a future stage activates `Options.dedup`).
+pub mod utils;

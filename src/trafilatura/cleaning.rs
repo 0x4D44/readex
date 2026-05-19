@@ -735,6 +735,684 @@ fn convert_details(elem: &NodeRef) {
 }
 
 // ===========================================================================
+// STAGE 2b' EXTENSION — htmlprocessing.py 93-285 (HLD §7.2 prerequisites
+// for Stage 2c-i)
+//
+// The functions below were NOT in Stage 1b. They are the rest of
+// `htmlprocessing.py`: `prune_unwanted_nodes`, `collect_link_info`,
+// `link_density_test`, `link_density_test_tables`, `delete_by_link_density`,
+// `handle_textnode`, `process_node`. These are the substrate the Stage 2c-i
+// handler primitives (`handle_titles` / `handle_formatting`) build on.
+//
+// Stage 1b functions above (`tree_cleaning` / `convert_tags` / `prune_html` /
+// per-tag converters / `strip_tags_multi` / `delete_elements_by_tag`) are
+// FROZEN; do not modify them in this stage.
+// ===========================================================================
+
+use crate::readability::dom::{
+    element_text, previous_element_sibling, set_element_text, set_tail, tail, text_content,
+};
+use crate::trafilatura::utils::{
+    duplicate_test, element_child_count, is_image_element, textfilter, trim,
+};
+use crate::trafilatura::xpath_engine;
+
+// ---------------------------------------------------------------------------
+// prune_unwanted_nodes (htmlprocessing.py:93-118)
+// ---------------------------------------------------------------------------
+
+/// Prune the HTML tree by removing nodes matched by each XPath expression in
+/// `nodelist`. With `with_backup=true`, restore from a pre-deletion snapshot
+/// if the post-deletion text shrank to less than 1/7 of the original.
+///
+/// **Source line-cite:** `htmlprocessing.py:93-118`.
+///
+/// # Python original
+///
+/// ```python
+/// def prune_unwanted_nodes(
+///     tree: HtmlElement, nodelist: List[XPath], with_backup: bool = False
+/// ) -> HtmlElement:
+///     "Prune the HTML tree by removing unwanted sections."
+///     if with_backup:
+///         old_len = len(tree.text_content())
+///         backup = deepcopy(tree)
+///
+///     for expression in nodelist:
+///         for subtree in expression(tree):
+///             # preserve tail text from deletion
+///             if subtree.tail is not None:
+///                 prev = subtree.getprevious()
+///                 if prev is None:
+///                     prev = subtree.getparent()
+///                 if prev is not None:
+///                     # There is a previous node, append text to its tail
+///                     prev.tail = (prev.tail or "") + " " + subtree.tail
+///             # remove the node
+///             subtree.getparent().remove(subtree)
+///
+///     if with_backup:
+///         new_len = len(tree.text_content())
+///         # todo: adjust for recall and precision settings
+///         return tree if new_len > old_len / 7 else backup
+///     return tree
+/// ```
+///
+/// # Rust port shape
+///
+/// `nodelist` is a slice of XPath expression strings (the Python wrapper is
+/// a `List[XPath]` of pre-compiled `etree.XPath` callables; the Stage 0b
+/// engine takes strings, so we pass strings directly). Each expression is
+/// evaluated against `tree` via `xpath_engine::evaluate`.
+///
+/// **Tail preservation.** lxml's `getprevious()` returns the previous
+/// element/comment/PI sibling. With the `remove_comments=True` parser
+/// (utils.py:70), it is effectively "previous element sibling". The Rust
+/// port uses `dom::previous_element_sibling` (Stage 2b' addition); if there
+/// is none, it falls back to `getparent()` — at which point the Python sets
+/// `prev.tail`, where `prev` IS the parent (so the appended text becomes
+/// the parent's tail, i.e. text after the parent's closing tag). That is
+/// the lxml semantic the port mirrors faithfully (it's unusual but it's
+/// what the source says).
+///
+/// **Backup branch.** When `with_backup=true`, the Python deep-copies the
+/// tree, prunes, and reverts if post-deletion text < pre-deletion / 7.
+/// rcdom does not expose a public deep-clone, so the Stage 2b' Rust port
+/// captures the pre-deletion `text_content()` length AND a `serialize_html()`
+/// snapshot of the tree. After deletion, if the post text length fell
+/// below the threshold, we don't fully restore (a true restore would need
+/// a re-parse + tree-swap, which is multi-stage work). Instead we record
+/// `restored = false` in the return value so callers know whether the
+/// backup branch fired. Stage 2c orchestration sites that need the restored
+/// tree will call `prune_unwanted_nodes` on a freshly-parsed sub-tree
+/// (Stage 1b's `tree_cleaning` recall-backup already documented this same
+/// deferral).
+///
+/// Returns `()` (mutates in place). The Python returns `tree`; the Rust
+/// caller already holds the `NodeRef`.
+pub fn prune_unwanted_nodes(tree: &NodeRef, nodelist: &[&str], with_backup: bool) {
+    // htmlprocessing.py:97-99 — capture pre-deletion text length.
+    let old_len = if with_backup {
+        text_content(tree).chars().count()
+    } else {
+        0
+    };
+
+    // htmlprocessing.py:101-112 — for each XPath, for each match, preserve
+    // tail and remove.
+    for expression in nodelist {
+        let matches = xpath_engine::evaluate(expression, tree).unwrap_or_default();
+        for subtree in matches {
+            // htmlprocessing.py:104 — if subtree.tail is not None.
+            if let Some(t) = tail(&subtree) {
+                // htmlprocessing.py:105-107 — prev = subtree.getprevious() or
+                // subtree.getparent().
+                let prev = previous_element_sibling(&subtree).or_else(|| dom::parent(&subtree));
+                // htmlprocessing.py:108-110 — append tail to prev.tail.
+                if let Some(prev) = prev {
+                    let old_tail = tail(&prev).unwrap_or_default();
+                    let mut new_tail = old_tail;
+                    new_tail.push(' ');
+                    new_tail.push_str(&t);
+                    set_tail(&prev, Some(&new_tail));
+                }
+            }
+            // htmlprocessing.py:112 — subtree.getparent().remove(subtree).
+            // `dom::remove` detaches without preserving tail (we already
+            // moved the tail above); the Text-run that was the tail still
+            // lives in the parent at the original position, so we must drop
+            // it too. Easiest: detach the tail run as well.
+            //
+            // The simpler equivalent: clear the tail of `subtree` (drops
+            // the parent-level Text-run) then remove `subtree`. set_tail
+            // on a still-attached child clears the Text-run between it and
+            // the next non-Text sibling.
+            set_tail(&subtree, None);
+            dom::remove(&subtree);
+        }
+    }
+
+    // htmlprocessing.py:114-117 — backup branch.
+    if with_backup {
+        let new_len = text_content(tree).chars().count();
+        // The Python `new_len > old_len / 7` test. If we shrank too much,
+        // the Python returns the backup. Stage 2c-iii (`main_extractor.py:
+        // 537`) is the OVERALL_DISCARD_XPATH caller that activates this
+        // path. The backup branch requires deep-cloning the input tree,
+        // which dom.rs does not yet expose — so rather than silently
+        // over-prune we PANIC loudly, pinning the gap as a hard blocker
+        // for Stage 2c-iii. See Stage 2b' review findings M1/D1.
+        if (new_len * 7) <= old_len {
+            // htmlprocessing.py:117 — Python returns the backup tree here.
+            // The backup branch requires deep-cloning the input tree, which
+            // dom.rs does not yet expose. Stage 2c-iii (the OVERALL_DISCARD_XPATH
+            // caller at main_extractor.py:537) MUST land the dom.rs `deep_clone`
+            // facade fn before activating with_backup=true.
+            unimplemented!(
+                "prune_unwanted_nodes with_backup=true backup-restore branch \
+                 (htmlprocessing.py:117) requires dom.rs deep_clone; \
+                 pin via TODO(M3-stage-2c-iii)"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// collect_link_info (htmlprocessing.py:121-129)
+// ---------------------------------------------------------------------------
+
+/// Collect heuristics on link text — sum of lengths, count, short-element
+/// count, and the trimmed list itself.
+///
+/// **Source line-cite:** `htmlprocessing.py:121-129`.
+///
+/// # Python original
+///
+/// ```python
+/// def collect_link_info(
+///     links_xpath: List[HtmlElement],
+/// ) -> Tuple[int, int, int, List[str]]:
+///     "Collect heuristics on link text"
+///     mylist = [e for e in (trim(elem.text_content()) for elem in links_xpath) if e]
+///     lengths = list(map(len, mylist))
+///     # longer strings impact recall in favor of precision
+///     shortelems = sum(1 for l in lengths if l < 10)
+///     return sum(lengths), len(mylist), shortelems, mylist
+/// ```
+///
+/// # Rust port shape
+///
+/// Returns `(total_link_text_len, count, short_elem_count, list)`. Lengths
+/// are character counts (Python `len(str)` = code-point count); we use
+/// `str::chars().count()` to match.
+pub fn collect_link_info(links: &[NodeRef]) -> (usize, usize, usize, Vec<String>) {
+    let mylist: Vec<String> = links
+        .iter()
+        .map(|elem| trim(&text_content(elem)))
+        .filter(|s| !s.is_empty())
+        .collect();
+    let lengths: Vec<usize> = mylist.iter().map(|s| s.chars().count()).collect();
+    let shortelems = lengths.iter().filter(|&&l| l < 10).count();
+    let total: usize = lengths.iter().sum();
+    (total, mylist.len(), shortelems, mylist)
+}
+
+// ---------------------------------------------------------------------------
+// link_density_test (htmlprocessing.py:132-169)
+// ---------------------------------------------------------------------------
+
+/// Determine whether `element` is rich enough in links that it looks like
+/// boilerplate. Returns `(should_delete, link_text_list)`.
+///
+/// **Source line-cite:** `htmlprocessing.py:132-169`.
+///
+/// # Python original
+///
+/// See htmlprocessing.py:132-169. The logic, in summary:
+/// - Find all `<ref>` descendants (XPath `.//ref`).
+/// - If none, return `(false, [])`.
+/// - SHORTCUT for exactly one ref: if its trimmed link text is longer than
+///   a threshold (10 / 100 by `favor_precision`) and > 90% of element's
+///   text, return `(true, [])`.
+/// - Pick `limitlen` based on element tag + whether it has a next sibling:
+///     - tag == "p": 60 if no next sibling else 30.
+///     - else: 300 if no next sibling else 100.
+/// - If element text shorter than `limitlen`:
+///     - collect_link_info; if zero non-empty links, return `(true, [])`.
+///     - Otherwise return true if link text > 80% of total OR
+///       (more than one link AND > 80% are short).
+/// - Otherwise return `(false, mylist)`.
+pub fn link_density_test(
+    element: &NodeRef,
+    text: &str,
+    favor_precision: bool,
+) -> (bool, Vec<String>) {
+    // htmlprocessing.py:136 — links_xpath = element.findall(".//ref").
+    // `findall` semantic = XPath `.//ref` returning descendants in document
+    // order. Routed through Stage 0b engine.
+    let links_xpath = xpath_engine::evaluate(".//ref", element).unwrap_or_default();
+    if links_xpath.is_empty() {
+        return (false, Vec::new());
+    }
+
+    // htmlprocessing.py:141-145 — single-link shortcut.
+    if links_xpath.len() == 1 {
+        let len_threshold = if favor_precision { 10 } else { 100 };
+        let link_text = trim(&text_content(&links_xpath[0]));
+        let link_text_len = link_text.chars().count();
+        let text_len = text.chars().count();
+        // > len(text) * 0.9 — preserved as integer math via float coercion.
+        if link_text_len > len_threshold && link_text_len as f64 > text_len as f64 * 0.9 {
+            return (true, Vec::new());
+        }
+    }
+
+    // htmlprocessing.py:146-154 — pick limitlen.
+    let tag = dom::local_name(element).unwrap_or_default();
+    let has_next = dom::next_element_sibling(element).is_some();
+    let limitlen: usize = if tag == "p" {
+        if !has_next { 60 } else { 30 }
+    } else if !has_next {
+        300
+    } else {
+        100
+    };
+
+    // htmlprocessing.py:155-168 — short-element check.
+    let elemlen = text.chars().count();
+    let mut mylist_out: Vec<String> = Vec::new();
+    if elemlen < limitlen {
+        let (linklen, elemnum, shortelems, mylist) = collect_link_info(&links_xpath);
+        if elemnum == 0 {
+            return (true, mylist);
+        }
+        // > 80% of total OR (>1 ref AND >80% short).
+        if (linklen as f64) > (elemlen as f64) * 0.8
+            || (elemnum > 1 && (shortelems as f64) / (elemnum as f64) > 0.8)
+        {
+            return (true, mylist);
+        }
+        mylist_out = mylist;
+    }
+    (false, mylist_out)
+}
+
+// ---------------------------------------------------------------------------
+// link_density_test_tables (htmlprocessing.py:172-188)
+// ---------------------------------------------------------------------------
+
+/// Tables-specific variant of `link_density_test`. Returns true if the
+/// table looks like a link-heavy navigation table.
+///
+/// **Source line-cite:** `htmlprocessing.py:172-188`.
+pub fn link_density_test_tables(element: &NodeRef) -> bool {
+    let links_xpath = xpath_engine::evaluate(".//ref", element).unwrap_or_default();
+    if links_xpath.is_empty() {
+        return false;
+    }
+
+    let elem_text = trim(&text_content(element));
+    let elemlen = elem_text.chars().count();
+    // htmlprocessing.py:180-181 — short tables are never link-heavy enough.
+    if elemlen < 200 {
+        return false;
+    }
+
+    let (linklen, elemnum, _, _) = collect_link_info(&links_xpath);
+    if elemnum == 0 {
+        return true;
+    }
+
+    // htmlprocessing.py:188 — 80% threshold for "small" tables (< 1000
+    // chars), 50% threshold for larger tables.
+    if elemlen < 1000 {
+        (linklen as f64) > 0.8 * (elemlen as f64)
+    } else {
+        (linklen as f64) > 0.5 * (elemlen as f64)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// delete_by_link_density (htmlprocessing.py:191-219)
+// ---------------------------------------------------------------------------
+
+/// Determine the link density of every descendant `tagname` element and
+/// delete those identified as boilerplate.
+///
+/// **Source line-cite:** `htmlprocessing.py:191-219`.
+///
+/// # Python original
+///
+/// ```python
+/// def delete_by_link_density(
+///     subtree, tagname, backtracking=False, favor_precision=False
+/// ):
+///     deletions = []
+///     len_threshold = 200 if favor_precision else 100
+///     depth_threshold = 1 if favor_precision else 3
+///
+///     for elem in subtree.iter(tagname):
+///         elemtext = trim(elem.text_content())
+///         result, templist = link_density_test(elem, elemtext, favor_precision)
+///         if result or (
+///             backtracking
+///             and templist
+///             and 0 < len(elemtext) < len_threshold
+///             and len(elem) >= depth_threshold
+///         ):
+///             deletions.append(elem)
+///
+///     for elem in dict.fromkeys(deletions):  # dedup, preserve order
+///         delete_element(elem)
+///
+///     return subtree
+/// ```
+pub fn delete_by_link_density(
+    subtree: &NodeRef,
+    tagname: &str,
+    backtracking: bool,
+    favor_precision: bool,
+) {
+    let len_threshold = if favor_precision { 200 } else { 100 };
+    let depth_threshold = if favor_precision { 1 } else { 3 };
+
+    // htmlprocessing.py:203 — `subtree.iter(tagname)`. lxml's
+    // `Element.iter(tagname)` INCLUDES self if `self.tag == tagname`.
+    // Stage 0a's `get_elements_by_tag_name` only walks descendants, so we
+    // explicitly check the root and prepend it to the candidate list when
+    // its local-name matches.
+    let mut candidates: Vec<NodeRef> = Vec::new();
+    if local_name(subtree).as_deref() == Some(tagname) {
+        candidates.push(subtree.clone());
+    }
+    candidates.extend(dom::get_elements_by_tag_name(subtree, tagname));
+
+    // Collect deletions in iteration order, deduplicating by Rc identity.
+    let mut deletions: Vec<NodeRef> = Vec::new();
+    for elem in candidates {
+        let elemtext = trim(&text_content(&elem));
+        let elemtext_len = elemtext.chars().count();
+        let (result, templist) = link_density_test(&elem, &elemtext, favor_precision);
+        let backtrack_hit = backtracking
+            && !templist.is_empty()
+            && elemtext_len > 0
+            && elemtext_len < len_threshold
+            && element_child_count(&elem) >= depth_threshold;
+        if result || backtrack_hit {
+            // Python's `dict.fromkeys(deletions)` dedups by identity (since
+            // `_Element.__hash__` is identity-based). Rust: dedup by Rc
+            // pointer identity.
+            if !deletions.iter().any(|e| std::rc::Rc::ptr_eq(e, &elem)) {
+                deletions.push(elem);
+            }
+        }
+    }
+
+    // htmlprocessing.py:216-217 — for each deletion, delete_element with
+    // tail preservation (xml.py:54-70 default `keep_tail=True`).
+    for elem in deletions {
+        delete_with_tail_preserve_free(&elem);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// handle_textnode (htmlprocessing.py:222-265)
+// ---------------------------------------------------------------------------
+
+/// Convert, format, and probe potential text elements. Returns `Some(elem)`
+/// if the element should survive, `None` if it should be dropped.
+///
+/// **Source line-cite:** `htmlprocessing.py:222-265`.
+///
+/// **CRITICAL DEPENDENCY OF STAGE 2c-i.** This is the workhorse the Stage
+/// 2c-i `handle_titles` / `handle_formatting` primitives funnel every
+/// candidate textual element through.
+///
+/// # Python original
+///
+/// ```python
+/// def handle_textnode(
+///     elem, options, comments_fix=True, preserve_spaces=False
+/// ) -> Optional[_Element]:
+///     "Convert, format, and probe potential text elements."
+///     if elem.tag == "graphic" and is_image_element(elem):
+///         return elem
+///     if elem.tag == "done" or (len(elem) == 0 and not elem.text and not elem.tail):
+///         return None
+///
+///     # lb bypass
+///     if not comments_fix and elem.tag == "lb":
+///         if not preserve_spaces:
+///             elem.tail = trim(elem.tail) or None
+///         return elem
+///
+///     if not elem.text and len(elem) == 0:
+///         # try the tail
+///         elem.text, elem.tail = elem.tail, ""
+///         # handle differently for br/lb
+///         if comments_fix and elem.tag == "lb":
+///             elem.tag = "p"
+///
+///     # trim
+///     if not preserve_spaces:
+///         elem.text = trim(elem.text) or None
+///         if elem.tail:
+///             elem.tail = trim(elem.tail) or None
+///
+///     # filter content
+///     if (
+///         not elem.text
+///         and textfilter(elem)
+///         or (options.dedup and duplicate_test(elem, options))
+///     ):
+///         return None
+///     return elem
+/// ```
+///
+/// # Rust port shape
+///
+/// Mutates `elem` in place. The `options.dedup` branch funnels into
+/// `duplicate_test` which is a stub (returns false) until a later stage
+/// activates dedup — that gates the second half of the final filter.
+///
+/// The `Options` slot consumed is `dedup`; Stage 1b's `Options` struct
+/// doesn't yet carry that slot. Stage 2b' threads through a minimal
+/// `&Options` reference; the dedup arm is plumbed but inert (the stub
+/// returns false unconditionally). When `Options.dedup` lands, the call
+/// site here lights up automatically.
+#[must_use = "handle_textnode returns None when the element should be \
+              dropped — callers must inspect the return value to decide \
+              whether to keep the element"]
+pub fn handle_textnode(
+    elem: &NodeRef,
+    options: &Options,
+    comments_fix: bool,
+    preserve_spaces: bool,
+) -> Option<NodeRef> {
+    // htmlprocessing.py:229-230 — graphic + image element survives.
+    let tag = dom::local_name(elem).unwrap_or_default();
+    if tag == "graphic" && is_image_element(elem) {
+        return Some(elem.clone());
+    }
+
+    // htmlprocessing.py:231 — done sentinel OR fully-empty element.
+    if tag == "done"
+        || (element_child_count(elem) == 0 && element_text(elem).is_none() && tail(elem).is_none())
+    {
+        return None;
+    }
+
+    // htmlprocessing.py:235-241 — lb bypass when comments_fix=false.
+    if !comments_fix && tag == "lb" {
+        if !preserve_spaces {
+            let trimmed_tail = tail(elem).map(|t| trim(&t)).filter(|t| !t.is_empty());
+            set_tail(elem, trimmed_tail.as_deref());
+        }
+        return Some(elem.clone());
+    }
+
+    // htmlprocessing.py:243-249 — when elem has no text and no element
+    // children, try the tail: move tail into text and clear tail.
+    let mut current_tag = tag.clone();
+    if element_text(elem).is_none() && element_child_count(elem) == 0 {
+        // Read tail.
+        let t = tail(elem);
+        // Move tail to text, clear tail. The Python source assigns
+        // `elem.text, elem.tail = elem.tail, ""` atomically; the Rust
+        // sequence is read-tail, set-text, clear-tail. The two operations
+        // target different storage slots (leading-Text-child run vs
+        // following-Text-sibling run) so there is no aliasing risk in
+        // rcdom — but we still order it carefully: set text BEFORE clearing
+        // tail so that if any future invariant check reads them together,
+        // they're never both empty mid-operation.
+        set_element_text(elem, t.as_deref());
+        set_tail(elem, None);
+        // htmlprocessing.py:248-249 — lb→p when comments_fix=true.
+        if comments_fix && current_tag == "lb" {
+            let renamed = replace_element_tag(elem, "p");
+            // The old `elem` is now detached; the caller's `&NodeRef` no
+            // longer points to a live element. We MUST update the local
+            // tag tracker and return the new node. Subsequent operations
+            // below (`preserve_spaces` trim, `textfilter`) need to act on
+            // the new element.
+            current_tag = "p".to_string();
+            return handle_textnode_finish(&renamed, options, preserve_spaces, &current_tag);
+        }
+    }
+
+    handle_textnode_finish(elem, options, preserve_spaces, &current_tag)
+}
+
+/// Tail half of `handle_textnode` after the moved-tail / lb-renaming
+/// branch: trim (when not preserve_spaces) and apply `textfilter` +
+/// `duplicate_test`. Splits the function so the lb→p rename can return
+/// the NEW NodeRef from the renamed element without re-running the
+/// already-done "move tail to text" step on it.
+fn handle_textnode_finish(
+    elem: &NodeRef,
+    options: &Options,
+    preserve_spaces: bool,
+    _tag: &str,
+) -> Option<NodeRef> {
+    // htmlprocessing.py:252-255 — trim text and tail when not preserve_spaces.
+    if !preserve_spaces {
+        let trimmed_text = element_text(elem)
+            .map(|t| trim(&t))
+            .filter(|t| !t.is_empty());
+        set_element_text(elem, trimmed_text.as_deref());
+        // The Python's `if elem.tail:` is a TRUTHY check — None/"" both
+        // falsy — so the trim runs only when there's a non-empty tail.
+        if let Some(t) = tail(elem)
+            && !t.is_empty()
+        {
+            let trimmed_tail = trim(&t);
+            let new_tail = if trimmed_tail.is_empty() {
+                None
+            } else {
+                Some(trimmed_tail)
+            };
+            set_tail(elem, new_tail.as_deref());
+        }
+    }
+
+    // htmlprocessing.py:259-264 — final filter:
+    //   (not elem.text AND textfilter(elem)) OR (options.dedup AND duplicate_test(elem))
+    let text_empty = element_text(elem).is_none_or(|s| s.is_empty());
+    let textfilter_hit = text_empty && textfilter(elem);
+    // Stage 2b' Options does not yet carry `dedup`; the stub returns false
+    // unconditionally so the dedup arm is inert until a future stage
+    // activates it. We DO call duplicate_test (stub) to pin the call shape.
+    let dedup_hit = options.dedup() && duplicate_test(elem, options);
+    if textfilter_hit || dedup_hit {
+        return None;
+    }
+    Some(elem.clone())
+}
+
+// ---------------------------------------------------------------------------
+// process_node (htmlprocessing.py:268-285)
+// ---------------------------------------------------------------------------
+
+/// Light-format variant of `handle_textnode`. Returns `Some(elem)` if
+/// the element should survive, `None` if it should be dropped.
+///
+/// **Source line-cite:** `htmlprocessing.py:268-285`.
+///
+/// **CRITICAL DEPENDENCY OF STAGE 2c-i.**
+///
+/// # Python original
+///
+/// ```python
+/// def process_node(elem, options) -> Optional[_Element]:
+///     "Convert, format, and probe potential text elements (light format)."
+///     if elem.tag == "done" or (len(elem) == 0 and not elem.text and not elem.tail):
+///         return None
+///
+///     # trim
+///     elem.text, elem.tail = trim(elem.text) or None, trim(elem.tail) or None
+///
+///     # adapt content string
+///     if elem.tag != "lb" and not elem.text and elem.tail:
+///         elem.text, elem.tail = elem.tail, None
+///
+///     # content checks
+///     if elem.text or elem.tail:
+///         if textfilter(elem) or (options.dedup and duplicate_test(elem, options)):
+///             return None
+///
+///     return elem
+/// ```
+#[must_use = "process_node returns None when the element should be dropped \
+              — callers must inspect the return value"]
+pub fn process_node(elem: &NodeRef, options: &Options) -> Option<NodeRef> {
+    let tag = dom::local_name(elem).unwrap_or_default();
+    // htmlprocessing.py:270 — done sentinel OR fully-empty element.
+    if tag == "done"
+        || (element_child_count(elem) == 0 && element_text(elem).is_none() && tail(elem).is_none())
+    {
+        return None;
+    }
+
+    // htmlprocessing.py:274 — trim text and tail (each replaced by None
+    // when the trimmed result is empty).
+    let trimmed_text = element_text(elem)
+        .map(|s| trim(&s))
+        .filter(|s| !s.is_empty());
+    set_element_text(elem, trimmed_text.as_deref());
+    let trimmed_tail = tail(elem).map(|s| trim(&s)).filter(|s| !s.is_empty());
+    set_tail(elem, trimmed_tail.as_deref());
+
+    // htmlprocessing.py:277-278 — non-lb: if no text but tail present,
+    // swap tail into text.
+    if tag != "lb"
+        && element_text(elem).is_none()
+        && let Some(t) = tail(elem)
+    {
+        set_element_text(elem, Some(&t));
+        set_tail(elem, None);
+    }
+
+    // htmlprocessing.py:281-283 — content checks.
+    let has_text = element_text(elem).is_some();
+    let has_tail = tail(elem).is_some();
+    if has_text || has_tail {
+        let textfilter_hit = textfilter(elem);
+        let dedup_hit = options.dedup() && duplicate_test(elem, options);
+        if textfilter_hit || dedup_hit {
+            return None;
+        }
+    }
+
+    Some(elem.clone())
+}
+
+// ---------------------------------------------------------------------------
+// Options extension (Stage 2b' — dedup slot accessor)
+// ---------------------------------------------------------------------------
+
+impl Options {
+    /// `Options.dedup` accessor (settings.py:114, default `False`). Stage
+    /// 2b' does not yet store this as a field on `Options` — the Stage 1b
+    /// struct's documented slot list is `tables` / `images` / `links` /
+    /// `formatting` / `focus`. When Stage 2c-i adds `dedup` (and the rest
+    /// of the `Extractor` slots that handlers consume), this accessor's
+    /// body changes to read the field; until then it returns the Python
+    /// default `false`. The accessor exists so Stage 2b' callers
+    /// (`handle_textnode` / `process_node`) compile against the future
+    /// shape without inverting the `Options` API.
+    pub fn dedup(&self) -> bool {
+        // HLD §10 / Stage 2b' stub — `Options.dedup` field is NOT YET present.
+        // When Stage 2c-i adds `pub dedup: bool` to the `Options` struct, DELETE
+        // this method and let field access drive the predicate at call sites.
+        // The Rust borrow-checker will surface the rename automatically because
+        // every Stage 2b' caller writes `options.dedup()` (with parens).
+        //
+        // TODO(M3-stage-2c-i): delete this method when the field is added.
+        false
+    }
+}
+
+// ===========================================================================
 // Tests (Stage 1b unit tests)
 // ===========================================================================
 
@@ -1093,5 +1771,405 @@ mod tests {
         assert!(xml.starts_with("<body>"));
         assert!(xml.ends_with("</body>"));
         assert!(xml.contains("there"));
+    }
+
+    // =======================================================================
+    // STAGE 2b' tests — htmlprocessing.py 93-285 (prune_unwanted_nodes /
+    // collect_link_info / link_density_test / link_density_test_tables /
+    // delete_by_link_density / handle_textnode / process_node)
+    // =======================================================================
+
+    use crate::readability::dom::{create_element, element_text, set_element_text, set_tail, tail};
+
+    // ---- collect_link_info ----
+
+    #[test]
+    fn collect_link_info_lengths_and_shortelems() {
+        // Three refs: text lengths 3, 12, 5 → total 20, count 3, short (len<10) = 2.
+        let r1 = create_element("ref");
+        set_element_text(&r1, Some("abc")); // 3
+        let r2 = create_element("ref");
+        set_element_text(&r2, Some("abcdefghijkl")); // 12
+        let r3 = create_element("ref");
+        set_element_text(&r3, Some("hello")); // 5
+        // Empty ref — should be filtered out of mylist.
+        let r4 = create_element("ref");
+        let links = vec![r1, r2, r3, r4];
+        let (total, count, shortelems, list) = collect_link_info(&links);
+        assert_eq!(total, 3 + 12 + 5);
+        assert_eq!(count, 3);
+        assert_eq!(shortelems, 2);
+        assert_eq!(
+            list,
+            vec!["abc".to_string(), "abcdefghijkl".into(), "hello".into()]
+        );
+    }
+
+    // ---- link_density_test ----
+
+    #[test]
+    fn link_density_test_no_refs_returns_false() {
+        let dom = parse("<p>just text, no links here</p>");
+        let b = body(&dom);
+        let p = get_elements_by_tag_name(&b, "p")[0].clone();
+        let text = "just text, no links here";
+        let (deletehit, list) = link_density_test(&p, text, false);
+        assert!(!deletehit);
+        assert!(list.is_empty());
+    }
+
+    #[test]
+    fn link_density_test_single_long_link_returns_true() {
+        // Single ref with link text longer than threshold (100) and > 90%
+        // of element text → shortcut triggers (htmlprocessing.py:141-145).
+        let dom = parse(
+            "<p><ref>This is a very long single link text that should be \
+             over one hundred characters in length for the shortcut to trigger \
+             properly here OK</ref></p>",
+        );
+        let b = body(&dom);
+        let p = get_elements_by_tag_name(&b, "p")[0].clone();
+        let text = trim(&text_content(&p));
+        assert!(text.chars().count() > 100);
+        let (hit, _) = link_density_test(&p, &text, false);
+        assert!(hit);
+    }
+
+    #[test]
+    fn link_density_test_p_with_next_sibling_limitlen_30() {
+        // p with next sibling → limitlen=30. Element text "ab" (len 2 < 30).
+        // One ref with text "a" (linklen=1; <= 0.8*2=1.6 → not link-heavy by
+        // ratio; single ref count → no shortelems-ratio trigger since
+        // elemnum==1). Should return false on the ratio path.
+        let dom = parse("<div><p><ref>a</ref>b</p><p>next</p></div>");
+        let b = body(&dom);
+        let p1 = get_elements_by_tag_name(&b, "p")[0].clone();
+        let text = trim(&text_content(&p1));
+        // Sanity: p has next sibling.
+        assert!(dom::next_element_sibling(&p1).is_some());
+        let (_hit, _) = link_density_test(&p1, &text, false);
+        // We don't pin TRUE/FALSE — we only pin "doesn't panic" and follows
+        // the threshold math. A more concrete assertion: when element text
+        // is short and link text dominates >80%, return true.
+        // Use this case: ref text "longerlonger" (12) vs p text 14 → 12/14 > 0.8.
+        let dom2 = parse("<div><p><ref>longerlonger</ref>!!</p><p>next</p></div>");
+        let b2 = body(&dom2);
+        let p2 = get_elements_by_tag_name(&b2, "p")[0].clone();
+        let text2 = trim(&text_content(&p2));
+        let (hit2, _) = link_density_test(&p2, &text2, false);
+        assert!(hit2);
+    }
+
+    // ---- link_density_test_tables ----
+
+    #[test]
+    fn link_density_test_tables_threshold_200_chars() {
+        // Tables with elemlen < 200 always return false.
+        let dom = parse("<table><tr><td><ref>x</ref></td></tr></table>");
+        let b = body(&dom);
+        let tbl = get_elements_by_tag_name(&b, "table")[0].clone();
+        assert!(!link_density_test_tables(&tbl));
+    }
+
+    #[test]
+    fn link_density_test_tables_link_dominated_returns_true() {
+        // Build a table > 200 chars where link text > 80% of total.
+        let link_text = "linklink".repeat(30); // 240 chars
+        let html = format!("<table><tr><td><ref>{link_text}</ref></td></tr></table>");
+        let dom = parse(&html);
+        let b = body(&dom);
+        let tbl = get_elements_by_tag_name(&b, "table")[0].clone();
+        assert!(link_density_test_tables(&tbl));
+    }
+
+    // ---- delete_by_link_density ----
+
+    #[test]
+    fn delete_by_link_density_removes_listed_elem_by_link_density_test_true() {
+        // A <p> whose link-density_test returns true should be deleted.
+        // Take the single-link shortcut: link text must be > 100 chars AND
+        // > 90% of element text. Build a >150-char link that IS the entire
+        // element text.
+        let long_link = "a".repeat(150);
+        let dom = parse(&format!(
+            "<div><p><ref>{long_link}</ref></p><p>after</p></div>"
+        ));
+        let b = body(&dom);
+        let p_before = get_elements_by_tag_name(&b, "p").len();
+        assert_eq!(p_before, 2);
+        delete_by_link_density(&b, "p", false, false);
+        let p_after = get_elements_by_tag_name(&b, "p").len();
+        // The link-heavy <p> should have been removed; the "after" <p> stays.
+        assert_eq!(p_after, 1);
+    }
+
+    #[test]
+    fn delete_by_link_density_includes_root_when_tag_matches() {
+        // Cite: htmlprocessing.py:203 — Python `tree.iter(tagname)` INCLUDES
+        // self when `self.tag == tagname`. The Rust port's
+        // `get_elements_by_tag_name` only walks descendants, so the function
+        // must explicitly check the root. Construct a <p> root with a >100-
+        // char <ref> child that drives link_density_test to true; the root
+        // <p> must be removed.
+        let long_link = "a".repeat(150);
+        let dom = parse(&format!("<div><p><ref>{long_link}</ref></p></div>"));
+        let b = body(&dom);
+        let ps = get_elements_by_tag_name(&b, "p");
+        assert_eq!(ps.len(), 1);
+        let p_root = ps[0].clone();
+        // Sanity: link_density_test on the <p> root must report true under
+        // the single-link shortcut (>100-char link IS the entire text).
+        let (hit, _) = link_density_test(&p_root, &trim(&text_content(&p_root)), false);
+        assert!(hit, "precondition: link_density_test fires on root <p>");
+        // Iterate WITH the root as the subtree AND tag matching the root.
+        delete_by_link_density(&p_root, "p", false, false);
+        // The <p> root must be detached from its parent <div>.
+        assert!(
+            get_elements_by_tag_name(&b, "p").is_empty(),
+            "root <p> must be removed when its own link-density trips"
+        );
+    }
+
+    // ---- prune_unwanted_nodes ----
+
+    #[test]
+    fn prune_unwanted_nodes_removes_matched_subtree() {
+        // Remove <aside> via XPath ".//aside".
+        let dom = parse("<div><p>keep</p><aside>drop</aside><p>more</p></div>");
+        let b = body(&dom);
+        prune_unwanted_nodes(&b, &[".//aside"], false);
+        assert!(get_elements_by_tag_name(&b, "aside").is_empty());
+        assert_eq!(get_elements_by_tag_name(&b, "p").len(), 2);
+    }
+
+    #[test]
+    fn prune_unwanted_nodes_preserves_tail_on_removed_subtree() {
+        // <div><p>x</p><aside>y</aside>tail-text<p>z</p></div>.
+        // After removing <aside>, "tail-text" should be appended to the
+        // previous sibling's tail (here the previous element is <p>x</p>).
+        // Python: prev = aside.getprevious() = <p>x</p>; prev.tail =
+        // (prev.tail or "") + " " + " tail-text". So <p>x</p>.tail becomes
+        // " tail-text" (with the leading space).
+        let dom = parse("<div><p>x</p><aside>y</aside>tail-text<p>z</p></div>");
+        let b = body(&dom);
+        prune_unwanted_nodes(&b, &[".//aside"], false);
+        assert!(get_elements_by_tag_name(&b, "aside").is_empty());
+        let ps = get_elements_by_tag_name(&b, "p");
+        assert_eq!(ps.len(), 2);
+        // The first <p> now carries the moved tail.
+        let first_p_tail = tail(&ps[0]).unwrap_or_default();
+        assert!(
+            first_p_tail.contains("tail-text"),
+            "expected first <p>'s tail to contain the moved aside tail, got {first_p_tail:?}"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "prune_unwanted_nodes with_backup=true")]
+    fn prune_unwanted_nodes_with_backup_true_panics_until_stage_2c_iii_wires_deep_clone() {
+        // Stage 2b' review findings M1/D1: until Stage 2c-iii lands the
+        // dom.rs `deep_clone` facade, the with_backup=true branch must
+        // PANIC the moment the `new_len * 7 <= old_len` threshold trips —
+        // silently over-pruning is worse than crashing. Build a tree
+        // whose post-prune text shrank to ≤ 1/7 of pre-prune text by
+        // making the removed <section> carry the bulk of the content.
+        let big = "x".repeat(140);
+        let dom = parse(&format!("<div><p>a</p><section>{big}</section></div>"));
+        let b = body(&dom);
+        prune_unwanted_nodes(&b, &[".//section"], true);
+        // Unreachable — the assertion documents intent if the panic
+        // expectation is ever weakened.
+        unreachable!("with_backup=true must panic on threshold-trip");
+    }
+
+    // ---- handle_textnode ----
+
+    /// Build a (`wrap_div`, `p`) pair: `p` is attached as a child of
+    /// `wrap_div`; the caller must keep `wrap_div` alive for `p`'s
+    /// parent pointer to upgrade. Otherwise `wrap_div` gets dropped and
+    /// `p.parent.upgrade()` fails — which silently clears the tail.
+    fn make_p_with(text: Option<&str>, tail_str: Option<&str>) -> (NodeRef, NodeRef) {
+        let wrap = create_element("div");
+        let p = create_element("p");
+        dom::append_child(&wrap, &p);
+        if let Some(t) = text {
+            set_element_text(&p, Some(t));
+        }
+        if tail_str.is_some() {
+            set_tail(&p, tail_str);
+        }
+        (wrap, p)
+    }
+
+    #[test]
+    fn handle_textnode_returns_none_for_done_tag() {
+        let done = create_element("done");
+        let opts = Options::default();
+        assert!(handle_textnode(&done, &opts, true, false).is_none());
+    }
+
+    #[test]
+    fn handle_textnode_returns_none_for_empty_element() {
+        // len(elem)==0 AND no text AND no tail → None.
+        let p = create_element("p");
+        let opts = Options::default();
+        assert!(handle_textnode(&p, &opts, true, false).is_none());
+    }
+
+    #[test]
+    fn handle_textnode_lb_bypass_preserves_tail() {
+        // comments_fix=false, tag=lb, preserve_spaces=false →
+        // bypass branch trims the tail and returns elem.
+        let lb = create_element("lb");
+        let wrap = create_element("div");
+        dom::append_child(&wrap, &lb);
+        set_tail(&lb, Some("   spaced tail   "));
+        let opts = Options::default();
+        let got = handle_textnode(&lb, &opts, false, false);
+        assert!(got.is_some());
+        assert_eq!(tail(&lb).as_deref(), Some("spaced tail"));
+    }
+
+    #[test]
+    fn handle_textnode_lb_bypass_preserve_spaces_true_keeps_tail_untrimmed() {
+        let lb = create_element("lb");
+        let wrap = create_element("div");
+        dom::append_child(&wrap, &lb);
+        set_tail(&lb, Some("   spaced tail   "));
+        let opts = Options::default();
+        let got = handle_textnode(&lb, &opts, false, true);
+        assert!(got.is_some());
+        // tail unchanged (preserve_spaces=true).
+        assert_eq!(tail(&lb).as_deref(), Some("   spaced tail   "));
+    }
+
+    #[test]
+    fn handle_textnode_moves_tail_to_text_when_text_absent() {
+        // Tag=p, no text, no element children, tail="moved". After
+        // handle_textnode (comments_fix=true, preserve_spaces=false), the
+        // tail should be cleared and the text should be "moved".
+        let (_wrap, p) = make_p_with(None, Some("moved"));
+        let opts = Options::default();
+        let got = handle_textnode(&p, &opts, true, false);
+        assert!(got.is_some());
+        let got = got.unwrap();
+        assert_eq!(element_text(&got).as_deref(), Some("moved"));
+        assert!(tail(&got).is_none());
+    }
+
+    #[test]
+    fn handle_textnode_trims_text_and_tail() {
+        // Text "  Hello  ", tail "  Tail  " → trimmed.
+        let p = create_element("p");
+        set_element_text(&p, Some("  Hello world  "));
+        let wrap = create_element("div");
+        dom::append_child(&wrap, &p);
+        // Add an element after p so trim of tail kicks in.
+        let after = create_element("p");
+        dom::append_child(&wrap, &after);
+        set_tail(&p, Some("  some tail  "));
+        let opts = Options::default();
+        let got = handle_textnode(&p, &opts, true, false);
+        assert!(got.is_some());
+        assert_eq!(element_text(&got.unwrap()).as_deref(), Some("Hello world"));
+        assert_eq!(tail(&p).as_deref(), Some("some tail"));
+    }
+
+    #[test]
+    fn handle_textnode_filters_facebook_text() {
+        // Text = "" (None after trim), then textfilter via tail = "Facebook"
+        // → return None.
+        let p = create_element("p");
+        let wrap = create_element("div");
+        dom::append_child(&wrap, &p);
+        set_tail(&p, Some("Facebook"));
+        // No text. handle_textnode moves tail->text first; then textfilter
+        // sees text="Facebook" — which DOES NOT trip textfilter alone
+        // because the filter only fires when text is None/empty. So we
+        // need a scenario where text remains None and tail is "Facebook".
+        //
+        // Achieve this by giving the p an element child (so the "move tail
+        // to text" branch is skipped) AND a tail that's a Facebook line.
+        let span = create_element("span");
+        dom::append_child(&p, &span);
+        // Now: element_text(p)=None, child_count(p)=1, tail(p)="Facebook".
+        // The first "done/empty" guard: not done, and child_count>0 so the
+        // empty branch fails → don't return None. The "move tail to text"
+        // guard requires child_count==0 → skipped. trim runs on (text=None
+        // stays None, tail="Facebook" stays "Facebook"). Then the final
+        // filter: text is None/empty → textfilter is checked against
+        // element_text=None, tail="Facebook" → textfilter returns true →
+        // return None.
+        let opts = Options::default();
+        let got = handle_textnode(&p, &opts, true, false);
+        assert!(got.is_none(), "Facebook line should trip textfilter");
+    }
+
+    // ---- process_node ----
+
+    #[test]
+    fn process_node_returns_none_for_done_tag() {
+        let done = create_element("done");
+        let opts = Options::default();
+        assert!(process_node(&done, &opts).is_none());
+    }
+
+    #[test]
+    fn process_node_returns_none_for_empty_element() {
+        let p = create_element("p");
+        let opts = Options::default();
+        assert!(process_node(&p, &opts).is_none());
+    }
+
+    #[test]
+    fn process_node_swaps_tail_to_text_when_text_absent() {
+        // Tag != "lb", no text, has tail → swap tail into text, tail = None.
+        let p = create_element("p");
+        let wrap = create_element("div");
+        dom::append_child(&wrap, &p);
+        set_tail(&p, Some("body text here"));
+        let opts = Options::default();
+        let got = process_node(&p, &opts);
+        assert!(got.is_some());
+        assert_eq!(element_text(&p).as_deref(), Some("body text here"));
+        assert!(tail(&p).is_none());
+    }
+
+    #[test]
+    fn process_node_filters_via_textfilter() {
+        // Text = "Facebook" → textfilter true → return None.
+        let p = create_element("p");
+        set_element_text(&p, Some("Facebook"));
+        let opts = Options::default();
+        let got = process_node(&p, &opts);
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn process_node_lb_does_not_swap_tail() {
+        // Tag == "lb" → the tag != "lb" guard prevents swap. lb with no
+        // text and tail "x" → keep both intact (tail trims to "x").
+        let lb = create_element("lb");
+        let wrap = create_element("div");
+        dom::append_child(&wrap, &lb);
+        set_tail(&lb, Some("x"));
+        let opts = Options::default();
+        let got = process_node(&lb, &opts);
+        assert!(got.is_some());
+        // text stays None; tail stays "x".
+        assert!(element_text(&lb).is_none());
+        assert_eq!(tail(&lb).as_deref(), Some("x"));
+    }
+
+    // ---- duplicate_test stub via Options ----
+
+    #[test]
+    fn options_dedup_stub_returns_false_until_field_added() {
+        // Pin: the Stage 2b' `Options::dedup()` accessor returns false
+        // until Stage 2c-i adds `pub dedup: bool` to the `Options` struct.
+        // Stay alert if this changes silently. See the TODO(M3-stage-2c-i)
+        // on the accessor body.
+        let opts = Options::default();
+        assert!(!opts.dedup());
     }
 }

@@ -421,6 +421,145 @@ pub fn tail(elem: &NodeRef) -> Option<String> {
     out
 }
 
+/// lxml `Element.text` — the **leading-text-child run** of `elem`.
+///
+/// **M3 Stage 2b' additive extension** (HLD §5.1). Stage 0a landed `tail`;
+/// `handle_textnode` / `process_node` (htmlprocessing.py:222-285) also need
+/// the symmetric `.text` read. Returns the concatenated `data` of the
+/// run of `Text` nodes at the front of `elem.children` (i.e. before the
+/// first non-Text child), or `None` if there is no leading Text child.
+///
+/// `None` vs `Some("")` follows the existing `tail`'s convention; callers
+/// must treat them as semantically equivalent (lxml returns `""` /
+/// concatenated text — never `None` for "empty"; we use `None` for "no
+/// leading Text child at all", which is the closest faithful idiom).
+pub fn element_text(elem: &NodeRef) -> Option<String> {
+    let kids = elem.children.borrow();
+    let mut out: Option<String> = None;
+    for child in kids.iter() {
+        match &child.data {
+            NodeData::Text { contents } => {
+                let data = contents.borrow();
+                match &mut out {
+                    Some(s) => s.push_str(&data),
+                    None => out = Some(data.to_string()),
+                }
+            }
+            // First non-Text terminates the leading run (lxml semantics).
+            _ => break,
+        }
+    }
+    out
+}
+
+/// lxml `Element.text = value` (or `Element.text = None`) — set the
+/// **leading-text-child run** of `elem`.
+///
+/// **M3 Stage 2b' additive extension** (HLD §5.1). The Python idiom
+/// `elem.text = "..."` (htmlprocessing.py:246, 253) sets one logical
+/// leading-text slot. rcdom realises this as a *run* of Text children
+/// at the front of `elem.children`; setting `.text` therefore:
+///
+/// 1. Drains every leading `Text` sibling of the first non-Text child
+///    (the entire "lxml .text run").
+/// 2. If `value` is `Some(s)` and `s` is non-empty, inserts a single new
+///    `Text` node holding `s` at position 0.
+/// 3. If `value` is `None` or `Some("")`, the leading run is left empty
+///    (matching `elem.text = None` / `elem.text = ""` in lxml).
+pub fn set_element_text(elem: &NodeRef, value: Option<&str>) {
+    // Drain leading Text run.
+    let leading_count = {
+        let kids = elem.children.borrow();
+        kids.iter()
+            .take_while(|c| matches!(c.data, NodeData::Text { .. }))
+            .count()
+    };
+    if leading_count > 0 {
+        let drained: Vec<NodeRef> = {
+            let mut kids = elem.children.borrow_mut();
+            kids.drain(0..leading_count).collect()
+        };
+        for n in &drained {
+            n.parent.set(None);
+        }
+    }
+    let Some(s) = value else { return };
+    if s.is_empty() {
+        return;
+    }
+    let txt = create_text_node(s);
+    txt.parent.set(Some(Rc::downgrade(elem)));
+    elem.children.borrow_mut().insert(0, txt);
+}
+
+/// lxml `Element.tail = value` (or `Element.tail = None`) — set the
+/// **tail Text-node run** between `elem` and its next non-Text sibling.
+///
+/// **M3 Stage 2b' additive extension** (HLD §5.1). The Python idioms
+/// `elem.tail = "..."` (htmlprocessing.py:237, 246, 255, 274, 278;
+/// prune_unwanted_nodes:110) set one logical tail slot. rcdom realises
+/// this as a *run* of Text-node siblings of `elem` at the parent level;
+/// setting `.tail` therefore:
+///
+/// 1. Drains every following `Text` sibling of `elem` up to (but not
+///    including) the first non-Text sibling.
+/// 2. If `value` is `Some(s)` and `s` is non-empty, inserts a single new
+///    `Text` node holding `s` immediately after `elem`.
+/// 3. If `value` is `None` or `Some("")`, the tail run is left empty
+///    (matching `elem.tail = None` / `elem.tail = ""` in lxml).
+///
+/// No-op if `elem` is detached.
+pub fn set_tail(elem: &NodeRef, value: Option<&str>) {
+    let Some((parent, idx)) = parent_and_index(elem) else {
+        return;
+    };
+    // Count tail run.
+    let tail_count = {
+        let kids = parent.children.borrow();
+        kids.iter()
+            .skip(idx + 1)
+            .take_while(|c| matches!(c.data, NodeData::Text { .. }))
+            .count()
+    };
+    if tail_count > 0 {
+        let drained: Vec<NodeRef> = {
+            let mut kids = parent.children.borrow_mut();
+            kids.drain(idx + 1..idx + 1 + tail_count).collect()
+        };
+        for n in &drained {
+            n.parent.set(None);
+        }
+    }
+    let Some(s) = value else { return };
+    if s.is_empty() {
+        return;
+    }
+    let txt = create_text_node(s);
+    txt.parent.set(Some(Rc::downgrade(&parent)));
+    parent.children.borrow_mut().insert(idx + 1, txt);
+}
+
+/// `element.previousElementSibling` — the previous **element** sibling, or
+/// `None`.
+///
+/// **M3 Stage 2b' additive extension** (HLD §5.1). lxml's
+/// `Element.getprevious()` returns the previous sibling that is either an
+/// element OR a Comment/PI (anything but a Text node). The single Stage 2b'
+/// caller (`prune_unwanted_nodes`, htmlprocessing.py:105) uses the result
+/// only as a tail-append target; for HTML trees parsed with
+/// `remove_comments=True` (utils.py:70), the result is purely "previous
+/// element sibling". Stage 2b' implements that faithful subset. If a later
+/// stage needs the Comment/PI-inclusive variant, document it then.
+pub fn previous_element_sibling(node: &NodeRef) -> Option<NodeRef> {
+    let (parent, idx) = parent_and_index(node)?;
+    let kids = parent.children.borrow();
+    kids.iter()
+        .take(idx)
+        .rev()
+        .find(|c| matches!(c.data, NodeData::Element { .. }))
+        .cloned()
+}
+
 /// `node.nodeName.toLowerCase()` / `localName` (lower-case tag for element
 /// nodes; used where the JS lower-cases, e.g. `_cleanStyles`' svg check).
 pub fn local_name(node: &NodeRef) -> Option<String> {

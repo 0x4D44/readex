@@ -289,7 +289,33 @@ name = "mdrcel"
 # trafilatura::xpaths_constants`). Per semver PATCH: additive
 # infrastructure behind the same `#[doc(hidden)]` surface, no observable
 # change on the default extraction path.
-version = "0.4.6"
+#
+# M3 Stage 2b' (2026-05-19): 0.4.6 -> 0.4.7 PATCH. Adds
+# `src/trafilatura/utils.rs` — faithful port of small `utils.py` helpers
+# (`FORMATTING_PROTECTED` / `SPACING_PROTECTED` / `IMAGE_EXTENSION` /
+# `RE_FILTER` / `is_image_file` / `is_image_element` / `textfilter` /
+# `text_chars_test` / `trim`) plus a `duplicate_test` STUB (the full LRU
+# port from `deduplication.py:160-240` is deferred to a future stage; the
+# stub returns `false` faithfully on the default-`Options.dedup = False`
+# extraction path the Stage 0c gate exercises). Extends
+# `src/trafilatura/cleaning.rs` ADDITIVELY (Stage 1b functions FROZEN)
+# with the remaining `htmlprocessing.py` ports: `prune_unwanted_nodes`,
+# `collect_link_info`, `link_density_test`, `link_density_test_tables`,
+# `delete_by_link_density`, `handle_textnode`, `process_node`. Extends
+# `src/readability/dom.rs` ADDITIVELY (Stage 0a precedent) with four
+# small lxml-facade fns the new ports need: `element_text` (read lxml
+# `.text`), `set_element_text` (write lxml `.text`), `set_tail` (write
+# lxml `.tail`), `previous_element_sibling` (lxml `.getprevious()`'s
+# Element-only subset; full Comment/PI-inclusive variant deferred until a
+# stage needs it). The Trafilatura-equivalence BLOCKER gate
+# (`tests/trafilatura_equivalence_gate.rs`) remains 10/10 green; the M2
+# parser-equivalence gate (`tests/parser_equivalence_gate.rs`) is
+# byte-identical to commit 149c686. No public API change — all surfaces
+# under `#[doc(hidden)] pub mod trafilatura::{cleaning, utils}` and the
+# additive dom.rs surface. Per semver PATCH: additive infrastructure
+# behind the same `#[doc(hidden)]` surface, no observable change on the
+# default extraction path.
+version = "0.4.7"
 edition = "2024"
 
 [dependencies]
