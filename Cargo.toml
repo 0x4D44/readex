@@ -195,7 +195,24 @@ name = "mdrcel"
 # workspace `Cargo.lock` via `benchmark`), pure-algorithm, no I/O —
 # faithful per HLD §3 "deferred until the algorithm needs them" /
 # DEC-3 reasoning, mirroring the `regex` Stage-1a precedent.
-version = "0.4.0"
+#
+# M3 Stage 0a (2026-05-19): 0.4.0 -> 0.4.1 PATCH. Three additive helpers
+# land on `dom.rs`'s `#[doc(hidden)] pub mod readability` infrastructure
+# surface (HLD M3 §5.1 / §6.0): `tail(elem) -> Option<String>`,
+# `Dom::delete_with_tail_preserve(elem)`, and
+# `Dom::document_order_triplets(root) -> Vec<(NodeRef, Option<String>,
+# Option<String>)>`. They implement lxml `Element.tail` /
+# `etree.strip_elements`-with-tail-preserve / `ElementTree.iter()`
+# semantics needed by the M3 Trafilatura port's `xmltotxt`, `prune_html`
+# and `convert_tags` Stages (Stages 1b / 2 / 3). NO documented public
+# API change: `extract` / `extract_with` / `Extracted` / `Options` /
+# `ExtractError` are byte-unchanged; the M2 parser-equivalence BLOCKER
+# gate (`tests/parser_equivalence_gate.rs`) still passes against the
+# byte-identical-to-commit-149c686 oracle. Per semver (CLAUDE.md
+# "Version management") PATCH — additive helpers behind the same
+# `#[doc(hidden)]` infrastructure surface, no observable change on the
+# default extraction path.
+version = "0.4.1"
 edition = "2024"
 
 [dependencies]

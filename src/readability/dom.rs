@@ -369,6 +369,58 @@ pub fn tag_name(node: &NodeRef) -> Option<String> {
     }
 }
 
+/// lxml `Element.tail` (M3 Stage 0a — HLD §5.1 / §6.0; `dom.rs` additive
+/// extension required by Trafilatura's `xmltotxt`, `link_density_test_tables`,
+/// `process_node`, and `prune_html`).
+///
+/// Returns the text content of the **next-sibling Text node(s)** of `elem`,
+/// concatenated in document order until the first non-Text sibling
+/// (element, comment, PI), or `None` if `elem` has no next sibling at all *or*
+/// its very next sibling is not a Text node.
+///
+/// # lxml-fidelity notes
+///
+/// lxml/libxml2 internally coalesces consecutive text nodes at parse time, so
+/// in lxml `.tail` is intrinsically a single string. `markup5ever_rcdom` does
+/// **not** coalesce: a sequence like `</p>foo<!--c-->bar` parses to (`<p>`,
+/// Text("foo"), Comment, Text("bar")) and `<p>`'s tail is `"foo"`; the
+/// `Comment` interrupts the tail run. Where rcdom *does* yield consecutive
+/// Text siblings (rare but possible via DOM construction / serializer
+/// round-trips), we concatenate them — this is the lxml-equivalent answer
+/// (the same bytes lxml would have stored had it parsed the same input).
+///
+/// lxml returns `""` (empty string) when there is no tail; this facade uses
+/// `None` to match Rust idiom and the existing `dom.rs` style. **Downstream
+/// callers must treat `None` and `Some("")` as semantically equivalent** —
+/// this is the only stylistic deviation from lxml here, deliberate to align
+/// with the rest of this facade (e.g. `next_element_sibling -> Option<_>`).
+///
+/// # Strict scope
+///
+/// This does **not** recurse into `elem`'s children. The tail is exclusively
+/// the text *between* `elem` and its next non-Text sibling at the same tree
+/// level. (This is the load-bearing lxml semantic that distinguishes `.tail`
+/// from `.text` and from `text_content`.)
+pub fn tail(elem: &NodeRef) -> Option<String> {
+    let (parent, idx) = parent_and_index(elem)?;
+    let kids = parent.children.borrow();
+    let mut out: Option<String> = None;
+    for sibling in kids.iter().skip(idx + 1) {
+        match &sibling.data {
+            NodeData::Text { contents } => {
+                let data = contents.borrow();
+                match &mut out {
+                    Some(s) => s.push_str(&data),
+                    None => out = Some(data.to_string()),
+                }
+            }
+            // First non-Text terminates the tail run (lxml semantics).
+            _ => break,
+        }
+    }
+    out
+}
+
 /// `node.nodeName.toLowerCase()` / `localName` (lower-case tag for element
 /// nodes; used where the JS lower-cases, e.g. `_cleanStyles`' svg check).
 pub fn local_name(node: &NodeRef) -> Option<String> {
@@ -540,6 +592,51 @@ fn collect_descendants(root: &NodeRef, out: &mut Vec<NodeRef>, keep: &dyn Fn(&No
     }
 }
 
+/// lxml `Element.text`: concatenation of `node`'s leading consecutive
+/// `Text`-node children, up to the first non-Text child (element / comment /
+/// PI), or `None` if the first child is not a Text node (or `node` has no
+/// children). Symmetric to [`tail`] but anchored at the start of `node`'s
+/// children, not at the end of `elem`'s next-sibling run.
+///
+/// Private helper for [`Dom::document_order_triplets`].
+fn leading_text(node: &NodeRef) -> Option<String> {
+    let kids = node.children.borrow();
+    let mut out: Option<String> = None;
+    for child in kids.iter() {
+        match &child.data {
+            NodeData::Text { contents } => {
+                let data = contents.borrow();
+                match &mut out {
+                    Some(s) => s.push_str(&data),
+                    None => out = Some(data.to_string()),
+                }
+            }
+            _ => break,
+        }
+    }
+    out
+}
+
+/// Pre-order element-only walk emitting `(elem, .text, .tail)` triplets.
+/// Pushed for `node` itself before recursing into its element descendants
+/// (matches lxml `ElementTree.iter()` order).
+fn collect_triplets(node: &NodeRef, out: &mut Vec<(NodeRef, Option<String>, Option<String>)>) {
+    if matches!(node.data, NodeData::Element { .. }) {
+        let t = leading_text(node);
+        let tl = tail(node);
+        out.push((node.clone(), t, tl));
+    }
+    // Recurse into ALL children so we visit element descendants in document
+    // order; non-element children themselves are not pushed (their data is
+    // surfaced via their parent's .text or the previous element's .tail).
+    // Snapshot the child list — `tail()` will re-borrow `children` on each
+    // recursive call, and we must not hold a borrow across that.
+    let kids: Vec<NodeRef> = node.children.borrow().clone();
+    for child in &kids {
+        collect_triplets(child, out);
+    }
+}
+
 impl Dom {
     /// `_setNodeTag(node, tag)` — **slow branch only** (`Readability.js:760-772`;
     /// HLD §2.2 ruling B-2).
@@ -610,7 +707,165 @@ impl Dom {
         replacement
     }
 
-    // --- score side-table (HLD §5 / §5.1 — point-query-only) -------------
+    /// lxml `etree`-style "delete element, preserve its `.tail`" (M3 Stage 0a —
+    /// HLD §5.1 / §6.0).
+    ///
+    /// Removes `elem` from its parent **and** re-anchors `elem`'s tail text
+    /// (the Text node(s) between `elem` and its next non-Text sibling — see
+    /// [`tail`]) onto:
+    /// - `elem`'s **previous Text sibling** (appended to that node's data), if
+    ///   one exists; OR
+    /// - a fresh Text node inserted at `elem`'s old slot, if the previous
+    ///   sibling exists but is **not** a Text node (so the tail text lands
+    ///   immediately after that prev sibling); OR
+    /// - a fresh Text node inserted as `parent`'s **first child**, if `elem`
+    ///   had no previous sibling at all (the lxml "promote-to-`parent.text`"
+    ///   analogue: deleting the very first child in lxml relocates its tail
+    ///   onto `parent.text`).
+    ///
+    /// This is the semantic Trafilatura's `prune_html` relies on
+    /// (`htmlprocessing.py`, the lxml `getparent().remove(child)` /
+    /// `strip_tags` pattern that open-codes per-element tail re-attachment
+    /// throughout `main_extractor.py`). lxml's `etree.strip_elements(..., with_tail=False)`
+    /// is the closest stdlib equivalent — Trafilatura uses both shapes and we
+    /// match the "preserve tail" one, which is what `prune_html` does.
+    ///
+    /// # No-op cases
+    ///
+    /// - `elem` is detached (no parent) → no-op.
+    /// - `elem` has no tail text → still removes `elem`; only the
+    ///   re-anchoring is skipped.
+    ///
+    /// # Why `&mut self`?
+    ///
+    /// The current body does not touch `Dom`'s side tables, but its semantic
+    /// peer `set_node_tag` does; keeping this on `Dom` lets us evolve the
+    /// score-transfer rule (e.g. "score follows tail" if a future Stage finds
+    /// it needs to) without an API churn at call sites. The detached
+    /// `elem`'s side-table entries, like with the free `remove` function, are
+    /// left in the maps and reaped on `Dom` drop — point-query-only
+    /// guarantees no observable leak (HLD §5.1).
+    pub fn delete_with_tail_preserve(&mut self, elem: &NodeRef) {
+        let Some((parent, idx)) = parent_and_index(elem) else {
+            return;
+        };
+
+        // Step 1+2: collect the tail text and the run-length of Text siblings
+        // to remove alongside `elem`. Single scoped borrow — never held
+        // across a mutation.
+        let (tail_text, tail_run_len) = {
+            let kids = parent.children.borrow();
+            let mut text: Option<String> = None;
+            let mut run = 0usize;
+            for sibling in kids.iter().skip(idx + 1) {
+                match &sibling.data {
+                    NodeData::Text { contents } => {
+                        let data = contents.borrow();
+                        match &mut text {
+                            Some(s) => s.push_str(&data),
+                            None => text = Some(data.to_string()),
+                        }
+                        run += 1;
+                    }
+                    // First non-Text terminates the tail run (lxml semantics).
+                    _ => break,
+                }
+            }
+            (text, run)
+        };
+
+        // Step 3: detach `elem` and the tail Text-node run together. They
+        // sit at positions [idx .. idx + 1 + tail_run_len) in document order.
+        {
+            let mut kids = parent.children.borrow_mut();
+            let drained: Vec<NodeRef> = kids.drain(idx..idx + 1 + tail_run_len).collect();
+            for n in &drained {
+                n.parent.set(None);
+            }
+        }
+
+        // Step 4: re-anchor the tail text, if any.
+        let Some(text) = tail_text else { return };
+        // Even an empty `Some("")` is preserved — lxml stores `""` rather
+        // than coalescing to `None`, and downstream `xmltotxt` is whitespace-
+        // sensitive enough that we stay byte-faithful here.
+        if idx == 0 {
+            // No previous sibling -> insert as parent's leading Text child.
+            let txt = create_text_node(&text);
+            txt.parent.set(Some(Rc::downgrade(&parent)));
+            parent.children.borrow_mut().insert(0, txt);
+            return;
+        }
+        // Inspect prev sibling (at index idx-1 after the drain).
+        let prev_is_text = matches!(
+            parent.children.borrow()[idx - 1].data,
+            NodeData::Text { .. }
+        );
+        if prev_is_text {
+            // Append to prev's data in place.
+            let kids = parent.children.borrow();
+            let prev = &kids[idx - 1];
+            if let NodeData::Text { contents } = &prev.data {
+                // Round-trip via String -> StrTendril: Tendril's in-place
+                // append isn't on the publicly-stable surface, and one
+                // allocation here keeps the code obvious and matches the
+                // facade's "clone, never juggle borrows" style.
+                let mut merged = contents.borrow().to_string();
+                merged.push_str(&text);
+                *contents.borrow_mut() = merged.into();
+            }
+        } else {
+            // Insert a new Text node at elem's old slot (= immediately after
+            // prev, which is at idx-1).
+            let txt = create_text_node(&text);
+            txt.parent.set(Some(Rc::downgrade(&parent)));
+            parent.children.borrow_mut().insert(idx, txt);
+        }
+    }
+
+    /// lxml document-order `(element, .text, .tail)` triplet iteration (M3
+    /// Stage 0a — HLD §5.1 / §6.0).
+    ///
+    /// Yields one triplet per **element** descendant of `root`, in
+    /// pre-order (parent before children), with `root` itself as the first
+    /// triplet. Non-Element nodes (Text, Comment, PI, Doctype) are **not**
+    /// yielded — their data is exposed via the surrounding elements'
+    /// `.text` / `.tail` components, exactly as lxml's `ElementTree.iter()`
+    /// does (lxml's elementtree is element-only; text lives on elements).
+    ///
+    /// # `.text` semantic
+    ///
+    /// The `.text` component is the concatenation of **all leading
+    /// consecutive Text-node children** of the element, up to the first
+    /// non-Text child (element / comment / PI). `None` if the first child is
+    /// not a Text node (or the element has no children). This matches
+    /// lxml/libxml2's coalescing of consecutive text-node children into a
+    /// single string at `Element.text`; `markup5ever_rcdom` does not
+    /// coalesce, but the concatenation yields the byte-equivalent answer.
+    ///
+    /// # `.tail` semantic
+    ///
+    /// The `.tail` component is `tail(element)` — see that function for the
+    /// full semantics. `None` if there is no following Text sibling; `Some`
+    /// with the concatenated Text-run otherwise.
+    ///
+    /// # Return type
+    ///
+    /// Returns an owned `Vec<(NodeRef, Option<String>, Option<String>)>` (not
+    /// a borrowed iterator) — the brief permits either, and Vec sidesteps
+    /// holding `RefCell` borrows through a closure, which is awkward to make
+    /// safe across rcdom's interior-mutable child lists. The cost is one
+    /// `Vec` allocation per call (each `NodeRef` is a cheap `Rc` bump); the
+    /// strings are unavoidable since they are a logical recomposition of
+    /// possibly-multiple Text-node `data` slices.
+    pub fn document_order_triplets(
+        &self,
+        root: &NodeRef,
+    ) -> Vec<(NodeRef, Option<String>, Option<String>)> {
+        let mut out = Vec::new();
+        collect_triplets(root, &mut out);
+        out
+    }
 
     /// `node.readability.contentScore` read (or `None` if the node was never
     /// `_initializeNode`d). Point query — never iterate the table.
@@ -1302,6 +1557,296 @@ mod tests {
         // + the set_node_tag transfer; none iterate, and no `pub fn` yields an
         // iterator/keys. Point queries still work as the contract requires:
         assert_eq!(dom.content_score(&p), Some(1.0));
+    }
+
+    // ---- M3 Stage 0a: tail() — lxml Element.tail (HLD §5.1 / §6.0) ----
+    //
+    // Every expected value is hand-derived from the lxml `.tail` definition
+    // (text content of the next-sibling Text node(s), terminated by the first
+    // non-Text sibling) + html5ever's spec tree construction. The mdrcel
+    // facade returns `None` where lxml returns `""`; the brief documents
+    // that callers treat the two as equivalent.
+
+    /// First-child <p> of <body>'s first <div> (parser-built; helper used by
+    /// the tail()/delete_with_tail_preserve tests).
+    fn first_p_in_div(html: &str) -> (Dom, NodeRef, NodeRef) {
+        let dom = Dom::parse(html);
+        let body = dom.body().unwrap();
+        let div = get_elements_by_tag_name(&body, "div")[0].clone();
+        let p = get_elements_by_tag_name(&div, "p")[0].clone();
+        (dom, div, p)
+    }
+
+    #[test]
+    fn tail_no_next_sibling_is_none() {
+        // <p> is the only child of <div> -> no next sibling at all -> None.
+        let (_d, _div, p) = first_p_in_div("<div><p>x</p></div>");
+        assert_eq!(tail(&p), None);
+    }
+
+    #[test]
+    fn tail_no_parent_at_all_is_none() {
+        // "Empty document" case per the brief: a detached element has no
+        // parent, hence no siblings, hence no tail. Mirrors lxml semantics
+        // (a detached element's .tail is "" / not contributing).
+        let e = create_element("p");
+        assert_eq!(tail(&e), None);
+    }
+
+    #[test]
+    fn tail_next_sibling_is_text_returns_its_data() {
+        // <div><p>x</p>HELLO</div> -> <p>'s tail = "HELLO".
+        let (_d, _div, p) = first_p_in_div("<div><p>x</p>HELLO</div>");
+        assert_eq!(tail(&p).as_deref(), Some("HELLO"));
+    }
+
+    #[test]
+    fn tail_next_sibling_is_element_then_text_is_none() {
+        // <div><p>x</p><span>y</span>z</div>: the <span> immediately follows
+        // <p>, so <p>'s tail is None (terminated by element before any Text).
+        // The "z" is the <span>'s tail, not <p>'s.
+        let (_d, div, p) = first_p_in_div("<div><p>x</p><span>y</span>z</div>");
+        assert_eq!(tail(&p), None);
+        let span = get_elements_by_tag_name(&div, "span")[0].clone();
+        assert_eq!(tail(&span).as_deref(), Some("z"));
+    }
+
+    #[test]
+    fn tail_next_sibling_is_comment_then_text_is_none() {
+        // A Comment terminates the Text-run just like an element does.
+        let (_d, _div, p) = first_p_in_div("<div><p>x</p><!--c-->z</div>");
+        assert_eq!(tail(&p), None);
+    }
+
+    #[test]
+    fn tail_concatenates_multiple_consecutive_text_siblings() {
+        // The HTML parser coalesces adjacent literal text, so we construct
+        // a (Text, Text) sibling run via the DOM API: append two Text nodes
+        // after <p>. lxml would store this as a single string at <p>.tail;
+        // our rcdom-equivalent answer is the concatenation.
+        let dom = Dom::parse("<div><p>x</p></div>");
+        let div = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let p = get_elements_by_tag_name(&div, "p")[0].clone();
+        append_child(&div, &create_text_node("ALPHA"));
+        append_child(&div, &create_text_node("BETA"));
+        assert_eq!(tail(&p).as_deref(), Some("ALPHABETA"));
+        // And inserting an element between them terminates the run at the
+        // first non-Text: tail = "ALPHA" only.
+        let between = create_element("br");
+        // children order: <p>, Text(ALPHA), Text(BETA). Insert <br> between
+        // the two Text nodes -> <p>, Text(ALPHA), <br>, Text(BETA).
+        // Use the low-level child_nodes API + replace_child trick: detach
+        // BETA, append <br>, then re-append BETA.
+        let beta = child_nodes(&div).into_iter().last().unwrap();
+        remove(&beta);
+        append_child(&div, &between);
+        append_child(&div, &beta);
+        assert_eq!(tail(&p).as_deref(), Some("ALPHA"));
+    }
+
+    #[test]
+    fn tail_empty_text_node_is_preserved_as_some_empty() {
+        // lxml-faithful: an empty Text-node sibling produces tail = Some("").
+        // This is byte-faithful preservation (matches the rationale documented
+        // in `delete_with_tail_preserve`'s impl that an empty Text node is
+        // structurally distinct from no Text node at all — Stage-0a review
+        // NIT-1, M3 #24).
+        let dom = Dom::parse("<div><p>x</p></div>");
+        let div = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let p = get_elements_by_tag_name(&div, "p")[0].clone();
+        append_child(&div, &create_text_node(""));
+        assert_eq!(tail(&p).as_deref(), Some(""));
+    }
+
+    // ---- M3 Stage 0a: delete_with_tail_preserve (HLD §5.1 / §6.0) ----
+
+    #[test]
+    fn delete_with_tail_preserve_no_tail_just_removes() {
+        // <div><p>x</p><span></span></div>: <p>'s next sibling is an element,
+        // so tail() is None. Deleting <p> should just remove it; <span>
+        // remains untouched.
+        let mut dom = Dom::parse("<div><p>x</p><span></span></div>");
+        let div = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let p = get_elements_by_tag_name(&div, "p")[0].clone();
+        dom.delete_with_tail_preserve(&p);
+        assert!(parent(&p).is_none());
+        let remaining: Vec<_> = child_nodes(&div);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(tag_name(&remaining[0]).as_deref(), Some("SPAN"));
+    }
+
+    #[test]
+    fn delete_with_tail_preserve_tail_with_prev_text_appends() {
+        // <div>head<p>x</p>tail</div>:
+        //   children = [Text("head"), <p>, Text("tail")]
+        //   <p>.tail = "tail"; prev sibling = Text("head")
+        //   After: children = [Text("headtail")]
+        let mut dom = Dom::parse("<div>head<p>x</p>tail</div>");
+        let div = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let p = get_elements_by_tag_name(&div, "p")[0].clone();
+        dom.delete_with_tail_preserve(&p);
+        let kids = child_nodes(&div);
+        assert_eq!(kids.len(), 1);
+        // The remaining child must be a Text node holding "headtail".
+        match &kids[0].data {
+            NodeData::Text { contents } => {
+                assert_eq!(&*contents.borrow(), "headtail");
+            }
+            _ => panic!("expected merged Text child, got {:?}", kids[0].data),
+        }
+    }
+
+    #[test]
+    fn delete_with_tail_preserve_tail_with_prev_element_inserts_text() {
+        // <div><a>A</a><p>x</p>tail</div>:
+        //   children = [<a>, <p>, Text("tail")]
+        //   <p>.tail = "tail"; prev sibling = <a> (element, NOT text)
+        //   After: children = [<a>, Text("tail")] — fresh Text at <p>'s slot.
+        let mut dom = Dom::parse("<div><a>A</a><p>x</p>tail</div>");
+        let div = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let p = get_elements_by_tag_name(&div, "p")[0].clone();
+        dom.delete_with_tail_preserve(&p);
+        let kids = child_nodes(&div);
+        assert_eq!(kids.len(), 2);
+        assert_eq!(tag_name(&kids[0]).as_deref(), Some("A"));
+        match &kids[1].data {
+            NodeData::Text { contents } => {
+                assert_eq!(&*contents.borrow(), "tail");
+            }
+            _ => panic!("expected fresh Text at index 1, got {:?}", kids[1].data),
+        }
+    }
+
+    #[test]
+    fn delete_with_tail_preserve_tail_no_prev_sibling_promotes_to_parent_text() {
+        // <div><p>x</p>tail<span></span></div>:
+        //   children = [<p>, Text("tail"), <span>]
+        //   <p>.tail = "tail"; <p> is the FIRST child (no prev sibling).
+        //   After: children = [Text("tail"), <span>] — tail re-homed as
+        //   parent's first child (lxml "promote to parent.text").
+        let mut dom = Dom::parse("<div><p>x</p>tail<span></span></div>");
+        let div = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let p = get_elements_by_tag_name(&div, "p")[0].clone();
+        dom.delete_with_tail_preserve(&p);
+        let kids = child_nodes(&div);
+        assert_eq!(kids.len(), 2);
+        match &kids[0].data {
+            NodeData::Text { contents } => {
+                assert_eq!(&*contents.borrow(), "tail");
+            }
+            _ => panic!("expected Text first, got {:?}", kids[0].data),
+        }
+        assert_eq!(tag_name(&kids[1]).as_deref(), Some("SPAN"));
+    }
+
+    #[test]
+    fn delete_with_tail_preserve_tail_multiple_consecutive_text_nodes() {
+        // Construct <div>head<p>x</p>[Text(A)][Text(B)]<span/></div> via the
+        // DOM API (parser coalesces literal text, so we have to build the
+        // multi-Text-sibling case by hand). <p>'s tail spans both A and B;
+        // after delete-with-tail-preserve the merged "headAB" lands on the
+        // prev Text("head").
+        let mut dom = Dom::parse("<div>head<p>x</p><span></span></div>");
+        let div = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let p = get_elements_by_tag_name(&div, "p")[0].clone();
+        let span = get_elements_by_tag_name(&div, "span")[0].clone();
+        // Insert two Text nodes between <p> and <span>: detach span,
+        // append text(A), text(B), then re-append span.
+        remove(&span);
+        append_child(&div, &create_text_node("A"));
+        append_child(&div, &create_text_node("B"));
+        append_child(&div, &span);
+        // Sanity: <p>.tail concatenates A + B (terminated by <span>).
+        assert_eq!(tail(&p).as_deref(), Some("AB"));
+        // Now delete.
+        dom.delete_with_tail_preserve(&p);
+        let kids = child_nodes(&div);
+        assert_eq!(kids.len(), 2);
+        match &kids[0].data {
+            NodeData::Text { contents } => {
+                assert_eq!(&*contents.borrow(), "headAB");
+            }
+            _ => panic!("expected merged Text first, got {:?}", kids[0].data),
+        }
+        assert_eq!(tag_name(&kids[1]).as_deref(), Some("SPAN"));
+    }
+
+    // ---- M3 Stage 0a: document_order_triplets (HLD §5.1 / §6.0) ----
+
+    #[test]
+    fn document_order_triplets_single_root_no_children() {
+        // A bare detached element: one triplet for `root` itself, both .text
+        // and .tail = None (no children, no siblings).
+        let dom = Dom::parse("<p>x</p>"); // we won't actually use the DOM
+        let _ = &dom;
+        let e = create_element("section");
+        // Stage 0a triplet API is on Dom; we still need an instance.
+        let triplets = dom.document_order_triplets(&e);
+        assert_eq!(triplets.len(), 1);
+        assert!(Rc::ptr_eq(&triplets[0].0, &e));
+        assert_eq!(triplets[0].1, None);
+        assert_eq!(triplets[0].2, None);
+    }
+
+    #[test]
+    fn document_order_triplets_root_with_text_and_tail() {
+        // <div><p>HEAD<span/>MID</p>TAIL</div>:
+        //   <p>.text = "HEAD" (leading text before <span>)
+        //   <p>.tail = "TAIL" (next-sibling Text of <p>)
+        //   <span>.text = None (no children)
+        //   <span>.tail = "MID"
+        // Starting the walk at <p> yields [(p, HEAD, TAIL), (span, None, MID)].
+        let dom = Dom::parse("<div><p>HEAD<span></span>MID</p>TAIL</div>");
+        let p = get_elements_by_tag_name(&dom.body().unwrap(), "p")[0].clone();
+        let triplets = dom.document_order_triplets(&p);
+        assert_eq!(triplets.len(), 2);
+        assert_eq!(tag_name(&triplets[0].0).as_deref(), Some("P"));
+        assert_eq!(triplets[0].1.as_deref(), Some("HEAD"));
+        assert_eq!(triplets[0].2.as_deref(), Some("TAIL"));
+        assert_eq!(tag_name(&triplets[1].0).as_deref(), Some("SPAN"));
+        assert_eq!(triplets[1].1, None);
+        assert_eq!(triplets[1].2.as_deref(), Some("MID"));
+    }
+
+    #[test]
+    fn document_order_triplets_nested_elements_preorder() {
+        // <root><a><b/></a><c><d/></c></root>: pre-order = root, a, b, c, d.
+        let dom = Dom::parse("<section id=root><a><b></b></a><c-x><d></d></c-x></section>");
+        let root = get_elements_by_tag_name(&dom.body().unwrap(), "section")[0].clone();
+        let triplets = dom.document_order_triplets(&root);
+        let tags: Vec<String> = triplets
+            .iter()
+            .map(|(n, _, _)| tag_name(n).unwrap_or_default())
+            .collect();
+        assert_eq!(tags, vec!["SECTION", "A", "B", "C-X", "D"]);
+    }
+
+    #[test]
+    fn document_order_triplets_mixed_text_comment_element_children() {
+        // <div>txt1<!--c--><p>x</p>txt2<span/>txt3</div>:
+        //   div.text = "txt1" (leading Text, before the Comment)
+        //     -- the Comment terminates the leading-text run; this matches
+        //        lxml: lxml's .text only includes the leading TEXT, not
+        //        across comment boundaries.
+        //   div.tail = None (no parent's-Text-sibling-of-div)
+        //   p.text = "x"
+        //   p.tail = "txt2"
+        //   span.text = None
+        //   span.tail = "txt3"
+        // The Comment is NOT yielded as a triplet (element-only iteration).
+        let dom = Dom::parse("<div>txt1<!--c--><p>x</p>txt2<span></span>txt3</div>");
+        let div = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let triplets = dom.document_order_triplets(&div);
+        assert_eq!(triplets.len(), 3);
+        assert_eq!(tag_name(&triplets[0].0).as_deref(), Some("DIV"));
+        assert_eq!(triplets[0].1.as_deref(), Some("txt1"));
+        assert_eq!(triplets[0].2, None);
+        assert_eq!(tag_name(&triplets[1].0).as_deref(), Some("P"));
+        assert_eq!(triplets[1].1.as_deref(), Some("x"));
+        assert_eq!(triplets[1].2.as_deref(), Some("txt2"));
+        assert_eq!(tag_name(&triplets[2].0).as_deref(), Some("SPAN"));
+        assert_eq!(triplets[2].1, None);
+        assert_eq!(triplets[2].2.as_deref(), Some("txt3"));
     }
 
     // ---- body / root_element on a real-ish document ----
