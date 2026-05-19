@@ -26,3 +26,9 @@ pub mod cleaning;
 // line. Membership-test arrays, not HashSets — order is load-bearing per
 // Trafilatura's `# order could matter` comment at `settings.py:348`.
 pub mod settings_constants;
+
+// Stage 1c — `baseline()` rescue extractor + `html2txt()` last resort +
+// `basic_cleaning()` pre-strip (HLD §7.3). Source of truth:
+// `trafilatura@v2.0.0/baseline.py:18-123` plus `settings.py:432-434`
+// (BASIC_CLEAN_XPATH literal) and `utils.py:340-346` (trim).
+pub mod baseline;

@@ -251,7 +251,28 @@ name = "mdrcel"
 # trafilatura::cleaning`. Per semver (CLAUDE.md "Version management") PATCH:
 # additive infrastructure behind the same `#[doc(hidden)]` surface, no
 # observable change on the default (`Extractor::Readability`) extraction path.
-version = "0.4.4"
+#
+# M3 Stage 1c (2026-05-19): 0.4.4 -> 0.4.5 PATCH. Adds
+# `src/trafilatura/baseline.rs` — faithful port of `trafilatura@v2.0.0/
+# baseline.py:18-123` (basic_cleaning + baseline + html2txt) plus the
+# `settings.py:432-434` BASIC_CLEAN_XPATH literal and `utils.py:340-346`
+# trim helper. The four extraction paths (JSON-LD articleBody, <article>
+# scan, blockquote/code/p/pre/q/quote tag-set iteration, <body> itertext
+# fallback) execute in source order with full side effects (DA-B-2 anti-
+# inversion: basic_cleaning runs between paths 1 and 2 unconditionally).
+# All XPath evaluation goes through the Stage 0b engine
+# (`xpath_engine::evaluate`); all DOM mutation goes through the dom.rs
+# facade (`dom::create_element` / `append_child` / `text_content` /
+# `delete_with_tail_preserve_free` / `Dom::document_order_triplets`). No
+# imports of `markup5ever_rcdom` or `html5ever` outside the facade. The
+# Trafilatura-equivalence BLOCKER gate (`tests/trafilatura_equivalence_gate.rs`)
+# is frozen at 10/10 fixtures; the M2 parser-equivalence gate
+# (`tests/parser_equivalence_gate.rs`) is byte-identical to commit 149c686.
+# No public API change — `baseline` / `html2txt` / `basic_cleaning` /
+# `BaselineOutput` live under `#[doc(hidden)] pub mod trafilatura::baseline`.
+# Per semver PATCH: additive infrastructure behind the same `#[doc(hidden)]`
+# surface, no observable change on the default extraction path.
+version = "0.4.5"
 edition = "2024"
 
 [dependencies]
