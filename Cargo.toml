@@ -234,7 +234,7 @@ name = "mdrcel"
 # 2000-3000 budget; the conformance discipline replaces line-cite for
 # this file, so the bar is "every supported operator has a conformance
 # row", which it does).
-version = "0.4.2"
+version = "0.4.3"
 edition = "2024"
 
 [dependencies]
