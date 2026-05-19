@@ -1395,6 +1395,116 @@ pub fn clear_attributes(elem: &NodeRef) {
     }
 }
 
+/// `copy.deepcopy(elem)` — recursive subtree clone (M3 Stage 2c-i additive
+/// extension, HLD §5.1).
+///
+/// Returns a fresh, **detached** `NodeRef` that is a structural deep copy of
+/// `node`'s entire subtree: every descendant is freshly allocated, no `Rc`
+/// pointer aliases the source tree, and the returned root has no parent.
+/// Children, attributes, and text/comment/PI/doctype payloads are all
+/// independently owned by the clone.
+///
+/// # lxml fidelity
+///
+/// lxml `copy.deepcopy(elem)` returns a new element with the same tag,
+/// attributes, text, tail, and recursively-cloned children. Empirically
+/// (verified against a live `lxml.etree` 5.x), **lxml DOES preserve the
+/// source element's `.tail` on the cloned root** — the cloned `.tail`
+/// attribute equals the source `.tail`, even though the clone has no
+/// parent.
+///
+/// rcdom represents lxml's `.tail` as a sibling `Text` node owned by the
+/// element's parent. A detached `NodeRef` returned by this function has
+/// no parent and therefore no anchor for a root-level tail; the Rust port
+/// drops the root-tail bytes. This is an honest, observable divergence
+/// from lxml — but it is **inert for every Stage 2c-i caller** because
+/// the only consumer (`handle_titles`, `main_extractor.py:53`) walks
+/// `title.itertext()` and `title.append(...)` and never reads
+/// `title.tail`. The prospective Stage 2c-iii consumer
+/// (`prune_unwanted_nodes`'s `with_backup` branch) also does not read the
+/// root's tail — it just re-uses the backup as the working tree.
+///
+/// If a future stage introduces a caller that DOES read `clone.tail`, this
+/// fn must grow a paired "carrier" return shape (e.g. `(NodeRef,
+/// Option<StrTendril>)`) or attach a transient Text-sibling under a
+/// synthetic wrapper. Until then, the docstring is the contract.
+///
+/// **Descendant tails ARE preserved** without special-case logic: each
+/// descendant's tail is a Text-node sibling between it and the next
+/// non-Text sibling; that sibling Text node is itself a child of the
+/// descendant's parent in the subtree. Since we deep-clone the entire
+/// `children` list verbatim — including the interleaved Text-node siblings
+/// that materialise lxml's `.tail` — the descendant-tail bytes survive
+/// faithfully.
+///
+/// # Variant handling
+///
+/// - `Element`: clone `name`, clone every `Attribute` in source order,
+///   recursively clone every child.
+/// - `Text`: clone the `contents` (`StrTendril::clone` is a refcount bump
+///   on the underlying buffer; the new `RefCell` is independent).
+/// - `Comment`: clone the `contents` (immutable `StrTendril`).
+/// - `ProcessingInstruction`: clone `target` + `contents`.
+/// - `Doctype`: clone `name` + `public_id` + `system_id`.
+/// - `Document`: clone children only (Document carries no payload).
+///
+/// `template_contents` is reset to `None` (a fresh `RefCell`). Template
+/// element contents are an HTML-spec rarity Trafilatura never traverses;
+/// the safer default is "drop, do not deep-clone an inner document".
+///
+/// # Citation
+///
+/// `main_extractor.py:53` — `title = deepcopy(element)` in `handle_titles`.
+/// Also expected to be consumed by Stage 2c-iii `prune_unwanted_nodes`'s
+/// `with_backup` branch (`htmlprocessing.py:99` — `tcopy = deepcopy(tree)`).
+pub fn deep_clone(node: &NodeRef) -> NodeRef {
+    let clone = match &node.data {
+        NodeData::Element {
+            name,
+            attrs,
+            mathml_annotation_xml_integration_point,
+            ..
+        } => Node::new(NodeData::Element {
+            name: name.clone(),
+            attrs: RefCell::new(attrs.borrow().clone()),
+            template_contents: RefCell::new(None),
+            mathml_annotation_xml_integration_point: *mathml_annotation_xml_integration_point,
+        }),
+        NodeData::Text { contents } => Node::new(NodeData::Text {
+            contents: RefCell::new(contents.borrow().clone()),
+        }),
+        NodeData::Comment { contents } => Node::new(NodeData::Comment {
+            contents: contents.clone(),
+        }),
+        NodeData::ProcessingInstruction { target, contents } => {
+            Node::new(NodeData::ProcessingInstruction {
+                target: target.clone(),
+                contents: contents.clone(),
+            })
+        }
+        NodeData::Doctype {
+            name,
+            public_id,
+            system_id,
+        } => Node::new(NodeData::Doctype {
+            name: name.clone(),
+            public_id: public_id.clone(),
+            system_id: system_id.clone(),
+        }),
+        NodeData::Document => Node::new(NodeData::Document),
+    };
+
+    // Recursively clone every child, linking each into `clone` (the new root
+    // is detached — `clone.parent` stays `None`).
+    for child in node.children.borrow().iter() {
+        let child_clone = deep_clone(child);
+        child_clone.parent.set(Some(Rc::downgrade(&clone)));
+        clone.children.borrow_mut().push(child_clone);
+    }
+
+    clone
+}
+
 /// Canonical XML serialization for the M3 Stage 0c Trafilatura-equivalence
 /// gate (HLD §6.2). Emits a deterministic, ASCII-stable XML representation
 /// of `node`'s subtree:
@@ -2487,5 +2597,64 @@ mod tests {
         let div = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
         let s = serialize_converted_tree(&div);
         assert_eq!(s, "<div>ab</div>");
+    }
+
+    // -----------------------------------------------------------------
+    // M3 Stage 2c-i — deep_clone (lxml `copy.deepcopy(elem)` semantics)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn deep_clone_returns_detached_root() {
+        let dom = Dom::parse("<div><p>x</p></div>");
+        let div = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let cloned = deep_clone(&div);
+        // The clone is detached (no parent).
+        assert!(parent(&cloned).is_none());
+        // The original is still attached.
+        assert!(parent(&div).is_some());
+    }
+
+    #[test]
+    fn deep_clone_independence_from_source() {
+        let dom = Dom::parse("<div><p>x</p></div>");
+        let div = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let cloned = deep_clone(&div);
+        // Different NodeRef identities.
+        assert!(!Rc::ptr_eq(&div, &cloned));
+        // Mutating the clone does NOT affect the source.
+        let cloned_p = get_elements_by_tag_name(&cloned, "p")[0].clone();
+        set_element_text(&cloned_p, Some("mutated"));
+        let original_p = get_elements_by_tag_name(&div, "p")[0].clone();
+        assert_eq!(element_text(&original_p).as_deref(), Some("x"));
+        assert_eq!(element_text(&cloned_p).as_deref(), Some("mutated"));
+    }
+
+    #[test]
+    fn deep_clone_copies_attributes_and_text_and_descendant_tail() {
+        // Text + tail interleavings should survive verbatim.
+        let dom = Dom::parse(r#"<div><p class="a">hello<span>x</span>tailbytes</p></div>"#);
+        let div = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let cloned = deep_clone(&div);
+        // Attribute preserved.
+        let cloned_p = get_elements_by_tag_name(&cloned, "p")[0].clone();
+        assert_eq!(get_attribute(&cloned_p, "class").as_deref(), Some("a"));
+        // Leading text preserved.
+        assert_eq!(element_text(&cloned_p).as_deref(), Some("hello"));
+        // Descendant <span>'s tail preserved.
+        let cloned_span = get_elements_by_tag_name(&cloned_p, "span")[0].clone();
+        assert_eq!(tail(&cloned_span).as_deref(), Some("tailbytes"));
+    }
+
+    #[test]
+    fn deep_clone_recurses_into_nested_subtree() {
+        let dom = Dom::parse("<div><section><p><i>x</i></p></section></div>");
+        let div = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let cloned = deep_clone(&div);
+        // Every descendant tag survives.
+        assert_eq!(get_elements_by_tag_name(&cloned, "section").len(), 1);
+        assert_eq!(get_elements_by_tag_name(&cloned, "p").len(), 1);
+        assert_eq!(get_elements_by_tag_name(&cloned, "i").len(), 1);
+        let i = get_elements_by_tag_name(&cloned, "i")[0].clone();
+        assert_eq!(element_text(&i).as_deref(), Some("x"));
     }
 }

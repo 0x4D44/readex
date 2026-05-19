@@ -315,7 +315,32 @@ name = "mdrcel"
 # additive dom.rs surface. Per semver PATCH: additive infrastructure
 # behind the same `#[doc(hidden)]` surface, no observable change on the
 # default extraction path.
-version = "0.4.7"
+#
+# M3 Stage 2c-i (2026-05-19): 0.4.7 -> 0.4.8 PATCH. Adds
+# `src/trafilatura/main_extractor.rs` — faithful port of
+# `trafilatura@v2.0.0/main_extractor.py:30-160` (the handler primitives
+# Stage 2c-ii's block handlers consume): module constants (P_FORMATTING /
+# TABLE_ELEMS / TABLE_ALL / FORMATTING / CODES_QUOTES / NOT_AT_THE_END),
+# `handle_titles`, `handle_formatting`, `add_sub_element`,
+# `process_nested_elements`, `update_elem_rendition`, `is_text_element`,
+# `define_newelem`. `process_nested_elements` routes `<list>` descendants
+# through a **forward-declared `handle_lists` stub** that panics with a
+# Stage-2c-ii citation; the Stage 2c-ii implementer replaces it.
+# Extends `src/readability/dom.rs` ADDITIVELY (Stage 0a / 2b' precedent)
+# with `deep_clone(node) -> NodeRef` — the lxml `copy.deepcopy(elem)`
+# subtree clone needed by `handle_titles` (line 53) AND, prospectively,
+# by Stage 2c-iii's `prune_unwanted_nodes` `with_backup` branch
+# (`htmlprocessing.py:99` — `tcopy = deepcopy(tree)`). The Trafilatura-
+# equivalence BLOCKER gate (`tests/trafilatura_equivalence_gate.rs`)
+# remains 10/10 green; the M2 parser-equivalence gate
+# (`tests/parser_equivalence_gate.rs`) is byte-identical to commit
+# 149c686. No public API change — all surfaces under
+# `#[doc(hidden)] pub mod trafilatura::main_extractor` plus the additive
+# `dom::deep_clone` extension. Per semver PATCH: additive infrastructure
+# behind the same `#[doc(hidden)]` surface, no observable change on the
+# default extraction path (handler primitives are consumed only by
+# Stage 2c-ii's block dispatchers, none of which are wired yet).
+version = "0.4.8"
 edition = "2024"
 
 [dependencies]

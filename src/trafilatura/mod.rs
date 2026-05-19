@@ -49,3 +49,14 @@ pub mod xpaths_constants;
 // `duplicate_test` stub from `deduplication.py:243-254` (the full LRU port
 // is deferred until a future stage activates `Options.dedup`).
 pub mod utils;
+
+// Stage 2c-i — handler primitives ported from
+// `trafilatura@v2.0.0/main_extractor.py:30-160` (HLD §7.4): module constants
+// (P_FORMATTING / TABLE_ELEMS / TABLE_ALL / FORMATTING / CODES_QUOTES /
+// NOT_AT_THE_END), `handle_titles`, `handle_formatting`, `add_sub_element`,
+// `process_nested_elements`, `update_elem_rendition`, `is_text_element`,
+// `define_newelem`. The `process_nested_elements` list dispatch routes
+// through a forward-stub `handle_lists` that panics with a Stage 2c-ii
+// citation; Stage 2c-ii replaces that stub with the full port
+// (`main_extractor.py:161-205`).
+pub mod main_extractor;
