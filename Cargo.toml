@@ -443,7 +443,22 @@ name = "mdrcel"
 # keep the `Dom` alive (e.g. return a `(Dom, NodeRef)` pair). The
 # `_extract_probe_body_xpath_evaluation` test documents this discovery
 # inline.
-version = "0.4.13"
+#
+# M3 Stage 3-A (2026-05-20): 0.4.13 -> 0.4.14 PATCH. Adds the first
+# end-to-end pipeline smoke gate (`tests/trafilatura_extract_smoke.rs`).
+# The smoke gate runs the full Stage 1b cleaning + Stage 2 extraction
+# pipeline against the 10 corpus fixtures the M3 converted-tree BLOCKER
+# gate uses, asserting:
+# 1. No panic / no unimplemented! / no infinite loop on any fixture.
+# 2. ≥ 7/10 fixtures yield substantive extractions (> 200 chars of text);
+#    allows for tiny "low yield" fixtures like example.com (528 bytes of
+#    HTML).
+# Current verdict: SUBSTANTIVE 9/10 (only example.com falls below the
+# threshold). This is a SMOKE gate, not a BLOCKER — it does NOT pin
+# byte-equivalence to Python's `extract_content` output (Stage 3-B will
+# add that with a fresh Python oracle mode). Per semver PATCH: a new
+# test file with no production-code change.
+version = "0.4.14"
 edition = "2024"
 
 [dependencies]
