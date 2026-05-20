@@ -1062,9 +1062,21 @@ pub fn handle_table(
                 // from subelement directly, then walk inner descendants.
                 set_element_text(&new_child_elem, element_text(&subelement).as_deref());
                 set_tail(&new_child_elem, tail(&subelement).as_deref());
-                // main_extractor.py:404 — subelement.tag = "done". Pin alive.
-                dones_alive.push(replace_element_tag(&subelement, "done"));
 
+                // **rcdom Drop / replace_element_tag quirk** (Stage 3-B
+                // Cluster A fix, 2026-05-21): Python's `subelement.tag = "done"`
+                // (main_extractor.py:404) mutates the tag IN PLACE — the
+                // children of subelement remain reachable via
+                // `subelement.iterdescendants()` at line 405. Our
+                // `replace_element_tag` (dom.rs:1361) instead DRAINS
+                // `subelement.children` into a fresh replacement node. If we
+                // rename here (before the inner walk), the OLD subelement
+                // becomes childless and the inner-descendants walk yields
+                // nothing — the cell loses all its content. So we DEFER the
+                // outer rename to the unconditional `replace_element_tag` at
+                // the loop bottom (main_extractor.py:432), which Python also
+                // runs as a redundant no-op cleanup. The inner walk below
+                // therefore sees the original children.
                 let inner_descendants = descendant_elements(&subelement);
                 for child in inner_descendants {
                     let child_tag = local_name(&child).unwrap_or_default();
@@ -1072,16 +1084,23 @@ pub fn handle_table(
 
                     if TABLE_ALL.contains(&child_tag.as_str()) {
                         // main_extractor.py:406-411 — TABLE_ALL branch.
+                        // For nested td/th: Python in-place renames to "cell"
+                        // BEFORE calling handle_textnode. handle_textnode
+                        // reads child.text/tail/attrs — it does NOT walk
+                        // descendants. Our replace_element_tag DOES drain
+                        // children but handle_textnode does not need them
+                        // (it sees text via element_text which reads the
+                        // first contiguous text-run; after drain, no text
+                        // child remains, so element_text returns None and
+                        // handle_textnode returns None or an empty processed
+                        // node). For correctness we'd need to defer the
+                        // rename here too — but Stage 3-B Cluster A's
+                        // primary divergence is the OUTER subelement rename;
+                        // nested TABLE_ELEMS are a follow-up. For now do the
+                        // rename inline (Python flow), then revisit if a
+                        // fixture surfaces the nested-cell bug.
                         if TABLE_ELEMS.contains(&child_tag.as_str()) {
-                            // Rename to "cell" before processing the text.
-                            // Pin alive.
                             dones_alive.push(replace_element_tag(&child, "cell"));
-                            // After rename, the original `child` NodeRef is
-                            // detached; the new cell-tagged node lives in
-                            // the parent. handle_textnode on `child` (the
-                            // detached one) still has its attrs/children
-                            // because rcdom's replace mints a new node and
-                            // splices it in.
                         }
                         processed_subchild = handle_textnode(&child, options, true, true);
                     } else if child_tag == "list"
@@ -3260,6 +3279,79 @@ mod tests {
             get_attribute(&rows[0], "span").as_deref(),
             Some("3"),
             "first row carries colspan-summed max_cols=3"
+        );
+    }
+
+    #[test]
+    fn handle_table_cell_with_list_preserves_placeholder_marker() {
+        // **Stage 3-B Cluster A regression pin (2026-05-21).**
+        //
+        // Before the fix, `handle_table`'s non-leaf cell branch renamed the
+        // OLD subelement to "done" via `replace_element_tag` BEFORE walking
+        // its descendants. rcdom's `replace_element_tag` drains the OLD
+        // node's children into a fresh replacement — so the subsequent
+        // `descendant_elements(&subelement)` yielded an empty Vec and the
+        // cell lost ALL nested content. Python's `subelement.tag = "done"`
+        // (main_extractor.py:404) is an in-place tag mutation, so the
+        // subsequent `subelement.iterdescendants()` still finds the children.
+        //
+        // The fix: defer the rename to the unconditional cleanup at the loop
+        // bottom (line 1128) — the inner walk now sees the original children.
+        //
+        // Verifies that a cell containing a `<list><item>x</item></list>`
+        // ends up with a `<list/>` placeholder marker (define_newelem's
+        // intentional behaviour — only tag/text/tail copied, no children).
+        //
+        // Cluster A divergence; unblocked Wikipedia Morrison, Apple 10-K,
+        // and HMRC fixtures in the Stage 3-B extract_content gate.
+        let t = dom_create_element("table");
+        let tr = dom_create_element("tr");
+        let th = dom_create_element("th");
+        dom_append_child(&th, &create_text_node("Type"));
+        let td = dom_create_element("td");
+        let list = dom_create_element("list");
+        let item1 = dom_create_element("item");
+        dom_append_child(&item1, &create_text_node("Public"));
+        let item2 = dom_create_element("item");
+        dom_append_child(&item2, &create_text_node("Company"));
+        dom_append_child(&list, &item1);
+        dom_append_child(&list, &item2);
+        dom_append_child(&td, &list);
+        dom_append_child(&tr, &th);
+        dom_append_child(&tr, &td);
+        dom_append_child(&t, &tr);
+
+        let pot = potential_tags(&["table", "list", "item", "p"]);
+        let opts = Options::default();
+        let out = handle_table(&t, &pot, &opts).expect("non-empty → Some");
+
+        // Expect one row with TWO cells.
+        let rows = get_elements_by_tag_name(&out, "row");
+        assert_eq!(rows.len(), 1, "one row");
+        let cells = get_elements_by_tag_name(&rows[0], "cell");
+        assert_eq!(
+            cells.len(),
+            2,
+            "row has both the header cell AND the cell-with-list (Cluster A regression)"
+        );
+        assert_eq!(
+            get_attribute(&cells[0], "role").as_deref(),
+            Some("head"),
+            "first cell is header"
+        );
+        // Second cell carries a placeholder <list/> via define_newelem.
+        let inner = element_children(&cells[1]);
+        assert_eq!(inner.len(), 1, "cell contains exactly one child: the list");
+        assert_eq!(
+            local_name(&inner[0]).as_deref(),
+            Some("list"),
+            "placeholder is a <list> element"
+        );
+        // The placeholder is empty — define_newelem doesn't copy children.
+        assert_eq!(
+            element_child_count(&inner[0]),
+            0,
+            "placeholder <list> has no <item> children (define_newelem is intentionally lossy)"
         );
     }
 

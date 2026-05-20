@@ -68,6 +68,11 @@ use mdrcel::trafilatura::{cleaning, main_extractor};
 const FIXTURES: &[&str] = &[
     // ---- phase 1 (commit 64d8814) ----
     "benchmark/corpus/snapshots/0f115db062b7c0dd.html", // example.com (528 bytes, edge_case)
+    // ---- phase 2 (Cluster A fix) ----
+    "benchmark/corpus/snapshots/9c8f49f04f792f81.html", // en.wikipedia Wm_Morrison
+    "benchmark/corpus/snapshots/9a1590d0917107a7.html", // Apple FY2025 10-K (62 tables)
+    "benchmark/corpus/snapshots/9ec7aaf8edb71ac1.html", // HMRC 2025-26 (23 tables)
+    "benchmark/corpus/snapshots/f405a9e3314e15da.html", // BBC News tech (news)
 ];
 
 #[test]

@@ -474,7 +474,26 @@ name = "mdrcel"
 # rollout is operationally honest, "all 10 expected failures" is not.
 # Per semver PATCH: an additive test file + an additive Python oracle CLI
 # flag, no production-code change to the M3 surface.
-version = "0.4.15"
+#
+# M3 Stage 3-B Cluster A (2026-05-21): 0.4.15 -> 0.4.16 PATCH.
+# `handle_table` cell-with-children fix. Python's
+# `subelement.tag = "done"` at main_extractor.py:404 is an IN-PLACE tag
+# mutation — the subsequent `subelement.iterdescendants()` at line 405
+# still finds the cell's children. Our `replace_element_tag`
+# (`dom.rs:1361`) instead DRAINS the original element's children into a
+# fresh replacement node. The pre-fix code did the rename BEFORE walking
+# inner descendants, so the OLD subelement became childless and the inner
+# walk yielded nothing — every non-leaf table cell lost ALL nested
+# content. Fix: defer the rename to the unconditional cleanup at the
+# loop bottom (line 1128) — same Python no-op cleanup at
+# main_extractor.py:432. Inner walk now sees the original children.
+# Stage 3-B extract_content gate goes 1/10 -> 5/10 (added Wikipedia
+# Morrison, Apple 10-K, HMRC, BBC News). The new regression-pin test
+# `handle_table_cell_with_list_preserves_placeholder_marker` (lib test
+# 580) freezes the invariant on a minimal `<th>Type</th><td><list>...`
+# input. Per semver PATCH: bugfix in already-public function, no API
+# change.
+version = "0.4.16"
 edition = "2024"
 
 [dependencies]
