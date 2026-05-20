@@ -1,8 +1,10 @@
-//! `main_extractor` — Stage 2c-i: handler primitives.
+//! `main_extractor` — Stage 2c-i + 2c-ii: handler primitives and block
+//! handlers.
 //!
 //! HLD anchor: `2026.05.19 - HLD - mdrcel Trafilatura Port (M3)` §7.4 (the
 //! `main_extractor.py` handler dispatch). Source of truth:
-//! `trafilatura@v2.0.0/main_extractor.py:30-160`.
+//! `trafilatura@v2.0.0/main_extractor.py:30-353` (Stage 2c-i: 30-160; Stage
+//! 2c-ii: 161-353).
 //!
 //! # Scope
 //!
@@ -64,12 +66,14 @@
 //! `None` — so a Stage 2c-ii regression cannot mask itself behind this file.
 
 use crate::readability::dom::{
-    NodeData, NodeRef, append_child, attributes_in_source_order, create_element, deep_clone,
-    element_text, get_attribute, local_name, parent, previous_element_sibling, replace_element_tag,
+    NodeData, NodeRef, append_child, attributes_in_source_order, clear_attributes, create_element,
+    deep_clone, delete_with_tail_preserve_free, element_text, get_attribute,
+    get_elements_by_tag_name, local_name, parent, previous_element_sibling, replace_element_tag,
     set_attribute, set_element_text, set_tail, tail,
 };
-use crate::trafilatura::cleaning::{Options, handle_textnode, process_node};
+use crate::trafilatura::cleaning::{Options, handle_textnode, process_node, strip_tags_multi};
 use crate::trafilatura::utils::{FORMATTING_PROTECTED, text_chars_test};
+use std::collections::HashSet;
 
 // ===========================================================================
 // Module constants (main_extractor.py:30-35)
@@ -121,22 +125,672 @@ pub const NOT_AT_THE_END: &[&str] = &["head", "ref"];
 // port emits no extraction debug logs at Stage 2c-i.
 
 // ===========================================================================
-// handle_lists — FORWARD STUB (Stage 2c-ii will replace this)
+// handle_lists (main_extractor.py:161-199) — Stage 2c-ii
 // ===========================================================================
 
-/// `handle_lists(element, options)` — **STAGE 2c-ii FORWARD STUB**.
+/// `handle_lists(element, options)` — `main_extractor.py:161-199`.
 ///
-/// `process_nested_elements` (`main_extractor.py:131-134`) dispatches to
-/// `handle_lists` when it encounters a descendant whose tag is `"list"`.
-/// The full implementation is Stage 2c-ii's responsibility (`main_extractor.py
-/// :161-205`). To keep Stage 2c-i compilable and to **surface loudly** if a
-/// caller actually exercises the list branch before Stage 2c-ii lands, this
-/// stub panics with a Stage-citing message rather than silently returning
-/// `None` (which would hide a regression).
+/// Process a `<list>` element and its `<item>` descendants. The element's tag
+/// is preserved on the freshly-minted output (Trafilatura's `convert_lists`
+/// pass produces `<list>` from `<ul>` / `<ol>`, so the input element's tag is
+/// almost always `"list"`; we preserve whatever it is to match Python's
+/// `Element(element.tag)` exactly).
 ///
-/// Stage 2c-ii will replace this `unimplemented!` with the full port.
-fn handle_lists(_elem: &NodeRef, _opts: &Options) -> Option<NodeRef> {
-    unimplemented!("Stage 2c-ii: handle_lists (main_extractor.py:161-205)")
+/// # Python original
+///
+/// ```python
+/// def handle_lists(element, options):
+///     "Process lists elements including their descendants."
+///     processed_element = Element(element.tag)
+///
+///     if element.text is not None and element.text.strip():
+///         new_child_elem = SubElement(processed_element, "item")
+///         new_child_elem.text = element.text
+///
+///     for child in element.iterdescendants("item"):
+///         new_child_elem = Element("item")
+///         if len(child) == 0:
+///             processed_child = process_node(child, options)
+///             if processed_child is not None:
+///                 new_child_elem.text = processed_child.text or ""
+///                 if processed_child.tail and processed_child.tail.strip():
+///                     new_child_elem.text += " " + processed_child.tail
+///                 processed_element.append(new_child_elem)
+///         else:
+///             process_nested_elements(child, new_child_elem, options)
+///             if child.tail is not None and child.tail.strip():
+///                 new_child_elem_children = [el for el in new_child_elem if el.tag != "done"]
+///                 if new_child_elem_children:
+///                     last_subchild = new_child_elem_children[-1]
+///                     if last_subchild.tail is None or not last_subchild.tail.strip():
+///                         last_subchild.tail = child.tail
+///                     else:
+///                         last_subchild.tail += " " + child.tail
+///         if new_child_elem.text or len(new_child_elem) > 0:
+///             update_elem_rendition(child, new_child_elem)
+///             processed_element.append(new_child_elem)
+///         child.tag = "done"
+///     element.tag = "done"
+///     # test if it has children and text. Avoid double tags??
+///     if is_text_element(processed_element):
+///         update_elem_rendition(element, processed_element)
+///         return processed_element
+///     return None
+/// ```
+///
+/// # Faithfulness notes
+///
+/// 1. `Element(element.tag)` (line 163) — preserves the input element's tag.
+///    We read `local_name(element)` and pass to `create_element`. Detached
+///    elements with no parent return `None`; we fall back to `"list"`, but
+///    the Python source assumes the input has a tag (so the fallback is
+///    inert on real inputs).
+/// 2. `element.iterdescendants("item")` (line 171) — descendant-only, tag-
+///    filtered. The `<item>` children of `<list>` are direct children, but
+///    nested lists can produce deeper `<item>`s; `get_elements_by_tag_name`
+///    walks descendants in document order with the right semantics.
+/// 3. `new_child_elem_children = [el for el in new_child_elem if el.tag !=
+///    "done"]` (line 183) — filter element-children whose tag != "done".
+/// 4. `child.tail and child.tail.strip()` (line 182) — TRUTHY check: None
+///    and "" are falsy; the trimmed must be non-empty.
+/// 5. `processed_child.text or ""` (line 176) — None / empty / falsy
+///    falls back to "". We use `unwrap_or_default()`.
+/// 6. `new_child_elem.text or len(new_child_elem) > 0` (line 190) — the
+///    survival gate: keep new_child_elem if it has text OR any element-
+///    child (Python `len(elem)` is element-child count).
+pub fn handle_lists(element: &NodeRef, options: &Options) -> Option<NodeRef> {
+    // main_extractor.py:163 — Element(element.tag). Preserve the tag.
+    let tag = local_name(element).unwrap_or_else(|| "list".to_string());
+    let processed_element = create_element(&tag);
+
+    // main_extractor.py:165-167 — leading text becomes its own <item>.
+    if let Some(text) = element_text(element)
+        && !text.trim().is_empty()
+    {
+        let new_child_elem = create_element("item");
+        append_child(&processed_element, &new_child_elem);
+        set_element_text(&new_child_elem, Some(&text));
+    }
+
+    // main_extractor.py:171 — iterdescendants("item") snapshot.
+    let item_descendants = get_elements_by_tag_name(element, "item");
+
+    // **rcdom Drop quirk anchor** (`markup5ever_rcdom-0.39.0/lib.rs:268-284`):
+    // dropping a `Node` iteratively walks `self.children.borrow_mut().drain`
+    // AND `mem::take`s every descendant's children Vec. Discarding the
+    // `replace_element_tag` return value lets the fresh "done" handle drop
+    // immediately — which mem::takes the children of every descendant of
+    // the now-detached subtree (including elements we still hold NodeRefs
+    // for via `item_descendants`). Pin returned "done" handles alive in
+    // `dones_alive` for the duration of the function so subsequent
+    // iterations still see the original child trees.
+    let mut dones_alive: Vec<NodeRef> = Vec::new();
+
+    for child in item_descendants {
+        // main_extractor.py:172 — fresh <item>.
+        let new_child_elem = create_element("item");
+
+        if element_child_count(&child) == 0 {
+            // main_extractor.py:173-179 — leaf <item>: process_node, then
+            // text + tail concatenation into new_child_elem.text.
+            if let Some(processed_child) = process_node(&child, options) {
+                let mut text = element_text(&processed_child).unwrap_or_default();
+                if let Some(t) = tail(&processed_child)
+                    && !t.trim().is_empty()
+                {
+                    text.push(' ');
+                    text.push_str(&t);
+                }
+                set_element_text(&new_child_elem, Some(&text));
+                // main_extractor.py:179 — append. Note: the Python code
+                // appends here AND again at line 192 if the survival gate
+                // is met. The double-append is a Python source quirk; we
+                // mirror it faithfully (the second append on an already-
+                // attached node is a re-parent — but new_child_elem has
+                // text but NO element children, so the gate condition
+                // (text OR len>0) is the same in both branches and the
+                // second append is a no-op move-back into the same parent).
+                append_child(&processed_element, &new_child_elem);
+            }
+        } else {
+            // main_extractor.py:180-189 — non-leaf <item>: rewire descendants
+            // into new_child_elem, then handle the tail-merge.
+            process_nested_elements(&child, &new_child_elem, options);
+            if let Some(child_tail) = tail(&child)
+                && !child_tail.trim().is_empty()
+            {
+                // main_extractor.py:183 — element-children of new_child_elem
+                // whose tag != "done".
+                let new_child_elem_children: Vec<NodeRef> = element_children(&new_child_elem)
+                    .into_iter()
+                    .filter(|el| local_name(el).as_deref() != Some("done"))
+                    .collect();
+                if let Some(last_subchild) = new_child_elem_children.last() {
+                    // main_extractor.py:186-189 — merge child.tail onto
+                    // last_subchild.tail (or set if empty).
+                    let existing_tail = tail(last_subchild);
+                    let merged = match existing_tail.as_deref() {
+                        Some(t) if !t.trim().is_empty() => format!("{t} {child_tail}"),
+                        _ => child_tail.clone(),
+                    };
+                    set_tail(last_subchild, Some(&merged));
+                }
+            }
+        }
+
+        // main_extractor.py:190-192 — survival gate: keep new_child_elem if
+        // it has text OR any element-children. Apply rendition copy.
+        let has_text = element_text(&new_child_elem)
+            .map(|t| !t.is_empty())
+            .unwrap_or(false);
+        let has_children = element_child_count(&new_child_elem) > 0;
+        if has_text || has_children {
+            update_elem_rendition(&child, &new_child_elem);
+            append_child(&processed_element, &new_child_elem);
+        }
+        // main_extractor.py:193 — rename child to "done", unconditional.
+        // Pin alive (rcdom Drop quirk).
+        dones_alive.push(replace_element_tag(&child, "done"));
+    }
+    // main_extractor.py:194 — rename element to "done", unconditional.
+    dones_alive.push(replace_element_tag(element, "done"));
+    let _ = &dones_alive;
+
+    // main_extractor.py:196-199 — is_text_element gate, plus rendition copy.
+    if is_text_element(Some(&processed_element)) {
+        update_elem_rendition(element, &processed_element);
+        Some(processed_element)
+    } else {
+        None
+    }
+}
+
+// ===========================================================================
+// is_code_block_element (main_extractor.py:202-215) — Stage 2c-ii
+// ===========================================================================
+
+/// `is_code_block_element(element)` — `main_extractor.py:202-215`.
+///
+/// True iff `element` looks like a code block by structural markers:
+///   1. has a `lang` attribute (pip-style), OR is tag `<code>` (line 205);
+///   2. parent's `class` attribute contains "highlight" (GitHub) (line 209);
+///   3. has exactly one element child whose tag is `<code>` (highlightjs)
+///      (lines 212-213).
+///
+/// # Python original
+///
+/// ```python
+/// def is_code_block_element(element):
+///     "Check if it is a code element according to common structural markers."
+///     # pip
+///     if element.get("lang") or element.tag == "code":
+///         return True
+///     # GitHub
+///     parent = element.getparent()
+///     if parent is not None and "highlight" in parent.get("class", ""):
+///         return True
+///     # highlightjs
+///     code = element.find("code")
+///     if code is not None and len(element) == 1:
+///         return True
+///     return False
+/// ```
+///
+/// # Faithfulness notes
+///
+/// 1. `element.get("lang")` (line 205) — Python's TRUTHY check; an absent
+///    attr → None → falsy; an empty-string attr → "" → falsy.
+/// 2. `parent.get("class", "")` (line 209) — substring `in`-check against
+///    the class attribute string (which may carry many tokens), NOT a
+///    tokenised match. "highlight-py" is also a hit (matches Python `in`).
+/// 3. `element.find("code")` (line 212) — lxml's `find()` is XPath
+///    `./code` (CHILD axis), returning the FIRST matching ELEMENT child.
+///    NOT a descendant search. Stage 2c-ii: first child whose tag is "code".
+/// 4. `len(element) == 1` (line 213) — element-child count equals 1. The
+///    Python's TWO conditions on line 213 must BOTH hold (code exists AND
+///    element has exactly one element-child).
+pub fn is_code_block_element(element: &NodeRef) -> bool {
+    // main_extractor.py:205 — lang attr OR tag == "code".
+    let has_lang = get_attribute(element, "lang")
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    if has_lang || local_name(element).as_deref() == Some("code") {
+        return true;
+    }
+    // main_extractor.py:208-210 — parent's class contains "highlight".
+    if let Some(p) = parent(element) {
+        let class = get_attribute(&p, "class").unwrap_or_default();
+        if class.contains("highlight") {
+            return true;
+        }
+    }
+    // main_extractor.py:212-214 — first <code> CHILD element AND len==1.
+    let first_code_child = element
+        .children
+        .borrow()
+        .iter()
+        .find(|c| {
+            matches!(c.data, NodeData::Element { .. }) && local_name(c).as_deref() == Some("code")
+        })
+        .cloned();
+    if first_code_child.is_some() && element_child_count(element) == 1 {
+        return true;
+    }
+    false
+}
+
+// ===========================================================================
+// handle_code_blocks (main_extractor.py:218-224) — Stage 2c-ii
+// ===========================================================================
+
+/// `handle_code_blocks(element)` — `main_extractor.py:218-224`.
+///
+/// Deep-clone the element, mark every descendant of the ORIGINAL as "done",
+/// and rename the CLONE's tag to `"code"`.
+///
+/// # Python original
+///
+/// ```python
+/// def handle_code_blocks(element):
+///     "Turn element into a properly tagged code block."
+///     processed_element = deepcopy(element)
+///     for child in element.iter("*"):
+///         child.tag = "done"
+///     processed_element.tag = "code"
+///     return processed_element
+/// ```
+///
+/// # Faithfulness notes
+///
+/// 1. `element.iter("*")` (line 221) — pre-order walk over `element` AND its
+///    descendants (INCLUDING self). Every element gets renamed to "done".
+/// 2. The rename loop runs on `element` (the ORIGINAL), NOT on the clone:
+///    the clone keeps its original tag structure (then its root tag is
+///    overwritten to "code" at line 223).
+/// 3. `replace_element_tag` returns a NEW NodeRef; the original is detached.
+///    We deliberately ignore the returned handle — the sole purpose of the
+///    rename is to mark the original tree's nodes as processed, which is
+///    a side-effect on `element`'s subtree (the rename mutates the parent's
+///    child list, so subsequent walks see "done"). For the root element
+///    itself, the rename of root happens INSIDE the loop (since iter("*")
+///    starts at self) — the new root then sits in the original parent.
+pub fn handle_code_blocks(element: &NodeRef) -> NodeRef {
+    // main_extractor.py:220 — deepcopy first (before the rename pass would
+    // affect the clone).
+    let processed_element = deep_clone(element);
+    // main_extractor.py:221-222 — rename every node in element.iter("*") to
+    // "done". iter("*") includes self, so we walk self + descendants.
+    let mut all: Vec<NodeRef> = vec![element.clone()];
+    collect_descendant_elements(element, &mut all);
+    // **rcdom Drop quirk anchor**: see handle_paragraphs / handle_lists docs.
+    // Pin returned "done" handles alive so dropping them doesn't drain
+    // descendants we haven't yet visited.
+    let mut dones_alive: Vec<NodeRef> = Vec::new();
+    for n in all {
+        dones_alive.push(replace_element_tag(&n, "done"));
+    }
+    let _ = &dones_alive;
+    // main_extractor.py:223 — set the clone's tag to "code".
+    replace_element_tag(&processed_element, "code")
+}
+
+// ===========================================================================
+// handle_quotes (main_extractor.py:227-242) — Stage 2c-ii
+// ===========================================================================
+
+/// `handle_quotes(element, options)` — `main_extractor.py:227-242`.
+///
+/// Process a `<quote>` element. If it looks like a code block (via
+/// `is_code_block_element`), dispatch to `handle_code_blocks`. Otherwise
+/// build a fresh element with the same tag, walk `element.iter("*")`
+/// (self + descendants), run each through `process_node`, append surviving
+/// children via `define_newelem`, and finally strip nested `<quote>` tags.
+///
+/// # Python original
+///
+/// ```python
+/// def handle_quotes(element, options):
+///     "Process quotes elements."
+///     if is_code_block_element(element):
+///         return handle_code_blocks(element)
+///
+///     processed_element = Element(element.tag)
+///     for child in element.iter("*"):
+///         processed_child = process_node(child, options)
+///         if processed_child is not None:
+///             define_newelem(processed_child, processed_element)
+///         child.tag = "done"
+///     if is_text_element(processed_element):
+///         # avoid double/nested tags
+///         strip_tags(processed_element, "quote")
+///         return processed_element
+///     return None
+/// ```
+///
+/// # Faithfulness notes
+///
+/// 1. `element.iter("*")` (line 233) — INCLUDES self.
+/// 2. `strip_tags(processed_element, "quote")` (line 240) — lxml's
+///    strip_tags: remove `<quote>` element wrappers from the subtree while
+///    keeping their text/children/tail. Maps to `strip_tags_multi(_,
+///    &["quote"])`.
+pub fn handle_quotes(element: &NodeRef, options: &Options) -> Option<NodeRef> {
+    // main_extractor.py:229-230 — code-block dispatch.
+    if is_code_block_element(element) {
+        return Some(handle_code_blocks(element));
+    }
+    // main_extractor.py:232 — fresh element with same tag.
+    let tag = local_name(element).unwrap_or_else(|| "quote".to_string());
+    let processed_element = create_element(&tag);
+
+    // main_extractor.py:233-237 — walk self + descendants.
+    let mut all: Vec<NodeRef> = vec![element.clone()];
+    collect_descendant_elements(element, &mut all);
+    // **rcdom Drop quirk anchor**: see handle_paragraphs / handle_lists docs.
+    let mut dones_alive: Vec<NodeRef> = Vec::new();
+    for child in all {
+        let processed_child = process_node(&child, options);
+        if let Some(p) = processed_child.as_ref() {
+            define_newelem(Some(p), &processed_element);
+        }
+        dones_alive.push(replace_element_tag(&child, "done"));
+    }
+    let _ = &dones_alive;
+
+    // main_extractor.py:238-241 — is_text_element gate; strip nested quotes.
+    if is_text_element(Some(&processed_element)) {
+        strip_tags_multi(&processed_element, &["quote"]);
+        Some(processed_element)
+    } else {
+        None
+    }
+}
+
+// ===========================================================================
+// handle_other_elements (main_extractor.py:245-269) — Stage 2c-ii
+// ===========================================================================
+
+/// `handle_other_elements(element, potential_tags, options)` —
+/// `main_extractor.py:245-269`.
+///
+/// Diverse-element fallback: handle w3schools-style code divs, drop
+/// unexpected tags, and route surviving `<div>` blocks through `handle_textnode`
+/// → `<p>` rename.
+///
+/// # Python original
+///
+/// ```python
+/// def handle_other_elements(element, potential_tags, options):
+///     "Handle diverse or unknown elements in the scope of relevant tags."
+///     # handle w3schools code
+///     if element.tag == "div" and "w3-code" in element.get("class", ""):
+///         return handle_code_blocks(element)
+///
+///     # delete unwanted
+///     if element.tag not in potential_tags:
+///         if element.tag != "done":
+///             _log_event("discarding element", element.tag, element.text)
+///         return None
+///
+///     if element.tag == "div":
+///         processed_element = handle_textnode(element, options, comments_fix=False, preserve_spaces=True)
+///         if processed_element is not None and text_chars_test(processed_element.text) is True:
+///             processed_element.attrib.clear()
+///             if processed_element.tag == "div":
+///                 processed_element.tag = "p"
+///             return processed_element
+///
+///     return None
+/// ```
+///
+/// # Faithfulness notes
+///
+/// 1. `"w3-code" in element.get("class", "")` (line 248) — substring `in`-check.
+/// 2. `_log_event(...)` (line 254) — observability, SKIPPED.
+/// 3. `processed_element.attrib.clear()` (line 262) — wipe attributes via
+///    `clear_attributes` (Stage 1b).
+pub fn handle_other_elements(
+    element: &NodeRef,
+    potential_tags: &HashSet<String>,
+    options: &Options,
+) -> Option<NodeRef> {
+    let tag = local_name(element).unwrap_or_default();
+    let class = get_attribute(element, "class").unwrap_or_default();
+
+    // main_extractor.py:248-249 — w3schools code div.
+    if tag == "div" && class.contains("w3-code") {
+        return Some(handle_code_blocks(element));
+    }
+
+    // main_extractor.py:252-255 — drop unexpected tags. _log_event SKIPPED.
+    if !potential_tags.contains(&tag) {
+        return None;
+    }
+
+    // main_extractor.py:257-267 — div path: handle_textnode + clear-attrs +
+    // div→p rename.
+    if tag == "div" {
+        let processed_element = handle_textnode(element, options, false, true)?;
+        if text_chars_test(element_text(&processed_element).as_deref()) {
+            clear_attributes(&processed_element);
+            // main_extractor.py:264-265 — div→p rename.
+            if local_name(&processed_element).as_deref() == Some("div") {
+                return Some(replace_element_tag(&processed_element, "p"));
+            }
+            return Some(processed_element);
+        }
+    }
+
+    None
+}
+
+// ===========================================================================
+// handle_paragraphs (main_extractor.py:272-351) — Stage 2c-ii
+// ===========================================================================
+
+/// `handle_paragraphs(element, potential_tags, options)` —
+/// `main_extractor.py:272-351`.
+///
+/// Process a `<p>` along with its children: clean, trim, and rebuild as a
+/// `<p>`-tagged tree carrying only the surviving `text_chars_test`-passing
+/// children. The largest of the block handlers.
+///
+/// # Python original
+///
+/// See module-level Python source (lines 272-351). The active body:
+///
+/// 1. clear element's attribs (line 274);
+/// 2. no-children fast path → `process_node` (lines 278-279);
+/// 3. else: fresh `<p>`-typed processed_element; iterate `element.iter("*")`;
+///    skip non-potential / non-"done" tags; run each through `handle_textnode`
+///    with `preserve_spaces=True`; handle `<p>` children specially (merge
+///    text into processed_element.text); for other survivors, build a new
+///    sub-element with the child's tag, copy text+tail from the processed
+///    child, copy `rend`/`target` attrs for `hi`/`ref`, and append;
+/// 4. clean trailing `<lb>` element if it has no tail;
+/// 5. return processed_element if it has children OR text; else `None`.
+///
+/// # Faithfulness notes
+///
+/// 1. `element.iter("*")` (line 283) — INCLUDES self. The "self" iteration
+///    will have `child.tag == element.tag == "p"` (which is in potential_tags
+///    on every reasonable call site); when that step runs `handle_textnode`
+///    on the parent, the result has `processed_child.tag == "p"`, taking
+///    the line-292 merge branch — which copies the parent's text into
+///    `processed_element.text` and renames `element` itself to "done". The
+///    iteration's downstream visits to `element`'s descendants then run
+///    against a "done"-tagged ancestor, but the `iter("*")` is materialised
+///    before iteration so we still visit every descendant (lxml semantics).
+/// 2. `child.tag not in potential_tags and child.tag != "done"` (line 284):
+///    skip via `continue`. The "done" allowance is so prior-stage renames
+///    don't break the iteration.
+/// 3. `processed_child.tag == "p"` (line 292): inner-p merge.
+/// 4. `if processed_element.text: ... += " " + (processed_child.text or "")`
+///    (line 294-295): truthy check on existing text; append with separator
+///    space.
+/// 5. P_FORMATTING branch (line 302-314): strip and clean nested formatting.
+/// 6. `handle_image` (line 336): FORWARD STUB at module-private scope.
+/// 7. lines 342-351: finish — clean trailing lb, return if children or text.
+pub fn handle_paragraphs(
+    element: &NodeRef,
+    potential_tags: &HashSet<String>,
+    options: &Options,
+) -> Option<NodeRef> {
+    // main_extractor.py:274 — element.attrib.clear().
+    clear_attributes(element);
+
+    // main_extractor.py:278-279 — no element children: single dispatch.
+    if element_child_count(element) == 0 {
+        return process_node(element, options);
+    }
+
+    // main_extractor.py:282 — fresh processed_element with same tag.
+    let elem_tag = local_name(element).unwrap_or_else(|| "p".to_string());
+    let processed_element = create_element(&elem_tag);
+
+    // main_extractor.py:283 — iter("*") snapshot: self + descendants.
+    let mut all: Vec<NodeRef> = vec![element.clone()];
+    collect_descendant_elements(element, &mut all);
+
+    // **rcdom Drop quirk anchor**: rcdom's `impl Drop for Node` iteratively
+    // walks `self.children.borrow_mut().drain(..)` AND mem::take's the
+    // children Vec on every descendant during the walk
+    // (markup5ever_rcdom-0.39.0/lib.rs:268-284). Because
+    // `replace_element_tag` returns a fresh node owning the OLD subtree's
+    // children, discarding that handle as a `_renamed` binding lets it Drop
+    // at the end of the statement — which then drains every descendant's
+    // children Vec (including descendants we've already snapshotted into
+    // `all` and intend to revisit). To pin the iteration's snapshot
+    // semantics, we keep every returned "done" NodeRef alive in this
+    // `dones_alive` Vec for the duration of the function.
+    let mut dones_alive: Vec<NodeRef> = Vec::new();
+
+    for child in all {
+        let child_tag = local_name(&child).unwrap_or_default();
+        // main_extractor.py:284-286 — skip non-potential, non-done tags.
+        if !potential_tags.contains(&child_tag) && child_tag != "done" {
+            continue;
+        }
+        // main_extractor.py:289 — handle_textnode with preserve_spaces=True.
+        let processed_child = match handle_textnode(&child, options, false, true) {
+            Some(p) => p,
+            None => {
+                // main_extractor.py:340 — child.tag = "done" runs even when
+                // handle_textnode returns None (the outer if-block continues
+                // straight to it via the for-loop end). Pin the returned
+                // "done" handle alive (rcdom Drop quirk — see fn header).
+                dones_alive.push(replace_element_tag(&child, "done"));
+                continue;
+            }
+        };
+
+        let processed_child_tag = local_name(&processed_child).unwrap_or_default();
+
+        // main_extractor.py:292-299 — inner-p merge branch.
+        if processed_child_tag == "p" {
+            let inner_text = element_text(&processed_child).unwrap_or_default();
+            let existing = element_text(&processed_element);
+            let merged = match existing.as_deref() {
+                Some(t) if !t.is_empty() => format!("{t} {inner_text}"),
+                _ => inner_text,
+            };
+            set_element_text(&processed_element, Some(&merged));
+            // Pin the returned "done" handle alive (rcdom Drop quirk).
+            dones_alive.push(replace_element_tag(&child, "done"));
+            continue;
+        }
+
+        // main_extractor.py:301 — newsub = Element(child.tag).
+        let mut newsub = create_element(&child_tag);
+
+        // main_extractor.py:302-314 — P_FORMATTING handling.
+        if P_FORMATTING.contains(&processed_child_tag.as_str()) {
+            // main_extractor.py:304-308 — nested-children cleanup.
+            if element_child_count(&processed_child) > 0 {
+                for item in element_children(&processed_child) {
+                    if text_chars_test(element_text(&item).as_deref()) {
+                        let prefixed = format!(" {}", element_text(&item).unwrap_or_default());
+                        set_element_text(&item, Some(&prefixed));
+                    }
+                    // main_extractor.py:308 — strip_tags(processed_child, item.tag).
+                    let item_tag = local_name(&item).unwrap_or_default();
+                    strip_tags_multi(&processed_child, &[item_tag.as_str()]);
+                }
+            }
+            // main_extractor.py:310-314 — attribute copy (hi: rend; ref: target).
+            if child_tag == "hi" {
+                let rend = get_attribute(&child, "rend").unwrap_or_default();
+                set_attribute(&newsub, "rend", &rend);
+            } else if child_tag == "ref"
+                && let Some(target) = get_attribute(&child, "target")
+            {
+                set_attribute(&newsub, "target", &target);
+            }
+        }
+
+        // main_extractor.py:333 — newsub.text, newsub.tail = processed_child.text,
+        // processed_child.tail.
+        set_element_text(&newsub, element_text(&processed_child).as_deref());
+        // We need processed_child to have a parent before we can read its
+        // tail meaningfully. In the Python source `processed_child` is
+        // `child` (handle_textnode mutates and returns the same node), so
+        // its tail IS whatever was on `child`. We mirror by reading from
+        // `processed_child` directly — set_tail/tail handle the detached
+        // case as None.
+        set_tail(&newsub, tail(&processed_child).as_deref());
+
+        // main_extractor.py:335-338 — graphic dispatch (FORWARD STUB).
+        if processed_child_tag == "graphic"
+            && let Some(image_elem) = handle_image(&processed_child)
+        {
+            newsub = image_elem;
+        }
+
+        // main_extractor.py:339 — append newsub to processed_element.
+        append_child(&processed_element, &newsub);
+        // main_extractor.py:340 — child.tag = "done". Pin alive (rcdom Drop
+        // quirk).
+        dones_alive.push(replace_element_tag(&child, "done"));
+    }
+    // Keep dones_alive in scope until the end of the function (rcdom Drop
+    // quirk pin).
+    let _ = dones_alive;
+
+    // main_extractor.py:342-351 — finish.
+    if element_child_count(&processed_element) > 0 {
+        // main_extractor.py:343-346 — trailing lb cleanup.
+        let kids = element_children(&processed_element);
+        if let Some(last_elem) = kids.last()
+            && local_name(last_elem).as_deref() == Some("lb")
+            && tail(last_elem).is_none()
+        {
+            delete_with_tail_preserve_free(last_elem);
+        }
+        return Some(processed_element);
+    }
+    if element_text(&processed_element)
+        .map(|t| !t.is_empty())
+        .unwrap_or(false)
+    {
+        return Some(processed_element);
+    }
+    // main_extractor.py:350 — _log_event SKIPPED.
+    None
+}
+
+// ===========================================================================
+// handle_image — FORWARD STUB (Stage 2c-iii will replace this)
+// ===========================================================================
+
+/// `handle_image(elem)` — **STAGE 2c-iii FORWARD STUB**.
+///
+/// `handle_paragraphs` (`main_extractor.py:336`) calls `handle_image` when
+/// it encounters a `<graphic>` processed child. The full implementation
+/// (`main_extractor.py:445-480`) is Stage 2c-iii's responsibility. This stub
+/// panics with a Stage-citing message so any code path that exercises it
+/// surfaces loudly until Stage 2c-iii lands.
+fn handle_image(_elem: &NodeRef) -> Option<NodeRef> {
+    unimplemented!("Stage 2c-iii: handle_image (main_extractor.py:445-480)")
 }
 
 // ===========================================================================
@@ -854,18 +1508,35 @@ mod tests {
     // -------------------------------------------------------------------
 
     #[test]
-    #[should_panic(expected = "Stage 2c-ii: handle_lists")]
-    fn process_nested_elements_dispatches_list_to_handle_lists_stub() {
-        // Confirm the dispatch routes <list> descendants through
-        // handle_lists — the Stage 2c-ii stub panics with the documented
-        // message. This pins the dispatch shape; the actual return-value
-        // semantics are Stage 2c-ii's responsibility.
+    fn process_nested_elements_routes_list_descendant_through_handle_lists() {
+        // Stage 2c-ii replaced the panicking handle_lists stub with the
+        // real impl (main_extractor.py:161-199). The dispatch shape that
+        // Stage 2c-i pinned (with #[should_panic]) is now exercised end-to-
+        // end: build a tree with a <list><item>x</item></list> descendant,
+        // run process_nested_elements, and assert the new_child_elem now
+        // carries the handle_lists output (a <list> with an <item> child).
         let child = dom_create_element("div");
         let list_elem = dom_create_element("list");
+        let item = dom_create_element("item");
+        dom_append_child(&item, &create_text_node("x"));
+        dom_append_child(&list_elem, &item);
         dom_append_child(&child, &list_elem);
         let new_child_elem = dom_create_element("div");
         let opts = Options::default();
         process_nested_elements(&child, &new_child_elem, &opts);
+        // After dispatch, new_child_elem should have a <list> child carrying
+        // an <item> grandchild — proving the list branch ran handle_lists
+        // and appended its output (not stripped via the textnode/add_sub
+        // path).
+        let lists = get_elements_by_tag_name(&new_child_elem, "list");
+        assert_eq!(lists.len(), 1, "handle_lists output appended");
+        let items = get_elements_by_tag_name(&lists[0], "item");
+        assert_eq!(items.len(), 1, "item preserved through handle_lists");
+        let item_text = element_text(&items[0]).unwrap_or_default();
+        assert!(
+            item_text.contains('x'),
+            "item text preserved: {item_text:?}"
+        );
     }
 
     #[test]
@@ -971,5 +1642,412 @@ mod tests {
         let p = &kids[0];
         assert_eq!(element_text(p).as_deref(), Some("HELLO"));
         assert_eq!(tail(p).as_deref(), Some("TAIL"));
+    }
+
+    // -------------------------------------------------------------------
+    // Stage 2c-ii — handle_lists (main_extractor.py:161-199)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn handle_lists_empty_input_returns_none() {
+        // <list></list> — no text, no item descendants → is_text_element
+        // on processed_element returns false → None.
+        let list = dom_create_element("list");
+        let opts = Options::default();
+        assert!(handle_lists(&list, &opts).is_none());
+    }
+
+    #[test]
+    fn handle_lists_with_text_creates_item() {
+        // <list>leading</list> — leading text becomes a synthetic <item>.
+        let list = dom_create_element("list");
+        dom_append_child(&list, &create_text_node("leading text"));
+        let opts = Options::default();
+        let out = handle_lists(&list, &opts).expect("text → Some");
+        // The output has a single <item> carrying the leading text.
+        let items = get_elements_by_tag_name(&out, "item");
+        assert_eq!(items.len(), 1);
+        assert_eq!(element_text(&items[0]).as_deref(), Some("leading text"));
+    }
+
+    #[test]
+    fn handle_lists_descendant_items_processed() {
+        // <list><item>one</item><item>two</item></list> — both items survive.
+        let list = dom_create_element("list");
+        for txt in ["one", "two"] {
+            let item = dom_create_element("item");
+            dom_append_child(&item, &create_text_node(txt));
+            dom_append_child(&list, &item);
+        }
+        let opts = Options::default();
+        let out = handle_lists(&list, &opts).expect("items present → Some");
+        let items = get_elements_by_tag_name(&out, "item");
+        // Two original items get processed; each becomes a new <item> on
+        // the output tree.
+        assert_eq!(items.len(), 2);
+        let item_texts: Vec<String> = items
+            .iter()
+            .map(|i| element_text(i).unwrap_or_default())
+            .collect();
+        assert!(item_texts.iter().any(|t| t.contains("one")));
+        assert!(item_texts.iter().any(|t| t.contains("two")));
+    }
+
+    #[test]
+    fn handle_lists_returns_none_when_no_text_chars() {
+        // <list><item>   </item></list> — process_node strips whitespace,
+        // is_text_element on the resulting processed_element fails (no text
+        // chars survive) → None.
+        let list = dom_create_element("list");
+        let item = dom_create_element("item");
+        dom_append_child(&item, &create_text_node("   "));
+        dom_append_child(&list, &item);
+        let opts = Options::default();
+        assert!(handle_lists(&list, &opts).is_none());
+    }
+
+    #[test]
+    fn handle_lists_preserves_rend_attribute() {
+        // <list rend="bullet"><item>x</item></list> — update_elem_rendition
+        // at line 197 copies element's rend to processed_element.
+        let list = dom_create_element("list");
+        set_attribute(&list, "rend", "bullet");
+        let item = dom_create_element("item");
+        dom_append_child(&item, &create_text_node("x"));
+        dom_append_child(&list, &item);
+        let opts = Options::default();
+        let out = handle_lists(&list, &opts).expect("text → Some");
+        assert_eq!(get_attribute(&out, "rend").as_deref(), Some("bullet"));
+    }
+
+    // -------------------------------------------------------------------
+    // Stage 2c-ii — is_code_block_element (main_extractor.py:202-215)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn is_code_block_element_true_for_code_tag() {
+        // main_extractor.py:205 — element.tag == "code" → True.
+        let code = dom_create_element("code");
+        assert!(is_code_block_element(&code));
+    }
+
+    #[test]
+    fn is_code_block_element_true_for_lang_attr() {
+        // main_extractor.py:205 — element.get("lang") truthy → True.
+        let pre = dom_create_element("pre");
+        set_attribute(&pre, "lang", "python");
+        assert!(is_code_block_element(&pre));
+    }
+
+    #[test]
+    fn is_code_block_element_true_for_highlight_parent_class() {
+        // main_extractor.py:208-210 — parent.class contains "highlight".
+        let parent_div = dom_create_element("div");
+        set_attribute(&parent_div, "class", "highlight-py source");
+        let pre = dom_create_element("pre");
+        dom_append_child(&parent_div, &pre);
+        assert!(is_code_block_element(&pre));
+    }
+
+    #[test]
+    fn is_code_block_element_true_for_single_child_code() {
+        // main_extractor.py:212-213 — find("code") AND len==1.
+        let pre = dom_create_element("pre");
+        let code = dom_create_element("code");
+        dom_append_child(&pre, &code);
+        assert!(is_code_block_element(&pre));
+    }
+
+    #[test]
+    fn is_code_block_element_false_for_plain_div() {
+        // No lang, not code tag, no highlight parent, no single code child.
+        let div = dom_create_element("div");
+        dom_append_child(&div, &create_text_node("plain"));
+        assert!(!is_code_block_element(&div));
+    }
+
+    // -------------------------------------------------------------------
+    // Stage 2c-ii — handle_code_blocks (main_extractor.py:218-224)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn handle_code_blocks_renames_to_code() {
+        // <pre>foo</pre> → clone with tag "code".
+        let pre = dom_create_element("pre");
+        dom_append_child(&pre, &create_text_node("foo"));
+        let out = handle_code_blocks(&pre);
+        assert_eq!(local_name(&out).as_deref(), Some("code"));
+        let joined: String = itertext(&out).concat();
+        assert!(joined.contains("foo"), "clone text preserved: {joined:?}");
+    }
+
+    #[test]
+    fn handle_code_blocks_marks_descendants_done() {
+        // <root><pre><span>x</span></pre></root> — original's <pre> + <span>
+        // both renamed to "done" via replace_element_tag (which in rcdom
+        // mints a NEW node and splices into the parent). Attach <pre> to a
+        // <root> so we can probe the resulting parent tree.
+        let root = dom_create_element("root");
+        let pre = dom_create_element("pre");
+        let span = dom_create_element("span");
+        dom_append_child(&span, &create_text_node("x"));
+        dom_append_child(&pre, &span);
+        dom_append_child(&root, &pre);
+        let out = handle_code_blocks(&pre);
+        // The CLONE has tag "code".
+        assert_eq!(local_name(&out).as_deref(), Some("code"));
+        // Original <root> no longer contains a <pre> or <span>; both got
+        // renamed to "done" descendants of <root>.
+        let pre_remaining = get_elements_by_tag_name(&root, "pre");
+        assert!(pre_remaining.is_empty(), "pre renamed away");
+        let span_remaining = get_elements_by_tag_name(&root, "span");
+        assert!(span_remaining.is_empty(), "span renamed away");
+        let done_remaining = get_elements_by_tag_name(&root, "done");
+        assert_eq!(done_remaining.len(), 2, "both pre and span renamed to done");
+    }
+
+    // -------------------------------------------------------------------
+    // Stage 2c-ii — handle_quotes (main_extractor.py:227-242)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn handle_quotes_dispatches_to_code_block_when_codey() {
+        // <quote lang="python">x</quote> — is_code_block_element fires →
+        // handle_code_blocks renames to "code".
+        let quote = dom_create_element("quote");
+        set_attribute(&quote, "lang", "python");
+        dom_append_child(&quote, &create_text_node("x"));
+        let opts = Options::default();
+        let out = handle_quotes(&quote, &opts).expect("code-block path → Some");
+        assert_eq!(local_name(&out).as_deref(), Some("code"));
+    }
+
+    #[test]
+    fn handle_quotes_strips_nested_quote_tags() {
+        // <quote>outer<quote>inner</quote></quote> — line 240 strips the
+        // nested <quote> tag, leaving its inline content merged.
+        let outer = dom_create_element("quote");
+        dom_append_child(&outer, &create_text_node("outer "));
+        let inner = dom_create_element("quote");
+        dom_append_child(&inner, &create_text_node("inner"));
+        dom_append_child(&outer, &inner);
+        let opts = Options::default();
+        let out = handle_quotes(&outer, &opts).expect("text → Some");
+        // The result must NOT contain a nested <quote> element (strip_tags).
+        let quotes = get_elements_by_tag_name(&out, "quote");
+        assert!(quotes.is_empty(), "nested <quote> stripped");
+    }
+
+    #[test]
+    fn handle_quotes_returns_none_for_empty() {
+        // <quote></quote> — no text → is_text_element fails → None.
+        let quote = dom_create_element("quote");
+        let opts = Options::default();
+        assert!(handle_quotes(&quote, &opts).is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // Stage 2c-ii — handle_other_elements (main_extractor.py:245-269)
+    // -------------------------------------------------------------------
+
+    fn potential_tags(tags: &[&str]) -> HashSet<String> {
+        tags.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn handle_other_elements_dispatches_w3_code_div_to_code_blocks() {
+        // <div class="w3-code">x</div> — main_extractor.py:248-249 →
+        // handle_code_blocks renames to "code".
+        let div = dom_create_element("div");
+        set_attribute(&div, "class", "w3-code notranslate");
+        dom_append_child(&div, &create_text_node("x"));
+        let pot = potential_tags(&["div", "p"]);
+        let opts = Options::default();
+        let out = handle_other_elements(&div, &pot, &opts).expect("w3-code → Some");
+        assert_eq!(local_name(&out).as_deref(), Some("code"));
+    }
+
+    #[test]
+    fn handle_other_elements_returns_none_when_tag_not_in_potential() {
+        // <article>x</article> — "article" not in potential_tags → None
+        // (main_extractor.py:252-255).
+        let article = dom_create_element("article");
+        dom_append_child(&article, &create_text_node("x"));
+        let pot = potential_tags(&["p"]);
+        let opts = Options::default();
+        assert!(handle_other_elements(&article, &pot, &opts).is_none());
+    }
+
+    #[test]
+    fn handle_other_elements_renames_div_to_p_when_text_present() {
+        // <div>some text</div> — div in potential_tags, text_chars_test
+        // passes, attribs cleared, div→p rename (main_extractor.py:257-267).
+        let div = dom_create_element("div");
+        set_attribute(&div, "class", "removeme");
+        dom_append_child(&div, &create_text_node("some text"));
+        let pot = potential_tags(&["div", "p"]);
+        let opts = Options::default();
+        let out = handle_other_elements(&div, &pot, &opts).expect("div text → Some");
+        assert_eq!(local_name(&out).as_deref(), Some("p"));
+    }
+
+    #[test]
+    fn handle_other_elements_clears_attributes_on_div() {
+        // main_extractor.py:262 — processed_element.attrib.clear() wipes attrs.
+        let div = dom_create_element("div");
+        set_attribute(&div, "class", "removeme");
+        set_attribute(&div, "id", "alsoremoved");
+        dom_append_child(&div, &create_text_node("text"));
+        let pot = potential_tags(&["div", "p"]);
+        let opts = Options::default();
+        let out = handle_other_elements(&div, &pot, &opts).expect("div text → Some");
+        assert!(get_attribute(&out, "class").is_none(), "class attr cleared");
+        assert!(get_attribute(&out, "id").is_none(), "id attr cleared");
+    }
+
+    // -------------------------------------------------------------------
+    // Stage 2c-ii — handle_paragraphs (main_extractor.py:272-351)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn handle_paragraphs_empty_dispatches_to_process_node() {
+        // <p>text</p> — no element children (only Text), so len(element)==0
+        // → process_node single dispatch (main_extractor.py:278-279).
+        let p = dom_create_element("p");
+        dom_append_child(&p, &create_text_node("hello"));
+        let pot = potential_tags(&["p", "hi", "ref", "lb"]);
+        let opts = Options::default();
+        let out = handle_paragraphs(&p, &pot, &opts).expect("text → Some via process_node");
+        // process_node returns the same NodeRef; tag preserved.
+        assert_eq!(local_name(&out).as_deref(), Some("p"));
+    }
+
+    #[test]
+    fn handle_paragraphs_clears_input_attributes() {
+        // main_extractor.py:274 — element.attrib.clear() runs unconditionally.
+        let p = dom_create_element("p");
+        set_attribute(&p, "class", "junk");
+        set_attribute(&p, "id", "junkid");
+        dom_append_child(&p, &create_text_node("text"));
+        let pot = potential_tags(&["p"]);
+        let opts = Options::default();
+        let _ = handle_paragraphs(&p, &pot, &opts);
+        // Input's attrs are gone (the clear ran on `element` itself).
+        assert!(get_attribute(&p, "class").is_none());
+        assert!(get_attribute(&p, "id").is_none());
+    }
+
+    #[test]
+    fn handle_paragraphs_p_child_text_merges_into_processed_text() {
+        // <p>outer<p>inner</p></p> — line 292-298: processed_child.tag=="p"
+        // path merges inner text into processed_element.text. We need the
+        // outer to have an element child so we take the iter("*") branch.
+        let outer = dom_create_element("p");
+        dom_append_child(&outer, &create_text_node("outer"));
+        let inner = dom_create_element("p");
+        dom_append_child(&inner, &create_text_node("inner"));
+        dom_append_child(&outer, &inner);
+        let pot = potential_tags(&["p", "hi", "ref"]);
+        let opts = Options::default();
+        let out = handle_paragraphs(&outer, &pot, &opts).expect("text path → Some");
+        let joined = element_text(&out).unwrap_or_default();
+        // Both outer and inner texts merge into the output's .text.
+        assert!(joined.contains("outer"), "outer text merged: {joined:?}");
+        assert!(joined.contains("inner"), "inner text merged: {joined:?}");
+    }
+
+    #[test]
+    fn handle_paragraphs_hi_formatting_copies_rend() {
+        // <p>x<hi rend="bold">y</hi></p> — main_extractor.py:310-311 copies
+        // rend onto newsub.
+        let p = dom_create_element("p");
+        dom_append_child(&p, &create_text_node("x"));
+        let hi = dom_create_element("hi");
+        set_attribute(&hi, "rend", "bold");
+        dom_append_child(&hi, &create_text_node("y"));
+        dom_append_child(&p, &hi);
+        let pot = potential_tags(&["p", "hi"]);
+        let opts = Options::default();
+        let out = handle_paragraphs(&p, &pot, &opts).expect("p path → Some");
+        // The <hi> child in the output should carry rend="bold".
+        let his = get_elements_by_tag_name(&out, "hi");
+        assert_eq!(his.len(), 1, "hi survived");
+        assert_eq!(get_attribute(&his[0], "rend").as_deref(), Some("bold"));
+    }
+
+    #[test]
+    fn handle_paragraphs_ref_formatting_copies_target() {
+        // <p>x<ref target="/url">y</ref></p> — main_extractor.py:312-314
+        // copies target onto newsub.
+        let p = dom_create_element("p");
+        dom_append_child(&p, &create_text_node("x"));
+        let r = dom_create_element("ref");
+        set_attribute(&r, "target", "/url");
+        dom_append_child(&r, &create_text_node("y"));
+        dom_append_child(&p, &r);
+        let pot = potential_tags(&["p", "ref"]);
+        let opts = Options::default();
+        let out = handle_paragraphs(&p, &pot, &opts).expect("p path → Some");
+        let refs = get_elements_by_tag_name(&out, "ref");
+        assert_eq!(refs.len(), 1, "ref survived");
+        assert_eq!(get_attribute(&refs[0], "target").as_deref(), Some("/url"));
+    }
+
+    #[test]
+    fn handle_paragraphs_skips_unexpected_tags() {
+        // <p>x<unknown>y</unknown></p> — unknown tag not in potential_tags
+        // AND not "done" → skipped (main_extractor.py:284-286).
+        let p = dom_create_element("p");
+        dom_append_child(&p, &create_text_node("x"));
+        let u = dom_create_element("unknown");
+        dom_append_child(&u, &create_text_node("y"));
+        dom_append_child(&p, &u);
+        let pot = potential_tags(&["p"]);
+        let opts = Options::default();
+        let out = handle_paragraphs(&p, &pot, &opts).expect("p path → Some");
+        // The <unknown> tag must NOT appear in the output.
+        let unk = get_elements_by_tag_name(&out, "unknown");
+        assert!(unk.is_empty(), "unknown skipped");
+    }
+
+    #[test]
+    fn handle_paragraphs_strips_trailing_lb_without_tail() {
+        // <p>x<lb/></p> — trailing <lb> with no tail → delete (main_extractor.py:
+        // 343-346). After handle_paragraphs the output's element-children list
+        // must not end in <lb>.
+        let p = dom_create_element("p");
+        dom_append_child(&p, &create_text_node("x"));
+        let lb = dom_create_element("lb");
+        dom_append_child(&p, &lb);
+        let pot = potential_tags(&["p", "lb"]);
+        let opts = Options::default();
+        let out = handle_paragraphs(&p, &pot, &opts).expect("p path → Some");
+        // Either no element children at all, or the last one isn't lb.
+        let kids = element_children(&out);
+        if let Some(last) = kids.last() {
+            assert_ne!(
+                local_name(last).as_deref(),
+                Some("lb"),
+                "trailing lb stripped"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "Stage 2c-iii: handle_image")]
+    fn handle_paragraphs_graphic_dispatches_to_handle_image_stub() {
+        // <p>x<graphic/></p> — main_extractor.py:335-336 calls handle_image,
+        // which is the Stage 2c-iii forward stub: it panics. To reach line
+        // 336, graphic must survive handle_textnode. handle_textnode keeps
+        // <graphic> when is_image_element fires (which checks src/data-src
+        // attrs). Add a src to ensure survival.
+        let p = dom_create_element("p");
+        dom_append_child(&p, &create_text_node("x"));
+        let g = dom_create_element("graphic");
+        set_attribute(&g, "src", "/img.png");
+        dom_append_child(&p, &g);
+        let pot = potential_tags(&["p", "graphic"]);
+        let opts = Options::default();
+        let _ = handle_paragraphs(&p, &pot, &opts);
     }
 }

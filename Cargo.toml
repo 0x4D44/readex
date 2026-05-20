@@ -340,7 +340,26 @@ name = "mdrcel"
 # behind the same `#[doc(hidden)]` surface, no observable change on the
 # default extraction path (handler primitives are consumed only by
 # Stage 2c-ii's block dispatchers, none of which are wired yet).
-version = "0.4.8"
+#
+# M3 Stage 2c-ii (2026-05-19): 0.4.8 -> 0.4.9 PATCH. Adds the block
+# handlers to `src/trafilatura/main_extractor.rs` — faithful port of
+# `trafilatura@v2.0.0/main_extractor.py:161-353`: `handle_lists`
+# (replaces the Stage 2c-i forward stub), `is_code_block_element`,
+# `handle_code_blocks`, `handle_quotes`, `handle_other_elements`,
+# `handle_paragraphs`. `handle_paragraphs` calls `handle_image` via a
+# Stage 2c-iii forward stub (`main_extractor.py:445-480`); the panicking
+# stub surfaces loudly if the graphic-child path runs before Stage 2c-iii
+# lands. Promotes `cleaning::strip_tags_multi` from private to `pub`
+# (additive — `handle_quotes`/`handle_paragraphs` need lxml's `strip_tags`
+# on a single-tag list). The Trafilatura-equivalence BLOCKER gate
+# (`tests/trafilatura_equivalence_gate.rs`) remains 10/10 green; the M2
+# parser-equivalence gate (`tests/parser_equivalence_gate.rs`) is
+# byte-identical to commit 149c686. No public API change — all surfaces
+# under `#[doc(hidden)] pub mod trafilatura::main_extractor`. Per semver
+# PATCH: additive infrastructure behind the same `#[doc(hidden)]` surface,
+# no observable change on the default extraction path (block handlers are
+# consumed only by Stage 2d's `_extract` orchestrator, not yet wired).
+version = "0.4.9"
 edition = "2024"
 
 [dependencies]

@@ -242,7 +242,12 @@ fn find_figures_with_descendant_table(root: &NodeRef) -> Vec<NodeRef> {
 /// any of them (the snapshot semantics of `get_elements_by_tag_name` — HLD
 /// §5 / dom.rs risk #3). Otherwise removing the first match could invalidate
 /// the iterator over later ones.
-fn strip_tags_multi(tree: &NodeRef, stripping_list: &[&str]) {
+///
+/// Exposed as `pub` (Stage 2c-ii) so `main_extractor`'s `handle_quotes`
+/// (`main_extractor.py:240`) and `handle_paragraphs` (`:308`) can call lxml's
+/// `strip_tags` against a single tag name on a subtree. The same snapshot-then-
+/// mutate semantics apply.
+pub fn strip_tags_multi(tree: &NodeRef, stripping_list: &[&str]) {
     for tag in stripping_list {
         let matches = dom::get_elements_by_tag_name(tree, tag);
         for elem in matches {
