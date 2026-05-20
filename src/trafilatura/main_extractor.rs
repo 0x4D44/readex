@@ -108,6 +108,17 @@ pub const CODES_QUOTES: &[&str] = &["code", "quote"];
 /// (Stage 2c-iii prune logic). Stored here for parity.
 pub const NOT_AT_THE_END: &[&str] = &["head", "ref"];
 
+/// `TAG_CATALOG` — `frozenset(["blockquote", "code", "del", "head", "hi",
+/// "lb", "list", "p", "pre", "quote"])` (settings.py:436-438). The default
+/// `potential_tags` set used by `_extract` (`main_extractor.py:569`) and
+/// `recover_wild_text` (`main_extractor.py:512`). Vendored here (rather
+/// than in a settings module) because Stage 2c-iii is the first consumer
+/// and Stage 2d's `_extract` will consume it next. Order is irrelevant
+/// (membership-only set semantics).
+pub const TAG_CATALOG: &[&str] = &[
+    "blockquote", "code", "del", "head", "hi", "lb", "list", "p", "pre", "quote",
+];
+
 // ===========================================================================
 // _log_event (main_extractor.py:38-40) — SKIPPED
 // ===========================================================================
@@ -1216,6 +1227,249 @@ pub fn handle_textelem(
         "graphic" if potential_tags.contains("graphic") => handle_image(element),
         _ => handle_other_elements(element, potential_tags, options),
     }
+}
+
+// ===========================================================================
+// prune_unwanted_sections (main_extractor.py:533-564) — Stage 2c-iii
+// ===========================================================================
+
+/// `prune_unwanted_sections(tree, potential_tags, options)` —
+/// `main_extractor.py:533-564`.
+///
+/// Rule-based deletion of targeted document sections. Runs a cascade of
+/// XPath-driven prunes (with backup-restore on the OVERALL pass), two
+/// passes of link-density pruning on div/list/p, conditional table-link-
+/// density filtering, and precision-mode trailing-`<head>` cleanup.
+///
+/// # Python original
+///
+/// ```python
+/// def prune_unwanted_sections(tree, potential_tags, options):
+///     'Rule-based deletion of targeted document sections'
+///     favor_precision = options.focus == "precision"
+///     tree = prune_unwanted_nodes(tree, OVERALL_DISCARD_XPATH, with_backup=True)
+///     if 'graphic' not in potential_tags:
+///         tree = prune_unwanted_nodes(tree, DISCARD_IMAGE_ELEMENTS)
+///     if options.focus != "recall":
+///         tree = prune_unwanted_nodes(tree, TEASER_DISCARD_XPATH)
+///         if favor_precision:
+///             tree = prune_unwanted_nodes(tree, PRECISION_DISCARD_XPATH)
+///     for _ in range(2):
+///         tree = delete_by_link_density(tree, 'div', backtracking=True, favor_precision=favor_precision)
+///         tree = delete_by_link_density(tree, 'list', backtracking=False, favor_precision=favor_precision)
+///         tree = delete_by_link_density(tree, 'p', backtracking=False, favor_precision=favor_precision)
+///     if 'table' in potential_tags or favor_precision:
+///         for elem in tree.iter('table'):
+///             if link_density_test_tables(elem) is True:
+///                 delete_element(elem, keep_tail=False)
+///     if favor_precision:
+///         while len(tree) > 0 and (tree[-1].tag == 'head'):
+///             delete_element(tree[-1], keep_tail=False)
+///         tree = delete_by_link_density(tree, 'head', backtracking=False, favor_precision=True)
+///         tree = delete_by_link_density(tree, 'quote', backtracking=False, favor_precision=True)
+///     return tree
+/// ```
+///
+/// # Faithfulness notes
+///
+/// 1. `tree = prune_unwanted_nodes(...)` rebinds the local: only the OVERALL
+///    pass (with_backup=true) can actually swap; all other passes return
+///    the same tree (no backup). The `let tree = ...` shadow in Rust does
+///    the same rebind so downstream passes operate on the current handle.
+/// 2. `delete_by_link_density` mutates the input in place and returns the
+///    same tree in Python; our Rust port returns `()`, so no rebind is
+///    needed (the original handle still points at the in-place-mutated
+///    tree).
+/// 3. `tree.iter('table')` (line 554) is descendant-OR-self for "table",
+///    so a root that is itself `<table>` would match. In practice `_extract`
+///    passes the body element, so the iter starts at descendants.
+///    `get_elements_by_tag_name` is descendants-only; we explicitly include
+///    self when its local-name matches.
+/// 4. `delete_element(elem, keep_tail=False)` (line 556) — remove the
+///    element AND drop its tail Text-run. Faithful Rust: clear tail via
+///    `set_tail(None)` (drops the parent-level Text-run between elem and
+///    its next non-Text sibling) then `dom::remove(elem)`.
+/// 5. `while len(tree) > 0 and (tree[-1].tag == 'head')` (lines 560-561):
+///    Python's `tree[-1]` is the LAST element child of `tree`. Repeat the
+///    delete loop while the last element child is a `<head>`.
+pub fn prune_unwanted_sections(
+    tree: &NodeRef,
+    potential_tags: &HashSet<String>,
+    options: &Options,
+) -> NodeRef {
+    use crate::trafilatura::cleaning::{
+        Focus, delete_by_link_density, link_density_test_tables, prune_unwanted_nodes,
+    };
+    use crate::trafilatura::xpaths_constants::{
+        DISCARD_IMAGE_ELEMENTS, OVERALL_DISCARD_XPATH, PRECISION_DISCARD_XPATH,
+        TEASER_DISCARD_XPATH,
+    };
+
+    let favor_precision = options.focus == Focus::Precision;
+
+    // main_extractor.py:537 — OVERALL prune with backup.
+    let tree = prune_unwanted_nodes(tree, OVERALL_DISCARD_XPATH, true);
+
+    // main_extractor.py:539-540 — image elements unless graphic preserved.
+    let tree = if !potential_tags.contains("graphic") {
+        prune_unwanted_nodes(&tree, DISCARD_IMAGE_ELEMENTS, false)
+    } else {
+        tree
+    };
+
+    // main_extractor.py:542-545 — teaser + precision (when not recall).
+    let tree = if options.focus != Focus::Recall {
+        let tree = prune_unwanted_nodes(&tree, TEASER_DISCARD_XPATH, false);
+        if favor_precision {
+            prune_unwanted_nodes(&tree, PRECISION_DISCARD_XPATH, false)
+        } else {
+            tree
+        }
+    } else {
+        tree
+    };
+
+    // main_extractor.py:547-550 — two passes of link-density deletion.
+    for _ in 0..2 {
+        delete_by_link_density(&tree, "div", true, favor_precision);
+        delete_by_link_density(&tree, "list", false, favor_precision);
+        delete_by_link_density(&tree, "p", false, favor_precision);
+    }
+
+    // main_extractor.py:552-556 — table link-density.
+    if potential_tags.contains("table") || favor_precision {
+        // iter('table') is descendants-or-self; include self if it matches.
+        let mut tables: Vec<NodeRef> = Vec::new();
+        if local_name(&tree).as_deref() == Some("table") {
+            tables.push(tree.clone());
+        }
+        tables.extend(get_elements_by_tag_name(&tree, "table"));
+        for elem in tables {
+            if link_density_test_tables(&elem) {
+                // delete_element(elem, keep_tail=False).
+                set_tail(&elem, None);
+                crate::readability::dom::remove(&elem);
+            }
+        }
+    }
+
+    // main_extractor.py:558-563 — favor_precision tail-prune.
+    if favor_precision {
+        // while len(tree) > 0 and tree[-1].tag == 'head': delete.
+        loop {
+            let kids = element_children(&tree);
+            let Some(last) = kids.last() else { break };
+            if local_name(last).as_deref() != Some("head") {
+                break;
+            }
+            set_tail(last, None);
+            crate::readability::dom::remove(last);
+        }
+        delete_by_link_density(&tree, "head", false, true);
+        delete_by_link_density(&tree, "quote", false, true);
+    }
+
+    tree
+}
+
+// ===========================================================================
+// recover_wild_text (main_extractor.py:512-530) — Stage 2c-iii
+// ===========================================================================
+
+/// `recover_wild_text(tree, result_body, options, potential_tags)` —
+/// `main_extractor.py:512-530`.
+///
+/// Last-resort rescue: look for wild elements throughout the document
+/// (including outside the determined frame) to recover potentially missing
+/// text. Runs `prune_unwanted_sections` first, strips inline link wrappers
+/// (`<a>`/`<ref>`/`<span>` unless `ref` is preserved), then walks all
+/// remaining `<blockquote|code|p|pre|q|quote|table|div.w3-code>` elements
+/// (plus `<div|lb|list>` in recall mode), processes each through
+/// `handle_textelem`, and appends survivors to `result_body`.
+///
+/// # Python original
+///
+/// ```python
+/// def recover_wild_text(tree, result_body, options, potential_tags=TAG_CATALOG):
+///     LOGGER.debug('Recovering wild text elements')
+///     search_expr = './/blockquote|.//code|.//p|.//pre|.//q|.//quote|.//table|.//div[contains(@class, \'w3-code\')]'
+///     if options.focus == "recall":
+///         potential_tags.update(['div', 'lb'])
+///         search_expr += '|.//div|.//lb|.//list'
+///     search_tree = prune_unwanted_sections(tree, potential_tags, options)
+///     if 'ref' not in potential_tags:
+///         strip_tags(search_tree, 'a', 'ref', 'span')
+///     else:
+///         strip_tags(search_tree, 'span')
+///     subelems = search_tree.xpath(search_expr)
+///     result_body.extend(filter(lambda x: x is not None, (handle_textelem(e, potential_tags, options)
+///                        for e in subelems)))
+///     return result_body
+/// ```
+///
+/// # Faithfulness notes
+///
+/// 1. `potential_tags: Any = TAG_CATALOG` — Python default arg is the
+///    `TAG_CATALOG` frozenset. The first action mutates `potential_tags`
+///    (line 518: `update`), which can pollute the default arg across
+///    calls (a famous Python pitfall). Faithful Rust: take `&HashSet`
+///    by reference; the caller passes a fresh set. We clone-into-mutable
+///    inside the function so the recall branch's `update` doesn't have to
+///    rely on the caller's mutability.
+/// 2. `strip_tags(search_tree, 'a', 'ref', 'span')` (line 524) — strip
+///    three tags' wrappers (lift children up). Faithful Rust:
+///    `strip_tags_multi(search_tree, &["a", "ref", "span"])`.
+/// 3. `result_body.extend(filter(..., (handle_textelem(e, ...) for e in
+///    subelems)))` (lines 528-529) — generator expression filtered through
+///    `lambda x: x is not None`. Iterate over subelems, call handle_textelem
+///    on each, append non-None results to result_body.
+/// 4. The XPath union expression uses our Stage 0b engine; the gap survey
+///    showed contains() and unions are supported.
+pub fn recover_wild_text(
+    tree: &NodeRef,
+    result_body: &NodeRef,
+    options: &Options,
+    potential_tags: &HashSet<String>,
+) -> NodeRef {
+    use crate::trafilatura::cleaning::Focus;
+    use crate::trafilatura::xpath_engine;
+
+    // main_extractor.py:516 — base search expression.
+    let mut search_expr = String::from(
+        ".//blockquote|.//code|.//p|.//pre|.//q|.//quote|.//table|.//div[contains(@class, 'w3-code')]",
+    );
+
+    // main_extractor.py:517-519 — recall mode extends both the set and the
+    // expression. Clone the input set so we don't mutate the caller's view.
+    let mut pot = potential_tags.clone();
+    if options.focus == Focus::Recall {
+        pot.insert("div".to_string());
+        pot.insert("lb".to_string());
+        search_expr.push_str("|.//div|.//lb|.//list");
+    }
+
+    // main_extractor.py:521 — prune.
+    let search_tree = prune_unwanted_sections(tree, &pot, options);
+
+    // main_extractor.py:523-526 — strip inline tags based on whether ref
+    // is preserved.
+    if !pot.contains("ref") {
+        strip_tags_multi(&search_tree, &["a", "ref", "span"]);
+    } else {
+        strip_tags_multi(&search_tree, &["span"]);
+    }
+
+    // main_extractor.py:527 — XPath search.
+    let subelems = xpath_engine::evaluate(&search_expr, &search_tree).unwrap_or_default();
+
+    // main_extractor.py:528-529 — filter + extend.
+    for e in subelems {
+        if let Some(new_elem) = handle_textelem(&e, &pot, options) {
+            append_child(result_body, &new_elem);
+        }
+    }
+
+    result_body.clone()
 }
 
 // ===========================================================================
@@ -2918,5 +3172,95 @@ mod tests {
             Some("p"),
             "div renamed to p via handle_other_elements"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Stage 2c-iii — prune_unwanted_sections (main_extractor.py:533-564)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn prune_unwanted_sections_returns_tree_on_simple_input() {
+        // Smoke test: an empty body with just a <p> should round-trip
+        // through the prune cascade without panicking and with the <p>
+        // preserved.
+        let body = dom_create_element("body");
+        let p = dom_create_element("p");
+        dom_append_child(&p, &create_text_node("hello world"));
+        dom_append_child(&body, &p);
+        let pot = potential_tags(&["p"]);
+        let opts = Options::default();
+        let out = prune_unwanted_sections(&body, &pot, &opts);
+        let ps = get_elements_by_tag_name(&out, "p");
+        assert!(!ps.is_empty(), "p preserved");
+    }
+
+    #[test]
+    fn prune_unwanted_sections_strips_image_discard_targets_when_graphic_not_potential() {
+        // DISCARD_IMAGE_ELEMENTS (xpaths.py:189-195) targets divs/items/etc.
+        // with `id`/`class` containing "caption". Without "graphic" in
+        // potential_tags, a <div class="caption"> should be pruned.
+        let body = dom_create_element("body");
+        let p = dom_create_element("p");
+        dom_append_child(&p, &create_text_node("a sufficiently long body paragraph that survives any link-density culling unscathed for testing purposes"));
+        dom_append_child(&body, &p);
+        let caption = dom_create_element("div");
+        set_attribute(&caption, "class", "caption");
+        dom_append_child(&caption, &create_text_node("image caption"));
+        dom_append_child(&body, &caption);
+        let pot = potential_tags(&["p"]);
+        let opts = Options::default();
+        let out = prune_unwanted_sections(&body, &pot, &opts);
+        // The <div class="caption"> should be gone after the
+        // DISCARD_IMAGE_ELEMENTS pass.
+        let caption_divs: Vec<_> = get_elements_by_tag_name(&out, "div")
+            .into_iter()
+            .filter(|d| {
+                get_attribute(d, "class")
+                    .map(|c| c.contains("caption"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert!(
+            caption_divs.is_empty(),
+            "caption div pruned via DISCARD_IMAGE_ELEMENTS"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Stage 2c-iii — recover_wild_text (main_extractor.py:512-530)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn recover_wild_text_appends_paragraphs_to_result_body() {
+        // <body><p>one</p><p>two</p></body> + empty result_body.
+        // After recover, result_body should contain 2 paragraphs.
+        let body = dom_create_element("body");
+        let p1 = dom_create_element("p");
+        dom_append_child(&p1, &create_text_node("hello world"));
+        dom_append_child(&body, &p1);
+        let p2 = dom_create_element("p");
+        dom_append_child(&p2, &create_text_node("foo bar"));
+        dom_append_child(&body, &p2);
+        let result_body = dom_create_element("body");
+        let pot = potential_tags(TAG_CATALOG);
+        let opts = Options::default();
+        let _ = recover_wild_text(&body, &result_body, &opts, &pot);
+        let ps = get_elements_by_tag_name(&result_body, "p");
+        assert_eq!(ps.len(), 2, "both paragraphs recovered");
+    }
+
+    #[test]
+    fn recover_wild_text_returns_empty_when_tree_has_no_text_elements() {
+        // <body><script>x</script></body> — no blockquote/p/etc → nothing
+        // recovered.
+        let body = dom_create_element("body");
+        let scr = dom_create_element("script");
+        dom_append_child(&scr, &create_text_node("var x = 1;"));
+        dom_append_child(&body, &scr);
+        let result_body = dom_create_element("body");
+        let pot = potential_tags(TAG_CATALOG);
+        let opts = Options::default();
+        let _ = recover_wild_text(&body, &result_body, &opts, &pot);
+        assert_eq!(element_child_count(&result_body), 0, "no recoveries");
     }
 }

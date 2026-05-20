@@ -398,7 +398,24 @@ name = "mdrcel"
 #   unusual: it builds a fresh `<p>` from the `<lb>`'s tail, dropping the
 #   `<lb>` itself.
 # No public API change — all surfaces under `#[doc(hidden)] pub mod`.
-version = "0.4.11"
+#
+# M3 Stage 2c-iii-c (2026-05-20): 0.4.11 -> 0.4.12 PATCH. Closes out Stage
+# 2c-iii by porting `recover_wild_text` and `prune_unwanted_sections` from
+# `main_extractor.py:512-564`. Also adds the `TAG_CATALOG` constant
+# (settings.py:436-438) — the default `potential_tags` frozenset.
+# - `prune_unwanted_sections` runs the full prune cascade: OVERALL discard
+#   (with backup), graphic discard when not preserved, teaser + precision
+#   discard (when not recall), two passes of div/list/p link-density
+#   pruning, conditional table-link-density filtering via
+#   `link_density_test_tables`, and precision-mode trailing-<head> cleanup.
+# - `recover_wild_text` is the rescue extractor: prune, strip inline
+#   wrappers, XPath-search for blockquote/code/p/pre/q/quote/table/
+#   div.w3-code (+ div/lb/list in recall), dispatch each through
+#   `handle_textelem`, append survivors to the result body.
+# Stage 2c is now complete — the entire main_extractor.py file (664 LOC
+# source) has been faithfully ported. Stage 2d (`_extract` orchestrator +
+# BODY_XPATH-driven gate fixtures) is unblocked.
+version = "0.4.12"
 edition = "2024"
 
 [dependencies]
