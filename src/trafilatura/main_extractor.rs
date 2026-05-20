@@ -906,6 +906,319 @@ pub fn handle_image(element: &NodeRef) -> Option<NodeRef> {
 }
 
 // ===========================================================================
+// define_cell_type (main_extractor.py:354-360) — Stage 2c-iii
+// ===========================================================================
+
+/// `define_cell_type(is_header)` — `main_extractor.py:354-360`.
+///
+/// Mint a fresh `<cell>` element; if `is_header`, set its `role` attribute
+/// to `"head"`.
+///
+/// # Python original
+///
+/// ```python
+/// def define_cell_type(is_header: bool) -> _Element:
+///     "Determine cell element type and mint new element."
+///     cell_element = Element("cell")
+///     if is_header:
+///         cell_element.set("role", "head")
+///     return cell_element
+/// ```
+fn define_cell_type(is_header: bool) -> NodeRef {
+    let cell = create_element("cell");
+    if is_header {
+        set_attribute(&cell, "role", "head");
+    }
+    cell
+}
+
+// ===========================================================================
+// handle_table (main_extractor.py:363-442) — Stage 2c-iii
+// ===========================================================================
+
+/// `handle_table(table_elem, potential_tags, options)` —
+/// `main_extractor.py:363-442`.
+///
+/// Process a single `<table>` element: walk its descendants in document
+/// order, converting `<tr>` into `<row>` and `<td>`/`<th>` into `<cell>`,
+/// stripping structural wrappers (`<thead>`/`<tbody>`/`<tfoot>`),
+/// dispatching nested content through `handle_textnode` / `handle_lists` /
+/// `handle_textelem` as appropriate, and breaking at the first nested
+/// `<table>` descendant (to avoid double-processing).
+///
+/// # Faithfulness notes
+///
+/// 1. `strip_tags(table_elem, "thead", "tbody", "tfoot")` (line 368) — lift
+///    each wrapper's children into its parent. Maps to
+///    `cleaning::strip_tags_multi(table_elem, &["thead", "tbody", "tfoot"])`.
+/// 2. `iter('tr')` / `iter(TABLE_ELEMS)` (lines 372-373) — descendant-or-self
+///    walk filtered by tag. For a `<table>` root, the table itself can't
+///    match `tr` / `td` / `th`, so descendants-only suffices.
+/// 3. `td.get("colspan", 1)` (line 373) — `int(...)` of the colspan string,
+///    default 1. Faithful Rust: parse with `.unwrap_or(1)` on parse failure.
+/// 4. `iterdescendants()` (no arg, line 383) — every descendant in document
+///    order. Mirrors via `descendant_elements`.
+/// 5. `subelement.iterdescendants()` (line 405) — descendants of a CELL,
+///    mirroring the same shape.
+/// 6. `subelement.tag = "done"` at line 432 runs unconditionally at the END
+///    of each outer iteration (including the `<tr>` and TABLE_ELEMS
+///    branches). For the nested-table `break` branch, the rename does NOT
+///    run (`break` short-circuits). Faithful Rust: rename inside the loop
+///    body, never on break. Pin returned "done" handles in `dones_alive`
+///    against rcdom Drop quirk.
+/// 7. `newrow.attrib.pop("span", None)` (line 435) — remove the `span`
+///    attribute on the residual `newrow` (the one that hasn't been
+///    appended to newtable yet). Maps to `remove_attribute`.
+/// 8. `processed_subchild = None` (line 417) — explicit reset so the
+///    `if processed_subchild is not None` test at line 422 is false. In
+///    Rust we just use a separate variable scope and `let mut`.
+pub fn handle_table(
+    table_elem: &NodeRef,
+    potential_tags: &HashSet<String>,
+    options: &Options,
+) -> Option<NodeRef> {
+    // main_extractor.py:365 — newtable = Element("table").
+    let newtable = create_element("table");
+
+    // main_extractor.py:368 — strip thead/tbody/tfoot.
+    strip_tags_multi(table_elem, &["thead", "tbody", "tfoot"]);
+
+    // main_extractor.py:371-373 — max columns including colspan.
+    let mut max_cols: usize = 0;
+    let trs = get_elements_by_tag_name(table_elem, "tr");
+    for tr in &trs {
+        let mut row_cols: usize = 0;
+        for elem_tag in TABLE_ELEMS {
+            // `tr.iter(TABLE_ELEMS)` walks descendants-or-self of `tr`. A
+            // `<tr>` never matches `td`/`th`, so descendants suffice.
+            let cells = get_elements_by_tag_name(tr, elem_tag);
+            for cell in cells {
+                let colspan_attr = get_attribute(&cell, "colspan").unwrap_or_default();
+                let colspan: usize = colspan_attr.parse().unwrap_or(1);
+                row_cols += colspan;
+            }
+        }
+        if row_cols > max_cols {
+            max_cols = row_cols;
+        }
+    }
+
+    // main_extractor.py:376-381 — initial state.
+    let mut seen_header_row = false;
+    let mut seen_header = false;
+    let span_attr = if max_cols > 1 {
+        Some(max_cols.to_string())
+    } else {
+        None
+    };
+    let mut newrow = create_element("row");
+    if let Some(span) = &span_attr {
+        set_attribute(&newrow, "span", span);
+    }
+
+    // main_extractor.py:383 — outer descendants walk. Pin "done" handles
+    // alive against rcdom Drop quirk.
+    let mut dones_alive: Vec<NodeRef> = Vec::new();
+    let descendants = descendant_elements(table_elem);
+
+    for subelement in descendants {
+        let sub_tag = local_name(&subelement).unwrap_or_default();
+
+        if sub_tag == "tr" {
+            // main_extractor.py:384-391 — close existing row if it has cells.
+            if element_child_count(&newrow) > 0 {
+                append_child(&newtable, &newrow);
+                newrow = create_element("row");
+                if let Some(span) = &span_attr {
+                    set_attribute(&newrow, "span", span);
+                }
+                seen_header_row = seen_header_row || seen_header;
+            }
+        } else if TABLE_ELEMS.contains(&sub_tag.as_str()) {
+            // main_extractor.py:392-427 — cell.
+            let is_header = sub_tag == "th" && !seen_header_row;
+            seen_header = seen_header || is_header;
+            let new_child_elem = define_cell_type(is_header);
+
+            if element_child_count(&subelement) == 0 {
+                // main_extractor.py:397-400 — leaf cell.
+                if let Some(processed_cell) = process_node(&subelement, options) {
+                    set_element_text(&new_child_elem, element_text(&processed_cell).as_deref());
+                    set_tail(&new_child_elem, tail(&processed_cell).as_deref());
+                }
+            } else {
+                // main_extractor.py:402-424 — non-leaf cell: take text/tail
+                // from subelement directly, then walk inner descendants.
+                set_element_text(&new_child_elem, element_text(&subelement).as_deref());
+                set_tail(&new_child_elem, tail(&subelement).as_deref());
+                // main_extractor.py:404 — subelement.tag = "done". Pin alive.
+                dones_alive.push(replace_element_tag(&subelement, "done"));
+
+                let inner_descendants = descendant_elements(&subelement);
+                for child in inner_descendants {
+                    let child_tag = local_name(&child).unwrap_or_default();
+                    let mut processed_subchild: Option<NodeRef> = None;
+
+                    if TABLE_ALL.contains(&child_tag.as_str()) {
+                        // main_extractor.py:406-411 — TABLE_ALL branch.
+                        if TABLE_ELEMS.contains(&child_tag.as_str()) {
+                            // Rename to "cell" before processing the text.
+                            // Pin alive.
+                            dones_alive.push(replace_element_tag(&child, "cell"));
+                            // After rename, the original `child` NodeRef is
+                            // detached; the new cell-tagged node lives in
+                            // the parent. handle_textnode on `child` (the
+                            // detached one) still has its attrs/children
+                            // because rcdom's replace mints a new node and
+                            // splices it in.
+                        }
+                        processed_subchild = handle_textnode(&child, options, true, true);
+                    } else if child_tag == "list"
+                        && options.focus == crate::trafilatura::cleaning::Focus::Recall
+                    {
+                        // main_extractor.py:413-417 — list-in-cell, recall only.
+                        if let Some(list_out) = handle_lists(&child, options) {
+                            append_child(&new_child_elem, &list_out);
+                            // Don't dispatch via define_newelem below.
+                            processed_subchild = None;
+                        }
+                    } else {
+                        // main_extractor.py:418-420 — handle_textelem fallback.
+                        let pot_union: HashSet<String> = potential_tags
+                            .iter()
+                            .cloned()
+                            .chain(std::iter::once("div".to_string()))
+                            .collect();
+                        processed_subchild = handle_textelem(&child, &pot_union, options);
+                    }
+                    // main_extractor.py:422-423 — define_newelem dispatch.
+                    if let Some(p) = processed_subchild.as_ref() {
+                        define_newelem(Some(p), &new_child_elem);
+                    }
+                    // main_extractor.py:424 — child.tag = "done". Pin alive.
+                    dones_alive.push(replace_element_tag(&child, "done"));
+                }
+            }
+
+            // main_extractor.py:426-427 — append cell if it has text or
+            // element-children.
+            let has_text = element_text(&new_child_elem)
+                .map(|t| !t.is_empty())
+                .unwrap_or(false);
+            if has_text || element_child_count(&new_child_elem) > 0 {
+                append_child(&newrow, &new_child_elem);
+            }
+        } else if sub_tag == "table" {
+            // main_extractor.py:429-430 — break on nested table.
+            break;
+        }
+        // main_extractor.py:432 — subelement.tag = "done" (unconditional
+        // outer cleanup). Pin alive.
+        dones_alive.push(replace_element_tag(&subelement, "done"));
+    }
+    let _ = &dones_alive;
+
+    // main_extractor.py:435 — newrow.attrib.pop("span", None).
+    crate::readability::dom::remove_attribute(&newrow, "span");
+
+    // main_extractor.py:438-441 — append residual row, then return table
+    // or None.
+    if element_child_count(&newrow) > 0 {
+        append_child(&newtable, &newrow);
+    }
+    if element_child_count(&newtable) > 0 {
+        Some(newtable)
+    } else {
+        None
+    }
+}
+
+// ===========================================================================
+// handle_textelem (main_extractor.py:482-509) — Stage 2c-iii
+// ===========================================================================
+
+/// `handle_textelem(element, potential_tags, options)` —
+/// `main_extractor.py:482-509`.
+///
+/// Dispatch hub: routes each text element to the appropriate handle_*
+/// based on its tag. The central call site for `_extract`'s element-wise
+/// processing pass.
+///
+/// # Python original
+///
+/// ```python
+/// def handle_textelem(element, potential_tags, options):
+///     '''Process text element and determine how to deal with its content'''
+///     new_element = None
+///     if element.tag == 'list':
+///         new_element = handle_lists(element, options)
+///     elif element.tag in CODES_QUOTES:
+///         new_element = handle_quotes(element, options)
+///     elif element.tag == 'head':
+///         new_element = handle_titles(element, options)
+///     elif element.tag == 'p':
+///         new_element = handle_paragraphs(element, potential_tags, options)
+///     elif element.tag == 'lb':
+///         if text_chars_test(element.tail) is True:
+///             this_element = process_node(element, options)
+///             if this_element is not None:
+///                 new_element = Element('p')
+///                 new_element.text = this_element.tail
+///     elif element.tag in FORMATTING:
+///         new_element = handle_formatting(element, options)
+///     elif element.tag == 'table' and 'table' in potential_tags:
+///         new_element = handle_table(element, potential_tags, options)
+///     elif element.tag == 'graphic' and 'graphic' in potential_tags:
+///         new_element = handle_image(element)
+///     else:
+///         new_element = handle_other_elements(element, potential_tags, options)
+///     return new_element
+/// ```
+///
+/// # Faithfulness notes
+///
+/// 1. The `<lb>` branch (lines 494-499) is unusual: it builds a NEW `<p>`
+///    whose `.text` is the **tail** of the processed `<lb>`. The `<lb>`
+///    itself is dropped; only its tail survives as a fresh paragraph. The
+///    `text_chars_test(element.tail) is True` guard ensures we only do this
+///    when the tail has actual character content (post-strip).
+/// 2. `if 'table' in potential_tags` and `if 'graphic' in potential_tags`
+///    (lines 502, 504) — the dispatch is gated by the caller's
+///    `potential_tags` set. When the gate fails, the `<table>` / `<graphic>`
+///    falls through to `handle_other_elements`.
+pub fn handle_textelem(
+    element: &NodeRef,
+    potential_tags: &HashSet<String>,
+    options: &Options,
+) -> Option<NodeRef> {
+    let tag = local_name(element).unwrap_or_default();
+
+    match tag.as_str() {
+        "list" => handle_lists(element, options),
+        t if CODES_QUOTES.contains(&t) => handle_quotes(element, options),
+        "head" => handle_titles(element, options),
+        "p" => handle_paragraphs(element, potential_tags, options),
+        "lb" => {
+            // main_extractor.py:494-499 — <lb> tail-promotion.
+            if text_chars_test(tail(element).as_deref()) {
+                let this_element = process_node(element, options)?;
+                let new_element = create_element("p");
+                set_element_text(&new_element, tail(&this_element).as_deref());
+                Some(new_element)
+            } else {
+                None
+            }
+        }
+        t if FORMATTING.contains(&t) => handle_formatting(element, options),
+        "table" if potential_tags.contains("table") => {
+            handle_table(element, potential_tags, options)
+        }
+        "graphic" if potential_tags.contains("graphic") => handle_image(element),
+        _ => handle_other_elements(element, potential_tags, options),
+    }
+}
+
+// ===========================================================================
 // handle_titles (main_extractor.py:43-66)
 // ===========================================================================
 
@@ -2259,6 +2572,351 @@ mod tests {
             get_attribute(&out, "src").as_deref(),
             Some("/relative.png"),
             "single-slash relative URL unchanged"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Stage 2c-iii — define_cell_type (main_extractor.py:354-360)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn define_cell_type_no_header_has_no_role() {
+        let cell = define_cell_type(false);
+        assert_eq!(local_name(&cell).as_deref(), Some("cell"));
+        assert!(get_attribute(&cell, "role").is_none());
+    }
+
+    #[test]
+    fn define_cell_type_header_sets_role_head() {
+        let cell = define_cell_type(true);
+        assert_eq!(local_name(&cell).as_deref(), Some("cell"));
+        assert_eq!(get_attribute(&cell, "role").as_deref(), Some("head"));
+    }
+
+    // -------------------------------------------------------------------
+    // Stage 2c-iii — handle_table (main_extractor.py:363-442)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn handle_table_returns_none_for_empty_table() {
+        // <table></table> — no rows, no cells → None.
+        let t = dom_create_element("table");
+        let pot = potential_tags(&["table", "p"]);
+        let opts = Options::default();
+        assert!(handle_table(&t, &pot, &opts).is_none());
+    }
+
+    #[test]
+    fn handle_table_converts_tr_td_to_row_cell() {
+        // <table><tr><td>x</td></tr></table> — should produce <table><row><cell>x.
+        let t = dom_create_element("table");
+        let tr = dom_create_element("tr");
+        let td = dom_create_element("td");
+        dom_append_child(&td, &create_text_node("x"));
+        dom_append_child(&tr, &td);
+        dom_append_child(&t, &tr);
+        let pot = potential_tags(&["table", "p"]);
+        let opts = Options::default();
+        let out = handle_table(&t, &pot, &opts).expect("non-empty → Some");
+        assert_eq!(local_name(&out).as_deref(), Some("table"));
+        let rows = get_elements_by_tag_name(&out, "row");
+        assert_eq!(rows.len(), 1, "one row");
+        let cells = get_elements_by_tag_name(&out, "cell");
+        assert_eq!(cells.len(), 1, "one cell");
+        let cell_text = element_text(&cells[0]).unwrap_or_default();
+        assert!(cell_text.contains('x'), "cell text preserved: {cell_text:?}");
+    }
+
+    #[test]
+    fn handle_table_marks_th_as_header_cell() {
+        // <table><tr><th>H</th></tr></table> — the <th> cell gets role="head".
+        let t = dom_create_element("table");
+        let tr = dom_create_element("tr");
+        let th = dom_create_element("th");
+        dom_append_child(&th, &create_text_node("H"));
+        dom_append_child(&tr, &th);
+        dom_append_child(&t, &tr);
+        let pot = potential_tags(&["table"]);
+        let opts = Options::default();
+        let out = handle_table(&t, &pot, &opts).expect("non-empty → Some");
+        let cells = get_elements_by_tag_name(&out, "cell");
+        assert_eq!(cells.len(), 1);
+        assert_eq!(
+            get_attribute(&cells[0], "role").as_deref(),
+            Some("head"),
+            "th becomes header cell"
+        );
+    }
+
+    #[test]
+    fn handle_table_strips_thead_tbody_tfoot() {
+        // <table><thead><tr><th>H</th></tr></thead><tbody><tr><td>x</td></tr></tbody></table>
+        // — thead/tbody are stripped (children lifted to table) before processing.
+        let t = dom_create_element("table");
+        let thead = dom_create_element("thead");
+        let tr1 = dom_create_element("tr");
+        let th = dom_create_element("th");
+        dom_append_child(&th, &create_text_node("H"));
+        dom_append_child(&tr1, &th);
+        dom_append_child(&thead, &tr1);
+        let tbody = dom_create_element("tbody");
+        let tr2 = dom_create_element("tr");
+        let td = dom_create_element("td");
+        dom_append_child(&td, &create_text_node("x"));
+        dom_append_child(&tr2, &td);
+        dom_append_child(&tbody, &tr2);
+        dom_append_child(&t, &thead);
+        dom_append_child(&t, &tbody);
+        let pot = potential_tags(&["table"]);
+        let opts = Options::default();
+        let out = handle_table(&t, &pot, &opts).expect("non-empty → Some");
+        // The output table should NOT contain thead/tbody (they were stripped),
+        // and should have 2 rows (one for the th, one for the td).
+        assert!(get_elements_by_tag_name(&out, "thead").is_empty());
+        assert!(get_elements_by_tag_name(&out, "tbody").is_empty());
+        let rows = get_elements_by_tag_name(&out, "row");
+        assert_eq!(rows.len(), 2, "two rows after stripping wrappers");
+    }
+
+    #[test]
+    fn handle_table_pops_span_attribute_from_residual_row() {
+        // <table><tr><td>a</td><td>b</td><td>c</td></tr></table> — 3 cols.
+        // max_cols=3, so the initial newrow gets span="3". But Python's
+        // line 435 `newrow.attrib.pop("span", None)` runs on the RESIDUAL
+        // newrow before the final append (since len(newrow)>0 fires there,
+        // not at the tr branch — only the first tr triggered no `len`>0
+        // branch). The result: in a single-tr table, the appended row has
+        // NO span attribute, even though max_cols > 1. We faithfully
+        // preserve this Python source quirk.
+        let t = dom_create_element("table");
+        let tr = dom_create_element("tr");
+        for txt in ["a", "b", "c"] {
+            let td = dom_create_element("td");
+            dom_append_child(&td, &create_text_node(txt));
+            dom_append_child(&tr, &td);
+        }
+        dom_append_child(&t, &tr);
+        let pot = potential_tags(&["table"]);
+        let opts = Options::default();
+        let out = handle_table(&t, &pot, &opts).expect("non-empty → Some");
+        let rows = get_elements_by_tag_name(&out, "row");
+        assert_eq!(rows.len(), 1);
+        assert!(
+            get_attribute(&rows[0], "span").is_none(),
+            "residual-row span popped before final append (Python line 435)"
+        );
+    }
+
+    #[test]
+    fn handle_table_two_row_table_first_row_keeps_span_last_loses_it() {
+        // <table><tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr></table>
+        // — max_cols=2. The FIRST tr appends the initial newrow (with
+        // span="2") to newtable; the second tr's row is the residual one
+        // whose span gets popped. Faithful to main_extractor.py:435.
+        let t = dom_create_element("table");
+        for row_data in [["a", "b"], ["c", "d"]] {
+            let tr = dom_create_element("tr");
+            for txt in row_data {
+                let td = dom_create_element("td");
+                dom_append_child(&td, &create_text_node(txt));
+                dom_append_child(&tr, &td);
+            }
+            dom_append_child(&t, &tr);
+        }
+        let pot = potential_tags(&["table"]);
+        let opts = Options::default();
+        let out = handle_table(&t, &pot, &opts).expect("non-empty → Some");
+        let rows = get_elements_by_tag_name(&out, "row");
+        assert_eq!(rows.len(), 2, "two rows");
+        assert_eq!(
+            get_attribute(&rows[0], "span").as_deref(),
+            Some("2"),
+            "first row keeps span (appended before pop)"
+        );
+        assert!(
+            get_attribute(&rows[1], "span").is_none(),
+            "last row loses span via Python line 435 pop"
+        );
+    }
+
+    #[test]
+    fn handle_table_respects_colspan_in_max_cols() {
+        // <table><tr><td colspan="2">a</td><td>b</td></tr><tr><td>c</td></tr></table>
+        // — max_cols across both rows = 3 (first row: 2+1, second: 1).
+        // The first row (appended before pop) carries span="3".
+        let t = dom_create_element("table");
+        let tr1 = dom_create_element("tr");
+        let td1 = dom_create_element("td");
+        set_attribute(&td1, "colspan", "2");
+        dom_append_child(&td1, &create_text_node("a"));
+        let td2 = dom_create_element("td");
+        dom_append_child(&td2, &create_text_node("b"));
+        dom_append_child(&tr1, &td1);
+        dom_append_child(&tr1, &td2);
+        let tr2 = dom_create_element("tr");
+        let td3 = dom_create_element("td");
+        dom_append_child(&td3, &create_text_node("c"));
+        dom_append_child(&tr2, &td3);
+        dom_append_child(&t, &tr1);
+        dom_append_child(&t, &tr2);
+        let pot = potential_tags(&["table"]);
+        let opts = Options::default();
+        let out = handle_table(&t, &pot, &opts).expect("non-empty → Some");
+        let rows = get_elements_by_tag_name(&out, "row");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            get_attribute(&rows[0], "span").as_deref(),
+            Some("3"),
+            "first row carries colspan-summed max_cols=3"
+        );
+    }
+
+    #[test]
+    fn handle_table_breaks_on_nested_table() {
+        // <table><tr><td>x</td></tr><table>NESTED</table></table> — the
+        // nested <table> descendant triggers break (line 429-430).
+        // Asserting the outer table's row is preserved while no nested-table
+        // processing happens.
+        let outer = dom_create_element("table");
+        let tr = dom_create_element("tr");
+        let td = dom_create_element("td");
+        dom_append_child(&td, &create_text_node("x"));
+        dom_append_child(&tr, &td);
+        dom_append_child(&outer, &tr);
+        let nested = dom_create_element("table");
+        let ntr = dom_create_element("tr");
+        let ntd = dom_create_element("td");
+        dom_append_child(&ntd, &create_text_node("NESTED"));
+        dom_append_child(&ntr, &ntd);
+        dom_append_child(&nested, &ntr);
+        dom_append_child(&outer, &nested);
+
+        let pot = potential_tags(&["table"]);
+        let opts = Options::default();
+        let out = handle_table(&outer, &pot, &opts).expect("non-empty → Some");
+        // Output has one row (the outer's tr), no NESTED text.
+        let rows = get_elements_by_tag_name(&out, "row");
+        assert_eq!(rows.len(), 1, "outer row kept");
+        let cells = get_elements_by_tag_name(&out, "cell");
+        let cell_text = cells
+            .iter()
+            .map(|c| element_text(c).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(
+            !cell_text.contains("NESTED"),
+            "nested table content not processed: {cell_text:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Stage 2c-iii — handle_textelem (main_extractor.py:482-509)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn handle_textelem_routes_list_to_handle_lists() {
+        let list = dom_create_element("list");
+        let item = dom_create_element("item");
+        dom_append_child(&item, &create_text_node("x"));
+        dom_append_child(&list, &item);
+        let pot = potential_tags(&["list", "item"]);
+        let opts = Options::default();
+        let out = handle_textelem(&list, &pot, &opts).expect("list → Some");
+        assert_eq!(local_name(&out).as_deref(), Some("list"));
+    }
+
+    #[test]
+    fn handle_textelem_routes_code_to_handle_quotes() {
+        // CODES_QUOTES includes "code" — routed to handle_quotes.
+        let code = dom_create_element("code");
+        dom_append_child(&code, &create_text_node("x"));
+        let pot = potential_tags(&["code"]);
+        let opts = Options::default();
+        // handle_quotes on a <code> input (is_code_block_element fires
+        // because tag == "code"), so out is renamed to "code".
+        let out = handle_textelem(&code, &pot, &opts).expect("code → Some");
+        assert_eq!(local_name(&out).as_deref(), Some("code"));
+    }
+
+    #[test]
+    fn handle_textelem_routes_head_to_handle_titles() {
+        let head = dom_create_element("head");
+        dom_append_child(&head, &create_text_node("Title"));
+        let pot = potential_tags(&["head", "p"]);
+        let opts = Options::default();
+        let out = handle_textelem(&head, &pot, &opts).expect("head → Some");
+        // handle_titles returns a <head> with its text preserved.
+        assert_eq!(local_name(&out).as_deref(), Some("head"));
+    }
+
+    #[test]
+    fn handle_textelem_routes_p_to_handle_paragraphs() {
+        let p = dom_create_element("p");
+        dom_append_child(&p, &create_text_node("hello"));
+        let pot = potential_tags(&["p"]);
+        let opts = Options::default();
+        let out = handle_textelem(&p, &pot, &opts).expect("p → Some");
+        assert_eq!(local_name(&out).as_deref(), Some("p"));
+    }
+
+    #[test]
+    fn handle_textelem_routes_table_to_handle_table_when_gated() {
+        // potential_tags includes "table" → handle_table is called.
+        let t = dom_create_element("table");
+        let tr = dom_create_element("tr");
+        let td = dom_create_element("td");
+        dom_append_child(&td, &create_text_node("x"));
+        dom_append_child(&tr, &td);
+        dom_append_child(&t, &tr);
+        let pot = potential_tags(&["table"]);
+        let opts = Options::default();
+        let out = handle_textelem(&t, &pot, &opts).expect("table → Some");
+        assert_eq!(local_name(&out).as_deref(), Some("table"));
+    }
+
+    #[test]
+    fn handle_textelem_falls_through_table_to_other_when_not_in_potential() {
+        // potential_tags does NOT include "table" → fall through to
+        // handle_other_elements, which (since "table" is also not in
+        // potential_tags there) returns None.
+        let t = dom_create_element("table");
+        let tr = dom_create_element("tr");
+        let td = dom_create_element("td");
+        dom_append_child(&td, &create_text_node("x"));
+        dom_append_child(&tr, &td);
+        dom_append_child(&t, &tr);
+        let pot = potential_tags(&["p"]);
+        let opts = Options::default();
+        assert!(handle_textelem(&t, &pot, &opts).is_none());
+    }
+
+    #[test]
+    fn handle_textelem_routes_graphic_to_handle_image_when_gated() {
+        let g = dom_create_element("graphic");
+        set_attribute(&g, "src", "https://example.com/img.png");
+        let pot = potential_tags(&["graphic"]);
+        let opts = Options::default();
+        let out = handle_textelem(&g, &pot, &opts).expect("graphic → Some");
+        assert_eq!(local_name(&out).as_deref(), Some("graphic"));
+        assert_eq!(
+            get_attribute(&out, "src").as_deref(),
+            Some("https://example.com/img.png")
+        );
+    }
+
+    #[test]
+    fn handle_textelem_routes_unknown_to_handle_other_elements() {
+        // <div>text</div> with "div" in potential_tags → handle_other_elements
+        // renames to <p>.
+        let d = dom_create_element("div");
+        dom_append_child(&d, &create_text_node("some text"));
+        let pot = potential_tags(&["div", "p"]);
+        let opts = Options::default();
+        let out = handle_textelem(&d, &pot, &opts).expect("div text → Some");
+        assert_eq!(
+            local_name(&out).as_deref(),
+            Some("p"),
+            "div renamed to p via handle_other_elements"
         );
     }
 }

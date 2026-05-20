@@ -374,7 +374,31 @@ name = "mdrcel"
 # extracts `src`/`data-src*`/`alt`/`title` from the input, bails when no
 # usable src, and rewrites protocol-relative `^//` srcs to `http://`. Both
 # BLOCKER gates remain green; no public API change.
-version = "0.4.10"
+#
+# M3 Stage 2c-iii-b (2026-05-20): 0.4.10 -> 0.4.11 PATCH. Adds the dispatch
+# hub and table handler to `src/trafilatura/main_extractor.rs` — faithful
+# port of `trafilatura@v2.0.0/main_extractor.py:354-509`:
+# - `define_cell_type(is_header)`: mints a `<cell>` element, conditionally
+#   setting `role="head"`.
+# - `handle_table`: the largest single block handler (~80 LOC source).
+#   Strips `<thead>`/`<tbody>`/`<tfoot>` wrappers via `strip_tags_multi`,
+#   computes `max_cols` (with `colspan` summation) for the row `span`
+#   attribute, walks descendants in document order converting `<tr>`→
+#   `<row>` and `<td>`/`<th>`→`<cell>`, processes leaf and non-leaf cells
+#   differently, dispatches nested non-cell content through
+#   `handle_textelem` (mutual recursion via the dispatch hub) /
+#   `handle_lists` (recall mode only) / `handle_textnode`, and breaks at
+#   the first nested `<table>` descendant. Faithfully preserves the Python
+#   source quirk where `newrow.attrib.pop("span", None)` (line 435) only
+#   strips the RESIDUAL row's span; previously-appended rows retain theirs.
+# - `handle_textelem`: the central dispatcher routing each tag to
+#   `handle_lists`/`handle_quotes`/`handle_titles`/`handle_paragraphs`/
+#   `handle_formatting`/`handle_table`/`handle_image`/`handle_other_elements`
+#   based on tag and `potential_tags` gating. The `<lb>` branch is
+#   unusual: it builds a fresh `<p>` from the `<lb>`'s tail, dropping the
+#   `<lb>` itself.
+# No public API change — all surfaces under `#[doc(hidden)] pub mod`.
+version = "0.4.11"
 edition = "2024"
 
 [dependencies]
