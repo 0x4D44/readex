@@ -66,7 +66,7 @@ use mdrcel::trafilatura::{cleaning, main_extractor};
 /// diff index), fix the port, re-run until token-identical, then add the
 /// fixture here in a dedicated commit.
 const FIXTURES: &[&str] = &[
-    // ---- phase 1 (this commit) ----
+    // ---- phase 1 (commit 64d8814) ----
     "benchmark/corpus/snapshots/0f115db062b7c0dd.html", // example.com (528 bytes, edge_case)
 ];
 
