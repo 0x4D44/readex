@@ -821,26 +821,27 @@ use crate::trafilatura::xpath_engine;
 /// what the source says).
 ///
 /// **Backup branch.** When `with_backup=true`, the Python deep-copies the
-/// tree, prunes, and reverts if post-deletion text < pre-deletion / 7.
-/// rcdom does not expose a public deep-clone, so the Stage 2b' Rust port
-/// captures the pre-deletion `text_content()` length AND a `serialize_html()`
-/// snapshot of the tree. After deletion, if the post text length fell
-/// below the threshold, we don't fully restore (a true restore would need
-/// a re-parse + tree-swap, which is multi-stage work). Instead we record
-/// `restored = false` in the return value so callers know whether the
-/// backup branch fired. Stage 2c orchestration sites that need the restored
-/// tree will call `prune_unwanted_nodes` on a freshly-parsed sub-tree
-/// (Stage 1b's `tree_cleaning` recall-backup already documented this same
-/// deferral).
+/// tree, prunes, and reverts if post-deletion text < pre-deletion / 7. Stage
+/// 2c-iii-a (this commit) activates the full backup-restore using
+/// `dom::deep_clone` (landed Stage 2c-i). The function returns the live
+/// `NodeRef` to use downstream: either the pruned input tree (when text
+/// survives the threshold) or the pre-prune backup clone (when it doesn't).
+/// Python's `tree = prune_unwanted_nodes(...)` rebinds; Rust callers should
+/// shadow the same way: `let tree = prune_unwanted_nodes(&tree, ...);`.
 ///
-/// Returns `()` (mutates in place). The Python returns `tree`; the Rust
-/// caller already holds the `NodeRef`.
-pub fn prune_unwanted_nodes(tree: &NodeRef, nodelist: &[&str], with_backup: bool) {
-    // htmlprocessing.py:97-99 — capture pre-deletion text length.
-    let old_len = if with_backup {
-        text_content(tree).chars().count()
+/// Returns the live `NodeRef`. With `with_backup=false`, the function still
+/// mutates `tree` in place and returns `tree.clone()` (cheap Rc clone, same
+/// Node) so the call shape matches both Python and the backup-active case.
+pub fn prune_unwanted_nodes(tree: &NodeRef, nodelist: &[&str], with_backup: bool) -> NodeRef {
+    // htmlprocessing.py:97-99 — capture pre-deletion text length AND a deep
+    // clone of the tree to roll back to if the prune is too aggressive.
+    let (old_len, backup) = if with_backup {
+        (
+            text_content(tree).chars().count(),
+            Some(dom::deep_clone(tree)),
+        )
     } else {
-        0
+        (0, None)
     };
 
     // htmlprocessing.py:101-112 — for each XPath, for each match, preserve
@@ -877,28 +878,24 @@ pub fn prune_unwanted_nodes(tree: &NodeRef, nodelist: &[&str], with_backup: bool
         }
     }
 
-    // htmlprocessing.py:114-117 — backup branch.
+    // htmlprocessing.py:114-117 — backup branch. Stage 2c-iii-a activates
+    // the full restore using the `backup` deep_clone captured before pruning.
+    // Python's `return tree if new_len > old_len / 7 else backup` — we use
+    // `new_len * 7 > old_len` to avoid a division-by-zero on empty inputs
+    // (the inequality is identical for positive integers, and `old_len = 0`
+    // implies `new_len = 0` so `0 > 0` is false, falling back to backup, which
+    // matches Python's `0 > 0/7 → 0 > 0 → False` exactly).
     if with_backup {
         let new_len = text_content(tree).chars().count();
-        // The Python `new_len > old_len / 7` test. If we shrank too much,
-        // the Python returns the backup. Stage 2c-iii (`main_extractor.py:
-        // 537`) is the OVERALL_DISCARD_XPATH caller that activates this
-        // path. The backup branch requires deep-cloning the input tree,
-        // which dom.rs does not yet expose — so rather than silently
-        // over-prune we PANIC loudly, pinning the gap as a hard blocker
-        // for Stage 2c-iii. See Stage 2b' review findings M1/D1.
-        if (new_len * 7) <= old_len {
-            // htmlprocessing.py:117 — Python returns the backup tree here.
-            // The backup branch requires deep-cloning the input tree, which
-            // dom.rs does not yet expose. Stage 2c-iii (the OVERALL_DISCARD_XPATH
-            // caller at main_extractor.py:537) MUST land the dom.rs `deep_clone`
-            // facade fn before activating with_backup=true.
-            unimplemented!(
-                "prune_unwanted_nodes with_backup=true backup-restore branch \
-                 (htmlprocessing.py:117) requires dom.rs deep_clone; \
-                 pin via TODO(M3-stage-2c-iii)"
-            );
+        if (new_len * 7) > old_len {
+            tree.clone()
+        } else {
+            // htmlprocessing.py:117 — return the pristine pre-prune backup.
+            backup.expect("with_backup=true captured a deep_clone backup above")
         }
+    } else {
+        // htmlprocessing.py:118 — return tree (no backup branch).
+        tree.clone()
     }
 }
 
@@ -1970,21 +1967,46 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "prune_unwanted_nodes with_backup=true")]
-    fn prune_unwanted_nodes_with_backup_true_panics_until_stage_2c_iii_wires_deep_clone() {
-        // Stage 2b' review findings M1/D1: until Stage 2c-iii lands the
-        // dom.rs `deep_clone` facade, the with_backup=true branch must
-        // PANIC the moment the `new_len * 7 <= old_len` threshold trips —
-        // silently over-pruning is worse than crashing. Build a tree
-        // whose post-prune text shrank to ≤ 1/7 of pre-prune text by
-        // making the removed <section> carry the bulk of the content.
+    fn prune_unwanted_nodes_with_backup_true_restores_when_threshold_trips() {
+        // Stage 2c-iii-a: the `with_backup=true` branch is now fully wired
+        // via `dom::deep_clone` (landed Stage 2c-i). When the post-prune text
+        // shrinks to ≤ old_len/7, the returned NodeRef IS the deep_clone
+        // backup (i.e. the pristine pre-prune tree). Construct a tree where
+        // the <section> carries the bulk of the text so removing it trips
+        // the threshold (140-x section + 1-char paragraph; post-prune = 1,
+        // pre-prune = 141; 1*7 = 7 ≤ 141 → backup).
         let big = "x".repeat(140);
         let dom = parse(&format!("<div><p>a</p><section>{big}</section></div>"));
         let b = body(&dom);
-        prune_unwanted_nodes(&b, &[".//section"], true);
-        // Unreachable — the assertion documents intent if the panic
-        // expectation is ever weakened.
-        unreachable!("with_backup=true must panic on threshold-trip");
+        let result = prune_unwanted_nodes(&b, &[".//section"], true);
+        // The returned tree must still contain <section> (backup is pristine).
+        assert!(
+            !get_elements_by_tag_name(&result, "section").is_empty(),
+            "backup restored — <section> preserved"
+        );
+        // The IN-PLACE-mutated input `b` does NOT contain <section> any more
+        // (Python's `tree` was mutated then `return backup`; the mutation is
+        // permanent on the original `b`, but the caller rebinds to `result`).
+        assert!(
+            get_elements_by_tag_name(&b, "section").is_empty(),
+            "input tree is the over-pruned one (orphaned by caller's rebind)"
+        );
+    }
+
+    #[test]
+    fn prune_unwanted_nodes_with_backup_true_keeps_tree_when_text_survives() {
+        // Threshold-survival path: post-prune text > old_len/7. Build a tree
+        // where the removed <aside> is a small fraction (10 chars) of the
+        // total content (>140 chars elsewhere). The returned NodeRef is the
+        // (mutated) input tree, NOT the backup.
+        let p_text = "p".repeat(140);
+        let dom = parse(&format!("<div><p>{p_text}</p><aside>0123456789</aside></div>"));
+        let b = body(&dom);
+        let result = prune_unwanted_nodes(&b, &[".//aside"], true);
+        // <aside> is gone in the result — same handle as the input tree.
+        assert!(get_elements_by_tag_name(&result, "aside").is_empty());
+        // The p-paragraph is preserved.
+        assert_eq!(get_elements_by_tag_name(&result, "p").len(), 1);
     }
 
     // ---- handle_textnode ----

@@ -282,7 +282,7 @@ dependencies = [
 
 [[package]]
 name = "mdrcel"
-version = "0.4.9"
+version = "0.4.10"
 dependencies = [
  "html5ever",
  "markup5ever_rcdom",

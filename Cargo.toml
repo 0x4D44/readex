@@ -359,7 +359,22 @@ name = "mdrcel"
 # PATCH: additive infrastructure behind the same `#[doc(hidden)]` surface,
 # no observable change on the default extraction path (block handlers are
 # consumed only by Stage 2d's `_extract` orchestrator, not yet wired).
-version = "0.4.9"
+#
+# M3 Stage 2c-iii-a (2026-05-20): 0.4.9 -> 0.4.10 PATCH. (1) Activates the
+# `prune_unwanted_nodes with_backup=true` backup-restore branch using
+# `dom::deep_clone` (landed Stage 2c-i): the panicking stub from Stage 2b'
+# is replaced with a real `deepcopy(tree)` + threshold-trip restore,
+# matching `htmlprocessing.py:97-118`. Return type of
+# `cleaning::prune_unwanted_nodes` changes from `()` to `NodeRef` (the
+# Python signature is `... -> HtmlElement`; callers in Python rebind
+# `tree = prune_unwanted_nodes(...)`; Rust callers should shadow the same
+# way). All existing call sites are tests that already ignore the return,
+# so this is an additive widening. (2) Lands the real `handle_image`
+# (`main_extractor.py:445-480`), replacing the Stage 2c-ii forward stub:
+# extracts `src`/`data-src*`/`alt`/`title` from the input, bails when no
+# usable src, and rewrites protocol-relative `^//` srcs to `http://`. Both
+# BLOCKER gates remain green; no public API change.
+version = "0.4.10"
 edition = "2024"
 
 [dependencies]

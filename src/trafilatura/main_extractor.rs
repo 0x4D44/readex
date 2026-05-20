@@ -72,7 +72,7 @@ use crate::readability::dom::{
     set_attribute, set_element_text, set_tail, tail,
 };
 use crate::trafilatura::cleaning::{Options, handle_textnode, process_node, strip_tags_multi};
-use crate::trafilatura::utils::{FORMATTING_PROTECTED, text_chars_test};
+use crate::trafilatura::utils::{FORMATTING_PROTECTED, is_image_file, text_chars_test};
 use std::collections::HashSet;
 
 // ===========================================================================
@@ -779,18 +779,130 @@ pub fn handle_paragraphs(
 }
 
 // ===========================================================================
-// handle_image — FORWARD STUB (Stage 2c-iii will replace this)
+// handle_image (main_extractor.py:445-480) — Stage 2c-iii
 // ===========================================================================
 
-/// `handle_image(elem)` — **STAGE 2c-iii FORWARD STUB**.
+/// `handle_image(element)` — `main_extractor.py:445-480`.
 ///
-/// `handle_paragraphs` (`main_extractor.py:336`) calls `handle_image` when
-/// it encounters a `<graphic>` processed child. The full implementation
-/// (`main_extractor.py:445-480`) is Stage 2c-iii's responsibility. This stub
-/// panics with a Stage-citing message so any code path that exercises it
-/// surfaces loudly until Stage 2c-iii lands.
-fn handle_image(_elem: &NodeRef) -> Option<NodeRef> {
-    unimplemented!("Stage 2c-iii: handle_image (main_extractor.py:445-480)")
+/// Process an image element (typically `<graphic>` after `convert_tags`) and
+/// extract its src/alt/title attributes onto a fresh `<graphic>` (or the
+/// element's own tag — Python's `Element(element.tag)`). Returns `None` if
+/// the element has no usable `src` attribute.
+///
+/// # Python original
+///
+/// ```python
+/// def handle_image(element: Optional[_Element]) -> Optional[_Element]:
+///     "Process image elements and their relevant attributes."
+///     if element is None:
+///         return None
+///
+///     processed_element = Element(element.tag)
+///
+///     for attr in ("data-src", "src"):
+///         src = element.get(attr, "")
+///         if is_image_file(src):
+///             processed_element.set("src", src)
+///             break
+///     else:
+///         # take the first corresponding attribute
+///         for attr, value in element.attrib.items():
+///             if attr.startswith("data-src") and is_image_file(value):
+///                 processed_element.set("src", value)
+///                 break
+///
+///     # additional data
+///     if alt_attr := element.get("alt"):
+///         processed_element.set("alt", alt_attr)
+///     if title_attr := element.get("title"):
+///         processed_element.set("title", title_attr)
+///
+///     # don't return empty elements or elements without source, just None
+///     if not processed_element.attrib or not processed_element.get("src"):
+///         return None
+///
+///     # post-processing: URLs
+///     src_attr = processed_element.get("src", "")
+///     if not src_attr.startswith("http"):
+///         processed_element.set("src", re.sub(r"^//", "http://", src_attr))
+///
+///     return processed_element
+/// ```
+///
+/// # Faithfulness notes
+///
+/// 1. Python's `for..else` (line 452-462): the `else` block runs only when
+///    the loop completes WITHOUT a `break`. Both `for` loops use `break` on
+///    a successful match, so the `else` only runs if `data-src` and `src`
+///    are both absent or invalid. Faithful Rust: track a `found` flag.
+/// 2. `processed_element.attrib.items()` (line 459) — iterate in source
+///    order via `attributes_in_source_order` (Stage 1b dom facade).
+/// 3. `not src_attr.startswith("http")` (line 476) — covers `http://` AND
+///    `https://`. Python's startswith on a non-empty string with empty
+///    prefix returns True, but `src_attr` here is non-empty (line 472
+///    guard).
+/// 4. `re.sub(r"^//", "http://", src_attr)` (line 477) — only rewrite when
+///    the src begins with `//` (protocol-relative URL). Otherwise the regex
+///    matches nothing and the src is unchanged. Faithful Rust: check prefix.
+pub fn handle_image(element: &NodeRef) -> Option<NodeRef> {
+    // main_extractor.py:450 — Element(element.tag). Preserve the tag.
+    let tag = local_name(element).unwrap_or_else(|| "graphic".to_string());
+    let processed_element = create_element(&tag);
+
+    // main_extractor.py:452-456 — first loop: ("data-src", "src").
+    let mut found_src = false;
+    for attr in ["data-src", "src"] {
+        let src = get_attribute(element, attr);
+        if is_image_file(src.as_deref()) {
+            // src is guaranteed Some(..) inside is_image_file's true branch.
+            set_attribute(&processed_element, "src", src.as_deref().unwrap_or(""));
+            found_src = true;
+            break;
+        }
+    }
+    // main_extractor.py:457-462 — for..else: scan attrs starting with "data-src".
+    if !found_src {
+        for (name, value) in attributes_in_source_order(element) {
+            if name.starts_with("data-src") && is_image_file(Some(&value)) {
+                set_attribute(&processed_element, "src", &value);
+                break;
+            }
+        }
+    }
+
+    // main_extractor.py:465-468 — alt and title attribute copy. Python's
+    // walrus operator `if alt_attr := element.get("alt"):` is a TRUTHY check
+    // — empty string is falsy. Faithful Rust: only copy when value is Some
+    // and non-empty.
+    if let Some(alt) = get_attribute(element, "alt")
+        && !alt.is_empty()
+    {
+        set_attribute(&processed_element, "alt", &alt);
+    }
+    if let Some(title) = get_attribute(element, "title")
+        && !title.is_empty()
+    {
+        set_attribute(&processed_element, "title", &title);
+    }
+
+    // main_extractor.py:471 — bail if no attrs OR no src. attributes_in_source_order
+    // returns an empty Vec when there are no attrs; checking get_attribute("src")
+    // covers both the "no attrs at all" and "attrs but no src" cases.
+    let src_attr = get_attribute(&processed_element, "src")?;
+    if src_attr.is_empty() {
+        return None;
+    }
+
+    // main_extractor.py:474-477 — URL canonicalisation: only rewrite when
+    // the src begins with `//` (protocol-relative). The regex `^//` only
+    // matches at start, so non-`//` non-`http` srcs are unchanged.
+    if !src_attr.starts_with("http")
+        && let Some(rest) = src_attr.strip_prefix("//")
+    {
+        set_attribute(&processed_element, "src", &format!("http://{rest}"));
+    }
+
+    Some(processed_element)
 }
 
 // ===========================================================================
@@ -2034,13 +2146,14 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Stage 2c-iii: handle_image")]
-    fn handle_paragraphs_graphic_dispatches_to_handle_image_stub() {
-        // <p>x<graphic/></p> — main_extractor.py:335-336 calls handle_image,
-        // which is the Stage 2c-iii forward stub: it panics. To reach line
-        // 336, graphic must survive handle_textnode. handle_textnode keeps
-        // <graphic> when is_image_element fires (which checks src/data-src
-        // attrs). Add a src to ensure survival.
+    fn handle_paragraphs_graphic_dispatches_to_handle_image() {
+        // <p>x<graphic src="/img.png"/></p> — Stage 2c-iii replaced the
+        // panicking handle_image forward stub with the real impl
+        // (main_extractor.py:445-480). The graphic now survives the
+        // dispatch with src canonicalised to "http:///img.png" (because
+        // "/img.png" doesn't start with "http" and doesn't start with "//",
+        // so it's unchanged from the input — Python's re.sub(r"^//", ...)
+        // is a no-op on non-`//` prefixes).
         let p = dom_create_element("p");
         dom_append_child(&p, &create_text_node("x"));
         let g = dom_create_element("graphic");
@@ -2048,6 +2161,104 @@ mod tests {
         dom_append_child(&p, &g);
         let pot = potential_tags(&["p", "graphic"]);
         let opts = Options::default();
-        let _ = handle_paragraphs(&p, &pot, &opts);
+        let out = handle_paragraphs(&p, &pot, &opts).expect("p path → Some");
+        // The <graphic> survives as a child of the output, with src preserved.
+        let graphics = get_elements_by_tag_name(&out, "graphic");
+        assert_eq!(graphics.len(), 1, "graphic survived");
+        assert_eq!(
+            get_attribute(&graphics[0], "src").as_deref(),
+            Some("/img.png"),
+            "src preserved through handle_image canonicalisation"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Stage 2c-iii — handle_image (main_extractor.py:445-480)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn handle_image_picks_src_attr() {
+        // <graphic src="https://example.com/img.png"/> — src is preserved.
+        let g = dom_create_element("graphic");
+        set_attribute(&g, "src", "https://example.com/img.png");
+        let out = handle_image(&g).expect("valid src → Some");
+        assert_eq!(
+            get_attribute(&out, "src").as_deref(),
+            Some("https://example.com/img.png")
+        );
+    }
+
+    #[test]
+    fn handle_image_picks_data_src_when_src_missing() {
+        // <graphic data-src="https://example.com/img.png"/> — Python's first
+        // loop ("data-src", "src") finds data-src first and breaks.
+        let g = dom_create_element("graphic");
+        set_attribute(&g, "data-src", "https://example.com/img.png");
+        let out = handle_image(&g).expect("valid data-src → Some");
+        assert_eq!(
+            get_attribute(&out, "src").as_deref(),
+            Some("https://example.com/img.png")
+        );
+    }
+
+    #[test]
+    fn handle_image_scans_data_src_variants_via_for_else() {
+        // <graphic data-src-large="https://example.com/img.png"/> — neither
+        // data-src nor src is set, so the for..else fallback scans every attr
+        // starting with "data-src".
+        let g = dom_create_element("graphic");
+        set_attribute(&g, "data-src-large", "https://example.com/img.png");
+        let out = handle_image(&g).expect("data-src variant → Some");
+        assert_eq!(
+            get_attribute(&out, "src").as_deref(),
+            Some("https://example.com/img.png")
+        );
+    }
+
+    #[test]
+    fn handle_image_copies_alt_and_title() {
+        let g = dom_create_element("graphic");
+        set_attribute(&g, "src", "https://example.com/img.png");
+        set_attribute(&g, "alt", "an image");
+        set_attribute(&g, "title", "title text");
+        let out = handle_image(&g).expect("valid → Some");
+        assert_eq!(get_attribute(&out, "alt").as_deref(), Some("an image"));
+        assert_eq!(get_attribute(&out, "title").as_deref(), Some("title text"));
+    }
+
+    #[test]
+    fn handle_image_returns_none_when_no_src() {
+        // <graphic alt="x"/> — no src/data-src present, so the bail at line
+        // 471 fires.
+        let g = dom_create_element("graphic");
+        set_attribute(&g, "alt", "x");
+        assert!(handle_image(&g).is_none());
+    }
+
+    #[test]
+    fn handle_image_rewrites_protocol_relative_url() {
+        // <graphic src="//cdn.example.com/img.png"/> — main_extractor.py:476-477
+        // rewrites `^//` → `http://`.
+        let g = dom_create_element("graphic");
+        set_attribute(&g, "src", "//cdn.example.com/img.png");
+        let out = handle_image(&g).expect("valid → Some");
+        assert_eq!(
+            get_attribute(&out, "src").as_deref(),
+            Some("http://cdn.example.com/img.png")
+        );
+    }
+
+    #[test]
+    fn handle_image_does_not_rewrite_relative_src() {
+        // <graphic src="/relative.png"/> — re.sub(r"^//", ...) doesn't match,
+        // so the src is unchanged.
+        let g = dom_create_element("graphic");
+        set_attribute(&g, "src", "/relative.png");
+        let out = handle_image(&g).expect("valid → Some");
+        assert_eq!(
+            get_attribute(&out, "src").as_deref(),
+            Some("/relative.png"),
+            "single-slash relative URL unchanged"
+        );
     }
 }
