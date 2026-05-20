@@ -458,7 +458,23 @@ name = "mdrcel"
 # byte-equivalence to Python's `extract_content` output (Stage 3-B will
 # add that with a fresh Python oracle mode). Per semver PATCH: a new
 # test file with no production-code change.
-version = "0.4.14"
+#
+# M3 Stage 3-B (2026-05-20): 0.4.14 -> 0.4.15 PATCH. Adds the byte-meaningful
+# `extract_content` equivalence BLOCKER gate
+# (`tests/trafilatura_extract_content_gate.rs`) plus its Python-side
+# oracle mode (`benchmark/oracles/trafilatura/run.py --extract-content`).
+# Where Stage 3-A's smoke gate only asserts the pipeline returns *something*,
+# this gate asserts the Rust `extract_content` output is structurally
+# token-identical to Trafilatura's own `extract_content` via lxml. The
+# tokenizer tracks a wider attribute set than the Stage 1b gate
+# (rend/target/href/src/alt/title/role/span/class) to cover the extra
+# attribute-bearing elements `extract_content` emits (graphic/cell/etc).
+# The fixture corpus is born small (1 fixture: example.com) and grows by
+# one commit per fixture as per-fixture divergences are resolved — phased
+# rollout is operationally honest, "all 10 expected failures" is not.
+# Per semver PATCH: an additive test file + an additive Python oracle CLI
+# flag, no production-code change to the M3 surface.
+version = "0.4.15"
 edition = "2024"
 
 [dependencies]
