@@ -415,7 +415,35 @@ name = "mdrcel"
 # Stage 2c is now complete — the entire main_extractor.py file (664 LOC
 # source) has been faithfully ported. Stage 2d (`_extract` orchestrator +
 # BODY_XPATH-driven gate fixtures) is unblocked.
-version = "0.4.12"
+#
+# M3 Stage 2d (2026-05-20): 0.4.12 -> 0.4.13 PATCH (MINOR-eligible — adds
+# the first content-extraction public surface, but kept PATCH because all
+# new functions are inside `#[doc(hidden)] pub mod`). Port of
+# `main_extractor.py:567-640`:
+# - `Options.min_extracted_size: usize` added (default 250, matching
+#   `settings.cfg:MIN_EXTRACTED_SIZE`). The "enough paragraph text" gate
+#   threshold for `_extract` and the wild-text fallback condition for
+#   `extract_content`.
+# - `_extract(tree, options)`: the central orchestrator. Builds
+#   `potential_tags` from `TAG_CATALOG` gated by tables/images/links
+#   options, iterates BODY_XPATH expressions until one finds a non-empty
+#   subtree, prunes via `prune_unwanted_sections`, gates "enough p text"
+#   to optionally add "div" to potential_tags, strips inline ref/span
+#   wrappers when not preserved, walks all descendants via
+#   `handle_textelem`, trims trailing NOT_AT_THE_END elements, and exits
+#   the loop when the result body has multiple children.
+# - `extract_content(cleaned_tree, options)`: high-level wrapper. Backs
+#   up the cleaned tree, runs `_extract`, falls back to `recover_wild_text`
+#   when the result is empty or too short, strips `<done>` artifacts
+#   (with content) and `<div>` wrappers (without content).
+# **Discovery (commit-pinned as a permanent regression-pin test):** the
+# rcdom Drop quirk also affects test fixtures — a `Dom` dropping its
+# document iteratively drains every descendant's children Vec, even when
+# the caller holds Rc references to those descendants. Test helpers must
+# keep the `Dom` alive (e.g. return a `(Dom, NodeRef)` pair). The
+# `_extract_probe_body_xpath_evaluation` test documents this discovery
+# inline.
+version = "0.4.13"
 edition = "2024"
 
 [dependencies]

@@ -96,6 +96,11 @@ pub struct Options {
     ///   all `<p>` elements, restore from the backup
     ///   (htmlprocessing.py:67-73).
     pub focus: Focus,
+    /// `Extractor.min_extracted_size` (settings.cfg:26 = `MIN_EXTRACTED_SIZE`,
+    /// default `250`). Threshold for `_extract`'s "enough paragraph text"
+    /// gate (`main_extractor.py:594`) and `extract_content`'s wild-text
+    /// fallback (`main_extractor.py:633`). Stage 2d.
+    pub min_extracted_size: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +119,7 @@ impl Default for Options {
             links: false,
             formatting: false,
             focus: Focus::Balanced,
+            min_extracted_size: 250,
         }
     }
 }

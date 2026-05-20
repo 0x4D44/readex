@@ -1473,6 +1473,244 @@ pub fn recover_wild_text(
 }
 
 // ===========================================================================
+// _extract (main_extractor.py:567-617) — Stage 2d
+// ===========================================================================
+
+/// `_extract(tree, options)` — `main_extractor.py:567-617`.
+///
+/// The main extraction orchestrator. Builds the `potential_tags` set from
+/// `options`, then iterates BODY_XPATH expressions until one finds a
+/// non-empty subtree, prunes it, dispatches each descendant through
+/// `handle_textelem`, and accumulates survivors into a fresh `<body>`.
+///
+/// Returns `(result_body, temp_text, potential_tags)`.
+///
+/// # Python original
+///
+/// See the module-level `_extract` (lines 567-617). The active body:
+///
+/// 1. Build `potential_tags` from TAG_CATALOG, gated by tables/images/links.
+/// 2. For each `BODY_XPATH` expression:
+///    - Find the first non-None match in `tree`.
+///    - Prune it via `prune_unwanted_sections`.
+///    - Skip if the pruned tree has no element children.
+///    - Compute `ptest = subtree.xpath('//p//text()')` (descendant text
+///      nodes under `<p>`). If `ptest` is empty OR the joined length is
+///      below `min_extracted_size * factor`, ADD `"div"` to potential_tags
+///      (a recall booster — division-class blocks become harvestable).
+///      `factor = 1` for precision, `3` otherwise.
+///    - Strip `<ref>` / `<span>` when not in potential_tags.
+///    - Build `subelems = subtree.xpath('.//*')` (all descendants).
+///    - Special case: if every descendant has tag "lb", use `[subtree]`
+///      instead so handle_textelem dispatches the lb-containing container.
+///    - Dispatch every elem through handle_textelem; append non-None
+///      results to result_body.
+///    - Trim trailing NOT_AT_THE_END elements (`<head>`/`<ref>`) via
+///      `delete_element(_, keep_tail=False)`.
+///    - Exit the BODY_XPATH loop early if `len(result_body) > 1`.
+/// 3. Compute `temp_text = ' '.join(result_body.itertext()).strip()`.
+///
+/// # Faithfulness notes
+///
+/// 1. The `next(...)` (line 580) takes the FIRST element from
+///    `expr(tree)`. Our XPath engine returns a Vec; `first().cloned()`
+///    has identical semantics for tree-ordered results.
+/// 2. `factor = 3` for non-precision means the `min_extracted_size`
+///    threshold becomes 750 chars by default — quite high. This is the
+///    "rescue gate" that pulls `<div>` into `potential_tags` when the
+///    primary BODY_XPATH match doesn't have enough paragraph text.
+/// 3. `len(subtree) == 0` (line 586) — element-child count.
+/// 4. The text-node string extraction reads each Text node's `.data`
+///    field. Our `xpath_engine::evaluate` returns Text nodes via the
+///    text() axis, and `data` is accessible via the NodeData::Text arm.
+pub fn _extract(tree: &NodeRef, options: &Options) -> (NodeRef, String, HashSet<String>) {
+    use crate::trafilatura::cleaning::Focus;
+    use crate::trafilatura::xpath_engine;
+    use crate::trafilatura::xpaths_constants::BODY_XPATH;
+
+    // main_extractor.py:569-575 — build potential_tags.
+    let mut potential_tags: HashSet<String> =
+        TAG_CATALOG.iter().map(|s| s.to_string()).collect();
+    if options.tables {
+        for t in ["table", "td", "th", "tr"] {
+            potential_tags.insert(t.to_string());
+        }
+    }
+    if options.images {
+        potential_tags.insert("graphic".to_string());
+    }
+    if options.links {
+        potential_tags.insert("ref".to_string());
+    }
+
+    // main_extractor.py:576 — fresh <body>.
+    let result_body = create_element("body");
+
+    // main_extractor.py:578 — iterate BODY_XPATH.
+    for expr in BODY_XPATH {
+        // main_extractor.py:580 — first non-None match.
+        let matches = xpath_engine::evaluate(expr, tree).unwrap_or_default();
+        let Some(subtree) = matches.into_iter().next() else {
+            continue;
+        };
+
+        // main_extractor.py:584 — prune.
+        let subtree = prune_unwanted_sections(&subtree, &potential_tags, options);
+
+        // main_extractor.py:586-587 — skip empty.
+        if element_child_count(&subtree) == 0 {
+            continue;
+        }
+
+        // main_extractor.py:589 — ptest = subtree.xpath('//p//text()').
+        // Use ".//p//text()" (descendant-relative) instead of "//p//text()"
+        // (absolute, root-relative) to match the document's <p> elements
+        // anchored at the subtree's root.
+        let ptest =
+            xpath_engine::evaluate(".//p//text()", &subtree).unwrap_or_default();
+        let factor: usize = if options.focus == Focus::Precision {
+            1
+        } else {
+            3
+        };
+        // main_extractor.py:594 — Python's `''.join(ptest)` joins all
+        // Text-node data values into one string. Our Rust port reads each
+        // node's NodeData::Text contents.
+        let ptest_total_len: usize = ptest
+            .iter()
+            .filter_map(|n| match &n.data {
+                NodeData::Text { contents } => Some(contents.borrow().chars().count()),
+                _ => None,
+            })
+            .sum();
+        if ptest.is_empty() || ptest_total_len < options.min_extracted_size * factor {
+            potential_tags.insert("div".to_string());
+        }
+
+        // main_extractor.py:597-600 — strip ref/span when not in potential_tags.
+        if !potential_tags.contains("ref") {
+            strip_tags_multi(&subtree, &["ref"]);
+        }
+        if !potential_tags.contains("span") {
+            strip_tags_multi(&subtree, &["span"]);
+        }
+
+        // main_extractor.py:603 — subelems = subtree.xpath('.//*').
+        let mut subelems = get_elements_by_tag_name(&subtree, "*");
+
+        // main_extractor.py:605-606 — special case: only-lb shape.
+        let only_lb = !subelems.is_empty()
+            && subelems
+                .iter()
+                .all(|e| local_name(e).as_deref() == Some("lb"));
+        if only_lb {
+            subelems = vec![subtree.clone()];
+        }
+
+        // main_extractor.py:608 — handle_textelem dispatch + append.
+        for e in subelems {
+            if let Some(new_elem) = handle_textelem(&e, &potential_tags, options) {
+                append_child(&result_body, &new_elem);
+            }
+        }
+
+        // main_extractor.py:610-611 — trim trailing NOT_AT_THE_END.
+        loop {
+            let kids = element_children(&result_body);
+            let Some(last) = kids.last() else { break };
+            let last_tag = local_name(last).unwrap_or_default();
+            if !NOT_AT_THE_END.contains(&last_tag.as_str()) {
+                break;
+            }
+            set_tail(last, None);
+            crate::readability::dom::remove(last);
+        }
+
+        // main_extractor.py:613-615 — exit if result has >1 children.
+        if element_child_count(&result_body) > 1 {
+            break;
+        }
+    }
+
+    // main_extractor.py:616 — temp_text = ' '.join(result_body.itertext()).strip().
+    let texts = itertext(&result_body);
+    let temp_text = texts.join(" ").trim().to_string();
+
+    (result_body, temp_text, potential_tags)
+}
+
+// ===========================================================================
+// extract_content (main_extractor.py:620-640) — Stage 2d
+// ===========================================================================
+
+/// `extract_content(cleaned_tree, options)` — `main_extractor.py:620-640`.
+///
+/// High-level extraction wrapper: backs up the cleaned tree, runs
+/// `_extract`, falls back to `recover_wild_text` when nothing or too
+/// little came out, then strips `<done>` artifacts (with content) and
+/// `<div>` wrappers (preserving inline content), and returns
+/// `(result_body, temp_text, len(temp_text))`.
+///
+/// # Python original
+///
+/// ```python
+/// def extract_content(cleaned_tree, options) -> Tuple[_Element, str, int]:
+///     backup_tree = deepcopy(cleaned_tree)
+///     result_body, temp_text, potential_tags = _extract(cleaned_tree, options)
+///     if len(result_body) == 0 or len(temp_text) < options.min_extracted_size:
+///         result_body = recover_wild_text(backup_tree, result_body, options, potential_tags)
+///         temp_text = ' '.join(result_body.itertext()).strip()
+///     strip_elements(result_body, 'done')
+///     strip_tags(result_body, 'div')
+///     return result_body, temp_text, len(temp_text)
+/// ```
+///
+/// # Faithfulness notes
+///
+/// 1. `deepcopy(cleaned_tree)` (line 625) — pre-prune backup. Use
+///    `dom::deep_clone` (Stage 2c-i facade).
+/// 2. `strip_elements(result_body, 'done')` (line 637) — removes every
+///    `<done>` descendant AND its subtree, AND drops the tail Text-run
+///    that follows (Python's `with_tail=False` is the default for
+///    `etree.strip_elements`). Our 2-step pattern: snapshot via
+///    `get_elements_by_tag_name`, then `set_tail(None) + dom::remove`.
+/// 3. `strip_tags(result_body, 'div')` (line 638) — DIFFERENT semantic:
+///    removes only the `<div>` WRAPPER, preserving its children and
+///    tail. Maps to `cleaning::strip_tags_multi(result_body, &["div"])`.
+pub fn extract_content(cleaned_tree: &NodeRef, options: &Options) -> (NodeRef, String, usize) {
+    // main_extractor.py:625 — backup.
+    let backup_tree = deep_clone(cleaned_tree);
+
+    // main_extractor.py:627 — _extract.
+    let (result_body, mut temp_text, potential_tags) = _extract(cleaned_tree, options);
+
+    // main_extractor.py:633-635 — wild-text fallback.
+    let result_body = if element_child_count(&result_body) == 0
+        || temp_text.chars().count() < options.min_extracted_size
+    {
+        let rb = recover_wild_text(&backup_tree, &result_body, options, &potential_tags);
+        let texts = itertext(&rb);
+        temp_text = texts.join(" ").trim().to_string();
+        rb
+    } else {
+        result_body
+    };
+
+    // main_extractor.py:637 — strip_elements(result_body, 'done').
+    let dones = get_elements_by_tag_name(&result_body, "done");
+    for d in dones {
+        set_tail(&d, None);
+        crate::readability::dom::remove(&d);
+    }
+
+    // main_extractor.py:638 — strip_tags(result_body, 'div').
+    strip_tags_multi(&result_body, &["div"]);
+
+    let temp_text_len = temp_text.chars().count();
+    (result_body, temp_text, temp_text_len)
+}
+
+// ===========================================================================
 // handle_titles (main_extractor.py:43-66)
 // ===========================================================================
 
@@ -3262,5 +3500,111 @@ mod tests {
         let opts = Options::default();
         let _ = recover_wild_text(&body, &result_body, &opts, &pot);
         assert_eq!(element_child_count(&result_body), 0, "no recoveries");
+    }
+
+    // -------------------------------------------------------------------
+    // Stage 2d — _extract (main_extractor.py:567-617)
+    // -------------------------------------------------------------------
+
+    /// Parse `html` into a `(Dom, body)` pair. The `Dom` MUST be kept alive
+    /// for the duration of any test that uses `body` — rcdom's iterative
+    /// `impl Drop for Node` (markup5ever_rcdom-0.39.0/lib.rs:268-284)
+    /// drains every descendant's children Vec on doc-drop, even when the
+    /// caller holds Rc references to those descendants. Returning the Dom
+    /// keeps it pinned. (See identical-shape rcdom Drop pin in
+    /// `handle_table`'s `dones_alive` Vec.)
+    fn parse_body(
+        html: &str,
+    ) -> (
+        crate::readability::dom::Dom,
+        crate::readability::dom::NodeRef,
+    ) {
+        let d = crate::readability::dom::Dom::parse(html);
+        let body = d.body().expect("html input has <body>");
+        (d, body)
+    }
+
+    #[test]
+    fn _extract_returns_empty_body_for_no_content() {
+        // <body><script>x</script></body> — no BODY_XPATH match yields content.
+        let (_d, body) = parse_body("<html><body><script>x</script></body></html>");
+        let opts = Options::default();
+        let (result_body, temp_text, _pot) = _extract(&body, &opts);
+        assert_eq!(local_name(&result_body).as_deref(), Some("body"));
+        assert_eq!(element_child_count(&result_body), 0, "no content extracted");
+        assert!(temp_text.is_empty(), "no text extracted");
+    }
+
+    #[test]
+    fn _extract_finds_article_paragraphs() {
+        // <article><p>...</p></article> — BODY_XPATH[1] = `(.//article)[1]`
+        // matches. We expect either a paragraph in result_body OR the
+        // extracted text to contain the body paragraph.
+        let (_d, body) = parse_body(
+            "<html><body><article><p>The quick brown fox jumps over the lazy dog.</p></article></body></html>",
+        );
+        let opts = Options::default();
+        let (result_body, temp_text, _pot) = _extract(&body, &opts);
+        assert!(
+            element_child_count(&result_body) > 0 || temp_text.contains("quick brown fox"),
+            "extraction produced output: children={}, text={temp_text:?}",
+            element_child_count(&result_body)
+        );
+    }
+
+    #[test]
+    fn _extract_populates_potential_tags_from_options() {
+        // With tables/images/links=true, potential_tags should include
+        // table/td/th/tr/graphic/ref.
+        let (_d, body) = parse_body("<html><body><article><p>x</p></article></body></html>");
+        let opts = Options {
+            tables: true,
+            images: true,
+            links: true,
+            ..Options::default()
+        };
+        let (_rb, _tt, pot) = _extract(&body, &opts);
+        assert!(pot.contains("table"));
+        assert!(pot.contains("td"));
+        assert!(pot.contains("th"));
+        assert!(pot.contains("tr"));
+        assert!(pot.contains("graphic"));
+        assert!(pot.contains("ref"));
+    }
+
+    // -------------------------------------------------------------------
+    // Stage 2d — extract_content (main_extractor.py:620-640)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn extract_content_returns_body_text_and_length_for_article() {
+        // A long article paragraph that should survive _extract or
+        // recover_wild_text fallback.
+        let (_d, body) = parse_body(
+            "<html><body><article><p>The quick brown fox jumps over the lazy dog. This is a longer paragraph that should easily exceed the minimum extracted size threshold to ensure the extractor returns meaningful results without triggering the wild-text fallback path. We need at least 250 characters of content here so that the assertion holds reliably across runs in autonomous mode.</p></article></body></html>",
+        );
+        let opts = Options::default();
+        let (result_body, text, len) = extract_content(&body, &opts);
+        assert_eq!(local_name(&result_body).as_deref(), Some("body"));
+        assert!(
+            text.contains("quick brown fox"),
+            "text extracted: {text:?}"
+        );
+        assert_eq!(len, text.chars().count(), "len matches text length");
+    }
+
+    #[test]
+    fn extract_content_strips_done_elements_with_content() {
+        // After extract_content, no <done> elements should remain
+        // (strip_elements(_, 'done') cleanup at main_extractor.py:637).
+        let (_d, body) = parse_body(
+            "<html><body><article><p>A paragraph long enough to survive any minimum-size gates the orchestrator might apply, with several sentences of plausible body text to keep the extractor happy and avoid the wild-text fallback path entirely for testing purposes.</p></article></body></html>",
+        );
+        let opts = Options::default();
+        let (result_body, _t, _l) = extract_content(&body, &opts);
+        assert!(
+            get_elements_by_tag_name(&result_body, "done").is_empty(),
+            "no <done> elements in output"
+        );
     }
 }
