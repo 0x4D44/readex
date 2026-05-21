@@ -936,6 +936,297 @@ fn python_repr_list(items: &[String]) -> String {
 }
 
 // ===========================================================================
+// build_json_output (xml.py:115-134)
+// ===========================================================================
+
+/// `xml.py:115-134` — `build_json_output(docmeta, with_metadata=True) -> str`.
+///
+/// Serialises `Document` + optional metadata into a JSON string.
+///
+/// # `with_metadata=true` branch (`xml.py:117-127`)
+///
+/// Python: builds `outputdict = {slot: getattr(docmeta, slot, None) for slot
+/// in docmeta.__slots__}` (21 slots from `settings.py:209-232`), then runs
+/// `.update({...})` which renames-via-pop: `url`→`source`, `sitename`→
+/// `source-hostname`, `description`→`excerpt`, `categories`→
+/// `';'.join(categories or [])` (string), `tags`→`';'.join(tags or [])`
+/// (string), `body`→`text` (via `xmltotxt(body, include_formatting=False)`).
+/// Pops `commentsbody` and re-anchors as `comments` via `xmltotxt(commentsbody,
+/// include_formatting=False)` (this OVERWRITES the slot-derived `comments`
+/// key, since the slot is `Optional[str]`).
+///
+/// Final key order (insertion-preserving): `title`, `author`, `hostname`,
+/// `date`, `fingerprint`, `id`, `license`, `comments`, `raw_text`, `text`,
+/// `language`, `image`, `pagetype`, `filedate`, `source`, `source-hostname`,
+/// `excerpt`, `categories`, `tags` — 19 keys.
+///
+/// # `with_metadata=false` branch (`xml.py:128-130`)
+///
+/// Python: `outputdict = {'text': xmltotxt(docmeta.body, ...)}` then
+/// `outputdict['comments'] = xmltotxt(commentsbody, ...)`. Two keys:
+/// `text`, `comments`.
+///
+/// # Field availability divergence (recorded honestly)
+///
+/// `Metadata` does not carry `fingerprint`/`id`/`filedate` (M4 Stage 6 deferred).
+/// Following the `build_yaml_header` precedent (Stage 3-B), these render as
+/// JSON `null` — matching Python's behaviour on a pre-`set_id` /
+/// pre-`content_fingerprint` `Document` whose slots default to `None`.
+///
+/// # Ordering preservation
+///
+/// `serde_json::Map` is backed by `BTreeMap` by default (alphabetical key
+/// order on serialisation). We hand-render the JSON to preserve Python's
+/// insertion order — faithful to `json.dumps(outputdict, ensure_ascii=False)`
+/// (Python `dict` insertion order since 3.7).
+pub(crate) fn build_json_output(doc: &Document, with_metadata: bool) -> String {
+    // xml.py:132 — comments are derived from `xmltotxt(commentsbody,
+    // include_formatting=False)` regardless of branch.
+    let comments_text = xmltotxt(doc.commentsbody.as_ref(), false);
+    // xml.py:125/129 — body text via xmltotxt with include_formatting=false.
+    let body_text = xmltotxt(Some(&doc.body), false);
+
+    if !with_metadata {
+        // xml.py:128-130 — body-only branch. Two keys, hand-rendered to
+        // preserve insertion order: text, comments.
+        let mut out = String::from("{");
+        out.push_str(&format!("\"text\": {}, ", json_str(&body_text)));
+        out.push_str(&format!("\"comments\": {}", json_str(&comments_text)));
+        out.push('}');
+        return out;
+    }
+
+    // xml.py:117-127 — full metadata branch. 19 keys in Python insertion
+    // order (see function docstring above).
+    let md = &doc.metadata;
+    let mut out = String::from("{");
+
+    let pairs: [(&str, String); 19] = [
+        // 1. title
+        ("title", json_optional_str(md.title.as_deref())),
+        // 2. author
+        ("author", json_optional_str(md.author.as_deref())),
+        // 3. hostname
+        ("hostname", json_optional_str(md.hostname.as_deref())),
+        // 4. date
+        ("date", json_optional_str(md.date.as_deref())),
+        // 5. fingerprint — Metadata does not carry this (Stage 6 deferred);
+        //    Python's `Document.fingerprint` defaults to `None` pre-set_id.
+        ("fingerprint", "null".to_string()),
+        // 6. id — same as fingerprint.
+        ("id", "null".to_string()),
+        // 7. license
+        ("license", json_optional_str(md.license.as_deref())),
+        // 8. comments (overwritten by xmltotxt(commentsbody))
+        ("comments", json_str(&comments_text)),
+        // 9. raw_text — from Document, not Metadata.
+        (
+            "raw_text",
+            if doc.raw_text.is_empty() {
+                "null".to_string()
+            } else {
+                json_str(&doc.raw_text)
+            },
+        ),
+        // 10. text (xmltotxt(body))
+        ("text", json_str(&body_text)),
+        // 11. language
+        ("language", json_optional_str(md.language.as_deref())),
+        // 12. image
+        ("image", json_optional_str(md.image.as_deref())),
+        // 13. pagetype
+        ("pagetype", json_optional_str(md.pagetype.as_deref())),
+        // 14. filedate — Metadata does not carry this; Python default None.
+        ("filedate", "null".to_string()),
+        // 15. source (popped from `url`)
+        ("source", json_optional_str(md.url.as_deref())),
+        // 16. source-hostname (popped from `sitename`)
+        (
+            "source-hostname",
+            json_optional_str(md.site_name.as_deref()),
+        ),
+        // 17. excerpt (popped from `description`)
+        ("excerpt", json_optional_str(md.description.as_deref())),
+        // 18. categories — `';'.join(categories or [])` (string, not list).
+        ("categories", json_str(&md.categories.join(";"))),
+        // 19. tags — `';'.join(tags or [])` (string, not list).
+        ("tags", json_str(&md.tags.join(";"))),
+    ];
+
+    for (i, (k, v)) in pairs.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&format!("\"{k}\": {v}"));
+    }
+    out.push('}');
+    out
+}
+
+/// Render an `Option<&str>` as a JSON string or `null` (Python `None` →
+/// `null` per `json.dumps`).
+fn json_optional_str(v: Option<&str>) -> String {
+    match v {
+        Some(s) => json_str(s),
+        None => "null".to_string(),
+    }
+}
+
+/// Render a `&str` as a JSON string literal. Delegates to `serde_json` for
+/// faithful escaping (`\n`, `\t`, `\"`, `\\`, `\u00XX` for control chars,
+/// non-ASCII passes through verbatim — matching Python's
+/// `json.dumps(..., ensure_ascii=False)` at `xml.py:134`).
+fn json_str(s: &str) -> String {
+    serde_json::Value::String(s.to_string()).to_string()
+}
+
+// ===========================================================================
+// xmltocsv (xml.py:366-390)
+// ===========================================================================
+
+/// `xml.py:366-390` — `xmltocsv(document, include_formatting, *, delim="\t",
+/// null="null") -> str`.
+///
+/// Emits ONE data row (Python `outputwriter.writerow([...])`); the caller
+/// supplies the optional header row separately. The Stage 3-C public surface
+/// `extract_to_csv` emits header + data row (see [`extract_to_csv`] note).
+///
+/// # Column order (xml.py:377-389)
+///
+/// 11 columns, in exactly this order:
+/// 1. `url` (Document.url)
+/// 2. `id` (Document.id)
+/// 3. `fingerprint` (Document.fingerprint)
+/// 4. `hostname` (Document.hostname)
+/// 5. `title` (Document.title)
+/// 6. `image` (Document.image)
+/// 7. `date` (Document.date)
+/// 8. `text` (xmltotxt(body, include_formatting) OR `null` when empty)
+/// 9. `comments` (xmltotxt(commentsbody, include_formatting) OR `null`
+///    when empty)
+/// 10. `license` (Document.license)
+/// 11. `pagetype` (Document.pagetype)
+///
+/// Python writes `d if d else null` for every field (`xml.py:377`) — empty
+/// strings, `None`, and missing values render as the `null` parameter.
+///
+/// # CSV quoting (xml.py:374)
+///
+/// Python uses `csv.QUOTE_MINIMAL`: quote a field only when it contains the
+/// delimiter, a `"`, a `\r`, or a `\n`. Quoted fields double-up internal
+/// `"` characters. No CSV-crate dep is used — this is a hand-roll faithful
+/// to Python's stdlib behaviour.
+pub(crate) fn xmltocsv(
+    doc: &Document,
+    include_formatting: bool,
+    delim: &str,
+    null: &str,
+) -> String {
+    // xml.py:369-370 — body / comments text via xmltotxt, falling back to
+    // the `null` token when empty.
+    let body_text = xmltotxt(Some(&doc.body), include_formatting);
+    let posttext = if body_text.is_empty() { null.to_string() } else { body_text };
+    let comments_text = xmltotxt(doc.commentsbody.as_ref(), include_formatting);
+    let commentstext = if comments_text.is_empty() {
+        null.to_string()
+    } else {
+        comments_text
+    };
+
+    let md = &doc.metadata;
+    // xml.py:378-388 — column order, with `d if d else null` for each.
+    let columns: [String; 11] = [
+        csv_or_null(md.url.as_deref(), null),       // 1. url
+        csv_or_null(None, null),                    // 2. id (Metadata lacks)
+        csv_or_null(None, null),                    // 3. fingerprint (lacks)
+        csv_or_null(md.hostname.as_deref(), null),  // 4. hostname
+        csv_or_null(md.title.as_deref(), null),     // 5. title
+        csv_or_null(md.image.as_deref(), null),     // 6. image
+        csv_or_null(md.date.as_deref(), null),      // 7. date
+        posttext,                                   // 8. text
+        commentstext,                               // 9. comments
+        csv_or_null(md.license.as_deref(), null),   // 10. license
+        csv_or_null(md.pagetype.as_deref(), null),  // 11. pagetype
+    ];
+
+    let mut row = String::new();
+    for (i, col) in columns.iter().enumerate() {
+        if i > 0 {
+            row.push_str(delim);
+        }
+        row.push_str(&csv_quote_minimal(col, delim));
+    }
+    // Python's csv.writer terminates rows with `\r\n` per
+    // `csv.writer(..., lineterminator='\r\n')` default. Match that.
+    row.push_str("\r\n");
+    row
+}
+
+/// Returns `null` when the value is `None` or empty (Python `d if d else
+/// null` — empty strings are falsy), else the value as a String.
+fn csv_or_null(v: Option<&str>, null: &str) -> String {
+    match v {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => null.to_string(),
+    }
+}
+
+/// Faithful subset of Python `csv.writer`'s `QUOTE_MINIMAL` rule: quote the
+/// field when it contains the delimiter, a `"`, `\r`, or `\n`. Inside a
+/// quoted field, double-up `"` characters.
+fn csv_quote_minimal(field: &str, delim: &str) -> String {
+    let needs_quote = field.contains(delim)
+        || field.contains('"')
+        || field.contains('\r')
+        || field.contains('\n');
+    if !needs_quote {
+        return field.to_string();
+    }
+    let mut out = String::with_capacity(field.len() + 2);
+    out.push('"');
+    for c in field.chars() {
+        if c == '"' {
+            out.push('"');
+            out.push('"');
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// The 11-column CSV header row (column names matching [`xmltocsv`]'s
+/// column order). Emitted by the public `extract_to_csv` once per call
+/// to match a "headers + one data row" expectation; Python's `xmltocsv`
+/// emits only the data row (Python callers prepend headers themselves
+/// or use pandas / csv.DictWriter for header emission).
+pub(crate) fn csv_header_row(delim: &str) -> String {
+    let cols = [
+        "url",
+        "id",
+        "fingerprint",
+        "hostname",
+        "title",
+        "image",
+        "date",
+        "text",
+        "comments",
+        "license",
+        "pagetype",
+    ];
+    let mut out = String::new();
+    for (i, c) in cols.iter().enumerate() {
+        if i > 0 {
+            out.push_str(delim);
+        }
+        out.push_str(c);
+    }
+    out.push_str("\r\n");
+    out
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -1495,5 +1786,97 @@ mod tests {
         };
         assert!(doc.commentsbody.is_some());
         assert_eq!(doc.raw_text, "raw");
+    }
+
+    // -------------------------------------------------------------------
+    // build_json_output (xml.py:115-134) — sub-stage C
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn build_json_output_with_comments_serialises_commentsbody() {
+        // Body has "hello", commentsbody has "a comment".
+        let body = create_element("body");
+        let p_body = create_element("p");
+        append_child(&p_body, &create_text_node("hello world"));
+        append_child(&body, &p_body);
+
+        let commentsbody = create_element("body");
+        let p_com = create_element("p");
+        append_child(&p_com, &create_text_node("a comment"));
+        append_child(&commentsbody, &p_com);
+
+        let doc = Document {
+            metadata: Metadata::default(),
+            body,
+            commentsbody: Some(commentsbody),
+            raw_text: String::new(),
+        };
+        let out = build_json_output(&doc, false);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("parse");
+        assert!(v["text"].as_str().unwrap().contains("hello world"));
+        assert!(v["comments"].as_str().unwrap().contains("a comment"));
+    }
+
+    #[test]
+    fn build_json_output_with_metadata_renders_categories_and_tags_as_joined_strings() {
+        // Python: `';'.join(categories or [])` — categories render as a
+        // semicolon-joined string, NOT a list.
+        let md = Metadata {
+            categories: vec!["catA".to_string(), "catB".to_string()],
+            tags: vec!["tagA".to_string(), "tagB".to_string()],
+            ..Metadata::default()
+        };
+        let doc = Document {
+            metadata: md,
+            body: create_element("body"),
+            commentsbody: None,
+            raw_text: String::new(),
+        };
+        let out = build_json_output(&doc, true);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("parse");
+        assert_eq!(v["categories"].as_str(), Some("catA;catB"));
+        assert_eq!(v["tags"].as_str(), Some("tagA;tagB"));
+    }
+
+    // -------------------------------------------------------------------
+    // xmltocsv (xml.py:366-390) — sub-stage C
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn xmltocsv_uses_null_token_for_empty_body() {
+        // No body content + no metadata → text + comments columns are "null".
+        let doc = Document {
+            metadata: Metadata::default(),
+            body: create_element("body"),
+            commentsbody: None,
+            raw_text: String::new(),
+        };
+        let row = xmltocsv(&doc, false, "\t", "null");
+        let cols: Vec<&str> = row.trim_end_matches("\r\n").split('\t').collect();
+        // Column 8 (index 7) is text; column 9 (index 8) is comments.
+        assert_eq!(cols[7], "null", "text col must be null");
+        assert_eq!(cols[8], "null", "comments col must be null");
+    }
+
+    #[test]
+    fn xmltocsv_custom_delimiter_and_null_token() {
+        let doc = Document {
+            metadata: Metadata::default(),
+            body: create_element("body"),
+            commentsbody: None,
+            raw_text: String::new(),
+        };
+        let row = xmltocsv(&doc, false, ",", "N/A");
+        // 11 columns, all "N/A", comma-delimited.
+        assert!(row.starts_with("N/A,N/A,N/A"), "got: {row:?}");
+        assert!(row.contains("N/A,N/A\r\n"), "ends with N/A row");
+    }
+
+    #[test]
+    fn csv_header_row_matches_python_column_order() {
+        let h = csv_header_row("\t");
+        let expected =
+            "url\tid\tfingerprint\thostname\ttitle\timage\tdate\ttext\tcomments\tlicense\tpagetype\r\n";
+        assert_eq!(h, expected);
     }
 }

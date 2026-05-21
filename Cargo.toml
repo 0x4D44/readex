@@ -2458,7 +2458,22 @@ name = "mdrcel"
 # on a fresh-extraction `Document` (whose `fingerprint`/`id` are the
 # pre-`set_id`/`pre-content_fingerprint` defaults — empty / None at this
 # pipeline stage).
-version = "0.13.0"
+# M4 Stage 3 sub-stage C (2026-05-21): 0.13.0 -> 0.13.1 PATCH. Additive — extends
+# the new output-format surface with two more public formatters:
+# `extract_to_json` (Python `extract(output_format="json")` per `xml.py:115-134`
+# `build_json_output`) and `extract_to_csv` (Python `extract(output_format="csv")`
+# per `xml.py:366-390` `xmltocsv`). Both consume the same Stage 3-A `output`
+# helpers (xmltotxt + Document) and the same metadata/cleaning cascade as
+# `extract_to_markdown` (Stage 3-B). NO new dependency: serde_json is already
+# pinned at 1.0.149 for the M2 JSON-LD path; CSV emission is hand-rolled
+# (faithful to Python `csv.writer(quoting=csv.QUOTE_MINIMAL, delimiter='\t')`).
+# JSON key ordering preserves Python's `build_json_output` insertion order
+# without the `preserve_order` feature, by hand-rendering each key in sequence.
+# `with_metadata` semantics mirror Python `core.py:67`'s
+# `build_json_output(document, options.with_metadata)` — the flag is HONORED,
+# matching the same default-false semantics `extract_to_markdown` already uses.
+# No public API removal; `Options` unchanged.
+version = "0.13.1"
 edition = "2024"
 
 [dependencies]

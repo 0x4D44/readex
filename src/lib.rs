@@ -627,6 +627,180 @@ pub fn extract_to_markdown(
     Ok(normalised)
 }
 
+/// Extract `html` and render the main content as a JSON object.
+///
+/// Equivalent to Python's `extract(html, output_format="json")` per
+/// `core.py:66-67` (`returnstring = build_json_output(document,
+/// options.with_metadata)`).
+///
+/// # `with_metadata` semantics
+///
+/// Python's `core.py:67` passes `options.with_metadata` into
+/// `build_json_output` (`xml.py:115`); `Extractor.with_metadata` defaults
+/// to `False` (`settings.py:118`). We mirror this exactly: when
+/// `opts.with_metadata` is `false` (the [`Options::default`]), the JSON
+/// is a body-only object with just `{"text": ..., "comments": ...}`
+/// (`xml.py:128-132`). When `true`, the JSON carries the full 19-key
+/// Python metadata object (`xml.py:117-127`).
+///
+/// # JSON key set
+///
+/// `with_metadata=true` emits, in Python's `dict` insertion order:
+/// `title`, `author`, `hostname`, `date`, `fingerprint`, `id`, `license`,
+/// `comments`, `raw_text`, `text`, `language`, `image`, `pagetype`,
+/// `filedate`, `source`, `source-hostname`, `excerpt`, `categories`,
+/// `tags`. `fingerprint`/`id`/`filedate` render as JSON `null` until
+/// M4 Stage 6 wires them; the rest map directly from the Trafilatura
+/// metadata pipeline.
+///
+/// # `base_url`
+///
+/// As in [`extract`] — informational only, used by the cascade for
+/// language hints and relative-URL resolution where applicable. Never
+/// fetched.
+///
+/// # Errors
+///
+/// Same shape as [`extract_with`]: only [`ExtractError::ContentTooShort`]
+/// when `opts.min_word_count > 0` and the produced body text fails the
+/// threshold. The default-`Options` path (`min_word_count == 0`) never
+/// produces an error — an empty body returns a valid JSON object
+/// (`{"text": "", "comments": ""}` with default opts).
+pub fn extract_to_json(
+    html: &str,
+    base_url: Option<&str>,
+    opts: &Options,
+) -> Result<String, ExtractError> {
+    // 1. Metadata (same as extract_to_markdown).
+    let metadata = trafilatura::metadata::extract_metadata(html, base_url, true, &[]);
+
+    // 2. Body extraction via the cascade.
+    let cleaning_opts = trafilatura::cleaning::Options {
+        url: base_url.map(|s| s.to_string()),
+        ..trafilatura::cleaning::Options::default()
+    };
+    let body_opt =
+        trafilatura::readability_fork::bare_extraction_with_cascade(html, &cleaning_opts);
+
+    // 3. Min-word-count gate. Run on the same `xmltotxt` body text the JSON
+    //    formatter emits so the threshold reflects what the consumer sees.
+    let body_text = trafilatura::output::xmltotxt(body_opt.as_ref(), false);
+    let word_count = body_text.split_whitespace().count();
+    if opts.min_word_count > 0 && word_count < opts.min_word_count {
+        let _ = body_opt;
+        return Err(ExtractError::ContentTooShort {
+            word_count,
+            threshold: opts.min_word_count,
+        });
+    }
+
+    // 4. Build the Document carrier — body MUST be non-None for the
+    //    formatter (xml.py:125's `xmltotxt(outputdict.pop('body'), ...)`
+    //    walks the element directly). Empty bodies are represented by an
+    //    empty `<body>` element so the formatter's xmltotxt returns "".
+    let body_node = body_opt.clone().unwrap_or_else(|| {
+        use crate::readability::dom::create_element;
+        create_element("body")
+    });
+    let doc = trafilatura::output::Document {
+        metadata,
+        body: body_node,
+        commentsbody: None,
+        raw_text: String::new(),
+    };
+
+    // 5. Build JSON output per xml.py:115-134.
+    let out = trafilatura::output::build_json_output(&doc, opts.with_metadata);
+
+    // Keep cascade body alive until after the formatter walks it (rcdom
+    // Drop quirk, HLD §m-3).
+    let _ = body_opt;
+    Ok(out)
+}
+
+/// Extract `html` and render the main content as CSV (or delimiter-
+/// separated values). Equivalent to Python's `extract(html,
+/// output_format="csv")` per `core.py:63-64` (`returnstring =
+/// xmltocsv(document, options.formatting)`).
+///
+/// # Output shape
+///
+/// Returns a CSV string of TWO rows: a header row (`url`, `id`,
+/// `fingerprint`, `hostname`, `title`, `image`, `date`, `text`,
+/// `comments`, `license`, `pagetype` — 11 columns) followed by ONE data
+/// row per call. Python's `xmltocsv` emits only the data row; the header
+/// is added here for ergonomic single-call use (the typical Python user
+/// either calls `csv.DictWriter` with the same column names or prepends
+/// the header manually).
+///
+/// # CSV dialect
+///
+/// Tab-delimited (`\t`) by default with Python `csv.QUOTE_MINIMAL` quoting
+/// (`xml.py:374`): fields containing the delimiter, a `"`, `\r`, or `\n`
+/// are wrapped in `"..."` with internal `"` doubled. Rows terminate with
+/// `\r\n` (Python `csv.writer` default `lineterminator`). The null token
+/// is the literal string `null` (`xml.py:366`), emitted for empty / `None`
+/// fields per Python's `d if d else null` rule.
+///
+/// # `base_url`
+///
+/// As in [`extract`] — informational only. Never fetched.
+///
+/// # Errors
+///
+/// Same shape as [`extract_with`]: only [`ExtractError::ContentTooShort`]
+/// when `opts.min_word_count > 0` and the produced body text fails the
+/// threshold. The default-`Options` path never produces an error — an
+/// empty body yields a valid CSV row with `null` in the text column.
+pub fn extract_to_csv(
+    html: &str,
+    base_url: Option<&str>,
+    opts: &Options,
+) -> Result<String, ExtractError> {
+    // 1. Metadata.
+    let metadata = trafilatura::metadata::extract_metadata(html, base_url, true, &[]);
+
+    // 2. Body extraction via the cascade.
+    let cleaning_opts = trafilatura::cleaning::Options {
+        url: base_url.map(|s| s.to_string()),
+        ..trafilatura::cleaning::Options::default()
+    };
+    let body_opt =
+        trafilatura::readability_fork::bare_extraction_with_cascade(html, &cleaning_opts);
+
+    // 3. Min-word-count gate.
+    let body_text = trafilatura::output::xmltotxt(body_opt.as_ref(), false);
+    let word_count = body_text.split_whitespace().count();
+    if opts.min_word_count > 0 && word_count < opts.min_word_count {
+        let _ = body_opt;
+        return Err(ExtractError::ContentTooShort {
+            word_count,
+            threshold: opts.min_word_count,
+        });
+    }
+
+    // 4. Build Document (empty <body> sentinel when cascade returned None).
+    let body_node = body_opt.clone().unwrap_or_else(|| {
+        use crate::readability::dom::create_element;
+        create_element("body")
+    });
+    let doc = trafilatura::output::Document {
+        metadata,
+        body: body_node,
+        commentsbody: None,
+        raw_text: String::new(),
+    };
+
+    // 5. Header + one data row. xmltocsv produces ONE row matching Python
+    //    `outputwriter.writerow([...])` (xml.py:377-389). Defaults match
+    //    Python's `delim="\t"`, `null="null"`.
+    let mut out = trafilatura::output::csv_header_row("\t");
+    out.push_str(&trafilatura::output::xmltocsv(&doc, false, "\t", "null"));
+
+    let _ = body_opt;
+    Ok(out)
+}
+
 /// Extract via the **M2 Mozilla Readability port** (the previous default).
 ///
 /// This is the pre-Stage-9 extraction path preserved verbatim. The M3
@@ -1511,6 +1685,252 @@ mod tests {
             md.contains("'alpha, beta, gamma'"),
             "tag content missing, got: {md:?}"
         );
+    }
+
+    // ====== M4 Stage 3 sub-stage C — extract_to_json + extract_to_csv tests.
+
+    const JSON_CSV_ARTICLE_HTML: &str = r#"<html><head>
+        <meta property="og:title" content="OG Title Wins">
+        <meta property="og:description" content="A brief description for OG">
+        <meta property="og:site_name" content="Example Site">
+        <meta property="article:author" content="Jane Author">
+        <link rel="canonical" href="https://example.com/canon">
+        <title>Fallback Title</title>
+        </head><body><article>
+        <p>A real readable paragraph with enough words to extract; lorem ipsum dolor
+        sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut
+        labore et dolore magna aliqua ut enim ad minim veniam quis nostrud
+        exercitation.</p>
+        </article></body></html>"#;
+
+    /// Sub-stage C JSON test #1 — basic article with with_metadata=true
+    /// returns a JSON object whose payload `text` field is non-empty.
+    #[test]
+    fn extract_to_json_with_metadata_returns_valid_json() {
+        let opts = Options {
+            with_metadata: true,
+            ..Options::default()
+        };
+        let out = extract_to_json(JSON_CSV_ARTICLE_HTML, None, &opts).expect("ok");
+        // Must be parseable JSON.
+        let v: serde_json::Value =
+            serde_json::from_str(&out).expect("output must be valid JSON");
+        assert!(v.is_object(), "expected JSON object, got {out:?}");
+        // Author and title come from the metadata pipeline.
+        assert_eq!(v["title"].as_str(), Some("OG Title Wins"));
+        assert_eq!(v["author"].as_str(), Some("Jane Author"));
+        // Text must contain the paragraph body.
+        let text = v["text"].as_str().expect("text field");
+        assert!(
+            text.contains("readable paragraph"),
+            "text missing body content, got {text:?}"
+        );
+    }
+
+    /// Sub-stage C JSON test #2 — empty body returns JSON with empty `text`.
+    #[test]
+    fn extract_to_json_empty_body_returns_empty_text() {
+        let out = extract_to_json("<html><body></body></html>", None, &Options::default())
+            .expect("ok");
+        let v: serde_json::Value =
+            serde_json::from_str(&out).expect("must be valid JSON");
+        assert_eq!(v["text"].as_str(), Some(""), "text must be empty: {out:?}");
+        assert_eq!(v["comments"].as_str(), Some(""), "comments must be empty");
+    }
+
+    /// Sub-stage C JSON test #3 — output must always be parseable.
+    #[test]
+    fn extract_to_json_is_always_parseable() {
+        for opts in [
+            Options::default(),
+            Options {
+                with_metadata: true,
+                ..Options::default()
+            },
+        ] {
+            let out =
+                extract_to_json(JSON_CSV_ARTICLE_HTML, None, &opts).expect("ok");
+            let _v: serde_json::Value = serde_json::from_str(&out)
+                .unwrap_or_else(|e| panic!("must parse: {e} — out={out:?}"));
+        }
+    }
+
+    /// Sub-stage C JSON test #4 — without metadata, output has only `text`
+    /// and `comments` keys (xml.py:128-130 body-only branch).
+    #[test]
+    fn extract_to_json_without_metadata_only_text_and_comments() {
+        let out = extract_to_json(JSON_CSV_ARTICLE_HTML, None, &Options::default())
+            .expect("ok");
+        let v: serde_json::Value =
+            serde_json::from_str(&out).expect("must parse");
+        let obj = v.as_object().expect("object");
+        let keys: Vec<&String> = obj.keys().collect();
+        assert_eq!(keys.len(), 2, "body-only branch must have 2 keys: {keys:?}");
+        assert!(obj.contains_key("text"));
+        assert!(obj.contains_key("comments"));
+    }
+
+    /// Sub-stage C JSON test #5 — with metadata, the 19 Python-spec keys are
+    /// all present in the output (key-set parity vs xml.py:117-127).
+    #[test]
+    fn extract_to_json_with_metadata_has_python_spec_key_set() {
+        let opts = Options {
+            with_metadata: true,
+            ..Options::default()
+        };
+        let out = extract_to_json(JSON_CSV_ARTICLE_HTML, None, &opts).expect("ok");
+        let v: serde_json::Value = serde_json::from_str(&out).expect("must parse");
+        let obj = v.as_object().expect("object");
+        let expected: &[&str] = &[
+            "title",
+            "author",
+            "hostname",
+            "date",
+            "fingerprint",
+            "id",
+            "license",
+            "comments",
+            "raw_text",
+            "text",
+            "language",
+            "image",
+            "pagetype",
+            "filedate",
+            "source",
+            "source-hostname",
+            "excerpt",
+            "categories",
+            "tags",
+        ];
+        for k in expected {
+            assert!(
+                obj.contains_key(*k),
+                "missing JSON key {k:?} — got keys: {:?}",
+                obj.keys().collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(obj.len(), expected.len());
+        // Source = canonical URL via metadata pipeline.
+        assert_eq!(v["source"].as_str(), Some("https://example.com/canon"));
+        assert_eq!(v["excerpt"].as_str(), Some("A brief description for OG"));
+        assert_eq!(v["source-hostname"].as_str(), Some("Example Site"));
+        // Stage-6-deferred fields render as null.
+        assert!(v["fingerprint"].is_null());
+        assert!(v["id"].is_null());
+        assert!(v["filedate"].is_null());
+    }
+
+    /// Sub-stage C CSV test #6 — output has header row + exactly ONE data row.
+    #[test]
+    fn extract_to_csv_emits_header_plus_one_row() {
+        let out = extract_to_csv(JSON_CSV_ARTICLE_HTML, None, &Options::default())
+            .expect("ok");
+        // Two CRLF-terminated lines: header + data.
+        let lines: Vec<&str> = out.split("\r\n").collect();
+        // split yields trailing empty after the final \r\n.
+        assert!(lines.len() >= 2, "expected ≥2 rows, got: {out:?}");
+        assert!(lines[0].starts_with("url\t"), "header start: {:?}", lines[0]);
+        assert!(!lines[1].is_empty(), "data row missing");
+    }
+
+    /// Sub-stage C CSV test #7 — default delimiter is TAB.
+    #[test]
+    fn extract_to_csv_is_tab_delimited_by_default() {
+        let out = extract_to_csv(JSON_CSV_ARTICLE_HTML, None, &Options::default())
+            .expect("ok");
+        // The header row has 11 columns → 10 tabs.
+        let first_line = out.split("\r\n").next().expect("first line");
+        let tab_count = first_line.matches('\t').count();
+        assert_eq!(tab_count, 10, "header tab count: {first_line:?}");
+        // No commas in the header (a comma-default would dispatch as CSV not TSV).
+        assert!(!first_line.contains(','), "must not be comma-delimited");
+    }
+
+    /// Sub-stage C CSV test #8 — empty fields render as the `null` token.
+    #[test]
+    fn extract_to_csv_renders_null_for_empty_fields() {
+        // Minimal HTML with no metadata → most fields will be empty.
+        let html = "<html><body><p>plain text</p></body></html>";
+        let out = extract_to_csv(html, None, &Options::default()).expect("ok");
+        // The data row's URL column (col 1) has no source — must be "null".
+        let data_row = out.split("\r\n").nth(1).expect("data row");
+        let first_col = data_row.split('\t').next().expect("first col");
+        assert_eq!(first_col, "null", "empty URL must be null: {data_row:?}");
+    }
+
+    /// Sub-stage C CSV test #9 — newlines and tabs in body text are properly
+    /// CSV-quoted (per QUOTE_MINIMAL).
+    #[test]
+    fn extract_to_csv_quotes_fields_containing_delimiter_or_newline() {
+        use crate::trafilatura::output::{xmltocsv, Document};
+        use crate::readability::dom::{append_child, create_element, create_text_node};
+        // Build a programmatic body containing a tab and a newline.
+        let body = create_element("body");
+        let p = create_element("p");
+        append_child(&p, &create_text_node("line1\ttab\nline2"));
+        append_child(&body, &p);
+        let doc = Document {
+            metadata: crate::trafilatura::metadata::Metadata::default(),
+            body,
+            commentsbody: None,
+            raw_text: String::new(),
+        };
+        let row = xmltocsv(&doc, false, "\t", "null");
+        // The text column must be quoted (contains both \t and \n).
+        // Easiest check: the row contains a `"`.
+        assert!(
+            row.contains('"'),
+            "expected quoted field, got: {row:?}"
+        );
+    }
+
+    /// Sub-stage C CSV test #10 — empty body still produces a valid row with
+    /// the correct number of columns.
+    #[test]
+    fn extract_to_csv_empty_body_produces_valid_row() {
+        let out = extract_to_csv("<html><body></body></html>", None, &Options::default())
+            .expect("ok");
+        let lines: Vec<&str> = out.split("\r\n").collect();
+        // 2 substantive lines (header + data), possibly + 1 trailing empty.
+        assert!(lines.len() >= 2);
+        // The data row, unquoted with empty/null fields, splits on \t to give
+        // exactly 11 columns.
+        let data_row = lines[1];
+        let cols: Vec<&str> = data_row.split('\t').collect();
+        assert_eq!(cols.len(), 11, "expected 11 columns, got: {cols:?}");
+    }
+
+    /// Sub-stage C CSV test #11 — header columns match Python's xmltocsv
+    /// column order exactly (xml.py:378-388).
+    #[test]
+    fn extract_to_csv_header_column_order_matches_python() {
+        let out = extract_to_csv("<html><body></body></html>", None, &Options::default())
+            .expect("ok");
+        let header = out.split("\r\n").next().expect("header");
+        let expected = "url\tid\tfingerprint\thostname\ttitle\timage\tdate\ttext\tcomments\tlicense\tpagetype";
+        assert_eq!(header, expected, "header column order");
+    }
+
+    /// Sub-stage C CSV test #12 — min_word_count threshold fires when set
+    /// (parity with extract_with / extract_to_markdown behaviour).
+    #[test]
+    fn extract_to_csv_respects_min_word_count() {
+        let opts = Options {
+            min_word_count: 5,
+            ..Options::default()
+        };
+        let err = extract_to_csv("<html><body></body></html>", None, &opts)
+            .expect_err("must Err");
+        match err {
+            ExtractError::ContentTooShort {
+                word_count,
+                threshold,
+            } => {
+                assert_eq!(word_count, 0);
+                assert_eq!(threshold, 5);
+            }
+            other => panic!("expected ContentTooShort, got {other:?}"),
+        }
     }
 
     /// Sub-stage B brief #16 — min_word_count threshold fires when set
