@@ -649,9 +649,19 @@ pub fn extract_to_markdown(
     // 1. Metadata.
     let metadata = trafilatura::metadata::extract_metadata(html, base_url, true, &[]);
 
-    // 2. Body extraction via the cascade. Identical wiring to extract_with.
+    // 2. Body extraction via the cascade. Identical wiring to extract_with,
+    //    EXCEPT `formatting` is forced on. Python's `settings.py:133` has:
+    //        self.formatting = formatting or self.format == "markdown"
+    //    i.e. the `markdown` output format auto-enables `formatting`. That
+    //    flag is what makes `cleaning::convert_tags` rewrite `<b>/<strong>/
+    //    <i>/<em>/<u>/<tt>` to `<hi rend="#b|#i|#u|#t">` (cleaning.rs:548)
+    //    instead of stripping them. Without it, no `<hi>` element survives
+    //    for `xmltotxt`'s formatting branch (xml.py:266-269) to wrap, so
+    //    `**bold**` / `*italic*` / `__underline__` / `` `tt` `` markers are
+    //    dropped — the bug M5 Stage 4 fixes.
     let cleaning_opts = trafilatura::cleaning::Options {
         url: base_url.map(|s| s.to_string()),
+        formatting: true,
         ..trafilatura::cleaning::Options::default()
     };
     let body_opt =

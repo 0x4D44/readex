@@ -2547,9 +2547,22 @@ name = "mdrcel"
 # sandbox we surface it as MINOR (matching M3 Stage 9's `comments` field
 # precedent at 0.9.0 -> 0.10.0). No new dependency; no public API removal;
 # `Options` unchanged.
-version = "0.15.2"
+version = "0.15.3"
 edition = "2024"
 
+# M5 Stage 4 (2026-05-21): 0.15.2 -> 0.15.3 PATCH. Bug fix only: the
+# markdown formatting path (`extract_to_markdown`) now forces
+# `cleaning::Options.formatting = true`, mirroring Python's
+# `settings.py:133` (`self.formatting = formatting or self.format ==
+# "markdown"`). Without this, `cleaning::convert_tags` strips `<b>/
+# <strong>/<i>/<em>/<u>/<tt>` instead of rewriting them to `<hi
+# rend="#b|#i|#u|#t">`, and `xmltotxt`'s formatting branch (xml.py:266-269)
+# has nothing to wrap — so `**bold**`/`*italic*`/`__underline__`/`` `tt` ``
+# markers were dropped from the markdown output. Surfaced by M5 Stage 2's
+# corpus-wide markdown gate (`tests/trafilatura_markdown_gate.rs`):
+# content-mismatch bucket 32 -> 25, 5 fixtures now pass entirely. No
+# public API change; no signature change; no new dependency.
+#
 # M4 Stage 6 (2026-05-21): 0.14.1 -> 0.15.0 MINOR. Lifts `deduplication.py`'s
 # Simhash + content_fingerprint + is_similar_domain trio off the M3 Stage 8
 # deferred list (the doc-block at the top of `src/trafilatura/deduplication.rs`
