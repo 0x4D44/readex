@@ -1740,11 +1740,26 @@ pub fn _extract(tree: &NodeRef, options: &Options) -> (NodeRef, String, HashSet<
         }
 
         // main_extractor.py:589 — ptest = subtree.xpath('//p//text()').
-        // Use ".//p//text()" (descendant-relative) instead of "//p//text()"
-        // (absolute, root-relative) to match the document's <p> elements
-        // anchored at the subtree's root.
+        // lxml's `//p//text()` is **absolute** (rooted at the owning
+        // document), so the node-set includes every `<p>//text()` in the
+        // whole tree, NOT just descendants of `subtree`. M5 Stage 6g (Verge
+        // d153da3363ba7cf1): a `.//p//text()` relative variant was the
+        // original Stage 2 port, which under-counted ptest for subtrees
+        // with few inline `<p>` (Verge's article subtree has only one
+        // article-body `<p>`, but the surrounding document has many
+        // navigation/teaser `<p>`s), pushing `potential_tags` to include
+        // `<div>` and surfacing byline divs (`Terrence O'Brien` /
+        // headline) in the output. Walk parents up to the topmost
+        // ancestor (Document node) and evaluate from there.
+        let root: NodeRef = {
+            let mut cur = subtree.clone();
+            while let Some(p) = crate::readability::dom::parent(&cur) {
+                cur = p;
+            }
+            cur
+        };
         let ptest =
-            xpath_engine::evaluate(".//p//text()", &subtree).unwrap_or_default();
+            xpath_engine::evaluate(".//p//text()", &root).unwrap_or_default();
         let factor: usize = if options.focus == Focus::Precision {
             1
         } else {
