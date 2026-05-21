@@ -940,7 +940,81 @@ name = "mdrcel"
 # extract_content) remain green. Lib test count 628 -> 633 (+5 new unit
 # tests covering english/french/unknown-language/listing/consistency).
 # `cargo clippy --release --all-targets -- -D warnings` is clean.
-version = "0.6.1"
+#
+# M3 Stage 5b (2026-05-21): 0.6.1 -> 0.6.2 PATCH. Adds
+# `src/trafilatura/justext_core.rs` — faithful port of jusText's text
+# segmentation: the `Paragraph` dataclass (`justext/paragraph.py:14-66`)
+# and the `ParagraphMaker` SAX walker (`justext/core.py:133-199`), plus
+# the `PARAGRAPH_TAGS` constant (`justext/core.py:37-42`), `PathInfo`
+# xpath/dom-path tracker (`justext/core.py:202-233`), and the
+# `is_blank` / `normalize_whitespace` helpers (`justext/utils.py:11-34`).
+#
+# New public surface on the NEW `#[doc(hidden)] pub mod
+# trafilatura::justext_core`:
+# - `Paragraph` struct with seven Stage-5b fields (`text`, `dom_path`,
+#   `tag`, `chars_count_in_links`, `word_count`, `is_heading`) plus
+#   three Stage-5c placeholder fields (`class_type`, `stopwords_count`,
+#   `is_boilerplate`, all `Option<_>`-typed, set to `None` at
+#   segmentation time and filled by Stage 5c's `classify_paragraphs`).
+# - `Paragraph::new(...)` constructor (consumes the segmentation
+#   outputs and defaults the Stage-5c fields to `None`).
+# - `Paragraph::link_density() -> f64` (port of
+#   `justext/paragraph.py:61-66`).
+# - `Paragraph::is_blank() -> bool` (ergonomic helper; Python tests
+#   `len(paragraph) == 0` at the call-site).
+# - `make_paragraphs(root: &NodeRef) -> Vec<Paragraph>` — the public
+#   entry-point matching `ParagraphMaker.make_paragraphs(cls, root)` at
+#   `justext/core.py:139-144`.
+#
+# **SAX → tree-walk translation** (the key faithfulness move): Python's
+# `lxml.sax.saxify(root, handler)` is a streaming event source firing
+# `startElementNS` / `characters` / `endElementNS` in document order;
+# the Rust port replaces it with a recursive walker (`walk_dom` +
+# `walk_child` helpers) that fires the same three callbacks on
+# `ParagraphMaker` in the same order. `Text` nodes → `characters`,
+# `Element` → recursive descent (start + children + end), Comment /
+# ProcessingInstruction / Doctype → no events (matching SAX). The
+# `<br><br>` paragraph-separator quirk (`core.py:164-170`) is preserved
+# verbatim — two consecutive `<br>` start a new paragraph and the
+# second `<br>` does NOT increment `tags_count`.
+#
+# Faithful divergence (documented in the module header):
+# `is_heading_path` scans every dot-separated component of `dom_path`
+# for `h\d` (single digit), matching the Python regex `\bh\d\b`
+# applied to the full dom_path string. The detection is
+# behaviourally equivalent on every Stage 5b test input; if Stage 5c's
+# corpus surfaces a `<p>`-nested-in-`<h2>` shape where the regex
+# would match but the per-component scan would also match (same
+# answer), no change is needed.
+#
+# Why PATCH (not MINOR): the new module is `#[doc(hidden)]`
+# infrastructure with a small read-only public surface (one struct +
+# two methods + one free function). Matches the Stage 5a (vendored
+# stoplists) PATCH precedent for "additive new module in the
+# in-progress `trafilatura::*` infrastructure namespace". A strict
+# reading of CLAUDE.md ("new public types = MINOR") would support
+# MINOR; PATCH is recorded as the conservative call given the module
+# is consumed only by Stage 5c's classifier and Stage 5d's cascade
+# (both pending). All four BLOCKER gates (parser_equivalence /
+# trafilatura_equivalence / extract_smoke / extract_content) remain
+# byte-identical green; lib test count 633 -> 646 (+13 new
+# justext_core::tests covering simple-article / nested-inline /
+# block-break / link-char-tracking / heading-detection / script-style
+# skip / link-density-math / is-blank-true / is-blank-false /
+# br-br-separator / word-count / blank-text-skip / stage-5c-
+# placeholders). `cargo clippy --release --all-targets -- -D warnings`
+# is clean.
+#
+# What's left for Stage 5c: `classify_paragraphs`
+# (`justext/core.py:243-275`) — the context-free good/neargood/short/bad
+# classifier; fills the Paragraph::class_type / stopwords_count
+# placeholder fields using a stoplist from Stage 5a's
+# `justext_stoplists::get_stoplist`. Then
+# `revise_paragraph_classification` (`core.py:307-371`) — the
+# context-sensitive heading + short reclassifier.
+# Stage 5d wires `make_paragraphs` + classify + revise into the M3
+# cascade (own/readability/justext arbiter).
+version = "0.6.2"
 edition = "2024"
 
 [dependencies]

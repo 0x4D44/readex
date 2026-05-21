@@ -85,3 +85,12 @@ pub mod readability_fork;
 // `.lower()` step that owned strings would re-do on every call).
 // Consumed by Stage 5c's `classify_paragraphs` port.
 pub mod justext_stoplists;
+
+// Stage 5b — jusText paragraph segmentation port. Source of truth:
+// `justext/core.py:28-200` (`PARAGRAPH_TAGS` + `ParagraphMaker` SAX
+// walker + `make_paragraphs`) and `justext/paragraph.py:14-66` (the
+// `Paragraph` dataclass). Stage 5b lands SEGMENTATION only — DOM →
+// Vec<Paragraph> with link-density inputs and heading flags ready for
+// Stage 5c's classifier. Stage 5c will fill the `class_type` /
+// `stopwords_count` / `is_boilerplate` placeholder fields.
+pub mod justext_core;
