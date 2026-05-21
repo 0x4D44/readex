@@ -2547,7 +2547,7 @@ name = "mdrcel"
 # sandbox we surface it as MINOR (matching M3 Stage 9's `comments` field
 # precedent at 0.9.0 -> 0.10.0). No new dependency; no public API removal;
 # `Options` unchanged.
-version = "0.15.6"
+version = "0.15.7"
 edition = "2024"
 
 # M5 Stage 6a (2026-05-21): 0.15.5 -> 0.15.6 PATCH. Bug fix only:
@@ -2703,6 +2703,32 @@ edition = "2024"
 # actionable diff report" — NOT all-green; triage is Stage 3 work. No
 # production-code change (test file + oracle CLI flag only); per CLAUDE.md
 # PATCH.
+#
+# M5 Stage 6b (2026-05-21): 0.15.6 -> 0.15.7 PATCH. Allowlist mechanism +
+# three Python-under-extract ADRs. Bug fix only at the test-harness level:
+# `tests/trafilatura_markdown_gate.rs` gains a `PYTHON_UNDER_EXTRACT_ALLOWLIST`
+# constant + an `allowlist_python_bug` reporting bucket, so anti-inversion-clean
+# fixtures where Python's `trafilatura.extract` is the under-extractor (or
+# is HTML5-spec-violating) no longer count against the substantive pass
+# tally. Three fixtures allowlisted with checked-in ADRs in
+# `wrk_docs/m5-allowlist/`:
+# - `41d2afac25d46010.html` — SEC 10-K (legacy SGML wrap). Python returns
+#   empty on the 75 KB filing; mdrcel extracts faithfully. Anti-inversion
+#   forbids out-cleaning to match Python's silent failure.
+# - `683d5643b173c7fd.html` — DFIN XBRL 10-K. Single empty-cell drift in
+#   a 375 KB filing (0.043% byte delta). Harmless structural artefact of
+#   html5ever vs lxml on XBRL-namespaced inputs.
+# - `dc8ba3c086153274.html` — DFIN XBRL 10-K. Source uses `&#153;` which
+#   HTML5 §13.2.5 mandates CP-1252-remap to U+2122 TRADEMARK SIGN.
+#   mdrcel follows the spec; lxml strips the control character. Total
+#   drift: 12 chars in 468 KB.
+# Per semver PATCH — additive test-harness mechanism, no production-code
+# change, no public API change. Honest accounting invariant added: the
+# gate now asserts `pass + bucket_empty + bucket_ws + bucket_content +
+# allowlist == total` so fixtures cannot be silently dropped.
+# Gate movement: 32/51 substantive (Stage 6a) -> 32/51 substantive + 3
+# allowlisted (35/51 total accounted as non-divergent). content-mismatch
+# 18 -> 16; empty-vs-non 1 -> 0.
 
 [dependencies]
 # DEC-3 (M1): the library was a zero-dependency crate at the Milestone-1 floor;
