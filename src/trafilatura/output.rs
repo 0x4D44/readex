@@ -803,12 +803,28 @@ fn line_processing(line: &str) -> Option<String> {
     }
 }
 
-/// Faithful subset of Python's `html.unescape` for the small entity set
-/// `process_element`'s output stream realistically carries. Stage 3-A's
-/// helpers never emit named entities themselves; this is the cleanup pass
-/// for entities that survived from the source HTML through lxml's
-/// `.text` getter. Decodes `&amp;`, `&lt;`, `&gt;`, `&quot;`, `&apos;` and
-/// numeric entities `&#NN;` / `&#xHH;` (decimal / hex codepoints).
+/// Faithful subset of Python's `html.unescape` (stdlib `html` module)
+/// for the entity set `process_element`'s output stream realistically
+/// carries. Stage 3-A's helpers never emit named entities themselves;
+/// this is the cleanup pass for entities that survived from the source
+/// HTML through lxml's `.text` getter — chiefly cases where the HTML
+/// double-escaped them (e.g. `&amp;eacute;` → text `&eacute;`).
+///
+/// Decodes:
+///   * The XML-mandatory five (`amp`, `lt`, `gt`, `quot`, `apos`).
+///   * Numeric entities `&#NN;` / `&#xHH;` (decimal / hex codepoints).
+///   * The Latin-1 supplement (U+00A0..U+00FF) and the most common
+///     general-punctuation / symbol named entities — the ones the
+///     M5 corpus actually surfaces (`nbsp`, `eacute`, `times`, `copy`,
+///     `reg`, `middot`, `ntilde`, `rsquo`, `lsquo`, `pound`, `ndash`,
+///     `mdash`, `raquo`, `laquo`, `hellip`, `bull`, `trade`, …) plus
+///     their Latin-1 siblings so we don't have to revisit this for
+///     `&Eacute;` / `&Aacute;` / etc.
+///
+/// Source-of-truth: CPython `html/__init__.py` — `html.unescape`
+/// dispatches on `html.entities.html5`. We cover the subset that
+/// appears in real-world UTF-8 article HTML; rarer mathematical /
+/// Greek-alphabet entities fall through to the verbatim path.
 fn unescape_html(s: &str) -> String {
     // Char-by-char scanner. We iterate chars (not bytes) so multi-byte
     // UTF-8 sequences pass through verbatim — a byte-loop would split
@@ -852,6 +868,150 @@ fn unescape_html(s: &str) -> String {
             "gt" => Some(">".to_string()),
             "quot" => Some("\"".to_string()),
             "apos" => Some("'".to_string()),
+            // Latin-1 supplement + common punctuation / symbol entities,
+            // mirroring CPython `html.unescape` for the subset realistic
+            // HTML article bodies surface (corpus-driven; see doc above).
+            "nbsp" => Some("\u{00A0}".to_string()),
+            "iexcl" => Some("\u{00A1}".to_string()),
+            "cent" => Some("\u{00A2}".to_string()),
+            "pound" => Some("\u{00A3}".to_string()),
+            "curren" => Some("\u{00A4}".to_string()),
+            "yen" => Some("\u{00A5}".to_string()),
+            "brvbar" => Some("\u{00A6}".to_string()),
+            "sect" => Some("\u{00A7}".to_string()),
+            "uml" => Some("\u{00A8}".to_string()),
+            "copy" => Some("\u{00A9}".to_string()),
+            "ordf" => Some("\u{00AA}".to_string()),
+            "laquo" => Some("\u{00AB}".to_string()),
+            "not" => Some("\u{00AC}".to_string()),
+            "shy" => Some("\u{00AD}".to_string()),
+            "reg" => Some("\u{00AE}".to_string()),
+            "macr" => Some("\u{00AF}".to_string()),
+            "deg" => Some("\u{00B0}".to_string()),
+            "plusmn" => Some("\u{00B1}".to_string()),
+            "sup2" => Some("\u{00B2}".to_string()),
+            "sup3" => Some("\u{00B3}".to_string()),
+            "acute" => Some("\u{00B4}".to_string()),
+            "micro" => Some("\u{00B5}".to_string()),
+            "para" => Some("\u{00B6}".to_string()),
+            "middot" => Some("\u{00B7}".to_string()),
+            "cedil" => Some("\u{00B8}".to_string()),
+            "sup1" => Some("\u{00B9}".to_string()),
+            "ordm" => Some("\u{00BA}".to_string()),
+            "raquo" => Some("\u{00BB}".to_string()),
+            "frac14" => Some("\u{00BC}".to_string()),
+            "frac12" => Some("\u{00BD}".to_string()),
+            "frac34" => Some("\u{00BE}".to_string()),
+            "iquest" => Some("\u{00BF}".to_string()),
+            "Agrave" => Some("\u{00C0}".to_string()),
+            "Aacute" => Some("\u{00C1}".to_string()),
+            "Acirc" => Some("\u{00C2}".to_string()),
+            "Atilde" => Some("\u{00C3}".to_string()),
+            "Auml" => Some("\u{00C4}".to_string()),
+            "Aring" => Some("\u{00C5}".to_string()),
+            "AElig" => Some("\u{00C6}".to_string()),
+            "Ccedil" => Some("\u{00C7}".to_string()),
+            "Egrave" => Some("\u{00C8}".to_string()),
+            "Eacute" => Some("\u{00C9}".to_string()),
+            "Ecirc" => Some("\u{00CA}".to_string()),
+            "Euml" => Some("\u{00CB}".to_string()),
+            "Igrave" => Some("\u{00CC}".to_string()),
+            "Iacute" => Some("\u{00CD}".to_string()),
+            "Icirc" => Some("\u{00CE}".to_string()),
+            "Iuml" => Some("\u{00CF}".to_string()),
+            "ETH" => Some("\u{00D0}".to_string()),
+            "Ntilde" => Some("\u{00D1}".to_string()),
+            "Ograve" => Some("\u{00D2}".to_string()),
+            "Oacute" => Some("\u{00D3}".to_string()),
+            "Ocirc" => Some("\u{00D4}".to_string()),
+            "Otilde" => Some("\u{00D5}".to_string()),
+            "Ouml" => Some("\u{00D6}".to_string()),
+            "times" => Some("\u{00D7}".to_string()),
+            "Oslash" => Some("\u{00D8}".to_string()),
+            "Ugrave" => Some("\u{00D9}".to_string()),
+            "Uacute" => Some("\u{00DA}".to_string()),
+            "Ucirc" => Some("\u{00DB}".to_string()),
+            "Uuml" => Some("\u{00DC}".to_string()),
+            "Yacute" => Some("\u{00DD}".to_string()),
+            "THORN" => Some("\u{00DE}".to_string()),
+            "szlig" => Some("\u{00DF}".to_string()),
+            "agrave" => Some("\u{00E0}".to_string()),
+            "aacute" => Some("\u{00E1}".to_string()),
+            "acirc" => Some("\u{00E2}".to_string()),
+            "atilde" => Some("\u{00E3}".to_string()),
+            "auml" => Some("\u{00E4}".to_string()),
+            "aring" => Some("\u{00E5}".to_string()),
+            "aelig" => Some("\u{00E6}".to_string()),
+            "ccedil" => Some("\u{00E7}".to_string()),
+            "egrave" => Some("\u{00E8}".to_string()),
+            "eacute" => Some("\u{00E9}".to_string()),
+            "ecirc" => Some("\u{00EA}".to_string()),
+            "euml" => Some("\u{00EB}".to_string()),
+            "igrave" => Some("\u{00EC}".to_string()),
+            "iacute" => Some("\u{00ED}".to_string()),
+            "icirc" => Some("\u{00EE}".to_string()),
+            "iuml" => Some("\u{00EF}".to_string()),
+            "eth" => Some("\u{00F0}".to_string()),
+            "ntilde" => Some("\u{00F1}".to_string()),
+            "ograve" => Some("\u{00F2}".to_string()),
+            "oacute" => Some("\u{00F3}".to_string()),
+            "ocirc" => Some("\u{00F4}".to_string()),
+            "otilde" => Some("\u{00F5}".to_string()),
+            "ouml" => Some("\u{00F6}".to_string()),
+            "divide" => Some("\u{00F7}".to_string()),
+            "oslash" => Some("\u{00F8}".to_string()),
+            "ugrave" => Some("\u{00F9}".to_string()),
+            "uacute" => Some("\u{00FA}".to_string()),
+            "ucirc" => Some("\u{00FB}".to_string()),
+            "uuml" => Some("\u{00FC}".to_string()),
+            "yacute" => Some("\u{00FD}".to_string()),
+            "thorn" => Some("\u{00FE}".to_string()),
+            "yuml" => Some("\u{00FF}".to_string()),
+            "OElig" => Some("\u{0152}".to_string()),
+            "oelig" => Some("\u{0153}".to_string()),
+            "Scaron" => Some("\u{0160}".to_string()),
+            "scaron" => Some("\u{0161}".to_string()),
+            "Yuml" => Some("\u{0178}".to_string()),
+            "fnof" => Some("\u{0192}".to_string()),
+            "circ" => Some("\u{02C6}".to_string()),
+            "tilde" => Some("\u{02DC}".to_string()),
+            "ensp" => Some("\u{2002}".to_string()),
+            "emsp" => Some("\u{2003}".to_string()),
+            "thinsp" => Some("\u{2009}".to_string()),
+            "zwnj" => Some("\u{200C}".to_string()),
+            "zwj" => Some("\u{200D}".to_string()),
+            "lrm" => Some("\u{200E}".to_string()),
+            "rlm" => Some("\u{200F}".to_string()),
+            "ndash" => Some("\u{2013}".to_string()),
+            "mdash" => Some("\u{2014}".to_string()),
+            "horbar" => Some("\u{2015}".to_string()),
+            "lsquo" => Some("\u{2018}".to_string()),
+            "rsquo" => Some("\u{2019}".to_string()),
+            "sbquo" => Some("\u{201A}".to_string()),
+            "ldquo" => Some("\u{201C}".to_string()),
+            "rdquo" => Some("\u{201D}".to_string()),
+            "bdquo" => Some("\u{201E}".to_string()),
+            "dagger" => Some("\u{2020}".to_string()),
+            "Dagger" => Some("\u{2021}".to_string()),
+            "bull" => Some("\u{2022}".to_string()),
+            "hellip" => Some("\u{2026}".to_string()),
+            "permil" => Some("\u{2030}".to_string()),
+            "prime" => Some("\u{2032}".to_string()),
+            "Prime" => Some("\u{2033}".to_string()),
+            "lsaquo" => Some("\u{2039}".to_string()),
+            "rsaquo" => Some("\u{203A}".to_string()),
+            "euro" => Some("\u{20AC}".to_string()),
+            "trade" => Some("\u{2122}".to_string()),
+            "larr" => Some("\u{2190}".to_string()),
+            "uarr" => Some("\u{2191}".to_string()),
+            "rarr" => Some("\u{2192}".to_string()),
+            "darr" => Some("\u{2193}".to_string()),
+            "harr" => Some("\u{2194}".to_string()),
+            "lArr" => Some("\u{21D0}".to_string()),
+            "uArr" => Some("\u{21D1}".to_string()),
+            "rArr" => Some("\u{21D2}".to_string()),
+            "dArr" => Some("\u{21D3}".to_string()),
+            "hArr" => Some("\u{21D4}".to_string()),
             _ => {
                 if let Some(rest) = entity.strip_prefix('#') {
                     let cp = if let Some(hex) =
