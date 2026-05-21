@@ -86,11 +86,13 @@ pub mod readability_fork;
 // Consumed by Stage 5c's `classify_paragraphs` port.
 pub mod justext_stoplists;
 
-// Stage 5b — jusText paragraph segmentation port. Source of truth:
-// `justext/core.py:28-200` (`PARAGRAPH_TAGS` + `ParagraphMaker` SAX
-// walker + `make_paragraphs`) and `justext/paragraph.py:14-66` (the
-// `Paragraph` dataclass). Stage 5b lands SEGMENTATION only — DOM →
-// Vec<Paragraph> with link-density inputs and heading flags ready for
-// Stage 5c's classifier. Stage 5c will fill the `class_type` /
-// `stopwords_count` / `is_boilerplate` placeholder fields.
+// Stage 5b/5c/5d — jusText paragraph segmentation + classifier + cascade
+// wrappers. Source of truth: `justext/core.py:28-371` + `justext/
+// paragraph.py:14-66` + `trafilatura/external.py:121-160`. Stage 5b
+// landed segmentation (`Paragraph` + `ParagraphMaker` + `make_paragraphs`);
+// Stage 5c landed the context-free + context-sensitive classifier
+// (`classify_paragraphs` + `revise_paragraph_classification`); Stage 5d
+// landed the cascade wrappers (`try_justext` + `justext_rescue` +
+// `JUSTEXT_LANGUAGES`) plus the 3-arm cascade integration in
+// `readability_fork::bare_extraction_with_cascade`.
 pub mod justext_core;

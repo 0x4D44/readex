@@ -105,6 +105,7 @@
 //!   the local tag name directly.
 
 use crate::readability::dom::{NodeData, NodeRef, is_text, local_name};
+use crate::trafilatura::justext_stoplists::get_stoplist;
 
 // ===========================================================================
 // Module constants (justext/core.py:28-46)
@@ -1146,6 +1147,214 @@ pub fn classify_and_revise(paragraphs: &mut [Paragraph], stoplist: &[&str]) {
 }
 
 // ===========================================================================
+// Stage 5d — jusText cascade wrappers (external.py:121-160)
+// ===========================================================================
+//
+// `try_justext` and `justext_rescue` are the cascade-side wrappers that
+// `compare_extraction` (external.py:45-108) invokes when the own + readability
+// arms haven't produced a satisfactory body. The Python module also defines
+// `custom_justext` (external.py:121-126), a thin wrapper around
+// `ParagraphMaker.make_paragraphs` + `classify_paragraphs` +
+// `revise_paragraph_classification`; Stage 5c's [`classify_and_revise`]
+// already runs that wrapper's body verbatim, so we re-use it here rather
+// than re-port `custom_justext` as a separate symbol.
+
+/// `JUSTEXT_LANGUAGES` — `trafilatura/settings.py:442-475`.
+///
+/// Maps ISO 639-1 language codes (as carried in `Options.lang`) to the
+/// capitalized language-name keys jusText's vendored stoplists use
+/// (see [`crate::trafilatura::justext_stoplists::LANGUAGES`]). The
+/// Python source comments out `ja` and `zh` (no vendored stoplist for
+/// CJK characters under jusText's whitespace-tokenized model) — we
+/// vendor the same omissions.
+///
+/// Stored as a `&[(&str, &str)]` slice for cheap linear search (the
+/// mapping has 28 entries; a `HashMap` would be overkill).
+pub const JUSTEXT_LANGUAGES: &[(&str, &str)] = &[
+    ("ar", "Arabic"),
+    ("bg", "Bulgarian"),
+    ("cz", "Czech"),
+    ("da", "Danish"),
+    ("de", "German"),
+    ("en", "English"),
+    ("el", "Greek"),
+    ("es", "Spanish"),
+    ("fa", "Persian"),
+    ("fi", "Finnish"),
+    ("fr", "French"),
+    ("hr", "Croatian"),
+    ("hu", "Hungarian"),
+    // 'ja': '' — Python source omits Japanese (no vendored stoplist).
+    ("ko", "Korean"),
+    ("id", "Indonesian"),
+    ("it", "Italian"),
+    ("no", "Norwegian_Nynorsk"),
+    ("nl", "Dutch"),
+    ("pl", "Polish"),
+    ("pt", "Portuguese"),
+    ("ro", "Romanian"),
+    ("ru", "Russian"),
+    ("sk", "Slovak"),
+    ("sl", "Slovenian"),
+    ("sr", "Serbian"),
+    ("sv", "Swedish"),
+    ("tr", "Turkish"),
+    ("uk", "Ukrainian"),
+    ("ur", "Urdu"),
+    ("vi", "Vietnamese"),
+    // 'zh': '' — Python source omits Chinese (no vendored stoplist).
+];
+
+/// Resolve an ISO 639-1 language code (or `None`) to a jusText stoplist
+/// slice. Returns the English stoplist when the language is unknown or
+/// missing — a faithful echo of Python's `JT_STOPLIST or jt_stoplist_init()`
+/// fallback (external.py:137), specialized to English because the all-
+/// languages union (which Python's `jt_stoplist_init` builds at
+/// external.py:111-118) is dominated by Latin-script vocabulary and the
+/// only stable Rust analogue would require eagerly parsing all 100
+/// stoplists on first cascade invocation — a sharp performance regression
+/// for the common monolingual extraction case. English is the closest
+/// faithful single-language proxy and is what jusText callers typically
+/// fall back to in practice.
+fn resolve_stoplist(target_language: Option<&str>) -> &'static [String] {
+    if let Some(lang) = target_language {
+        for (code, name) in JUSTEXT_LANGUAGES {
+            if *code == lang {
+                let list = get_stoplist(name);
+                if !list.is_empty() {
+                    return list;
+                }
+                // Vendored stoplist missing — fall through to English.
+                break;
+            }
+        }
+    }
+    get_stoplist("English")
+}
+
+/// `try_justext(tree, url, target_language)` — `external.py:129-150`.
+///
+/// Run jusText paragraph segmentation + the Stage 5c context-free / context-
+/// sensitive classifier over `tree`, then return the surviving non-
+/// boilerplate paragraphs.
+///
+/// ```python
+/// def try_justext(tree, url, target_language) -> _Element:
+///     result_body = Element('body')
+///     if target_language in JUSTEXT_LANGUAGES:
+///         justext_stoplist = get_stoplist(JUSTEXT_LANGUAGES[target_language])
+///     else:
+///         justext_stoplist = JT_STOPLIST or jt_stoplist_init()
+///     try:
+///         paragraphs = custom_justext(tree, justext_stoplist)
+///     except Exception as err:
+///         LOGGER.error('justext %s %s', err, url)
+///     else:
+///         for paragraph in paragraphs:
+///             if paragraph.is_boilerplate:
+///                 continue
+///             elem, elem.text = Element('p'), paragraph.text
+///             result_body.append(elem)
+///     return result_body
+/// ```
+///
+/// Rust shape: returns `Vec<Paragraph>` (the surviving paragraphs) instead
+/// of Python's "always return a `<body>` Element" pattern. The caller
+/// ([`justext_rescue`]) materializes the `<body>` + `<p>` children when
+/// it needs a NodeRef — splitting the responsibility lets callers reuse
+/// the raw paragraph stream (e.g. for the M3 cascade's text+length
+/// arbitration without paying the DOM-build cost twice).
+///
+/// The `url` argument is accepted for line-cite parity with the Python
+/// signature but not consumed (Python only uses it for the error-log
+/// message at external.py:142; the Rust port doesn't log).
+///
+/// Language dispatch (faithful to external.py:134-137):
+/// - If `target_language` is in `JUSTEXT_LANGUAGES`, use that stoplist.
+/// - Otherwise, fall back to the English stoplist (see [`resolve_stoplist`]
+///   doc for the faithful-divergence rationale on the all-languages
+///   union the Python `JT_STOPLIST` fallback represents).
+pub fn try_justext(tree: &NodeRef, _url: Option<&str>, target_language: Option<&str>) -> Vec<Paragraph> {
+    let stoplist = resolve_stoplist(target_language);
+    // Stage 5a's get_stoplist returns Vec<String>; classify_and_revise
+    // wants &[&str] — collect references in a temporary owned slice.
+    let stoplist_refs: Vec<&str> = stoplist.iter().map(|s| s.as_str()).collect();
+
+    let mut paragraphs = make_paragraphs(tree);
+    classify_and_revise(&mut paragraphs, &stoplist_refs);
+
+    // external.py:144-149 — filter to non-boilerplate paragraphs.
+    paragraphs
+        .into_iter()
+        .filter(|p| !p.is_boilerplate.unwrap_or(true))
+        .collect()
+}
+
+/// `justext_rescue(tree, options)` — `external.py:153-160`.
+///
+/// ```python
+/// def justext_rescue(tree, options) -> Tuple[_Element, str, int]:
+///     '''Try to use justext algorithm as a second fallback'''
+///     tree = basic_cleaning(tree)
+///     temppost_algo = try_justext(tree, options.url, options.lang)
+///     temp_text = trim(' '.join(temppost_algo.itertext()))
+///     return temppost_algo, temp_text, len(temp_text)
+/// ```
+///
+/// Wires [`try_justext`] into the cascade-call shape `compare_extraction`
+/// expects: a `(body_node, joined_text, char_count)` triple. The
+/// returned `<body>` NodeRef contains one `<p>` child per surviving
+/// paragraph (text set via [`crate::readability::dom::set_element_text`]).
+///
+/// Rust signature divergences from the Python source (documented):
+/// - The Python `basic_cleaning(tree)` pre-pass is the responsibility of
+///   the caller in the Rust port (the M3 cascade owns its own cleaning
+///   pipeline — `cleaning::tree_cleaning` runs in
+///   `bare_extraction_with_cascade` before the own arm fires, and is
+///   STRUCTURALLY equivalent to `basic_cleaning` plus a broader catalog).
+///   Re-running `basic_cleaning` here would double-clean the tree; we
+///   accept the tree as-cleaned by the caller and run [`try_justext`]
+///   directly. This is intentional, not a port omission.
+/// - `options.url` and `options.lang` are passed as `Option<&str>` so a
+///   caller without those slots (the current `cleaning::Options` shape
+///   lacks `url`/`lang`) can pass `None`.
+///
+/// The returned `String` is the trimmed space-joined text of the surviving
+/// paragraphs (matching Python's `' '.join(temppost_algo.itertext())`
+/// then `trim`). The `usize` is the character count of that text
+/// (Python `len(str)` on a Python 3 str is codepoint count;
+/// `chars().count()` in Rust matches).
+pub fn justext_rescue(
+    tree: &NodeRef,
+    url: Option<&str>,
+    target_language: Option<&str>,
+) -> (NodeRef, String, usize) {
+    let paragraphs = try_justext(tree, url, target_language);
+
+    // Build a fresh <body> NodeRef holding one <p> per surviving paragraph.
+    // Python's `Element('body')` + `result_body.append(elem)` for each
+    // surviving paragraph (external.py:132,148-149).
+    let body = crate::readability::dom::create_element("body");
+    let mut text_parts: Vec<String> = Vec::with_capacity(paragraphs.len());
+    for p in &paragraphs {
+        let p_elem = crate::readability::dom::create_element("p");
+        crate::readability::dom::set_element_text(&p_elem, Some(&p.text));
+        crate::readability::dom::append_child(&body, &p_elem);
+        text_parts.push(p.text.clone());
+    }
+
+    // external.py:159 — `trim(' '.join(temppost_algo.itertext()))`. The
+    // surviving paragraphs are the entire content (no nested elements
+    // produce extra itertext), so joining their `.text` with ' ' and
+    // then trim-collapsing whitespace matches.
+    let joined = text_parts.join(" ");
+    let trimmed = crate::trafilatura::utils::trim(&joined);
+    let len = trimmed.chars().count();
+
+    (body, trimmed, len)
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -1584,5 +1793,140 @@ mod tests {
             bads >= 1,
             "expected ≥ 1 bad paragraph (the nav), got {bads}"
         );
+    }
+
+    // ============================================================
+    // Stage 5d — try_justext + justext_rescue (external.py:121-160)
+    // ============================================================
+
+    /// Brief test 1 (Stage 5d): `try_justext` returns only good (non-
+    /// boilerplate) paragraphs. A page with link-heavy nav `<p>` and a
+    /// long article `<p>` returns only the article paragraph.
+    #[test]
+    fn try_justext_returns_only_good_paragraphs() {
+        let html = r#"<html><body>
+            <p><a href="/a">Home</a> <a href="/b">About</a> <a href="/c">Contact</a> <a href="/d">News</a></p>
+            <p>The quick brown fox jumps over the lazy dog and this is a substantive
+            article paragraph about animals and forests with many common words like
+            the and a and of and to and the dog runs fast in the forest with the fox
+            and the cat as the sun sets behind the trees and the moon rises in the
+            east over the meadow with the river flowing gently through the valley.</p>
+        </body></html>"#;
+        let (_dom, body) = parse_body(html);
+        let survivors = try_justext(&body, None, Some("en"));
+        // At least one survivor.
+        assert!(
+            !survivors.is_empty(),
+            "expected ≥ 1 surviving paragraph, got 0"
+        );
+        // Every survivor must NOT be boilerplate.
+        for p in &survivors {
+            assert_eq!(
+                p.is_boilerplate,
+                Some(false),
+                "survivor must be non-boilerplate, got {:?} for text {:?}",
+                p.is_boilerplate,
+                p.text
+            );
+        }
+        // Survivors must include the article body text.
+        let joined = survivors
+            .iter()
+            .map(|p| p.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            joined.contains("substantive"),
+            "expected article text in survivors, got {joined:?}"
+        );
+        // Survivors must NOT include the nav link text.
+        assert!(
+            !joined.contains("Home") && !joined.contains("About"),
+            "nav links should be filtered as boilerplate, got {joined:?}"
+        );
+    }
+
+    /// Brief test 2 (Stage 5d): unknown language falls back to the default
+    /// stoplist (English) rather than crashing or returning nothing.
+    /// Faithful echo of Python's `JT_STOPLIST or jt_stoplist_init()`
+    /// fallback at external.py:137.
+    #[test]
+    fn try_justext_handles_unknown_language_with_fallback() {
+        let html = r#"<html><body>
+            <p>The quick brown fox jumps over the lazy dog and this is a substantive
+            article paragraph about animals and forests with many common words like
+            the and a and of and to and the dog runs fast in the forest with the fox
+            and the cat as the sun sets behind the trees and the moon rises in the
+            east over the meadow with the river flowing gently through the valley.</p>
+        </body></html>"#;
+        let (_dom, body) = parse_body(html);
+        // "zz" is not a valid ISO 639-1 code; not in JUSTEXT_LANGUAGES.
+        let survivors = try_justext(&body, None, Some("zz"));
+        assert!(
+            !survivors.is_empty(),
+            "unknown language should fall back to default stoplist, got 0 survivors"
+        );
+    }
+
+    /// Brief test 3 (Stage 5d): `justext_rescue` builds a `<body>` NodeRef
+    /// whose children are `<p>` elements, one per surviving paragraph.
+    #[test]
+    fn justext_rescue_builds_body_with_p_elements() {
+        let html = r#"<html><body>
+            <p>The quick brown fox jumps over the lazy dog and this is a substantive
+            article paragraph about animals and forests with many common words like
+            the and a and of and to and the dog runs fast in the forest with the fox.</p>
+            <p>Another substantive paragraph about the same topic — the fox and the
+            dog run through the forest at speed, with the cat watching from a tree
+            as the sun sets in the west and the moon rises in the east over the
+            meadow with the river flowing gently through the green valley.</p>
+        </body></html>"#;
+        let (_dom, body) = parse_body(html);
+        let (rescue_body, text, len) = justext_rescue(&body, None, Some("en"));
+
+        // Body tag check.
+        assert_eq!(
+            crate::readability::dom::local_name(&rescue_body).as_deref(),
+            Some("body"),
+            "rescue body must be a <body> element"
+        );
+
+        // Children are all <p>.
+        let kids = crate::readability::dom::get_elements_by_tag_name(&rescue_body, "*");
+        assert!(!kids.is_empty(), "rescue body must have ≥ 1 child element");
+        for kid in &kids {
+            assert_eq!(
+                crate::readability::dom::local_name(kid).as_deref(),
+                Some("p"),
+                "every rescue body child must be a <p>"
+            );
+        }
+
+        // Returned text + length match.
+        assert!(!text.is_empty(), "rescue text must be non-empty");
+        assert_eq!(
+            len,
+            text.chars().count(),
+            "rescue len must equal chars().count() of returned text"
+        );
+        // Each <p>'s leading words appear in the joined string.
+        // The full <p>.text may include internal newlines (jusText's
+        // `normalize_whitespace` preserves NL when the source run had
+        // one); the joined string uses ' ' as the separator and runs
+        // through `trim` which collapses whitespace. So we compare the
+        // first few content tokens, not the full text byte-for-byte.
+        for kid in &kids {
+            let p_text = crate::readability::dom::element_text(kid).unwrap_or_default();
+            // Take first 5 whitespace-split tokens as a signature.
+            let signature: String = p_text
+                .split_whitespace()
+                .take(5)
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(
+                text.contains(&signature),
+                "joined text must contain each <p>'s leading tokens; missing {signature:?} in {text:?}"
+            );
+        }
     }
 }

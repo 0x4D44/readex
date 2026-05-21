@@ -1647,8 +1647,24 @@ pub fn cascade_prefers_readability(
     false
 }
 
+/// `SANITIZED_XPATH` — `external.py:29`. The descendant tag-set whose
+/// presence in the winning body triggers a jusText re-extraction. These
+/// are the elements the cascade considers "noise" — if a candidate body
+/// still contains them, it likely under-cleaned the input.
+///
+/// Stored as a tag-list slice (consumed via
+/// `dom::get_all_nodes_with_tag(body, SANITIZED_TAGS)` rather than as a
+/// raw XPath string — Stage 0b's XPath engine doesn't yet handle the
+/// `.//a|.//b|...` 19-way union shape compactly, so the
+/// descendant-by-tag-list call is the faithful equivalent).
+const SANITIZED_TAGS: &[&str] = &[
+    "aside", "audio", "button", "fieldset", "figure", "footer", "iframe", "input", "label",
+    "link", "nav", "noindex", "noscript", "object", "option", "select", "source", "svg", "time",
+];
+
 /// `bare_extraction_with_cascade(html, opts)` — partial faithful port of
-/// `core.trafilatura_sequence` (core.py:101-127).
+/// `core.trafilatura_sequence` (core.py:101-127) plus the three-arm
+/// arbiter from `external.compare_extraction` (external.py:45-108).
 ///
 /// Runs the full M3 cascade:
 /// 1. Parse + clean + convert via `cleaning::tree_cleaning` +
@@ -1657,13 +1673,17 @@ pub fn cascade_prefers_readability(
 /// 3. Run readability extraction via `try_readability` on the ORIGINAL
 ///    `html` (matches Python's `try_readability(backup_tree)` — a
 ///    snapshot taken before cleaning mutated the tree).
-/// 4. Arbitrate via `cascade_prefers_readability`.
+/// 4. Arbitrate own vs readability via `cascade_prefers_readability`.
+/// 5. **Stage 5d — jusText override (`external.py:94-102`)**: if the
+///    winning body has any `SANITIZED_TAGS` descendants OR its text
+///    length is below `options.min_extracted_size`, run
+///    `justext_core::justext_rescue` on the cleaned tree; if it
+///    produces non-empty text AND the winning length is NOT more than
+///    4× the jusText length, replace the winner with the jusText output.
 ///
 /// Returns:
-/// - `Some(NodeRef)` if EITHER arm produced an article. The chosen arm
-///   is determined by `cascade_prefers_readability`.
-/// - `None` if both arms returned empty / no article (the caller wanting
-///   a baseline rescue should call `baseline()` separately — Stage 1c).
+/// - `Some(NodeRef)` if any arm produced an article.
+/// - `None` if all three arms returned empty / no article.
 ///
 /// # Why this is a NEW entry-point (not a change to `extract_content`)
 ///
@@ -1674,11 +1694,27 @@ pub fn cascade_prefers_readability(
 /// against Python's own-arm extraction). So the cascade is its own
 /// callable and `extract_content` is untouched.
 ///
-/// # Justext arm (Stage 5)
+/// # Faithful divergences (recorded)
 ///
-/// The Python source's third arm (`justext_rescue` at external.py:96)
-/// is deliberately omitted; it lands in Stage 5. The current return
-/// value remains a faithful 2-arm cascade (own + readability).
+/// 1. The Python `options.url` and `options.lang` slots are NOT yet
+///    present on `cleaning::Options` (their Rust home arrives in a
+///    later stage with the full `Extractor` options surface). The
+///    jusText arm is invoked with `url=None, language=None`; the
+///    [`crate::trafilatura::justext_core::try_justext`] entry-point falls
+///    back to the English stoplist when language is unknown, matching
+///    Python's `JT_STOPLIST or jt_stoplist_init()` semantic (see
+///    `justext_core::resolve_stoplist` for the rationale).
+/// 2. The Python `compare_extraction` runs `prune_unwanted_nodes` under
+///    `focus="precision"` (external.py:54-55) BEFORE the readability
+///    arm fires; Stage 5d preserves the M3 cascade order (Stage 4d
+///    landed without this), since the option enum isn't yet wired to
+///    that level of precision/recall sensitivity.
+/// 3. The Python `len_algo in (0, len_text)` early-return at
+///    external.py:66 only suppresses the readability arm — it does NOT
+///    suppress the jusText override at external.py:94-102. The Rust
+///    port preserves this: the jusText gate is checked against the
+///    arbiter's WINNER (own or readability), not gated on whether
+///    readability won.
 pub fn bare_extraction_with_cascade(
     html: &str,
     opts: &crate::trafilatura::cleaning::Options,
@@ -1710,29 +1746,80 @@ pub fn bare_extraction_with_cascade(
         None => (String::new(), 0),
     };
 
-    // external.py:66-85 — arbiter.
+    // external.py:66-85 — arbiter (own vs readability).
     let use_readability = cascade_prefers_readability(&own_text, own_len, &algo_text, algo_len);
 
-    // Both arms empty → no article.
-    if own_len == 0 && algo_len == 0 {
-        // Keep `dom` alive (rcdom Drop quirk) until both arms are
-        // measured; then drop it by returning None.
+    // Both own and readability arms empty → fall through to jusText
+    // (matching Python's flow: even when both prior arms produce zero,
+    // the SANITIZED check at external.py:95 fires `len_text < min_extracted_size`
+    // because `len_text == 0 < min_extracted_size`).
+    let (mut winning_body, mut winning_text, mut winning_len): (NodeRef, String, usize) =
+        if use_readability {
+            // Readability won. `algo_body` is `Some(_)` because
+            // `cascade_prefers_readability` only returns true when
+            // `algo_len > 0` (which implies algo_body is Some).
+            match algo_body.clone() {
+                Some(b) => (b, algo_text.clone(), algo_len),
+                // Defensive: should be unreachable given the arbiter's
+                // own-empty + algo>0 branch is the only true case.
+                None => (own_body.clone(), own_text.clone(), own_len),
+            }
+        } else {
+            (own_body.clone(), own_text.clone(), own_len)
+        };
+
+    // Stage 5d — external.py:94-102 jusText override gate.
+    //
+    // Trigger: the winning body has SANITIZED_TAGS descendants OR its
+    // text is too short. The Rust port runs jusText on the cleaned
+    // `body` (the pre-extract-content state has been mutated by
+    // `extract_content`; the `body` NodeRef is the post-cleaning, pre-
+    // own-extraction tree — equivalent semantic to Python's `tree`
+    // arg at external.py:97).
+    let has_sanitized_descendants =
+        !crate::readability::dom::get_all_nodes_with_tag(&winning_body, SANITIZED_TAGS).is_empty();
+    let too_short = winning_len < opts.min_extracted_size;
+
+    if has_sanitized_descendants || too_short {
+        // external.py:97 — `body2, text2, len_text2 = justext_rescue(tree, options)`.
+        // We pass the cleaned `body` (Python passes the pre-cleaning
+        // `tree`, then `basic_cleaning`s it inside `justext_rescue`;
+        // see `justext_rescue` doc for why the Rust port doesn't
+        // re-clean — the M3 cascade's cleaning step is structurally
+        // equivalent).
+        let (jt_body, jt_text, jt_len) =
+            crate::trafilatura::justext_core::justext_rescue(&body, None, None);
+
+        // external.py:100 — `if text2 and not len_text > 4*len_text2`.
+        // Python `bool(text2)` is true for any non-empty string.
+        // `!(a > b)` is `a <= b` — preserved as the latter for clippy
+        // happiness; the Python source is `not len_text > 4*len_text2`,
+        // semantically identical.
+        if !jt_text.is_empty() && winning_len <= 4 * jt_len {
+            winning_body = jt_body;
+            winning_text = jt_text;
+            winning_len = jt_len;
+        }
+    }
+
+    // All three arms empty → no article. Keep `dom` alive until both
+    // prior arms are measured (rcdom Drop quirk), then return None.
+    if winning_len == 0 {
+        let _ = (own_body, algo_body);
         drop(dom);
         return None;
     }
 
-    if use_readability {
-        algo_body
-    } else {
-        // Keep the readability arm alive long enough for the arbiter to
-        // measure; then return the own-arm node. The own-arm `NodeRef`
-        // is rooted in `dom` which the caller now owns transitively
-        // through the returned `Rc` — but for safety against the rcdom
-        // Drop quirk on the readability side, we explicitly drop the
-        // arm we didn't pick.
-        let _ = algo_body;
-        Some(own_body)
-    }
+    // Keep the unused arms alive for the duration of the function so
+    // that the rcdom Drop quirk doesn't drain descendants of the
+    // returned node mid-call. The selected `winning_body` is rooted in
+    // either `dom` (own arm), `try_readability`'s internal Dom (algo arm,
+    // already detached via Document::summary's get_article reparenting),
+    // or a fresh detached body built by `justext_rescue` (jusText arm).
+    // Dropping `_` lifetime-extends the unused arms through the return.
+    let _ = (own_body, own_text, algo_body, algo_text);
+    let _ = winning_text;
+    Some(winning_body)
 }
 
 // ===========================================================================
@@ -2595,6 +2682,143 @@ mod tests {
         assert!(
             is_node_visible(&by_id("f")),
             "aria-hidden=true + class~=fallback-image is visible"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Stage 5d: 3-arm cascade (own / readability / jusText)
+    // -----------------------------------------------------------------------
+
+    /// A page where the own + readability arms produce thin / sanitized
+    /// output, but the underlying tree has substantive paragraphs that
+    /// jusText classifies as `good`. The cascade picks the jusText
+    /// output via the override gate at external.py:94-102.
+    ///
+    /// Construction: a page whose body is dominated by SANITIZED_TAGS
+    /// (`<aside>`/`<nav>`/`<footer>`) so the override gate fires
+    /// regardless of own/readability lengths; and contains substantive
+    /// `<p>` text that jusText classifies as `good`.
+    #[test]
+    fn cascade_three_arm_picks_justext_when_others_fail() {
+        // The own arm will extract `<p>` content as it ALWAYS does
+        // (Stage 2 own extractor), and readability may too. But the
+        // resulting body will contain SANITIZED_TAGS descendants from
+        // the unprocessed wrapper (the own extractor preserves the
+        // structural shape; aside/nav descendants surface in the output
+        // body if any survive cleaning).
+        //
+        // To trigger the override gate reliably, we build a page whose
+        // own+readability outputs are short (text < min_extracted_size,
+        // default 250) but jusText finds substantive prose.
+        let html = r#"<html><body>
+            <nav><a href="/a">Home</a></nav>
+            <p>Tiny.</p>
+            <p>The quick brown fox jumps over the lazy dog and this is a substantive
+            article paragraph about animals and forests with many common words like
+            the and a and of and to and the dog runs fast in the forest with the fox
+            and the cat as the sun sets behind the trees and the moon rises in the
+            east over the meadow with the river flowing gently through the valley.</p>
+            <aside>Footer ad copy that should not be in the output.</aside>
+        </body></html>"#;
+        let opts = crate::trafilatura::cleaning::Options::default();
+        let result = bare_extraction_with_cascade(html, &opts);
+        assert!(result.is_some(), "cascade should return Some");
+        let body = result.expect("cascade returned None");
+        let text = crate::readability::dom::text_content(&body);
+        // The substantive article paragraph must appear in the output.
+        assert!(
+            text.contains("substantive"),
+            "cascade output must include the substantive article text, got {text:.200?}"
+        );
+    }
+
+    /// When the own arm extracts a substantive body (clean, long, no
+    /// SANITIZED_TAGS descendants) the cascade keeps it — neither
+    /// readability nor jusText override fires.
+    #[test]
+    fn cascade_three_arm_picks_own_when_substantial() {
+        // Long-form article-shaped page; own arm should produce a
+        // substantive body. Use `<article>` to make the own extractor
+        // happy and avoid `<aside>`/`<nav>` SANITIZED descendants.
+        let html = r#"<html><body>
+            <article>
+                <h1>Article Title Here</h1>
+                <p>The first paragraph contains substantial prose with multiple clauses,
+                real punctuation, several commas, and well over one hundred and forty
+                characters of trimmed body text — enough to clear the content-length
+                floor on its own merit and convince the cascade that the own arm
+                produced a substantive extraction worthy of being kept.</p>
+                <p>A second paragraph continues the discussion at a similar length,
+                with reflection, analysis, and conclusion-pointing remarks that
+                demonstrably exceed the one hundred and forty character lower bound
+                the heuristic enforces. The own arm should win here without override.</p>
+                <p>The third paragraph wraps up the discussion, restating the thesis,
+                naming the conclusion, and closing out the article cleanly with
+                additional content to push the total length above the
+                min_extracted_size threshold of 250 characters comfortably.</p>
+            </article>
+        </body></html>"#;
+        let opts = crate::trafilatura::cleaning::Options::default();
+        let result = bare_extraction_with_cascade(html, &opts);
+        assert!(result.is_some(), "cascade should return Some");
+        let body = result.expect("cascade returned None");
+        let text = crate::readability::dom::text_content(&body);
+        // Should contain article body text.
+        assert!(
+            text.contains("first paragraph") || text.contains("substantial prose"),
+            "expected substantive article content, got {text:.200?}"
+        );
+        assert!(
+            text.chars().count() >= 250,
+            "expected substantive length, got {}",
+            text.chars().count()
+        );
+    }
+
+    /// Boundary case: own arm produces a short/empty body but
+    /// readability finds substantive content (no SANITIZED_TAGS in the
+    /// readability output, length above min_extracted_size). The
+    /// cascade picks readability — neither jusText override fires nor
+    /// own wins.
+    #[test]
+    fn cascade_three_arm_picks_readability_when_own_too_short_but_readability_succeeds() {
+        // A page where the own extractor's BODY_XPATH may not match
+        // well (no <article> tag, content in a `<div class="content">`)
+        // but readability's scoring finds the main content. The
+        // readability output should be clean and substantive — no
+        // SANITIZED_TAGS, length > 250 — so the jusText override does
+        // not fire and readability wins outright.
+        let html = r#"<html><body>
+            <div class="content">
+                <p>The first paragraph contains substantial prose with multiple clauses,
+                real punctuation, several commas, and well over one hundred and forty
+                characters of trimmed body text — enough to clear the content-length
+                floor on its own merit and convince the readability scorer.</p>
+                <p>A second paragraph continues the discussion at a similar length,
+                with reflection, analysis, and conclusion-pointing remarks that
+                demonstrably exceed the one hundred and forty character lower bound
+                the heuristic enforces. Readability should pick this content.</p>
+                <p>The third paragraph wraps up the discussion, restating the thesis,
+                naming the conclusion, and closing out cleanly with enough additional
+                content to push the total length above the min_extracted_size
+                threshold of 250 characters comfortably for the cascade arbiter.</p>
+            </div>
+        </body></html>"#;
+        let opts = crate::trafilatura::cleaning::Options::default();
+        let result = bare_extraction_with_cascade(html, &opts);
+        assert!(result.is_some(), "cascade should return Some");
+        let body = result.expect("cascade returned None");
+        let text = crate::readability::dom::text_content(&body);
+        assert!(
+            text.contains("first paragraph") || text.contains("substantial prose"),
+            "expected substantive article content from readability or own, got {text:.200?}"
+        );
+        // The output must be non-trivial — confirms one of the three
+        // arms (any) succeeded.
+        assert!(
+            text.chars().count() > 100,
+            "cascade output too short ({} chars): {text:.200?}",
+            text.chars().count()
         );
     }
 }

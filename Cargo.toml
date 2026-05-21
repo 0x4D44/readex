@@ -1126,7 +1126,106 @@ name = "mdrcel"
 # revise-promotes-heading-before-good, is-boilerplate-materializes,
 # end-to-end-pipeline-on-article-html). All four BLOCKER gates remain
 # green; `cargo clippy --release --all-targets -- -D warnings` is clean.
-version = "0.6.3"
+#
+# M3 Stage 5d (2026-05-21): 0.6.3 -> 0.7.0 MINOR. Wires jusText into the
+# M3 extract cascade as the THIRD arm — the cascade shape graduates from
+# 2-arm (own + readability) at Stage 4d to 3-arm (own + readability +
+# jusText) faithful to `external.compare_extraction` (external.py:45-108)
+# with the override gate at external.py:94-102. Stage 5 (the full
+# jusText port) is now complete across 5a/5b/5c/5d.
+#
+# New public surface on `#[doc(hidden)] pub mod trafilatura::justext_core`:
+# - `JUSTEXT_LANGUAGES: &[(&str, &str)]` — ISO 639-1 -> capitalized
+#   language-name mapping (`settings.py:442-475` verbatim, with the
+#   commented-out `ja`/`zh` omitted).
+# - `try_justext(tree, url, target_language) -> Vec<Paragraph>` —
+#   faithful port of `external.py:129-150`. Runs `make_paragraphs` +
+#   `classify_and_revise` (Stage 5b/c primitives) and filters to
+#   non-boilerplate paragraphs. Returns the surviving paragraph stream
+#   (caller materializes the `<body>` + `<p>` children if needed).
+# - `justext_rescue(tree, url, target_language)
+#   -> (NodeRef, String, usize)` — faithful port of
+#   `external.py:153-160`. Builds a `<body>` NodeRef whose children are
+#   `<p>` elements (one per surviving paragraph) plus the joined trim-
+#   collapsed text and its character count. The cascade-call shape
+#   `compare_extraction` expects.
+#
+# Behaviour change on `bare_extraction_with_cascade`: the 3-arm jusText
+# override now fires when the winning arm (own or readability) either
+# (a) has any `SANITIZED_TAGS` descendants
+# (`aside`/`audio`/`button`/`fieldset`/`figure`/`footer`/`iframe`/
+# `input`/`label`/`link`/`nav`/`noindex`/`noscript`/`object`/`option`/
+# `select`/`source`/`svg`/`time` — `external.py:29`) OR (b) its text
+# length is below `options.min_extracted_size`. The jusText output
+# replaces the winner if it produces non-empty text AND the winning
+# length is NOT more than 4x the jusText length (faithful to
+# `external.py:100`'s `if text2 and not len_text > 4*len_text2` gate).
+#
+# Faithful divergences (recorded):
+# - Python `options.url` and `options.lang` slots are not yet on
+#   `cleaning::Options` (their Rust home arrives with the full
+#   `Extractor` options surface in a later stage). The jusText arm is
+#   invoked with `url=None, language=None`; `try_justext` falls back to
+#   the English stoplist when language is unknown, matching Python's
+#   `JT_STOPLIST or jt_stoplist_init()` semantic (specialized to
+#   English-as-default rather than the all-languages union to avoid
+#   eagerly parsing all 100 vendored stoplists on first cascade
+#   invocation — a perf regression for the common monolingual case).
+# - Python `basic_cleaning(tree)` runs inside `justext_rescue` at
+#   external.py:156; the Rust port skips this (the M3 cascade's
+#   `cleaning::tree_cleaning` runs upstream and is STRUCTURALLY
+#   equivalent + broader). Re-running would double-clean the tree.
+# - Python `compare_extraction` runs `prune_unwanted_nodes` under
+#   `focus="precision"` (external.py:54-55) before the readability arm
+#   fires; preserved as Stage 4d shipped (no precision gate at this
+#   level until the option enum is wired).
+#
+# Per semver (CLAUDE.md "Version management") MINOR — adds NEW public
+# functions (`try_justext`, `justext_rescue`) AND a new public constant
+# (`JUSTEXT_LANGUAGES`) on the `#[doc(hidden)] pub mod
+# trafilatura::justext_core` surface, PLUS modifies the public
+# `bare_extraction_with_cascade` behaviour shape (2-arm -> 3-arm). The
+# behaviour change is the load-bearing MINOR trigger: callers of
+# `bare_extraction_with_cascade` will observe DIFFERENT outputs on
+# pages where the jusText override fires (the documented trigger
+# conditions). For purely-substantive pages where the own arm wins
+# outright (no SANITIZED_TAGS descendants AND length >= 250) the
+# behaviour is byte-unchanged.
+#
+# Backward compatibility: every prior public surface
+# (`extract`/`extract_with`/`Extracted`/`Options`/`ExtractError`,
+# Stage 4a-d's readability_fork surface, Stage 5a-c's justext_core /
+# justext_stoplists surface) is byte-unchanged. The Stage 4d
+# `cascade_prefers_readability` function is unchanged — Stage 5d
+# adds the jusText override as a POST-arbitration step, preserving
+# Stage 4d's own/readability arbiter semantics. All four BLOCKER gates
+# (parser_equivalence_gate / trafilatura_equivalence_gate /
+# trafilatura_extract_smoke / trafilatura_extract_content_gate) remain
+# byte-identical green.
+#
+# Lib test count 656 -> 662 (+6 new tests: 3 on justext_core
+# (try_justext_returns_only_good_paragraphs,
+# try_justext_handles_unknown_language_with_fallback,
+# justext_rescue_builds_body_with_p_elements) + 3 on readability_fork
+# (cascade_three_arm_picks_justext_when_others_fail,
+# cascade_three_arm_picks_own_when_substantial,
+# cascade_three_arm_picks_readability_when_own_too_short_but_readability_succeeds)).
+# `cargo clippy --release --all-targets -- -D warnings` is clean.
+#
+# Stage 5 — the entire `jusText` port — is now complete. What's left for
+# the M3 umbrella:
+# - **Stage 6**: full `compare_extraction` arbiter (the borderline
+#   `focus`-tuned arms at external.py:75-82, requires the full options
+#   surface for `focus` / `min_extracted_size` granularity) +
+#   `sanitize_tree` post-processing (external.py:163-190).
+# - **Stage 7**: `bare_extraction` top-level entry-point
+#   (core.py:130-310) — metadata extraction (htmldate / authors /
+#   tags / categories / JSON-LD via Stage 4 M2 surface).
+# - **Stage 8**: `extract` public entry-point with output format
+#   selection (xml / xmltei / txt / markdown / csv / json).
+# - **Stage 9**: HLD §7.6 wiring of the `mdrcel::extract` public
+#   surface into the trafilatura cascade.
+version = "0.7.0"
 edition = "2024"
 
 [dependencies]
