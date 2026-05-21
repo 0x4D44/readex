@@ -2385,7 +2385,80 @@ name = "mdrcel"
 # Per semver (CLAUDE.md "Version management") PATCH — feature extension
 # to an existing code path documented as a STUB pending Stage 2. The new
 # `pub(crate)` surfaces are additive on already-`#[doc(hidden)]` modules.
-version = "0.12.2"
+#
+# M4 Stage 3 sub-stage B (2026-05-21): 0.12.2 -> 0.13.0 MINOR. Adds the
+# FIRST public output-format entry-point on the stable public surface:
+# `pub fn extract_to_markdown(html, base_url, opts) -> Result<String,
+# ExtractError>`. Wires the Stage 3-A `output::process_element` helper
+# under a faithful port of `xml.py:354-363` (`xmltotxt`) plus the
+# markdown/TXT branch of `core.py:73-96` (`determine_returnstring`).
+#
+# # New public surface
+#
+# - `pub fn extract_to_markdown(html: &str, base_url: Option<&str>,
+#   opts: &Options) -> Result<String, ExtractError>` — top-level free
+#   function on `mdrcel`'s crate root. Runs the full Trafilatura cascade
+#   (own/readability/jusText, identical to `extract_with`), then formats
+#   the winning body via `output::process_element(_, _,
+#   include_formatting=true)` and joins. When `opts.with_metadata` is
+#   true, prepends a YAML-style `---` header listing the metadata fields
+#   Python's `core.py:75-91` enumerates (title / author / url / hostname
+#   / description / sitename / date / categories / tags / fingerprint /
+#   id / license). NFC-normalises the final string per `core.py:98`
+#   (`return normalize_unicode(returnstring)`). Plain TXT (formatting=
+#   false) is NOT a separate public entry-point: `extract_with(...)?.text`
+#   already returns the whitespace-collapsed plain-text body, documented
+#   in `extract_to_markdown`'s function header.
+# - `pub with_metadata: bool` field on `Options` (additive — default
+#   `false`, so existing callers using `..Options::default()` are
+#   forward-compatible). Documented as the YAML-header toggle the new
+#   markdown formatter honours; ignored by `extract` / `extract_with`
+#   (their public types do not carry a header concept).
+#
+# # NFC dependency promotion
+#
+# `unicode-normalization` graduates from a `[dev-dependencies]` entry
+# (test-only, used by `tests/parser_equivalence_gate.rs`) to a regular
+# `[dependencies]` entry. The crate is already in `Cargo.lock` at
+# 0.1.25 — promoting it adds ZERO new crates to the dependency graph.
+# Same DEC-3 reasoning the M2 Stage 1a / M2 Stage 4 dependency notes
+# apply: hand-rolling NFC (canonical ordering + Hangul composition + a
+# ~12 KB ucd table) is a non-trivial Unicode algorithm and would be a
+# fresh correctness-divergence surface. Pinned EXACTLY per project
+# new-dependency discipline.
+#
+# # Per semver (CLAUDE.md "Version management") MINOR
+#
+# - New public free function `extract_to_markdown` on the stable crate
+#   root. This is the FIRST output-format entry-point on the public
+#   surface; matches the M3 Stage 4a / Stage 5a / M3 Stage 9 / M4 Stage
+#   1 sub-stage A precedent for "first public function/type on a new
+#   public-surface area = MINOR bump".
+# - Additive `Options::with_metadata` field. Per the M2 Stage 4
+#   precedent (`Extracted` gained five additive fields), additive struct
+#   fields are MINOR-eligible because `..Default::default()` consumers
+#   upgrade transparently but exhaustive struct-literal callers must add
+#   the new field. The harness (`benchmark/`) already uses
+#   `..Options::default()` so it upgrades transparently.
+# - All five pre-existing BLOCKER gates remain byte-identical green
+#   (parser_equivalence_gate / trafilatura_equivalence_gate /
+#   trafilatura_extract_smoke / trafilatura_extract_content_gate /
+#   htmldate_parity_gate). The existing `extract` / `extract_with` /
+#   `Extracted` / `ExtractError` surface is byte-unchanged.
+#
+# # YAML header field set
+#
+# Faithful to `core.py:75-87`:
+#   title, author, url, hostname, description, sitename, date,
+#   categories, tags, fingerprint, id, license
+# The Rust `Metadata` struct (Stage 7a) carries every field except
+# `fingerprint` and `id` (M4 Stage 6 deferred). Both render as falsy
+# under Python's `if getattr(document, attr):` — so they are silently
+# omitted from the YAML header, matching the Python source's behaviour
+# on a fresh-extraction `Document` (whose `fingerprint`/`id` are the
+# pre-`set_id`/`pre-content_fingerprint` defaults — empty / None at this
+# pipeline stage).
+version = "0.13.0"
 edition = "2024"
 
 [dependencies]
@@ -2463,14 +2536,26 @@ regex = "=1.12.3"
 # preserved (parsing JSON in-memory is computation, not I/O).
 serde_json = "=1.0.149"
 
+# M4 Stage 3 sub-stage B (2026-05-21): the markdown / TXT formatter
+# (`extract_to_markdown`) is mandated by `core.py:97` to NFC-normalise its
+# output: `return normalize_unicode(returnstring)` where
+# `normalize_unicode` is Python's `unicodedata.normalize('NFC', s)`
+# (utils.py:277-279). Hand-rolling NFC is a non-trivial Unicode algorithm
+# (canonical ordering + Hangul composition); same DEC-3 reasoning that
+# pulled in `regex` (Stage 1a) and `serde_json` (M2 Stage 4) applies —
+# the conservative path is a pinned, audited dependency rather than
+# reimplementing the algorithm. `unicode-normalization` is already in the
+# workspace `Cargo.lock` at 0.1.25 (used as a dev-dep here and a runtime
+# dep by `benchmark/`); promoting it from dev-dep to a regular dep adds
+# ZERO new crates to the graph. Pure-algorithm, no I/O, no transitive
+# deps beyond the existing `tinyvec`.
+unicode-normalization = "=0.1.25"
+
 [dev-dependencies]
-# Test-scaffolding ONLY (never linked into the shipped library — CLAUDE.md
-# "Tests are scaffolding"). Used by `tests/parser_equivalence_gate.rs` (the
-# HLD §6.1 BLOCKER gate) to reproduce the harness tokenizer
-# (`benchmark/src/metrics.rs::tokens`) EXACTLY: `split(char::is_whitespace) ->
-# drop-empty -> to_lowercase -> NFC`. NFC requires `unicode-normalization`;
-# version pinned to "0.1" to match `benchmark/Cargo.toml` so the gate's
-# tokeniser is bit-identical to the harness's (HLD §6.1 requires *the harness
-# tokenizer semantics*, not an approximation). The gate self-checks this
-# mirror against hand-derived vectors so any future drift fails loudly.
-unicode-normalization = "0.1"
+# `unicode-normalization` is now a REGULAR dependency (see the M4 Stage 3
+# sub-stage B note above the `[dev-dependencies]` block). The dev-dep entry
+# previously here is therefore redundant — the regular dep is available in
+# `#[cfg(test)]` paths too. The `tests/parser_equivalence_gate.rs` BLOCKER
+# gate continues to consume it via the regular dep, with no change to the
+# tokenizer mirror semantics (the version pin is now `=0.1.25` — strictly
+# tighter than the previous `0.1` floor).

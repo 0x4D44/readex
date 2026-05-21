@@ -677,6 +677,265 @@ fn has_cell_ancestor(element: &NodeRef) -> bool {
 }
 
 // ===========================================================================
+// xmltotxt (xml.py:354-363)
+// ===========================================================================
+
+/// `xml.py:354-363` — `xmltotxt(xmloutput, include_formatting) -> str`.
+///
+/// The TXT / markdown formatter. Walks `xmloutput`'s subtree via
+/// [`process_element`], joins the resulting fragments with `""`, then
+/// runs Python's `unescape(sanitize(joined) or "")` post-processing.
+///
+/// `xmloutput` is `Option<&NodeRef>` (Python: `Optional[_Element]`); `None`
+/// short-circuits to `""` per `xml.py:356-357`.
+///
+/// # Sanitize / unescape
+///
+/// `xml.py:363` runs `unescape(sanitize(...))`. The Rust port:
+/// - `sanitize` is a faithful port of `utils.py:303-312`: line-by-line
+///   processing that removes `\u{2424}` (the SPECIAL/markdown spacing
+///   hack `process_element` emits at `xml.py:343`) and the HTML space
+///   entities `&#10;`, `&#13;`, `&nbsp;`. Empty lines are pruned.
+/// - `unescape` decodes the small handful of HTML entities Python's
+///   `html.unescape` produces in this pipeline. The post-`process_element`
+///   stream contains only `&amp;`/`&lt;`/`&gt;`/`&quot;`/`&apos;` —
+///   produced incidentally by lxml's `.text` getter when source HTML
+///   carried entities. We handle that minimal set; the full
+///   `html.unescape` (~250 named entities) is deferred until a test
+///   demands it.
+pub(crate) fn xmltotxt(xmloutput: Option<&NodeRef>, include_formatting: bool) -> String {
+    // xml.py:356-357 — `if xmloutput is None: return ""`.
+    let Some(root) = xmloutput else {
+        return String::new();
+    };
+
+    // xml.py:359-361 — `returnlist = []; process_element(...)`.
+    let mut returnlist: Vec<String> = Vec::new();
+    process_element(root, &mut returnlist, include_formatting);
+
+    // xml.py:363 — `return unescape(sanitize("".join(returnlist)) or "")`.
+    let joined: String = returnlist.concat();
+    let sanitized = sanitize_text(&joined);
+    unescape_html(&sanitized)
+}
+
+/// Faithful subset of `utils.py:303-312` (`sanitize`) — line-by-line cleanup
+/// with `\u{2424}` removed (xml.py:343's spacing hack) and HTML space
+/// entities decoded. Empty lines (whitespace-only after `line_processing`)
+/// are pruned; non-empty lines are `\n`-joined.
+fn sanitize_text(text: &str) -> String {
+    // utils.py:310 — `'\n'.join(filter(None, (line_processing(l, ...) for l
+    // in text.splitlines()))).replace('␤', '')`.
+    let mut out_lines: Vec<String> = Vec::new();
+    for line in text.split('\n') {
+        let processed = line_processing(line);
+        // utils.py:310 — `filter(None, ...)` drops `None`-returning lines.
+        if let Some(p) = processed {
+            out_lines.push(p);
+        }
+    }
+    // utils.py:310 — `.replace('␤', '')` — apply AFTER the join.
+    out_lines.join("\n").replace('\u{2424}', "")
+}
+
+/// Faithful subset of `utils.py:282-300` (`line_processing`):
+/// - replace `&#13;` -> '\r', `&#10;` -> '\n', `&nbsp;` -> '\u{00A0}'
+/// - trim (`utils.py:340-346`: collapse whitespace + strip)
+/// - return `None` for all-whitespace lines
+///
+/// Stage 3-B does NOT port the `preserve_space` / `trailing_space` knobs
+/// (the `sanitize`-`process_element` callsite at `xml.py:363` uses
+/// defaults). `remove_control_characters` is omitted — the upstream
+/// parser already drops C0 controls except whitespace; if a future test
+/// surfaces a control-character leak the helper grows here.
+fn line_processing(line: &str) -> Option<String> {
+    // utils.py:288 — `remove_control_characters(line.replace('&#13;',
+    // '\r').replace('&#10;', '\n').replace('&nbsp;', ' '))`.
+    let decoded = line
+        .replace("&#13;", "\r")
+        .replace("&#10;", "\n")
+        .replace("&nbsp;", "\u{00A0}");
+    // utils.py:292 — `trim(LINES_TRIMMING.sub(r" ", new_line))`. Our `trim`
+    // (utils.rs:97) already collapses Unicode whitespace + strips, which
+    // subsumes LINES_TRIMMING's behaviour on the realistic inputs.
+    let trimmed = crate::trafilatura::utils::trim(&decoded);
+    // utils.py:294-295 — `if all(map(str.isspace, new_line)): new_line = None`.
+    if trimmed.chars().all(char::is_whitespace) {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+/// Faithful subset of Python's `html.unescape` for the small entity set
+/// `process_element`'s output stream realistically carries. Stage 3-A's
+/// helpers never emit named entities themselves; this is the cleanup pass
+/// for entities that survived from the source HTML through lxml's
+/// `.text` getter. Decodes `&amp;`, `&lt;`, `&gt;`, `&quot;`, `&apos;` and
+/// numeric entities `&#NN;` / `&#xHH;` (decimal / hex codepoints).
+fn unescape_html(s: &str) -> String {
+    // Char-by-char scanner. We iterate chars (not bytes) so multi-byte
+    // UTF-8 sequences pass through verbatim — a byte-loop would split
+    // `\u{0301}` (UTF-8 `0xCC 0x81`) into two separate `char` casts and
+    // corrupt the encoding.
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '&' {
+            out.push(c);
+            continue;
+        }
+        // Lookahead: copy until ';' or until we run out / hit non-entity
+        // chars. Limit to 10 chars (named-entity longest + numeric upper
+        // bound) so a bare `&` in text doesn't scan unbounded.
+        let mut entity = String::new();
+        let mut found_end = false;
+        for _ in 0..10 {
+            match chars.peek() {
+                Some(&';') => {
+                    chars.next();
+                    found_end = true;
+                    break;
+                }
+                Some(&pc) if pc.is_ascii_alphanumeric() || pc == '#' => {
+                    entity.push(pc);
+                    chars.next();
+                }
+                _ => break,
+            }
+        }
+        if !found_end {
+            // Not an entity: copy '&' + whatever we consumed verbatim.
+            out.push('&');
+            out.push_str(&entity);
+            continue;
+        }
+        let decoded: Option<String> = match entity.as_str() {
+            "amp" => Some("&".to_string()),
+            "lt" => Some("<".to_string()),
+            "gt" => Some(">".to_string()),
+            "quot" => Some("\"".to_string()),
+            "apos" => Some("'".to_string()),
+            _ => {
+                if let Some(rest) = entity.strip_prefix('#') {
+                    let cp = if let Some(hex) =
+                        rest.strip_prefix('x').or_else(|| rest.strip_prefix('X'))
+                    {
+                        u32::from_str_radix(hex, 16).ok()
+                    } else {
+                        rest.parse::<u32>().ok()
+                    };
+                    cp.and_then(char::from_u32).map(|c| c.to_string())
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(text) = decoded {
+            out.push_str(&text);
+        } else {
+            // Unknown entity: copy verbatim (`&entity;`).
+            out.push('&');
+            out.push_str(&entity);
+            out.push(';');
+        }
+    }
+    out
+}
+
+// ===========================================================================
+// YAML header builder (core.py:73-91)
+// ===========================================================================
+
+/// `core.py:73-91` — build the YAML-style `---` header that prefixes
+/// `extract_to_markdown` output when `options.with_metadata` is true.
+///
+/// Emits one line per metadata field, in the SAME order Python's tuple
+/// at `core.py:75-87` defines:
+///
+/// ```text
+/// ---
+/// title: foo
+/// author: bar
+/// ...
+/// ---
+/// ```
+///
+/// Falsy fields (Python `if getattr(document, attr):`) are skipped: empty
+/// strings, `None`, and empty lists. Non-empty lists render as Python's
+/// `str(list)` (e.g. `['a', 'b']`) — faithful to `core.py:90`
+/// `f"{attr}: {str(getattr(document, attr))}\n"`.
+///
+/// `Metadata` does not carry `fingerprint` or `id` slots (M4 Stage 6
+/// deferred). They are silently omitted — equivalent to Python's
+/// behaviour on a pre-`set_id` / pre-`content_fingerprint` `Document`,
+/// whose `fingerprint`/`id` attributes default to `None` / `""`.
+pub(crate) fn build_yaml_header(metadata: &Metadata) -> String {
+    let mut header = String::from("---\n");
+    // Order is verbatim from core.py:75-87.
+    if let Some(v) = &metadata.title
+        && !v.is_empty()
+    {
+        header.push_str(&format!("title: {v}\n"));
+    }
+    if let Some(v) = &metadata.author
+        && !v.is_empty()
+    {
+        header.push_str(&format!("author: {v}\n"));
+    }
+    if let Some(v) = &metadata.url
+        && !v.is_empty()
+    {
+        header.push_str(&format!("url: {v}\n"));
+    }
+    if let Some(v) = &metadata.hostname
+        && !v.is_empty()
+    {
+        header.push_str(&format!("hostname: {v}\n"));
+    }
+    if let Some(v) = &metadata.description
+        && !v.is_empty()
+    {
+        header.push_str(&format!("description: {v}\n"));
+    }
+    if let Some(v) = &metadata.site_name
+        && !v.is_empty()
+    {
+        header.push_str(&format!("sitename: {v}\n"));
+    }
+    if let Some(v) = &metadata.date
+        && !v.is_empty()
+    {
+        header.push_str(&format!("date: {v}\n"));
+    }
+    if !metadata.categories.is_empty() {
+        header.push_str(&format!(
+            "categories: {}\n",
+            python_repr_list(&metadata.categories)
+        ));
+    }
+    if !metadata.tags.is_empty() {
+        header.push_str(&format!("tags: {}\n", python_repr_list(&metadata.tags)));
+    }
+    // fingerprint / id slots: omitted (Metadata does not carry them).
+    if let Some(v) = &metadata.license
+        && !v.is_empty()
+    {
+        header.push_str(&format!("license: {v}\n"));
+    }
+    header.push_str("---\n");
+    header
+}
+
+/// Mirror Python `str(list)`: `['a', 'b']` (single-quoted, comma+space
+/// separated). Faithful to `core.py:90`'s `str(getattr(document, attr))`
+/// for list-valued `categories` / `tags`.
+fn python_repr_list(items: &[String]) -> String {
+    let inner: Vec<String> = items.iter().map(|s| format!("'{s}'")).collect();
+    format!("[{}]", inner.join(", "))
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
