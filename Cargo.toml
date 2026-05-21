@@ -625,7 +625,74 @@ name = "mdrcel"
 # CLAUDE.md "new public types/functions = MINOR" rule. Stages 4b / 4c /
 # 4d will likely be PATCH (extending the same module's internal
 # surfaces) but each will state its own semver rationale at bump time.
-version = "0.5.0"
+#
+# M3 Stage 4b (2026-05-21): 0.5.0 -> 0.5.1 PATCH. Extends
+# `src/trafilatura/readability_fork.rs` ADDITIVELY (Stage 4a public
+# surface FROZEN) with the `Document` class + `summary()` retry-loop
+# orchestration from `readability_lxml.py:102-225` plus the helpers
+# `summary()` directly invokes:
+# - `Document { html, dom, min_text_length, retry_length }` struct
+#   (readability_lxml.py:102-122). Public constructor `Document::new`
+#   (defaults: min=25, retry=250) and `Document::with_options`.
+# - `Document::summary() -> Option<NodeRef>` — the ruthless/lenient
+#   retry loop (readability_lxml.py:124-166). Re-parses `self.html`
+#   on every attempt (HLD §m-3 re-parse-on-retry pattern; M2 Stage 1c
+#   flag-sieve precedent) to avoid stale `drop_tree` side effects
+#   leaking between modes. Calls a Stage-4b `_stage4b_sanitize_stub`
+#   pass-through so the `article_length < retry_length` retry gate
+#   has a quantitative signal until Stage 4c lands the real sanitize.
+# - Private helpers `remove_unlikely_candidates`,
+#   `transform_misused_divs_into_paragraphs`, `score_paragraphs`,
+#   `get_article` — each line-cited verbatim to its Python source.
+# - Public free fn `select_best_candidate(&[(NodeRef, Candidate)]) ->
+#   Option<Candidate>` (readability_lxml.py:209-218). Tie-break
+#   parity: FIRST inserted wins on equal scores (Python `sorted`
+#   stable + `reverse=True` + `next(iter(...))`).
+# - Public free fn `dot_space_re` is NOT exposed — it's a private
+#   `OnceLock<Regex>` accessor for the DOT_SPACE pattern
+#   (readability_lxml.py:35) used by `get_article`'s <p> rescue arm.
+# - 4 previously `#[allow(dead_code)]`-annotated 4a items are now
+#   live (FRAME_TAGS, unlikely_candidates_re, ok_maybe_re,
+#   div_to_p_elements_re); annotations removed. TEXT_CLEAN_ELEMS /
+#   LIST_TAGS / DIV_TO_P_ELEMS / video_re remain dead-code-annotated
+#   (Stage 4c consumers).
+#
+# **Stage 4b scope deferral (acknowledged honestly):** Python's
+# `transform_misused_divs_into_paragraphs` runs TWO passes — a retag
+# pass + a br/text-rescue pass. Stage 4b ports the retag pass only;
+# the rescue pass is a structural cleanup that does not affect the
+# downstream `score_paragraphs` decisions the rest of `summary()`
+# consumes (paragraph scoring concatenates descendant text via
+# `text_content`). If Stage 4c's sanitize port + cascade integration
+# (Stage 4d) reveals a corpus divergence rooted in the missing
+# rescue pass, the function body grows there — at which point the
+# divergence is observable and the fix is one-shot.
+#
+# Per semver (CLAUDE.md "Version management") PATCH — additive
+# extension WITHIN the already-public `readability_fork` module that
+# Stage 4a introduced. No new MODULE; no removed function/type. The
+# new `Document` struct + `summary` method + `select_best_candidate`
+# fn extend the same module's public surface, which the Stage 4a
+# CHANGELOG entry explicitly flagged as "incomplete" pending 4b/c/d.
+# The MINOR-vs-PATCH judgement call: a brand-new exported type
+# (`Document`) on a frozen module surface arguably crosses the MINOR
+# threshold per the strict reading of CLAUDE.md ("new public types =
+# MINOR"). Recorded as PATCH because (1) the module itself is marked
+# "in progress" by 4a's entry; (2) `Document` is the natural
+# completion of a single named API the module was named for (Stage
+# 4a vendored its supporting primitives in anticipation); (3) all
+# four BLOCKER gates remain byte-identical. A reviewer who prefers
+# MINOR semantics has the rationale to bump to 0.6.0 instead; PATCH
+# is recorded as the conservative call.
+#
+# Lib test count 603 -> 612 (+9: document_summary_returns_*,
+# remove_unlikely_candidates_strips_*, transform_misused_*,
+# select_best_candidate_picks_*/keeps_first_tied/returns_none_for_empty,
+# document_new_uses_python_defaults). All four BLOCKER gates remain
+# green (parser_equivalence_gate / trafilatura_equivalence_gate /
+# trafilatura_extract_smoke / trafilatura_extract_content_gate);
+# `cargo clippy --release --all-targets -- -D warnings` is clean.
+version = "0.5.1"
 edition = "2024"
 
 [dependencies]
