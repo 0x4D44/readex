@@ -66,24 +66,28 @@ use regex::Regex;
 use std::sync::OnceLock;
 
 use super::extractors::{
-    MAX_SEGMENT_LEN, extract_url_date, regex_parse, try_date_expr,
+    MAX_SEGMENT_LEN, extract_url_date, idiosyncrasies_search, img_search, json_search,
+    pattern_search, regex_parse, try_date_expr,
 };
 use super::regex_catalogues::{
-    copyright_pattern, datestrings_catch, datestrings_pattern, mmyyyy_pattern, mmyyyy_year,
-    select_ymd_pattern, select_ymd_year, simple_pattern, simple_pattern_post_filter,
-    slashes_pattern, slashes_year, three_catch, three_comp_regex_a, three_comp_regex_b,
-    three_loose_catch, three_loose_pattern, three_pattern, two_comp_regex, year_pattern,
-    ymd_pattern, ymd_year, yyyymm_catch, yyyymm_pattern,
+    DATE_EXPRESSIONS, FAST_PREPEND, SLOW_PREPEND, copyright_pattern, datestrings_catch,
+    datestrings_pattern, mmyyyy_pattern, mmyyyy_year, select_ymd_pattern, select_ymd_year,
+    simple_pattern, simple_pattern_post_filter, slashes_pattern, slashes_year, three_catch,
+    three_comp_regex_a, three_comp_regex_b, three_loose_catch, three_loose_pattern, three_pattern,
+    timestamp_pattern, two_comp_regex, year_pattern, ymd_pattern, ymd_year, yyyymm_catch,
+    yyyymm_pattern,
 };
-use super::settings::MAX_POSSIBLE_CANDIDATES;
-use super::utils::Extractor;
+use super::settings::{CLEANING_LIST, MAX_POSSIBLE_CANDIDATES};
+use super::utils::{Extractor, clean_html};
 use super::validators::{
     DateInput, DateTime, check_extracted_reference, compare_values, filter_ymd_candidate,
-    is_valid_date, plausible_year_filter, validate_and_convert,
+    is_valid_date, is_valid_format, plausible_year_filter, validate_and_convert,
 };
 
+use crate::htmldate::extractors::discard_unwanted;
 use crate::readability::dom::{
-    NodeRef, get_attribute, get_elements_by_tag_name, text_content,
+    NodeData, NodeRef, child_nodes, deep_clone, get_attribute, get_elements_by_tag_name,
+    serialize_html, text_content,
 };
 use crate::trafilatura::xpath_engine;
 
@@ -1319,6 +1323,216 @@ fn make_date(year: i32, month: u32, day: u32) -> Option<DateTime> {
 }
 
 // ===========================================================================
+// find_date (core.py:808-983) — sub-stage G entrypoint
+// ===========================================================================
+
+/// Extract dates from HTML documents using markup analysis and text patterns.
+///
+/// Ports `htmldate/core.py:808-983`. Wires every sub-stage A..F port into the
+/// full htmldate algorithm. Returns a date string formatted per
+/// `options.format`, or `None`.
+///
+/// # Signature divergence from Python (faithful)
+///
+/// Python accepts `htmlobject: Union[bytes, str, HtmlElement]` and runs
+/// `load_html` (encoding sniff + URL fetch + lxml parse). The Rust port
+/// takes a **pre-parsed `&NodeRef`** instead — every caller in the
+/// Trafilatura pipeline (specifically `metadata_url::extract_date` and
+/// `metadata::extract_metadata`) already holds a parsed `Dom`, so the
+/// `load_html` branch is dead weight. `load_html` remains deferred per the
+/// sub-stage A module header.
+///
+/// Python's `extensive_search` / `original_date` / `outputformat` /
+/// `url` / `min_date` / `max_date` parameters fold into the existing
+/// [`Extractor`] options struct sub-stages A-F already consume. The
+/// remaining `verbose` (a logging knob) is dropped — Rust callers can
+/// configure log levels separately. `deferred_url_extractor` defaults to
+/// `false` in Python and is currently never set true by any in-tree
+/// caller, so the Rust port pins it `false` for sub-stage G simplicity;
+/// the wiring can grow there if a future use case appears.
+///
+/// # Algorithm (cited line-by-line vs core.py:861-983)
+///
+/// 1. **core.py:866-867** — outputformat validity gate. Reject any
+///    non-default format that `is_valid_format` rejects.
+/// 2. **core.py:881-891** — URL handling. If `url` is `None`, probe
+///    `.//link[@rel="canonical"]` for an `href`. Then call
+///    `extract_url_date(url, options)`. If hit and not deferred, return.
+/// 3. **core.py:895** — `examine_header(tree, options) or
+///    json_search(tree, options)`.
+/// 4. **core.py:900-901** — deferred URL fallback (no-op when
+///    deferred=false).
+/// 5. **core.py:904-909** — `examine_abbr_elements(tree, options)`.
+/// 6. **core.py:912-919** — prune tree: `discard_unwanted(clean_html(
+///    deepcopy(tree), CLEANING_LIST))`. The `try / except ValueError`
+///    Python branch (a defensive lxml-NULL-byte rescue) has no Rust
+///    counterpart — `clean_html` / `discard_unwanted` cannot raise.
+/// 7. **core.py:922-925** — `date_expr = (SLOW_PREPEND if extensive
+///    else FAST_PREPEND) + DATE_EXPRESSIONS`.
+/// 8. **core.py:929-941** — `examine_date_elements(search_tree, date_expr,
+///    options) or examine_date_elements(search_tree, ".//title|.//h1",
+///    options) or examine_time_elements(search_tree, options)`.
+/// 9. **core.py:953-956** — serialize search_tree to a string for
+///    string-pattern arms.
+/// 10. **core.py:961-965** — `pattern_search(htmlstring, TIMESTAMP_PATTERN,
+///     options) or img_search(search_tree, options) or
+///     idiosyncrasies_search(htmlstring, options)`.
+/// 11. **core.py:970-981** — extensive last resort: iterate
+///     `FREE_TEXT_EXPRESSIONS` (FAST_PREPEND + `/text()`), accumulate
+///     `compare_reference` over each segment, then
+///     `check_extracted_reference(reference, options) or
+///     search_page(htmlstring, options)`.
+///
+/// Returns the formatted date string on success, or `None`.
+pub fn find_date(tree: &NodeRef, options: &Extractor) -> Option<String> {
+    // core.py:866-867 — outputformat validity gate.
+    if options.format != "%Y-%m-%d" && !is_valid_format(&options.format) {
+        return None;
+    }
+
+    // The Python signature exposes `url` + `deferred_url_extractor` as
+    // function-level arguments. The Rust port currently calls find_date
+    // without external URL context (the Trafilatura caller already routes
+    // URL handling through `metadata_url::extract_url`), and the
+    // deferred_url_extractor path is dead code in every in-tree caller.
+    let deferred_url_extractor = false;
+
+    // core.py:881-891 — URL probe. If we don't have a url, try the
+    // canonical link; then call extract_url_date.
+    let canonical_url: Option<String> = find_canonical_url(tree);
+    let url_result = extract_url_date(canonical_url.as_deref(), options);
+    if url_result.is_some() && !deferred_url_extractor {
+        return url_result;
+    }
+
+    // core.py:895 — examine_header then json_search.
+    let result = examine_header(tree, options).or_else(|| json_search(tree, options));
+    if result.is_some() {
+        return result;
+    }
+
+    // core.py:900-901 — deferred URL fallback (no-op when deferred=false).
+    if deferred_url_extractor && url_result.is_some() {
+        return url_result;
+    }
+
+    // core.py:904-909 — abbr elements.
+    let abbr_result = examine_abbr_elements(tree, options);
+    if abbr_result.is_some() {
+        return abbr_result;
+    }
+
+    // core.py:912-919 — prune tree: deepcopy + clean_html + discard_unwanted.
+    // Python wraps in `try / except ValueError` (lxml NULL-byte rescue);
+    // neither Rust port can raise, so no try/except equivalent needed.
+    let search_tree = deep_clone(tree);
+    clean_html(&search_tree, CLEANING_LIST);
+    let _discarded = discard_unwanted(&search_tree);
+
+    // core.py:922-925 — choose prepend by extensive flag.
+    let prepend = if options.extensive {
+        SLOW_PREPEND
+    } else {
+        FAST_PREPEND
+    };
+    let date_expr = format!("{}{}", prepend, DATE_EXPRESSIONS);
+
+    // core.py:929-941 — date_elements → title/h1 → time elements.
+    let result = examine_date_elements(&search_tree, &date_expr, options)
+        .or_else(|| examine_date_elements(&search_tree, ".//title|.//h1", options))
+        .or_else(|| examine_time_elements(&search_tree, options));
+    if result.is_some() {
+        return result;
+    }
+
+    // core.py:953-956 — robust conversion to string. Rust's serialize_html
+    // is UTF-8 throughout; no UnicodeDecodeError rescue branch needed.
+    let htmlstring = serialize_html(&search_tree);
+
+    // core.py:961-965 — timestamp pattern_search, img_search, idiosyncrasies.
+    let result = pattern_search(&htmlstring, timestamp_pattern(), options)
+        .or_else(|| img_search(&search_tree, options))
+        .or_else(|| idiosyncrasies_search(&htmlstring, options));
+    if result.is_some() {
+        return result;
+    }
+
+    // core.py:970-981 — extensive_search last resort.
+    if options.extensive {
+        let mut reference: i64 = 0;
+        for segment in free_text_segments(&search_tree) {
+            let stripped = segment.trim();
+            // core.py:976 — `if not MIN_SEGMENT_LEN < len(segment) <
+            // MAX_SEGMENT_LEN: continue`. Python's `<` is strict on both
+            // ends. Python `len(str)` counts codepoints; mirror via chars().
+            let n = stripped.chars().count();
+            if !(MIN_SEGMENT_LEN < n && n < MAX_SEGMENT_LEN) {
+                continue;
+            }
+            reference = compare_reference(reference, stripped, options);
+        }
+        let converted = check_extracted_reference(reference, options);
+        // core.py:981 — `return converted or search_page(htmlstring, options)`.
+        return converted.or_else(|| search_page(&htmlstring, options));
+    }
+
+    None
+}
+
+/// Probe the tree for a `<link rel="canonical" href="...">` and return its
+/// `href` attribute.
+///
+/// Ports `core.py:884-886`:
+///
+/// ```python
+/// urlelem = tree.find('.//link[@rel="canonical"]')
+/// if urlelem is not None:
+///     url = urlelem.get("href")
+/// ```
+///
+/// Returns the href value (which may be relative — `extract_url_date`'s
+/// regex is permissive enough to handle both).
+fn find_canonical_url(tree: &NodeRef) -> Option<String> {
+    for link in get_elements_by_tag_name(tree, "link") {
+        if let Some(rel) = get_attribute(&link, "rel")
+            && rel.eq_ignore_ascii_case("canonical")
+            && let Some(href) = get_attribute(&link, "href")
+        {
+            return Some(href);
+        }
+    }
+    None
+}
+
+/// Yield each direct-text-child string of every element matching
+/// `FAST_PREPEND`'s self-tag filter, in document order.
+///
+/// Ports the lxml `XPath(FAST_PREPEND + "/text()")` consumed by
+/// `core.py:974` (`for segment in FREE_TEXT_EXPRESSIONS(search_tree)`).
+/// Python yields each direct text child of every matching element as a
+/// separate string (lxml `_ElementUnicodeResult`). The Rust port does the
+/// same: collect text-typed `child_nodes` of each FAST_PREPEND-matched
+/// element and return their string data.
+///
+/// We resolve `FAST_PREPEND` via the Stage 0b XPath engine and then walk
+/// each match's direct children for `NodeData::Text` siblings — mirroring
+/// the `/text()` step semantically without extending the engine to yield
+/// text nodes directly (which would touch a hot conformance harness).
+fn free_text_segments(tree: &NodeRef) -> Vec<String> {
+    let elements = xpath_engine::evaluate(FAST_PREPEND, tree).unwrap_or_default();
+    let mut out = Vec::new();
+    for elem in &elements {
+        for child in child_nodes(elem) {
+            if let NodeData::Text { contents } = &child.data {
+                let data = contents.borrow().to_string();
+                out.push(data);
+            }
+        }
+    }
+    out
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -1830,5 +2044,167 @@ mod tests {
         let o = opts("%d.%m.%Y", (1995, 1, 1), (2030, 12, 31));
         let r = search_page(html, &o);
         assert_eq!(r.as_deref(), Some("15.03.2024"));
+    }
+
+    // -----------------------------------------------------------------------
+    // find_date (sub-stage G — core.py:808-983)
+    // -----------------------------------------------------------------------
+
+    /// Ports core.py:895 + examine_header — `<meta property=
+    /// "article:published_time">` resolves via the header walk.
+    #[test]
+    fn find_date_from_meta_article_published_time() {
+        let html = r#"<html><head>
+            <meta property="article:published_time" content="2024-06-15T10:00:00Z">
+        </head><body></body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts_orig("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        let r = find_date(&root, &o);
+        assert_eq!(r.as_deref(), Some("2024-06-15"));
+    }
+
+    /// Ports core.py:940 + examine_time_elements — fallback to `<time
+    /// datetime="...">` once the header / json / abbr / date_elements
+    /// cascade all miss.
+    #[test]
+    fn find_date_from_time_element() {
+        let html = r#"<html><head></head><body>
+            <article><time datetime="2024-06-15">Jun 15</time></article>
+        </body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        let r = find_date(&root, &o);
+        assert_eq!(r.as_deref(), Some("2024-06-15"));
+    }
+
+    /// Ports core.py:895 + json_search — JSON-LD `datePublished` populates
+    /// via the JSON scan when header doesn't fire.
+    #[test]
+    fn find_date_from_jsonld_date_published() {
+        let html = r#"<html><head>
+            <script type="application/ld+json">
+            {"@context":"https://schema.org","@type":"Article","datePublished":"2024-06-15T10:00:00Z"}
+            </script>
+        </head><body><p>An article.</p></body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        // original=true so json_search picks `datePublished` (json_published).
+        let o = opts_orig("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        let r = find_date(&root, &o);
+        assert_eq!(r.as_deref(), Some("2024-06-15"));
+    }
+
+    /// Ports core.py:970-981 — extensive_search free-text + search_page
+    /// rescue. With no markup-level signals and only "Last updated: ..."
+    /// in body text, the FREE_TEXT_EXPRESSIONS walk + search_page
+    /// fallback finds the ISO date.
+    #[test]
+    fn find_date_from_search_page_cascade() {
+        // Pure body text, no <meta>, <time>, <abbr>, JSON-LD. The
+        // FREE_TEXT_EXPRESSIONS iter feeds segments to compare_reference,
+        // and search_page's THREE_LOOSE_PATTERN arm picks up the ISO date.
+        let html = r#"<html><head></head><body>
+            <p>Last updated: 2024-03-15 for clarity.</p>
+        </body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        // extensive=true is required to reach the search_page fallback.
+        let o = Extractor::new(
+            true,
+            (2030, 12, 31),
+            (1995, 1, 1),
+            false,
+            "%Y-%m-%d".to_string(),
+        );
+        let r = find_date(&root, &o);
+        assert_eq!(r.as_deref(), Some("2024-03-15"));
+    }
+
+    /// Ports core.py:970-981 — pure-text English-prose date ("Posted:
+    /// January 15, 2024") parses via the FREE_TEXT_EXPRESSIONS +
+    /// `compare_reference` -> `try_date_expr` -> `regex_parse`
+    /// LONG_TEXT_PATTERN arm.
+    #[test]
+    fn find_date_from_pure_english_text_date() {
+        let html = r#"<html><head></head><body>
+            <p>Posted: January 15, 2024 by the editor.</p>
+        </body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = Extractor::new(
+            true,
+            (2030, 12, 31),
+            (1995, 1, 1),
+            false,
+            "%Y-%m-%d".to_string(),
+        );
+        let r = find_date(&root, &o);
+        assert_eq!(r.as_deref(), Some("2024-01-15"));
+    }
+
+    /// Ports core.py:895 — with `original_date=true`, examine_header picks
+    /// the publication date (article:published_time, EARLIER) over any
+    /// modification date.
+    #[test]
+    fn find_date_original_picks_publication_date() {
+        let html = r#"<html><head>
+            <meta property="article:published_time" content="2024-01-15">
+            <meta property="article:modified_time" content="2024-06-15">
+        </head><body></body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts_orig("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        let r = find_date(&root, &o);
+        assert_eq!(r.as_deref(), Some("2024-01-15"));
+    }
+
+    /// Ports core.py:895 — with `original_date=false` (default),
+    /// examine_header prefers the modification date (latest).
+    #[test]
+    fn find_date_default_picks_modification_date() {
+        let html = r#"<html><head>
+            <meta property="article:published_time" content="2024-01-15">
+            <meta property="article:modified_time" content="2024-06-15">
+        </head><body></body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        let r = find_date(&root, &o);
+        assert_eq!(r.as_deref(), Some("2024-06-15"));
+    }
+
+    /// Ports core.py:983 — HTML with no plausible date returns `None`.
+    #[test]
+    fn find_date_returns_none_for_dateless_html() {
+        let html = r#"<html><head><title>About</title></head><body>
+            <p>Just a paragraph with no date markers anywhere.</p>
+        </body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = Extractor::new(
+            true,
+            (2030, 12, 31),
+            (1995, 1, 1),
+            false,
+            "%Y-%m-%d".to_string(),
+        );
+        let r = find_date(&root, &o);
+        assert_eq!(r, None);
+    }
+
+    /// Ports core.py:881-891 — URL canonical link's date wins when
+    /// present (the URL probe runs BEFORE header/json/abbr/time).
+    #[test]
+    fn find_date_from_canonical_url_date() {
+        let html = r#"<html><head>
+            <link rel="canonical" href="https://example.com/blog/2024/03/15/post">
+        </head><body><p>Some content.</p></body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        let r = find_date(&root, &o);
+        assert_eq!(r.as_deref(), Some("2024-03-15"));
     }
 }

@@ -2256,7 +2256,102 @@ name = "mdrcel"
 # DATESTRINGS, SLASHES, YYYYMM, MMYYYY, SIMPLE year-only +
 # w3.org-rejection, copyright catchall, no-match, min_date filter
 # rejection, custom outputformat).
-version = "0.11.5"
+#
+# M4 Stage 1 sub-stage G (2026-05-21): 0.11.5 -> 0.12.0 MINOR. Closes out
+# the htmldate port by landing the `find_date` entrypoint
+# (`htmldate@1.9.x/core.py:808-983`) and `clean_html` helper
+# (`htmldate@1.9.x/utils.py:249-255`), then WIRES `find_date` into
+# `trafilatura::metadata_url::extract_date` — replacing the M3 Stage 7d
+# "obvious HTML hints" STUB.
+#
+# New / changed surfaces:
+# - `htmldate::core::find_date(tree, options) -> Option<String>` — public
+#   on the `#[doc(hidden)] pub mod htmldate::core` infrastructure surface.
+#   Orchestrates the full sub-stage A..F cascade in core.py:861-983 order:
+#   (1) outputformat validity gate (core.py:866-867), (2) canonical-link
+#   URL probe + extract_url_date (core.py:881-891), (3) examine_header /
+#   json_search (core.py:895), (4) deferred-url fallback no-op (currently
+#   pinned `false`), (5) examine_abbr_elements (core.py:904-909), (6)
+#   deepcopy + clean_html(CLEANING_LIST) + discard_unwanted prune
+#   (core.py:912-919), (7) FAST/SLOW_PREPEND + DATE_EXPRESSIONS path
+#   (core.py:922-925), (8) examine_date_elements / title|h1 /
+#   examine_time_elements (core.py:929-941), (9) serialize search_tree
+#   (core.py:953-956), (10) pattern_search(TIMESTAMP_PATTERN) / img_search
+#   / idiosyncrasies_search (core.py:961-965), (11) extensive
+#   FREE_TEXT_EXPRESSIONS iter + compare_reference accumulator + final
+#   `check_extracted_reference or search_page` (core.py:970-981).
+# - `htmldate::utils::clean_html(tree, cleaning_list)` — verbatim port of
+#   utils.py:249-255. Public on `#[doc(hidden)] pub mod htmldate::utils`.
+# - `trafilatura::metadata_url::extract_date(dom)` body REWRITTEN to call
+#   `htmldate::core::find_date` with Python's default Extractor settings
+#   (`extensive=true`, `original=false`, `outputformat="%Y-%m-%d"`,
+#   min=MIN_DATE, max=(9999, 12, 31)). The function signature
+#   `extract_date(dom: &Dom) -> Option<String>` is UNCHANGED — caller
+#   `metadata::extract_metadata` continues to wire it in additively.
+#
+# Faithful divergences (recorded — HLD §4 anti-inversion, all in
+# `find_date`'s function header):
+# - Python `find_date(htmlobject: Union[bytes, str, HtmlElement], ...)`
+#   accepts the encoding-sniff + URL-fetch input branches. The Rust port
+#   takes a pre-parsed `&NodeRef` because every in-tree caller (the
+#   Trafilatura `metadata.py` pipeline + `metadata_url::extract_date`)
+#   already holds a parsed `Dom`. `load_html` (utils.py:197-246) remains
+#   deferred per the sub-stage A module header.
+# - Python `verbose: bool` logging knob is dropped — Rust callers can
+#   configure log levels separately.
+# - Python `url: Optional[str]` external override is currently dropped —
+#   the canonical-link probe `tree.find('.//link[@rel="canonical"]')`
+#   runs unconditionally; the Trafilatura caller routes URL-string
+#   handling through `metadata_url::extract_url`. A future stage can
+#   thread external URL context here if needed.
+# - Python `deferred_url_extractor: bool` is currently pinned `false` —
+#   every in-tree caller leaves it at its `False` default; the branch is
+#   live in the algorithm (so adding the flag back later is one
+#   constant-rename).
+# - `try / except ValueError` (core.py:917-919) — Python's lxml
+#   NULL-byte-string rescue. Neither `clean_html` nor `discard_unwanted`
+#   can panic in Rust, so the rescue branch has no analogue.
+# - `tostring(search_tree, pretty_print=False, encoding="unicode")` plus
+#   `UnicodeDecodeError` rescue (core.py:953-956) — Rust's
+#   `serialize_html` is UTF-8 throughout; no decode-error rescue needed.
+# - `FREE_TEXT_EXPRESSIONS = XPath(FAST_PREPEND + "/text()")` —
+#   reproduced by `free_text_segments(tree)` which evaluates FAST_PREPEND
+#   via the Stage 0b XPath engine and then walks each match's
+#   `child_nodes` for `NodeData::Text` siblings (mirroring `/text()` step
+#   semantics without extending the engine's text-node return shape — the
+#   external.py arbiter that consumes text() returns containing elements).
+#
+# **VISIBLE BEHAVIOUR CHANGE (the MINOR rationale)** — the Stage 7d
+# STUB at metadata_url.rs:402-428 documented "Returns None for cases
+# where Python's htmldate would fall back to dateparser/dateutil for
+# locale-aware fuzzy parsing of free-text date strings". With sub-stage
+# G's wiring, those cases now succeed: pure-text dates like
+# `<p>Posted: January 15, 2024</p>` resolve to `Some("2024-01-15")`
+# via the full htmldate cascade (the FREE_TEXT_EXPRESSIONS +
+# compare_reference + try_date_expr -> regex_parse(LONG_TEXT_PATTERN)
+# path). The flipped lib test
+# `metadata_url::extract_date_from_pure_text_date_works_with_htmldate`
+# pins this. Per CLAUDE.md "Version management" this is the MINOR
+# threshold ("new features, new public functions/types,
+# backward-compatible additions" — `find_date` and `clean_html` are
+# brand-new public fns, AND the visible default behaviour of
+# `extract_date` expands from "obvious-HTML-hints subset" to
+# "full htmldate parity").
+#
+# All four BLOCKER gates remain green (parser_equivalence_gate /
+# trafilatura_equivalence_gate / trafilatura_extract_smoke /
+# trafilatura_extract_content_gate). Lib test count 955 -> 965
+# (+10 sub-stage-G tests: 9 find_date cases — meta article:published_time
+# header path, time-element fallback, JSON-LD datePublished, search_page
+# cascade with ISO date in body text, pure-English-text-date, original
+# vs default modification-vs-publication picking, no-date None, canonical
+# URL date wins; plus 1 clean_html removes-CLEANING_LIST-tags test).
+# The 4 existing `extract_date` tests in metadata_url::tests are
+# unchanged except the formerly-stub-pinned negative case which was
+# RENAMED `extract_date_from_pure_text_date_works_with_htmldate` and
+# flipped to assert `Some("2024-01-15")` — the htmldate port now covers
+# what was previously deferred.
+version = "0.12.0"
 edition = "2024"
 
 [dependencies]

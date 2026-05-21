@@ -1,11 +1,15 @@
-//! Small `htmldate.utils` ports — the bits sub-stage A needs.
+//! Small `htmldate.utils` ports — the bits sub-stages A + G need.
 //!
-//! Source of truth: `htmldate/utils.py`. Sub-stage A ports the `Extractor`
+//! Source of truth: `htmldate/utils.py`. Sub-stage A ported the `Extractor`
 //! options class (lines 47-65) and the `trim_text` helper (lines 258-260).
-//! The HTML-loading / cleaning / fetch surface (`load_html`, `clean_html`,
-//! `fetch_url`, `isutf8`, `decode_file`, …) is deferred to sub-stage G.
+//! Sub-stage G adds the `clean_html` tag stripper (lines 249-255).
+//! The HTML-loading / fetch surface (`load_html`, `fetch_url`,
+//! `isutf8`, `decode_file`, …) remains deferred — the Trafilatura caller
+//! already hands `find_date` a pre-parsed DOM (no string/URL input path).
 
 use super::settings::MIN_DATE;
+
+use crate::readability::dom::{NodeRef, get_elements_by_tag_name, remove};
 
 /// All extraction options for `htmldate.find_date` and its helpers.
 ///
@@ -122,6 +126,42 @@ pub fn trim_text(string: &str) -> String {
     joined.trim().to_string()
 }
 
+/// Delete every descendant whose tag is in `cleaning_list`.
+///
+/// Ports `htmldate/utils.py:249-255` verbatim:
+///
+/// ```python
+/// def clean_html(tree: HtmlElement, elemlist: List[str]) -> HtmlElement:
+///     "Delete selected elements."
+///     for element in tree.iter(elemlist):  # type: ignore[call-overload]
+///         parent = element.getparent()
+///         if parent is not None:
+///             parent.remove(element)
+///     return tree
+/// ```
+///
+/// Python `tree.iter(elemlist)` walks every descendant whose tag name is in
+/// `elemlist`. The Rust port iterates each tag name once via
+/// `get_elements_by_tag_name` and removes the matches — equivalent up to a
+/// minor ordering quirk (Python visits the tree in document order across
+/// tags, the Rust port visits document order within each tag). The end state
+/// (every node with a target tag removed, others untouched) is identical.
+///
+/// Returns nothing — the input tree is mutated in place, matching Python's
+/// `parent.remove(element)` side effect. Python also returns `tree` itself,
+/// but every caller (`core.find_date` at `core.py:914`) shadows the variable
+/// rather than reading the return, so the void Rust signature is faithful.
+pub fn clean_html(tree: &NodeRef, cleaning_list: &[&str]) {
+    for tag in cleaning_list {
+        for element in get_elements_by_tag_name(tree, tag) {
+            // `parent.remove(element)` — `dom::remove` no-ops cleanly if the
+            // element is already detached (mirroring Python's
+            // `getparent() is not None` guard).
+            remove(&element);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,5 +224,31 @@ mod tests {
         assert_eq!(trim_text(""), "");
         assert_eq!(trim_text("   "), "");
         assert_eq!(trim_text("\t\n\r "), "");
+    }
+
+    /// Ports `htmldate/utils.py:249-255` — `clean_html` strips every
+    /// descendant whose tag is in CLEANING_LIST.
+    #[test]
+    fn clean_html_removes_cleaning_list_tags() {
+        use crate::htmldate::settings::CLEANING_LIST;
+        use crate::readability::dom::{Dom, get_elements_by_tag_name};
+        let dom = Dom::parse(
+            r#"<html><body>
+                <script>noisy</script>
+                <p>keep</p>
+                <svg>drop</svg>
+                <iframe src="..."></iframe>
+                <video>drop</video>
+            </body></html>"#,
+        );
+        let body = dom.body().expect("body");
+        // <script> isn't in CLEANING_LIST but svg/iframe/video are.
+        clean_html(&body, CLEANING_LIST);
+        // Verified-stripped tags from CLEANING_LIST.
+        assert!(get_elements_by_tag_name(&body, "svg").is_empty());
+        assert!(get_elements_by_tag_name(&body, "iframe").is_empty());
+        assert!(get_elements_by_tag_name(&body, "video").is_empty());
+        // <p> is not in CLEANING_LIST so it survives.
+        assert_eq!(get_elements_by_tag_name(&body, "p").len(), 1);
     }
 }

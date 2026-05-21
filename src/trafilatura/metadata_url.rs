@@ -399,98 +399,45 @@ fn normalize_url(url: &str) -> String {
 // `htmldate` is a separate ~3000 LOC package — see header for scope).
 // ===========================================================================
 
-/// **Date-extraction stub** (Stage 7d).
+/// Extract a publication / modification date from the document.
 ///
-/// Looks at the obvious HTML hints Trafilatura's `htmldate` package would
-/// also find on the easy path:
-/// - `<meta property="article:published_time">` (Open Graph article
-///   namespace — the most common pattern on news / blog pages).
-/// - `<meta name="date">`, `<meta name="datePublished">`,
-///   `<meta itemprop="datePublished">`.
-/// - `<time datetime="...">` — HTML5's machine-readable date element.
+/// **M4 Stage 1 sub-stage G** wires Trafilatura's `metadata.find_date(tree)`
+/// call (`metadata.py:547-550` / `trafilatura/v2.0.0`) into the full
+/// `htmldate` port (`htmldate/core.py:808-983`). Where the M3 Stage 7d
+/// "obvious HTML hints" stub only knew about `<meta property=
+/// "article:published_time">`, `<meta name="date">`, `<meta itemprop=
+/// "datePublished">`, and `<time datetime="...">`, the full port runs the
+/// complete htmldate cascade: URL canonical-link probe → header walk →
+/// JSON-LD search → abbr/time element walks → discard_unwanted +
+/// CLEANING_LIST pruning → date-expression XPath + title/h1 fallback →
+/// timestamp pattern / img_search / idiosyncrasies_search → extensive
+/// free-text + search_page rescue.
 ///
-/// Returns `None` for cases where Python's `htmldate` would fall back to
-/// `dateparser` / `dateutil` for locale-aware fuzzy parsing of free-text
-/// date strings (e.g. `<p>Posted: January 15, 2024</p>`). The full
-/// `htmldate` port is deferred — that package is ~3000 LOC and depends on
-/// `dateparser` (another ~5000 LOC), neither of which the Stage 3-B
-/// BLOCKER corpus exercises.
-///
-/// Stage 7b (JSON-LD) populates `Metadata.date` from
-/// `datePublished`/`dateModified` schema.org fields when present; this
-/// stub is **purely additive** — wired into [`extract_metadata`] only when
-/// `metadata.date.is_none()` after the JSON-LD pass.
-///
-/// The returned string is the raw `content` / `datetime` attribute
-/// value, **trimmed but not parsed**. The caller is free to feed it into a
-/// real date parser; Trafilatura's downstream consumers do not require a
-/// canonical ISO-8601 representation at this layer (they treat the date
-/// as opaque metadata).
+/// The returned date string is formatted per `"%Y-%m-%d"` — the htmldate
+/// default and the format the existing tests pin. This is a **behaviour
+/// upgrade** vs the Stage 7d stub: pure-text dates ("Posted: January 15,
+/// 2024" in a `<p>`) now succeed instead of falling through to `None`.
+/// Stage 7b's JSON-LD `datePublished`/`dateModified` path still runs first
+/// in `extract_metadata` and keeps precedence — `extract_date` only fires
+/// when JSON-LD didn't supply a date.
 pub fn extract_date(dom: &Dom) -> Option<String> {
-    let head = find_head(dom)?;
-
-    // 1. <meta property="article:published_time"> — OG article namespace,
-    //    the most common pattern. Also accept `article:modified_time` as
-    //    a backup (the JSON-LD path also accepts both).
-    for elem in get_elements_by_tag_name(&head, "meta") {
-        if let Some(prop) = get_attribute(&elem, "property") {
-            let prop_lower = prop.to_ascii_lowercase();
-            if (prop_lower == "article:published_time"
-                || prop_lower == "article:modified_time")
-                && let Some(content) = get_attribute(&elem, "content")
-            {
-                let t = trim(&content);
-                if !t.is_empty() {
-                    return Some(t);
-                }
-            }
-        }
-    }
-
-    // 2. <meta name="date"> / <meta name="datePublished"> / etc.
-    for elem in get_elements_by_tag_name(&head, "meta") {
-        if let Some(name) = get_attribute(&elem, "name") {
-            let name_lower = name.to_ascii_lowercase();
-            if matches!(
-                name_lower.as_str(),
-                "date" | "datepublished" | "dc.date" | "dcterms.date" | "pubdate"
-            ) && let Some(content) = get_attribute(&elem, "content")
-            {
-                let t = trim(&content);
-                if !t.is_empty() {
-                    return Some(t);
-                }
-            }
-        }
-    }
-
-    // 3. <meta itemprop="datePublished">.
-    for elem in get_elements_by_tag_name(&head, "meta") {
-        if let Some(ip) = get_attribute(&elem, "itemprop")
-            && (ip.eq_ignore_ascii_case("datepublished")
-                || ip.eq_ignore_ascii_case("datemodified"))
-            && let Some(content) = get_attribute(&elem, "content")
-        {
-            let t = trim(&content);
-            if !t.is_empty() {
-                return Some(t);
-            }
-        }
-    }
-
-    // 4. <time datetime="..."> — HTML5 machine-readable. Search the whole
-    //    document (body too), since <time> commonly lives in the article
-    //    body.
-    let body = dom.body()?;
-    for time_elem in get_elements_by_tag_name(&body, "time") {
-        if let Some(dt) = get_attribute(&time_elem, "datetime") {
-            let t = trim(&dt);
-            if !t.is_empty() {
-                return Some(t);
-            }
-        }
-    }
-    None
+    let tree = dom.root_element()?;
+    let options = crate::htmldate::utils::Extractor::new(
+        // Python `extensive_search=True` default (core.py:810).
+        true,
+        // Python `get_max_date(None)` returns `datetime.now()`; the Rust
+        // port pins to a "very future" sentinel for test determinism (see
+        // validators.rs::get_max_date). The (9999, 12, 31) tuple gives the
+        // same "no upper bound" effect.
+        (9999, 12, 31),
+        // Python `get_min_date(None)` returns `MIN_DATE = (1995, 1, 1)`.
+        crate::htmldate::settings::MIN_DATE,
+        // Python `original_date=False` default (core.py:811).
+        false,
+        // Python `outputformat="%Y-%m-%d"` default (core.py:812).
+        "%Y-%m-%d".to_string(),
+    );
+    crate::htmldate::core::find_date(&tree, &options)
 }
 
 // ===========================================================================
@@ -939,14 +886,18 @@ mod tests {
     }
 
     #[test]
-    fn extract_date_returns_none_for_pure_text_date() {
-        // Pure-text date in a <p> — htmldate territory (deferred).
+    fn extract_date_from_pure_text_date_works_with_htmldate() {
+        // M4 Stage 1 sub-stage G FLIP: this case was the documented
+        // STUB-era miss. The pure-text date "Posted: January 15, 2024"
+        // parses via the full htmldate port's `regex_parse` arm
+        // (`LONG_TEXT_PATTERN` at extractors.rs:281), which the Stage 7d
+        // stub deferred. Now succeeds.
         let dom = parse(
             r#"<html><head></head><body>
                 <p>Posted: January 15, 2024</p>
                 </body></html>"#,
         );
-        assert_eq!(extract_date(&dom), None);
+        assert_eq!(extract_date(&dom).as_deref(), Some("2024-01-15"));
     }
 
     // ---- extract_catstags -------------------------------------------------

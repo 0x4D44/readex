@@ -62,4 +62,12 @@ pub mod extractors;
 // `examine_time_elements` / `normalize_match`. `search_page` and
 // `find_date` (the orchestrators at core.py:574-983) are deferred to
 // sub-stage F.
+//
+// Sub-stage F adds `search_page` (core.py:574-805). Sub-stage G adds
+// `find_date` (core.py:808-983) — the htmldate top-level entrypoint that
+// orchestrates every sub-stage above. The Rust signature drops Python's
+// `htmlobject: Union[bytes, str, HtmlElement]` polymorphism (load_html
+// remains deferred) and takes a pre-parsed `&NodeRef` directly. Sub-stage
+// G also wires `find_date` into `trafilatura::metadata_url::extract_date`,
+// replacing the M3 Stage 7d "obvious HTML hints" stub.
 pub mod core;
