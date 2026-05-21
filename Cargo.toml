@@ -2509,6 +2509,24 @@ name = "mdrcel"
 # branch); the prior XML-only callers are signature-compatible. No new
 # dependency; no public API removal; `Options` unchanged.
 #
+# M4 Stage 5 (2026-05-21): 0.14.0 -> 0.14.1 PATCH. Closes the deferred Stage 7
+# stub in `readability_fork::compare_extraction` that left
+# `external.py:54-55`'s precision pre-clean unwired. When
+# `options.focus == Focus::Precision`, the backup HTML now flows through
+# `prune_unwanted_nodes(_, OVERALL_DISCARD_XPATH, with_backup=false)` before
+# `try_readability` sees it — matching
+# `external.py:54-55` (`backup_tree = prune_unwanted_nodes(backup_tree,
+# OVERALL_DISCARD_XPATH)`). The implementation parses `backup_html` into a
+# fresh `Dom`, runs the existing `cleaning::prune_unwanted_nodes` helper
+# (`htmlprocessing.py:93-118`) over `OVERALL_DISCARD_XPATH` from
+# `xpaths_constants.rs:159`, re-serialises via
+# `readability::dom::serialize_html`, and feeds the pruned HTML to
+# `try_readability`. Behaviour is unchanged for `Focus::Default` and
+# `Focus::Recall` (the recall bypass at `external.py:49-50` still fires
+# first). No new public surface; the change is internal to
+# `compare_extraction`. Per CLAUDE.md "Version management", an internal
+# behaviour refinement of an already-public capability is PATCH.
+#
 # M4 Stage 4 (2026-05-21): 0.13.3 -> 0.14.0 MINOR. Additive **public surface
 # expansion**: six new fields are appended to `Extracted` — `categories:
 # Vec<String>`, `tags: Vec<String>`, `image: Option<String>`,
@@ -2529,7 +2547,7 @@ name = "mdrcel"
 # sandbox we surface it as MINOR (matching M3 Stage 9's `comments` field
 # precedent at 0.9.0 -> 0.10.0). No new dependency; no public API removal;
 # `Options` unchanged.
-version = "0.14.0"
+version = "0.14.1"
 edition = "2024"
 
 [dependencies]

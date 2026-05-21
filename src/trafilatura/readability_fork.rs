@@ -1790,26 +1790,44 @@ pub fn compare_extraction(
         return (body.clone(), text, len_text);
     }
 
-    // external.py:54-55 — precision pre-clean. Python prunes the backup_tree
-    // via `prune_unwanted_nodes(_, OVERALL_DISCARD_XPATH)`. The Rust port
-    // pre-cleans the raw HTML by parsing -> pruning -> re-serializing isn't
-    // worth the round-trip; instead we pre-parse the backup HTML into a
-    // fresh DOM, prune, and pass the resulting raw HTML/NodeRef through to
-    // `Document::summary()` which re-parses internally anyway.
+    // external.py:54-55 — precision pre-clean.
+    //   `if options.focus == "precision":
+    //        backup_tree = prune_unwanted_nodes(backup_tree, OVERALL_DISCARD_XPATH)`
     //
-    // Honest deferral: the precision pre-clean is a no-op at Stage 6 — the
-    // `try_readability` entrypoint already re-parses raw HTML and runs its
-    // ruthless/lenient retry. Wiring the precision-mode pre-clean would
-    // require either (a) plumbing a NodeRef through Document::new (currently
-    // takes raw HTML), or (b) re-serializing the pruned NodeRef back to
-    // HTML. Both are deferred to Stage 7; the focus=precision arbiter
-    // BRANCHES below still fire correctly because they key off length
-    // ratios, not the (pre)cleaned readability output. The pruning is a
-    // refinement, not a load-bearing branch trigger.
-    let _ = options.focus; // precision branch deferred (see comment above).
+    // Python operates on an in-memory `backup_tree` lxml element and rebinds
+    // it before feeding `try_readability`. The Rust port receives raw HTML
+    // (`backup_html`) because Stage 6 chose to let `Document::new` own the
+    // single parse. We honour the precision branch by:
+    //   1. Parsing `backup_html` into a fresh DOM,
+    //   2. Calling `cleaning::prune_unwanted_nodes(_, OVERALL_DISCARD_XPATH,
+    //      with_backup=false)` — matching `htmlprocessing.py:94`'s default,
+    //   3. Re-serializing the pruned DOM back to HTML via
+    //      `readability::dom::serialize_html(&document_root)`,
+    //   4. Feeding that pruned HTML into `try_readability` below.
+    //
+    // The extra parse+serialise round-trip is acceptable: it only fires under
+    // the opt-in `focus=Precision` flag, and `try_readability` re-parses
+    // anyway (`Document::new(html)` calls `Dom::parse(html)` at
+    // readability_fork.rs:532). The alternative (plumbing a NodeRef through
+    // `Document::new`) would broaden the readability fork's public surface
+    // for a single caller — option (b) keeps the change isolated here.
+    let backup_html_owned: String;
+    let backup_html_ref: &str = if options.focus == Focus::Precision {
+        let dom = crate::readability::dom::Dom::parse(backup_html);
+        let root = dom.document();
+        let _ = crate::trafilatura::cleaning::prune_unwanted_nodes(
+            &root,
+            crate::trafilatura::xpaths_constants::OVERALL_DISCARD_XPATH,
+            false,
+        );
+        backup_html_owned = crate::readability::dom::serialize_html(&root);
+        &backup_html_owned
+    } else {
+        backup_html
+    };
 
     // external.py:58-61 — readability arm.
-    let temppost_algo: Option<NodeRef> = try_readability(backup_html);
+    let temppost_algo: Option<NodeRef> = try_readability(backup_html_ref);
     let (algo_text, algo_len) = match &temppost_algo {
         Some(node) => {
             let raw = crate::readability::dom::text_content(node);
@@ -3346,5 +3364,240 @@ mod tests {
         let (_w3, t3, l3) = compare_extraction(&html_root, backup_html, &body3, text3, len3, &opts);
         assert_eq!(l3, 0, "third call: cacheval=2 > 1 ⇒ empty body returned");
         assert_eq!(t3, "", "third call: text emptied");
+    }
+
+    // -------------------------------------------------------------------
+    // M4 Stage 5 — focus=Precision pre-clean of backup_tree
+    // (external.py:54-55 — `prune_unwanted_nodes(backup_tree,
+    // OVERALL_DISCARD_XPATH)`). Tests verify:
+    //   1. Focus::Balanced → backup HTML untouched (regression for the
+    //      existing path).
+    //   2. Focus::Recall + own length > 10× min_extracted_size → recall
+    //      bypass fires BEFORE the precision branch (regression for the
+    //      external.py:49-50 short-circuit).
+    //   3. Focus::Precision with a discard-matching node → its text does
+    //      NOT survive the pre-clean, so the readability arm cannot
+    //      report it.
+    //   4. Focus::Precision without any discard-matching nodes → output
+    //      identical to Focus::Balanced (the prune is a no-op).
+    //   5. Focus::Precision regression — the length-ratio branches
+    //      (external.py:70-74) still fire after the pre-clean.
+    // -------------------------------------------------------------------
+
+    /// Run the readability arm directly via the same path
+    /// `compare_extraction` uses (parse `backup_html`, optionally prune
+    /// when `focus=Precision`, hand to `try_readability`, return trimmed
+    /// text). Mirrors lines 1799-1825 of `compare_extraction` so tests
+    /// can introspect the algo arm's text without running the full
+    /// arbiter (and without depending on jusText / dedup state).
+    fn algo_text_for(backup_html: &str, focus: crate::trafilatura::cleaning::Focus) -> String {
+        use crate::trafilatura::cleaning::Focus;
+        let backup_owned: String;
+        let backup_ref: &str = if focus == Focus::Precision {
+            let dom = crate::readability::dom::Dom::parse(backup_html);
+            let root = dom.document();
+            let _ = crate::trafilatura::cleaning::prune_unwanted_nodes(
+                &root,
+                crate::trafilatura::xpaths_constants::OVERALL_DISCARD_XPATH,
+                false,
+            );
+            backup_owned = crate::readability::dom::serialize_html(&root);
+            &backup_owned
+        } else {
+            backup_html
+        };
+        match try_readability(backup_ref) {
+            Some(node) => {
+                let raw = crate::readability::dom::text_content(&node);
+                trim(&raw)
+            }
+            None => String::new(),
+        }
+    }
+
+    /// Stage 5 / test-1 — Focus::Balanced leaves the backup HTML untouched.
+    /// The `VIRALPAYLOADTOKEN` text survives the readability arm because
+    /// the default path bypasses the precision pre-clean (external.py:54-55
+    /// only triggers when `focus == "precision"`).
+    ///
+    /// The payload sits on a `<div class="viral">` chosen specifically so
+    /// it matches `OVERALL_DISCARD_XPATH[0]` (via `contains(@id|@class,
+    /// "viral")` at xpaths_constants.rs:167) but does NOT match
+    /// readability's `unlikelyCandidatesRe` (readability_fork.rs:159 —
+    /// `combx|comment|community|disqus|extra|foot|header|menu|remark|rss|
+    /// shoutbox|sidebar|sponsor|ad-break|agegate|pagination|pager|popup|
+    /// tweet|twitter`, with no "viral" alternation). That gives us a
+    /// clean differential: balanced focus keeps the payload; precision
+    /// focus prunes it before readability runs (test 3 below).
+    ///
+    /// We embed the viral div INSIDE the `<article>` so readability's
+    /// best-candidate pick (typically the article subtree) includes it.
+    #[test]
+    fn precision_preclean_default_focus_leaves_backup_untouched() {
+        let backup_html = r#"<html><body>
+            <article>
+                <h1>Article Title</h1>
+                <p>This is the substantive article body with enough text to score as a real
+                paragraph in readability. The fox jumps over the lazy dog repeatedly and
+                this serves as filler to push the article past the candidate threshold for
+                the readability scorer to pick this article subtree.</p>
+                <div class="viral">VIRALPAYLOADTOKEN must survive Focus::Balanced.</div>
+                <p>Another paragraph after the viral div so the article subtree remains the
+                top scoring readability candidate and the viral div is contained within it.
+                We pad this paragraph with extra prose to keep the article comfortably
+                above the candidate threshold and the surrounding context substantial.</p>
+            </article>
+        </body></html>"#;
+        let algo_text = algo_text_for(backup_html, crate::trafilatura::cleaning::Focus::Balanced);
+        assert!(
+            algo_text.contains("VIRALPAYLOADTOKEN"),
+            "Focus::Balanced must not pre-clean; viral text expected in algo arm, got {algo_text:.300?}"
+        );
+    }
+
+    /// Stage 5 / test-2 — Focus::Recall recall-bypass fires BEFORE the
+    /// precision branch (external.py:49-50). When own length exceeds
+    /// 10× `min_extracted_size`, `compare_extraction` returns the own
+    /// tuple verbatim — no readability call, no precision branch.
+    #[test]
+    fn precision_preclean_recall_bypass_short_circuits() {
+        let (_dom, body) = build_own_body("recall bypass body");
+        let opts = crate::trafilatura::cleaning::Options {
+            focus: crate::trafilatura::cleaning::Focus::Recall,
+            ..Default::default()
+        };
+        // min_extracted_size default = 250; bypass threshold = 10 * 250 = 2500.
+        let own_text = "x".repeat(3000);
+        let own_len = own_text.chars().count();
+        let backup_html = "<html><body><p>ignored: bypass fires first</p></body></html>";
+        let (winning_body, winning_text, winning_len) = compare_extraction(
+            &body,
+            backup_html,
+            &body,
+            own_text.clone(),
+            own_len,
+            &opts,
+        );
+        // The bypass returns (body, text, len_text) verbatim — same Rc as `body`.
+        assert_eq!(
+            winning_len, own_len,
+            "recall bypass must short-circuit at external.py:49-50"
+        );
+        assert_eq!(winning_text, own_text, "recall bypass returns own text");
+        assert!(
+            std::rc::Rc::ptr_eq(&winning_body, &body),
+            "recall bypass returns the same body NodeRef (no readability call)"
+        );
+    }
+
+    /// Stage 5 / test-3 — Focus::Precision pre-clean DROPS the
+    /// OVERALL_DISCARD_XPATH-matching `<div class="viral">` subtree
+    /// before readability runs (external.py:54-55). Asserts via a
+    /// differential check: the same backup HTML produces DIFFERENT algo
+    /// text under Focus::Balanced vs Focus::Precision — Balanced keeps
+    /// the viral payload (it matches OVERALL_DISCARD_XPATH but not
+    /// readability's unlikelyCandidatesRe), Precision drops it.
+    #[test]
+    fn precision_preclean_drops_overall_discard_match() {
+        let backup_html = r#"<html><body>
+            <article>
+                <h1>Article Title</h1>
+                <p>This is the substantive article body with enough text to score as a real
+                paragraph in readability. The fox jumps over the lazy dog repeatedly and
+                this serves as filler to push the article past the candidate threshold for
+                the readability scorer to pick this article subtree.</p>
+                <div class="viral">VIRALPAYLOADTOKEN must be pruned by Focus::Precision.</div>
+                <p>Another paragraph after the viral div so the article subtree remains the
+                top scoring readability candidate and the viral div is contained within it.
+                We pad this paragraph with extra prose to keep the article comfortably
+                above the candidate threshold and the surrounding context substantial.</p>
+            </article>
+        </body></html>"#;
+        let default_algo =
+            algo_text_for(backup_html, crate::trafilatura::cleaning::Focus::Balanced);
+        let precision_algo =
+            algo_text_for(backup_html, crate::trafilatura::cleaning::Focus::Precision);
+        // Differential assertion: the viral payload appears in Balanced
+        // but not in Precision. This pins external.py:54-55's effect.
+        assert!(
+            default_algo.contains("VIRALPAYLOADTOKEN"),
+            "Focus::Balanced must keep the viral text (no pre-clean), got {default_algo:.300?}"
+        );
+        assert!(
+            !precision_algo.contains("VIRALPAYLOADTOKEN"),
+            "Focus::Precision must prune the viral text (external.py:54-55), got {precision_algo:.300?}"
+        );
+    }
+
+    /// Stage 5 / test-4 — Focus::Precision with no discard-matching
+    /// elements: prune is a no-op, so the algo arm output is identical
+    /// to Focus::Balanced. Pins that the precision branch does NOT
+    /// silently mutate content unrelated to OVERALL_DISCARD_XPATH.
+    #[test]
+    fn precision_preclean_no_match_yields_default_output() {
+        let backup_html = r#"<html><body>
+            <article>
+                <h1>Clean Article</h1>
+                <p>This article has no navigation, no footer, no sharing widgets, no
+                cookie banner, and nothing else OVERALL_DISCARD_XPATH would match. The
+                pre-clean should be a no-op and the algo arm output should be byte
+                identical to the Focus::Balanced path. We pad with enough text to clear
+                the readability candidate threshold for stable scoring across runs.</p>
+            </article>
+        </body></html>"#;
+        let default_algo =
+            algo_text_for(backup_html, crate::trafilatura::cleaning::Focus::Balanced);
+        let precision_algo =
+            algo_text_for(backup_html, crate::trafilatura::cleaning::Focus::Precision);
+        assert_eq!(
+            default_algo, precision_algo,
+            "no discard match ⇒ Focus::Precision algo text must equal Focus::Balanced algo text"
+        );
+        // Sanity: not vacuously empty.
+        assert!(
+            !default_algo.is_empty(),
+            "test setup error: algo arm produced empty text"
+        );
+    }
+
+    /// Stage 5 / test-5 — Focus::Precision regression: the length-ratio
+    /// branches (external.py:70-74) still fire correctly AFTER the
+    /// pre-clean runs. Drives the full `compare_extraction` with a
+    /// backup that produces an algo arm >> 2× own (Branch 4 →
+    /// use_readability=true). The precision pre-clean must NOT prune
+    /// enough text to flip the branch decision back to own.
+    #[test]
+    fn precision_preclean_branch_arbiter_still_fires() {
+        let (_dom, body) = build_own_body("tiny own arm");
+        let opts = crate::trafilatura::cleaning::Options {
+            focus: crate::trafilatura::cleaning::Focus::Precision,
+            ..Default::default()
+        };
+        // Substantive backup with NO OVERALL_DISCARD_XPATH matches — the
+        // pre-clean leaves it untouched, so the algo arm comfortably
+        // exceeds 2× own (Branch 4 fires).
+        let backup_html = r#"<html><body><article>
+            <h1>Substantial readability candidate</h1>
+            <p>The readability arm produces a candidate body with substantially more text
+            than the own arm. Padding with repeated substantive sentences ensures the
+            length ratio comfortably exceeds two times the own arm. The fox jumps over
+            the lazy dog. The fox jumps over the lazy dog. The fox jumps over the lazy
+            dog. The fox jumps over the lazy dog. The fox jumps over the lazy dog. The
+            fox jumps over the lazy dog. The fox jumps over the lazy dog. The fox jumps
+            over the lazy dog. The fox jumps over the lazy dog. The fox jumps over the
+            lazy dog. The fox jumps over the lazy dog.</p>
+        </article></body></html>"#;
+        let own_text = "tiny".to_string();
+        let own_len = own_text.chars().count();
+        let (_winning, winning_text, winning_len) =
+            compare_extraction(&body, backup_html, &body, own_text, own_len, &opts);
+        // Branch 4 (algo > 2× own, no JSON-LD) MUST have fired ⇒ winner
+        // text is substantially longer than the "tiny" own arm. We don't
+        // pin a specific arm (jusText override could re-substitute);
+        // we pin that the cascade did NOT silently keep the tiny own arm.
+        assert!(
+            winning_len > 4,
+            "Branch arbiter must override the tiny own arm via the readability/jusText path; got len={winning_len} text={winning_text:.200?}"
+        );
     }
 }
