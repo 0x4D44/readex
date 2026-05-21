@@ -2487,7 +2487,28 @@ name = "mdrcel"
 # yields a bare root. Output is NFC-normalised consistent with the other
 # formatters (`core.py:98` invariant). No new dependency; no public API
 # removal; `Options` unchanged.
-version = "0.13.2"
+#
+# M4 Stage 3 sub-stage E (2026-05-21): 0.13.2 -> 0.13.3 PATCH. Additive — adds
+# the FINAL output-format entry-point: `extract_to_tei` (Python
+# `extract(output_format="xmltei")` per `xml.py:159-175` TEI branch +
+# `xml.py:186-235` `build_tei_output` + `check_tei`). Ports `write_teitree`
+# (`xml.py:393-409`), `write_fullheader` (`xml.py:423-491`), `check_tei`
+# (`xml.py:196-235`), `_define_publisher_string` (`xml.py:412-420`), and the
+# five TEI helpers from `xml.py:494-607` (`_handle_text_content_of_div_nodes`,
+# `_handle_unwanted_tails`, `_tei_handle_complex_head`,
+# `_wrap_unwanted_siblings_of_div`, `_move_element_one_level_up`). Reuses the
+# `TEI_VALID_TAGS` whitelist already vendored at `cleaning.rs:1533` (Stage 6
+# `sanitize_tree` port). Adds new TEI-specific constants `TEI_VALID_ATTRS`
+# (`xml.py:30`), `TEI_REMOVE_TAIL` (`xml.py:32`), `TEI_DIV_SIBLINGS`
+# (`xml.py:33`). DEFERS `validate_tei` (`xml.py:238-250`) — Python's
+# `DTD.validate` requires lxml's DTD validator, no Rust equivalent. Per the
+# scoping report, `tei_validation` is an opt-in flag defaulting to false so
+# the deferral is silent on the default path; a `TODO: tei_validation
+# deferred — needs DTD validator` comment cites the omission. Dispatches
+# from `control_xml_output` via a new `OutputFormat` enum slot (XmlTei
+# branch); the prior XML-only callers are signature-compatible. No new
+# dependency; no public API removal; `Options` unchanged.
+version = "0.13.3"
 edition = "2024"
 
 [dependencies]

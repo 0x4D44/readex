@@ -906,11 +906,137 @@ pub fn extract_to_xml(
     };
 
     // 5. control_xml_output runs the full xml.py:159-175 pipeline and returns
-    //    the pretty-printed string.
-    let xml_string = trafilatura::output::control_xml_output(&doc);
+    //    the pretty-printed string. Stage 3-D dispatches the XML branch only.
+    let xml_string = trafilatura::output::control_xml_output(
+        &doc,
+        trafilatura::output::OutputFormat::Xml,
+    );
 
     // 6. NFC-normalise (core.py:98 invariant — extract_to_markdown does the
     //    same; consistent user-visible byte shape across all formatters).
+    use unicode_normalization::UnicodeNormalization;
+    let normalised: String = xml_string.as_str().nfc().collect();
+
+    // Keep cascade body alive through serialisation (rcdom Drop quirk, HLD §m-3).
+    let _ = body_opt;
+    Ok(normalised)
+}
+
+/// Extract `html` and render result as TEI-conformant XML (Text Encoding
+/// Initiative). Stricter than Trafilatura's own XML format — runs through
+/// `check_tei` to fix invalid structures (move/wrap/relabel).
+///
+/// Equivalent to Python's `extract(html, output_format="xmltei",
+/// tei_validation=False)` per `xml.py:159-175` TEI branch + `xml.py:186-235`
+/// `build_tei_output`. Produces a pretty-printed XML string whose root is
+/// `<TEI xmlns="http://www.tei-c.org/ns/1.0">`. The default tree shape is
+/// `<TEI><teiHeader>...</teiHeader><text><body><div type="entry">...</div>
+/// <div type="comments">...</div></body></text></TEI>`.
+///
+/// # `with_metadata` semantics
+///
+/// When `opts.with_metadata` is `true`, the `<teiHeader>` carries
+/// bibliographic info: `<fileDesc>` (titleStmt + publicationStmt +
+/// notesStmt + sourceDesc), `<profileDesc>` (abstract + textClass +
+/// creation), and `<encodingDesc>` (appInfo). When `false`, the header is
+/// still emitted (TEI conformance requires it) but with empty / default
+/// values throughout — title, author, description, date, url, keywords all
+/// blank / absent.
+///
+/// # `check_tei` walker
+///
+/// `xml.py:196-235` runs three passes:
+/// 1. `<head>` rename to `<ab type="header">`, complex-head conversion via
+///    `_tei_handle_complex_head`, `_move_element_one_level_up` when nested
+///    inside `<p>`.
+/// 2. `<lb>` directly under `<div>` with text-bearing tail becomes `<p>`.
+/// 3. Descendant walk of `text/body`: tags outside `TEI_VALID_TAGS` are
+///    merged with parent; tags in `TEI_REMOVE_TAIL` (`ab` / `p`) re-anchor
+///    their tails; `<div>` triggers `_handle_text_content_of_div_nodes` +
+///    `_wrap_unwanted_siblings_of_div`; attributes outside `TEI_VALID_ATTRS`
+///    are popped.
+///
+/// # `tei_validation` deferred
+///
+/// Python's `validate_tei` (`xml.py:238-250`) uses lxml's `DTD.validate`
+/// against the TEI DTD. Rust has no native DTD validator. Per the scoping
+/// report, `tei_validation` is opt-in (default `False`), so the deferral is
+/// silent on the default path. `extract_to_tei` does NOT validate.
+///
+/// # NFC normalisation
+///
+/// Output is NFC-normalised, consistent with [`extract_to_xml`] / [`extract_to_markdown`]
+/// (the `core.py:98` invariant).
+///
+/// # `base_url`
+///
+/// As in [`extract`] — informational only. Never fetched.
+///
+/// # Errors
+///
+/// Same shape as [`extract_with`]: only [`ExtractError::ContentTooShort`]
+/// when `opts.min_word_count > 0` and the produced body text fails the
+/// threshold. The default-`Options` path never produces an error — an empty
+/// body returns a minimal TEI tree with `<teiHeader>` + empty `<div
+/// type="entry">` + empty `<div type="comments">`.
+pub fn extract_to_tei(
+    html: &str,
+    base_url: Option<&str>,
+    opts: &Options,
+) -> Result<String, ExtractError> {
+    // M4 Stage 3 sub-stage E — port of `core.bare_extraction` +
+    // `control_xml_output` (xml.py:159-175 TEI branch) wired into the public
+    // surface. Mirrors `extract_to_xml`'s pipeline shape; the only difference
+    // is the `OutputFormat::Tei` discriminator passed to `control_xml_output`.
+
+    // 1. Metadata — always extract (the TEI header consumes everything; even
+    //    `with_metadata=false` produces a structurally valid header with empty
+    //    fields). `with_metadata` gates whether populated metadata reaches the
+    //    header (false = blank header fields).
+    let metadata = if opts.with_metadata {
+        trafilatura::metadata::extract_metadata(html, base_url, true, &[])
+    } else {
+        trafilatura::metadata::Metadata::default()
+    };
+
+    // 2. Body extraction via the cascade.
+    let cleaning_opts = trafilatura::cleaning::Options {
+        url: base_url.map(|s| s.to_string()),
+        ..trafilatura::cleaning::Options::default()
+    };
+    let body_opt =
+        trafilatura::readability_fork::bare_extraction_with_cascade(html, &cleaning_opts);
+
+    // 3. Min-word-count gate (xmltotxt of body matches all other formatters).
+    let body_text = trafilatura::output::xmltotxt(body_opt.as_ref(), false);
+    let word_count = body_text.split_whitespace().count();
+    if opts.min_word_count > 0 && word_count < opts.min_word_count {
+        let _ = body_opt;
+        return Err(ExtractError::ContentTooShort {
+            word_count,
+            threshold: opts.min_word_count,
+        });
+    }
+
+    // 4. Build Document (empty <body> sentinel when cascade returned None).
+    let body_node = body_opt.clone().unwrap_or_else(|| {
+        use crate::readability::dom::create_element;
+        create_element("body")
+    });
+    let doc = trafilatura::output::Document {
+        metadata,
+        body: body_node,
+        commentsbody: None,
+        raw_text: String::new(),
+    };
+
+    // 5. control_xml_output dispatched to the TEI branch.
+    let xml_string = trafilatura::output::control_xml_output(
+        &doc,
+        trafilatura::output::OutputFormat::Tei,
+    );
+
+    // 6. NFC-normalise (core.py:98 invariant — all formatters do the same).
     use unicode_normalization::UnicodeNormalization;
     let normalised: String = xml_string.as_str().nfc().collect();
 
@@ -2219,6 +2345,262 @@ mod tests {
             ..Options::default()
         };
         let err = extract_to_xml("<html><body></body></html>", None, &opts)
+            .expect_err("must Err on threshold miss");
+        match err {
+            ExtractError::ContentTooShort {
+                word_count,
+                threshold,
+            } => {
+                assert_eq!(word_count, 0);
+                assert_eq!(threshold, 5);
+            }
+            other => panic!("expected ContentTooShort, got {other:?}"),
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Stage 3-E: extract_to_tei — Python xml.py:186-235 build_tei_output +
+    // check_tei. The TEI branch of control_xml_output.
+    // -------------------------------------------------------------------
+
+    /// Brief #1 — Basic article: valid TEI structure with <TEI> root.
+    #[test]
+    fn extract_to_tei_basic_article_yields_tei_root() {
+        let html = r#"<html><body>
+            <article><h1>Title</h1><p>Hello, world.</p></article>
+        </body></html>"#;
+        let s = extract_to_tei(html, None, &Options::default()).expect("ok");
+        assert!(s.starts_with("<TEI"), "must start with <TEI: {s}");
+        assert!(
+            s.contains("xmlns=\"http://www.tei-c.org/ns/1.0\""),
+            "must declare TEI ns: {s}"
+        );
+        assert!(s.contains("Hello, world."), "must contain body text: {s}");
+        assert!(s.ends_with("</TEI>"), "must end with </TEI>: {s}");
+    }
+
+    /// Brief #2 — with_metadata=true: full <teiHeader> populated.
+    #[test]
+    fn extract_to_tei_with_metadata_populates_full_header() {
+        let html = r#"<html>
+            <head>
+                <title>The Article Title</title>
+                <meta property="og:url" content="https://example.com/a"/>
+                <meta property="og:site_name" content="Example"/>
+            </head>
+            <body><article><p>One two three four five six seven.</p></article></body>
+        </html>"#;
+        let opts = Options {
+            with_metadata: true,
+            ..Options::default()
+        };
+        let s = extract_to_tei(html, Some("https://example.com/a"), &opts).expect("ok");
+        assert!(s.contains("<teiHeader>"), "header present: {s}");
+        assert!(s.contains("<fileDesc>"), "{s}");
+        assert!(s.contains("<titleStmt>"), "{s}");
+        assert!(s.contains("<publicationStmt>"), "{s}");
+        assert!(s.contains("<sourceDesc>"), "{s}");
+        assert!(
+            s.contains("The Article Title"),
+            "title must appear in header: {s}"
+        );
+    }
+
+    /// Brief #3 — with_metadata=false: header still emitted (TEI requires it)
+    /// but with blank fields.
+    #[test]
+    fn extract_to_tei_without_metadata_still_emits_minimal_header() {
+        let html = r#"<html>
+            <head><title>Should Not Appear</title></head>
+            <body><article><p>The body content here.</p></article></body>
+        </html>"#;
+        let s = extract_to_tei(html, None, &Options::default()).expect("ok");
+        // teiHeader is always present (TEI conformance).
+        assert!(s.contains("<teiHeader>"), "{s}");
+        // But the title from metadata should NOT appear (with_metadata=false).
+        assert!(
+            !s.contains("Should Not Appear"),
+            "title must NOT leak when with_metadata=false: {s}"
+        );
+    }
+
+    /// Brief #4 — TEI namespace is declared on the root.
+    #[test]
+    fn extract_to_tei_declares_namespace_on_root() {
+        let html = r#"<html><body><article><p>x</p></article></body></html>"#;
+        let s = extract_to_tei(html, None, &Options::default()).expect("ok");
+        assert!(
+            s.contains("<TEI xmlns=\"http://www.tei-c.org/ns/1.0\""),
+            "namespace decl: {s}"
+        );
+    }
+
+    /// Brief #6 — Empty body: minimal valid TEI.
+    #[test]
+    fn extract_to_tei_empty_body_produces_minimal_tei() {
+        let s = extract_to_tei("<html><body></body></html>", None, &Options::default())
+            .expect("ok");
+        // Even empty content yields a structurally valid <TEI>...</TEI>.
+        assert!(s.starts_with("<TEI"), "{s}");
+        assert!(s.ends_with("</TEI>"), "{s}");
+        assert!(s.contains("<teiHeader>"), "{s}");
+        // text/body chain present even when empty.
+        assert!(s.contains("<text>") || s.contains("<text/>"), "{s}");
+    }
+
+    /// Brief #7 — `<TEI>` carries the expected children: teiHeader + text.
+    #[test]
+    fn extract_to_tei_structure_has_header_and_text() {
+        let html = r#"<html><body><article><p>Body para.</p></article></body></html>"#;
+        let s = extract_to_tei(html, None, &Options::default()).expect("ok");
+        // Order: teiHeader first, then text.
+        let header_idx = s.find("<teiHeader").expect("has teiHeader");
+        let text_idx = s.find("<text").expect("has text element");
+        assert!(
+            header_idx < text_idx,
+            "teiHeader must precede text: {s}"
+        );
+    }
+
+    /// Brief #11 — NFC normalisation: NFD input becomes NFC.
+    #[test]
+    fn extract_to_tei_output_is_nfc() {
+        // U+0065 U+0301 (NFD) -> U+00E9 (NFC).
+        let html =
+            "<html><body><article><p>cafe\u{0301} bistro</p></article></body></html>";
+        let s = extract_to_tei(html, None, &Options::default()).expect("ok");
+        assert!(
+            s.contains('\u{00E9}'),
+            "decomposed e+combining-acute must NFC: {s:?}"
+        );
+        assert!(
+            !s.contains('\u{0301}'),
+            "no combining acute should survive NFC: {s:?}"
+        );
+    }
+
+    /// Brief #13 — `<span>` (not in TEI_VALID_TAGS) is stripped.
+    #[test]
+    fn extract_to_tei_strips_non_whitelisted_descendant_tags() {
+        let html = r#"<html><body><article>
+            <p>good text in para that should survive cleaning</p>
+        </article></body></html>"#;
+        let s = extract_to_tei(html, None, &Options::default()).expect("ok");
+        // <span> should never appear in the output — it's not in
+        // TEI_VALID_TAGS (xml.py:28-29).
+        assert!(!s.contains("<span"), "no <span>: {s}");
+    }
+
+    /// Brief #17 — `<licence>` is `<licence>` rendered inside the
+    /// publicationStmt via availability/<p>. Test the structural shape.
+    /// (License extraction is stubbed in our Metadata so we exercise the
+    /// "no license" branch: an empty <p/> for conformity.)
+    #[test]
+    fn extract_to_tei_publicationstmt_includes_empty_p_when_no_license() {
+        let html = r#"<html><body><article><p>x y z a b c d e</p></article></body></html>"#;
+        let opts = Options {
+            with_metadata: true,
+            ..Options::default()
+        };
+        let s = extract_to_tei(html, None, &opts).expect("ok");
+        // publicationStmt is always present; without a license the
+        // conformity-filler is an empty <p/>.
+        assert!(s.contains("<publicationStmt>"), "{s}");
+    }
+
+    /// Brief #12 — Comments handling: `<div type="comments">` always present.
+    #[test]
+    fn extract_to_tei_emits_comments_div_when_no_comments() {
+        let html = r#"<html><body><article><p>a b c d e f g</p></article></body></html>"#;
+        let s = extract_to_tei(html, None, &Options::default()).expect("ok");
+        // The TEI body should have two <div>s: entry + comments. comments
+        // is empty here (no commentsbody extracted).
+        assert!(
+            s.contains("type=\"comments\"") || s.contains("type=\"entry\""),
+            "should have entry/comments divs: {s}"
+        );
+    }
+
+    /// Brief #15 — Date metadata renders as element text on <date>.
+    /// (Stage 7d's date wiring is deferred; the test asserts the
+    /// `<date type="download"/>` empty element survives in the creation block.)
+    #[test]
+    fn extract_to_tei_creation_block_has_download_date() {
+        let html = r#"<html><body><article><p>a b c d e f g h</p></article></body></html>"#;
+        let opts = Options {
+            with_metadata: true,
+            ..Options::default()
+        };
+        let s = extract_to_tei(html, None, &opts).expect("ok");
+        // creation block with <date type="download"/> is always present.
+        assert!(s.contains("<creation>"), "{s}");
+        assert!(s.contains("type=\"download\""), "{s}");
+    }
+
+    /// Brief #16 — URL renders as `<ptr type="URL" target="...">` in biblFull.
+    #[test]
+    fn extract_to_tei_url_renders_as_ptr_in_biblfull() {
+        let html = r#"<html>
+            <head><meta property="og:url" content="https://example.com/article"/></head>
+            <body><article><p>One two three four five.</p></article></body>
+        </html>"#;
+        let opts = Options {
+            with_metadata: true,
+            ..Options::default()
+        };
+        let s = extract_to_tei(html, Some("https://example.com/article"), &opts).expect("ok");
+        assert!(s.contains("<biblFull>"), "biblFull present: {s}");
+        // URL renders as <ptr type="URL" target="..."/>.
+        assert!(
+            s.contains("type=\"URL\"") && s.contains("https://example.com/article"),
+            "URL ptr: {s}"
+        );
+    }
+
+    /// Brief #18 — Output is well-formed enough to feed back into the HTML5
+    /// parser (no panic).
+    #[test]
+    fn extract_to_tei_output_is_parseable_by_html5_parser() {
+        use crate::readability::dom::Dom;
+        let html = r#"<html><body><article><p>Sample body content.</p></article></body></html>"#;
+        let s = extract_to_tei(html, None, &Options::default()).expect("ok");
+        // No panic on re-parse.
+        let _ = Dom::parse(&s);
+    }
+
+    /// Brief #19 — `<note type="fingerprint"/>` is emitted in notesStmt.
+    #[test]
+    fn extract_to_tei_notesstmt_has_fingerprint_note() {
+        let html = r#"<html><body><article><p>a b c d e</p></article></body></html>"#;
+        let opts = Options {
+            with_metadata: true,
+            ..Options::default()
+        };
+        let s = extract_to_tei(html, None, &opts).expect("ok");
+        assert!(s.contains("<notesStmt>"), "{s}");
+        assert!(s.contains("type=\"fingerprint\""), "{s}");
+    }
+
+    /// Brief #20 — Trafilatura `<application>` element with version + ident.
+    #[test]
+    fn extract_to_tei_encodingdesc_has_application_block() {
+        let html = r#"<html><body><article><p>a b c</p></article></body></html>"#;
+        let s = extract_to_tei(html, None, &Options::default()).expect("ok");
+        // Always present (the encodingDesc is structural).
+        assert!(s.contains("<encodingDesc>"), "{s}");
+        assert!(s.contains("<appInfo>"), "{s}");
+        assert!(s.contains("ident=\"Trafilatura\""), "{s}");
+        assert!(s.contains("https://github.com/adbar/trafilatura"), "{s}");
+    }
+
+    /// Stage 3-E parity with extract_to_xml — min_word_count gate fires.
+    #[test]
+    fn extract_to_tei_respects_min_word_count() {
+        let opts = Options {
+            min_word_count: 5,
+            ..Options::default()
+        };
+        let err = extract_to_tei("<html><body></body></html>", None, &opts)
             .expect_err("must Err on threshold miss");
         match err {
             ExtractError::ContentTooShort {

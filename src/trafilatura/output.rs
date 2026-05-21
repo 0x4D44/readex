@@ -97,6 +97,42 @@ pub(crate) fn hi_formatting(rend: &str) -> Option<&'static str> {
 /// `process_element` honours when emitting empty cells to pad a row.
 pub(crate) const MAX_TABLE_WIDTH: usize = 1000;
 
+// ---------------------------------------------------------------------------
+// TEI constants (xml.py:28-33) — Stage 3-E
+// ---------------------------------------------------------------------------
+
+/// `xml.py:30` — `TEI_VALID_ATTRS = {'rend', 'rendition', 'role', 'target',
+/// 'type'}`.
+///
+/// The attribute-name whitelist `check_tei` consults: any descendant element
+/// attribute NOT in this set is popped (`xml.py:232-234`).
+pub(crate) const TEI_VALID_ATTRS: &[&str] = &["rend", "rendition", "role", "target", "type"];
+
+/// `xml.py:32` — `TEI_REMOVE_TAIL = {"ab", "p"}`.
+///
+/// Tags whose tail text `check_tei` re-anchors via `_handle_unwanted_tails`
+/// (`xml.py:224-225`). Tail on a `<p>` is folded into the element text;
+/// tail on an `<ab>` becomes a fresh `<p>` sibling.
+pub(crate) const TEI_REMOVE_TAIL: &[&str] = &["ab", "p"];
+
+/// `xml.py:33` — `TEI_DIV_SIBLINGS = {"p", "list", "table", "quote", "ab"}`.
+///
+/// The set of element tags that `_wrap_unwanted_siblings_of_div` collects into
+/// a fresh `<div>` sibling when they appear next to a `<div>` (TEI requires
+/// every direct child of `<body>` to be a `<div>` — bare p/list/table next to
+/// a div is invalid; the helper re-wraps them).
+pub(crate) const TEI_DIV_SIBLINGS: &[&str] = &["p", "list", "table", "quote", "ab"];
+
+/// `core.py` constant string `'Trafilatura'` plus the package version Python
+/// reads via `importlib.metadata.version("trafilatura")` (`xml.py:24`). The
+/// Rust port pins the version it was authored against (matches the source
+/// commit's `pyproject.toml`); this string ONLY surfaces in the
+/// `<application version="...">` element of the TEI header (`xml.py:487`).
+///
+/// Tied to the Python source commit `v2.0.0`. If the upstream pyproject
+/// version bumps, this constant moves with it.
+pub(crate) const TRAFILATURA_VERSION: &str = "2.0.0";
+
 // ===========================================================================
 // Document struct (settings.py:207-303)
 // ===========================================================================
@@ -1357,31 +1393,822 @@ pub(crate) fn build_xml_output(doc: &Document) -> NodeRef {
 }
 
 // ===========================================================================
+// TEI output (xml.py:186-607) — Stage 3-E
+// ===========================================================================
+//
+// Port surface, in source order:
+//
+// | Item | Python source |
+// |---|---|
+// | `_define_publisher_string`         | xml.py:412-420 |
+// | `_handle_text_content_of_div_nodes`| xml.py:494-512 |
+// | `_handle_unwanted_tails`           | xml.py:515-529 |
+// | `_tei_handle_complex_head`         | xml.py:532-550 |
+// | `_wrap_unwanted_siblings_of_div`   | xml.py:553-575 |
+// | `_move_element_one_level_up`       | xml.py:578-607 |
+// | `write_fullheader`                 | xml.py:423-491 |
+// | `write_teitree`                    | xml.py:393-409 |
+// | `check_tei`                        | xml.py:196-235 |
+// | `build_tei_output`                 | xml.py:186-193 |
+//
+// `validate_tei` (`xml.py:238-250`) is DEFERRED — Python uses lxml's
+// `DTD.validate` which has no Rust equivalent. `tei_validation` is an opt-in
+// flag defaulting to false so the deferral is silent on the default path.
+// TODO: tei_validation deferred — needs DTD validator (xml.py:238-250).
+
+/// `xml.py:412-420` — `_define_publisher_string(docmeta) -> str`.
+///
+/// Picks the publisher string for the TEI header:
+/// - If BOTH hostname AND sitename are set: `"{sitename.strip()} ({hostname})"`.
+/// - Else fall back to hostname OR sitename OR the sentinel `"N/A"`.
+fn _define_publisher_string(metadata: &Metadata) -> String {
+    let hostname = metadata.hostname.as_deref().filter(|s| !s.is_empty());
+    let sitename = metadata.site_name.as_deref().filter(|s| !s.is_empty());
+    match (hostname, sitename) {
+        (Some(h), Some(s)) => format!("{} ({})", s.trim(), h),
+        (Some(h), None) => h.to_string(),
+        (None, Some(s)) => s.to_string(),
+        (None, None) => "N/A".to_string(),
+    }
+}
+
+/// `xml.py:494-512` — `_handle_text_content_of_div_nodes(element)`.
+///
+/// Wraps loose text on a `<div>` into `<p>` children for TEI conformity.
+/// `<div>` cannot carry direct text in TEI; the helper either folds the text
+/// onto the first/last `<p>` child or inserts a fresh `<p>` wrapper.
+///
+/// Both `element.text` (leading text) and `element.tail` (text between
+/// `element` and its next sibling) are handled. Whitespace-only text is left
+/// alone (`element.text.strip()` test at `xml.py:496`).
+fn _handle_text_content_of_div_nodes(element: &NodeRef) {
+    // xml.py:496-503 — handle leading text.
+    if let Some(text) = element_text(element)
+        && !text.trim().is_empty()
+    {
+        let kids = children(element);
+        let first_p = kids
+            .first()
+            .filter(|c| local_name(c).as_deref() == Some("p"))
+            .cloned();
+        if let Some(p) = first_p {
+            // xml.py:498 — `element[0].text = f'{element.text} {element[0].text or ""}'.strip()`.
+            let existing = element_text(&p).unwrap_or_default();
+            let merged = format!("{text} {existing}");
+            set_element_text(&p, Some(merged.trim()));
+        } else {
+            // xml.py:500-502 — insert a fresh `<p>` as the first child.
+            let new_child = dom::create_element("p");
+            set_element_text(&new_child, Some(&text));
+            insert_child_at(element, &new_child, 0);
+        }
+        // xml.py:503 — `element.text = None`.
+        set_element_text(element, None);
+    }
+
+    // xml.py:505-512 — handle tail text.
+    if let Some(tail_text) = tail(element)
+        && !tail_text.trim().is_empty()
+    {
+        let kids = children(element);
+        let last_p = kids
+            .last()
+            .filter(|c| local_name(c).as_deref() == Some("p"))
+            .cloned();
+        if let Some(p) = last_p {
+            // xml.py:507 — `element[-1].text = f'{element[-1].text or ""} {element.tail}'.strip()`.
+            let existing = element_text(&p).unwrap_or_default();
+            let merged = format!("{existing} {tail_text}");
+            set_element_text(&p, Some(merged.trim()));
+        } else {
+            // xml.py:509-511 — append a fresh `<p>` as the last child.
+            let new_child = dom::create_element("p");
+            set_element_text(&new_child, Some(&tail_text));
+            dom::append_child(element, &new_child);
+        }
+        // xml.py:512 — `element.tail = None`.
+        set_tail(element, None);
+    }
+}
+
+/// `xml.py:515-529` — `_handle_unwanted_tails(element)`.
+///
+/// Re-anchors tail text on `<p>` / `<ab>` elements: tails on disallowed
+/// contexts are stripped (whitespace-only → drop) and either folded into the
+/// element text (for `<p>`) or promoted to a fresh `<p>` sibling (for `<ab>`).
+fn _handle_unwanted_tails(element: &NodeRef) {
+    // xml.py:517 — `element.tail = element.tail.strip() if element.tail else None`.
+    let trimmed = tail(element).map(|t| t.trim().to_string());
+    let Some(trimmed) = trimmed.filter(|t| !t.is_empty()) else {
+        // xml.py:518-519 — if no tail, drop and return.
+        set_tail(element, None);
+        return;
+    };
+
+    let tag = local_name(element).unwrap_or_default();
+    if tag == "p" {
+        // xml.py:521-522 — `element.text = " ".join(filter(None, [element.text, element.tail]))`.
+        let existing = element_text(element).unwrap_or_default();
+        let merged: String = [existing.as_str(), trimmed.as_str()]
+            .iter()
+            .filter(|s| !s.is_empty())
+            .copied()
+            .collect::<Vec<_>>()
+            .join(" ");
+        set_element_text(element, Some(&merged));
+    } else {
+        // xml.py:523-528 — new `<p>` sibling at index+1, with text=trimmed_tail.
+        let new_sibling = dom::create_element("p");
+        set_element_text(&new_sibling, Some(&trimmed));
+        if let Some(p) = parent(element)
+            && let Some(idx) = position_of(&p, element)
+        {
+            insert_child_at(&p, &new_sibling, idx + 1);
+        }
+    }
+    // xml.py:529 — `element.tail = None`.
+    set_tail(element, None);
+}
+
+/// `xml.py:532-550` — `_tei_handle_complex_head(element)`.
+///
+/// Converts a `<head>` (which by `check_tei`'s outer pass has already been
+/// renamed to `<ab type="header">`) into a new `<ab>` whose `<p>` children are
+/// flattened into `<lb/>`-separated runs. Returns the new `<ab>` element; the
+/// caller replaces the original.
+fn _tei_handle_complex_head(element: &NodeRef) -> NodeRef {
+    // xml.py:534 — `new_element = Element('ab', attrib=element.attrib)`.
+    let new_element = dom::create_element("ab");
+    for (k, v) in dom::attributes_in_source_order(element) {
+        set_attribute(&new_element, &k, &v);
+    }
+
+    // xml.py:535 — `new_element.text = element.text.strip() if element.text else None`.
+    let elem_text = element_text(element).map(|t| t.trim().to_string());
+    if let Some(t) = elem_text.as_deref().filter(|t| !t.is_empty()) {
+        set_element_text(&new_element, Some(t));
+    }
+
+    // xml.py:536-546 — iterate children. `<p>` children flatten into the
+    // <ab>'s text or get separated by <lb/>; other children are appended.
+    for child in children(element) {
+        let child_tag = local_name(&child).unwrap_or_default();
+        if child_tag == "p" {
+            // xml.py:537-544 — flatten <p>.
+            let child_text = element_text(&child).unwrap_or_default();
+            let kids = children(&new_element);
+            let new_text = element_text(&new_element);
+            if !kids.is_empty() || new_text.is_some() {
+                // xml.py:539-541 — emit <lb> when ab has no children or last tail has text.
+                let last = kids.last().cloned();
+                let last_has_tail = last
+                    .as_ref()
+                    .and_then(tail)
+                    .map(|t| !t.is_empty())
+                    .unwrap_or(false);
+                if kids.is_empty() || last_has_tail {
+                    let lb = dom::create_element("lb");
+                    dom::append_child(&new_element, &lb);
+                }
+                // xml.py:542 — `new_element[-1].tail = child.text`.
+                if let Some(latest) = children(&new_element).last() {
+                    set_tail(latest, Some(&child_text));
+                }
+            } else {
+                // xml.py:543-544 — first child path: text goes onto <ab>.
+                set_element_text(&new_element, Some(&child_text));
+            }
+        } else {
+            // xml.py:545-546 — append other children verbatim.
+            dom::remove(&child);
+            dom::append_child(&new_element, &child);
+        }
+    }
+
+    // xml.py:547-549 — preserve trailing tail (trimmed).
+    let trimmed_tail = tail(element).map(|t| t.trim().to_string());
+    if let Some(t) = trimmed_tail.filter(|t| !t.is_empty()) {
+        set_tail(&new_element, Some(&t));
+    }
+
+    new_element
+}
+
+/// `xml.py:553-575` — `_wrap_unwanted_siblings_of_div(div_element)`.
+///
+/// Wraps subsequent siblings of `div_element` that are TEI_DIV_SIBLINGS into a
+/// fresh `<div>` (so a `<body>` of mixed `<div>` + `<p>` + `<list>` survives
+/// TEI's "body children must all be `<div>`" rule). Stops at the next
+/// `<div>` sibling.
+fn _wrap_unwanted_siblings_of_div(div_element: &NodeRef) {
+    let Some(p) = parent(div_element) else { return };
+
+    let mut new_sibling = dom::create_element("div");
+    let mut new_sibling_index: Option<usize> = None;
+
+    // xml.py:561 — iterate FOLLOWING siblings (Python `itersiblings()`).
+    let siblings = following_element_siblings(div_element);
+    for sibling in siblings {
+        let stag = local_name(&sibling).unwrap_or_default();
+        // xml.py:562-563 — break at the next <div>.
+        if stag == "div" {
+            break;
+        }
+        // xml.py:564-566 — sibling is a TEI_DIV_SIBLING -> append to new_sibling.
+        if TEI_DIV_SIBLINGS.contains(&stag.as_str()) {
+            if new_sibling_index.is_none() {
+                new_sibling_index = position_of(&p, &sibling);
+            }
+            // Detach and append to the new wrapper.
+            dom::remove(&sibling);
+            dom::append_child(&new_sibling, &sibling);
+        } else {
+            // xml.py:569-573 — non-TEI_DIV_SIBLING separator (e.g. <lb/>).
+            // Flush the current wrapper if it has any collected children, then
+            // start a fresh wrapper. The unmoved separator stays where it is.
+            if let Some(idx) = new_sibling_index
+                && !children(&new_sibling).is_empty()
+            {
+                insert_child_at(&p, &new_sibling, idx);
+                new_sibling = dom::create_element("div");
+                new_sibling_index = None;
+            }
+        }
+    }
+
+    // xml.py:574-575 — flush any remaining wrapper.
+    if let Some(idx) = new_sibling_index
+        && !children(&new_sibling).is_empty()
+    {
+        insert_child_at(&p, &new_sibling, idx);
+    }
+}
+
+/// `xml.py:578-607` — `_move_element_one_level_up(element)`.
+///
+/// Fix TEI compatibility issues by moving `<head>` (already converted to
+/// `<ab>`) out from inside a `<p>` and up to the grandparent — TEI does not
+/// allow `<ab>` nested under `<p>`.
+fn _move_element_one_level_up(element: &NodeRef) {
+    let Some(p) = parent(element) else { return };
+    let Some(gp) = parent(&p) else { return };
+
+    // xml.py:588-589 — `new_elem = Element("p"); new_elem.extend(list(element.itersiblings()))`.
+    // The "siblings" here are siblings of `element` AFTER it (lxml `itersiblings()`).
+    let new_elem = dom::create_element("p");
+    let following: Vec<NodeRef> = following_element_siblings(element);
+    for sib in &following {
+        dom::remove(sib);
+        dom::append_child(&new_elem, sib);
+    }
+
+    // xml.py:591 — `grand_parent.insert(grand_parent.index(parent) + 1, element)`.
+    // First detach `element` from `p`, then insert into `gp` after `p`.
+    dom::remove(element);
+    let gp_idx_of_p = position_of(&gp, &p);
+    let insert_at = gp_idx_of_p.map(|i| i + 1).unwrap_or_else(|| {
+        children(&gp).len() // fall back to end
+    });
+    insert_child_at(&gp, element, insert_at);
+
+    // xml.py:593-596 — tail of `element` becomes `new_elem.text`.
+    let elem_tail = tail(element).map(|t| t.trim().to_string());
+    if let Some(t) = elem_tail.filter(|t| !t.is_empty()) {
+        set_element_text(&new_elem, Some(&t));
+        set_tail(element, None);
+    }
+
+    // xml.py:598-601 — tail of `parent` becomes `new_elem.tail`.
+    let p_tail = tail(&p).map(|t| t.trim().to_string());
+    if let Some(t) = p_tail.filter(|t| !t.is_empty()) {
+        set_tail(&new_elem, Some(&t));
+        set_tail(&p, None);
+    }
+
+    // xml.py:603-604 — insert new_elem one slot after element if non-empty.
+    let has_kids = !children(&new_elem).is_empty();
+    let has_text = element_text(&new_elem).is_some_and(|s| !s.is_empty());
+    let has_tail = tail(&new_elem).is_some_and(|s| !s.is_empty());
+    if has_kids || has_text || has_tail {
+        // grand_parent.index(element) + 1.
+        if let Some(idx) = position_of(&gp, element) {
+            insert_child_at(&gp, &new_elem, idx + 1);
+        }
+    }
+
+    // xml.py:606-607 — drop `<p>` if it's now empty and has no text.
+    if children(&p).is_empty() && element_text(&p).is_none_or(|s| s.is_empty()) {
+        dom::remove(&p);
+    }
+}
+
+/// `xml.py:423-491` — `write_fullheader(teidoc, docmeta) -> _Element`.
+///
+/// Builds and appends the `<teiHeader>` to `teidoc`. Carries `<fileDesc>` with
+/// `<titleStmt>` / `<publicationStmt>` / `<notesStmt>` / `<sourceDesc>`, a
+/// `<profileDesc>` with `<abstract>` / `<textClass>` / `<creation>`, and an
+/// `<encodingDesc>` with `<appInfo>` (Trafilatura version + URL).
+///
+/// Returns the constructed `<teiHeader>` element (already attached to teidoc).
+fn write_fullheader(teidoc: &NodeRef, metadata: &Metadata) -> NodeRef {
+    let header = dom::create_element("teiHeader");
+    dom::append_child(teidoc, &header);
+
+    let filedesc = dom::create_element("fileDesc");
+    dom::append_child(&header, &filedesc);
+
+    // xml.py:428-431 — titleStmt with title (always) + author (if any).
+    let bib_titlestmt = dom::create_element("titleStmt");
+    dom::append_child(&filedesc, &bib_titlestmt);
+    let title_elem = dom::create_element("title");
+    set_attribute(&title_elem, "type", "main");
+    if let Some(t) = metadata.title.as_deref() {
+        set_element_text(&title_elem, Some(t));
+    }
+    dom::append_child(&bib_titlestmt, &title_elem);
+    if let Some(a) = metadata.author.as_deref().filter(|a| !a.is_empty()) {
+        let author_elem = dom::create_element("author");
+        set_element_text(&author_elem, Some(a));
+        dom::append_child(&bib_titlestmt, &author_elem);
+    }
+
+    // xml.py:433-442 — publicationStmt with publisher + availability/license.
+    let publicationstmt_a = dom::create_element("publicationStmt");
+    dom::append_child(&filedesc, &publicationstmt_a);
+    let publisher_string = _define_publisher_string(metadata);
+    if let Some(license) = metadata.license.as_deref().filter(|s| !s.is_empty()) {
+        let publisher = dom::create_element("publisher");
+        set_element_text(&publisher, Some(&publisher_string));
+        dom::append_child(&publicationstmt_a, &publisher);
+        let availability = dom::create_element("availability");
+        dom::append_child(&publicationstmt_a, &availability);
+        let lic_p = dom::create_element("p");
+        set_element_text(&lic_p, Some(license));
+        dom::append_child(&availability, &lic_p);
+    } else {
+        // xml.py:441-442 — empty <p> for conformity when no license.
+        let empty_p = dom::create_element("p");
+        dom::append_child(&publicationstmt_a, &empty_p);
+    }
+
+    // xml.py:444-447 — notesStmt with id (if any) + fingerprint (always, even if None).
+    let notesstmt = dom::create_element("notesStmt");
+    dom::append_child(&filedesc, &notesstmt);
+    // id and fingerprint live on Document in Python but Metadata in Rust has neither
+    // (M4 Stage 6 deferred — `set_id` / `content_fingerprint`). Python emits the
+    // fingerprint note unconditionally with text=docmeta.fingerprint (None becomes
+    // a tagless empty element via lxml). We mirror with an empty <note type="fingerprint">.
+    let note_fp = dom::create_element("note");
+    set_attribute(&note_fp, "type", "fingerprint");
+    dom::append_child(&notesstmt, &note_fp);
+
+    // xml.py:449-456 — sourceDesc with bibl (title+sitename+date) + bibl[type=sigle].
+    let sourcedesc = dom::create_element("sourceDesc");
+    dom::append_child(&filedesc, &sourcedesc);
+    let source_bibl = dom::create_element("bibl");
+    dom::append_child(&sourcedesc, &source_bibl);
+
+    let sigle_parts: Vec<&str> = [
+        metadata.site_name.as_deref(),
+        metadata.date.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|s| !s.is_empty())
+    .collect();
+    let sigle = sigle_parts.join(", ");
+
+    let bibl_parts: Vec<&str> = [metadata.title.as_deref(), Some(sigle.as_str())]
+        .into_iter()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .collect();
+    let source_bibl_text = bibl_parts.join(", ");
+    if !source_bibl_text.is_empty() {
+        set_element_text(&source_bibl, Some(&source_bibl_text));
+    }
+
+    let sigle_bibl = dom::create_element("bibl");
+    set_attribute(&sigle_bibl, "type", "sigle");
+    if !sigle.is_empty() {
+        set_element_text(&sigle_bibl, Some(&sigle));
+    }
+    dom::append_child(&sourcedesc, &sigle_bibl);
+
+    // xml.py:458-468 — biblFull with full title/author/publisher/url/date.
+    let biblfull = dom::create_element("biblFull");
+    dom::append_child(&sourcedesc, &biblfull);
+    let bib_titlestmt2 = dom::create_element("titleStmt");
+    dom::append_child(&biblfull, &bib_titlestmt2);
+    let title2 = dom::create_element("title");
+    set_attribute(&title2, "type", "main");
+    if let Some(t) = metadata.title.as_deref() {
+        set_element_text(&title2, Some(t));
+    }
+    dom::append_child(&bib_titlestmt2, &title2);
+    if let Some(a) = metadata.author.as_deref().filter(|s| !s.is_empty()) {
+        let author2 = dom::create_element("author");
+        set_element_text(&author2, Some(a));
+        dom::append_child(&bib_titlestmt2, &author2);
+    }
+
+    let publicationstmt = dom::create_element("publicationStmt");
+    dom::append_child(&biblfull, &publicationstmt);
+    let publisher2 = dom::create_element("publisher");
+    set_element_text(&publisher2, Some(&publisher_string));
+    dom::append_child(&publicationstmt, &publisher2);
+    if let Some(url) = metadata.url.as_deref().filter(|s| !s.is_empty()) {
+        let ptr = dom::create_element("ptr");
+        set_attribute(&ptr, "type", "URL");
+        set_attribute(&ptr, "target", url);
+        dom::append_child(&publicationstmt, &ptr);
+    }
+    let date_elem = dom::create_element("date");
+    if let Some(d) = metadata.date.as_deref() {
+        set_element_text(&date_elem, Some(d));
+    }
+    dom::append_child(&publicationstmt, &date_elem);
+
+    // xml.py:470-483 — profileDesc with abstract, optional textClass, creation.
+    let profiledesc = dom::create_element("profileDesc");
+    dom::append_child(&header, &profiledesc);
+    let abstract_elem = dom::create_element("abstract");
+    dom::append_child(&profiledesc, &abstract_elem);
+    let abs_p = dom::create_element("p");
+    if let Some(d) = metadata.description.as_deref() {
+        set_element_text(&abs_p, Some(d));
+    }
+    dom::append_child(&abstract_elem, &abs_p);
+
+    if !metadata.categories.is_empty() || !metadata.tags.is_empty() {
+        let textclass = dom::create_element("textClass");
+        dom::append_child(&profiledesc, &textclass);
+        let keywords = dom::create_element("keywords");
+        dom::append_child(&textclass, &keywords);
+        if !metadata.categories.is_empty() {
+            let term = dom::create_element("term");
+            set_attribute(&term, "type", "categories");
+            set_element_text(&term, Some(&metadata.categories.join(",")));
+            dom::append_child(&keywords, &term);
+        }
+        if !metadata.tags.is_empty() {
+            let term = dom::create_element("term");
+            set_attribute(&term, "type", "tags");
+            set_element_text(&term, Some(&metadata.tags.join(",")));
+            dom::append_child(&keywords, &term);
+        }
+    }
+
+    let creation = dom::create_element("creation");
+    dom::append_child(&profiledesc, &creation);
+    // Python uses `docmeta.filedate` which Metadata doesn't yet carry (M4 Stage 6
+    // deferred). Emit an empty <date type="download"/> for shape parity.
+    let creation_date = dom::create_element("date");
+    set_attribute(&creation_date, "type", "download");
+    dom::append_child(&creation, &creation_date);
+
+    // xml.py:485-489 — encodingDesc / appInfo / application / label / ptr.
+    let encodingdesc = dom::create_element("encodingDesc");
+    dom::append_child(&header, &encodingdesc);
+    let appinfo = dom::create_element("appInfo");
+    dom::append_child(&encodingdesc, &appinfo);
+    let application = dom::create_element("application");
+    set_attribute(&application, "version", TRAFILATURA_VERSION);
+    set_attribute(&application, "ident", "Trafilatura");
+    dom::append_child(&appinfo, &application);
+    let label = dom::create_element("label");
+    set_element_text(&label, Some("Trafilatura"));
+    dom::append_child(&application, &label);
+    let app_ptr = dom::create_element("ptr");
+    set_attribute(&app_ptr, "target", "https://github.com/adbar/trafilatura");
+    dom::append_child(&application, &app_ptr);
+
+    header
+}
+
+/// `xml.py:393-409` — `write_teitree(docmeta) -> _Element`.
+///
+/// Builds the TEI root: `<TEI xmlns="...">` with `<teiHeader>` (via
+/// [`write_fullheader`]) and `<text><body>` carrying the post and comments
+/// bodies (both renamed to `<div type="entry">` / `<div type="comments">`).
+fn write_teitree(doc: &Document) -> NodeRef {
+    let teidoc = dom::create_element("TEI");
+    set_attribute(&teidoc, "xmlns", "http://www.tei-c.org/ns/1.0");
+
+    // xml.py:396 — `write_fullheader(teidoc, docmeta)`.
+    let _ = write_fullheader(&teidoc, &doc.metadata);
+
+    // xml.py:397-398 — `text/body` wrapper.
+    let textelem = dom::create_element("text");
+    dom::append_child(&teidoc, &textelem);
+    let textbody = dom::create_element("body");
+    dom::append_child(&textelem, &textbody);
+
+    // xml.py:400-403 — post body: rename to <div type="entry"> after clean_attributes.
+    let postbody = dom::replace_element_tag(&doc.body, "div");
+    clean_attributes(&postbody);
+    set_attribute(&postbody, "type", "entry");
+    dom::append_child(&textbody, &postbody);
+
+    // xml.py:405-408 — comments body: synthesise empty when None (Python default).
+    let commentsbody = match &doc.commentsbody {
+        Some(cb) => dom::replace_element_tag(cb, "div"),
+        None => dom::create_element("div"),
+    };
+    clean_attributes(&commentsbody);
+    set_attribute(&commentsbody, "type", "comments");
+    dom::append_child(&textbody, &commentsbody);
+
+    teidoc
+}
+
+/// `xml.py:196-235` — `check_tei(xmldoc, url)`.
+///
+/// Scrubs TEI-invalid structures in place:
+/// 1. Pass 1: `<head>` → `<ab type="header">`, with `_tei_handle_complex_head`
+///    for `<head>` with element children and `_move_element_one_level_up`
+///    when the head was inside a `<p>`.
+/// 2. Pass 2: `<lb>` directly under `<div>` with tail text becomes `<p>`.
+/// 3. Pass 3: walk every descendant of `text/body/`. Tags outside
+///    [`crate::trafilatura::cleaning::TEI_VALID_TAGS`] are merged with parent
+///    via [`merge_with_parent`]. Tags in [`TEI_REMOVE_TAIL`] route through
+///    `_handle_unwanted_tails`. `<div>` routes through
+///    `_handle_text_content_of_div_nodes` + `_wrap_unwanted_siblings_of_div`.
+///    Attributes not in [`TEI_VALID_ATTRS`] are popped.
+fn check_tei(xmldoc: &NodeRef) -> &NodeRef {
+    use crate::trafilatura::cleaning::TEI_VALID_TAGS;
+
+    // xml.py:199-210 — Pass 1: convert <head> to <ab type="header">.
+    let heads: Vec<NodeRef> = get_elements_by_tag_name(xmldoc, "head");
+    for elem in heads {
+        // Rename head -> ab; replace_element_tag returns a NEW node.
+        let ab = dom::replace_element_tag(&elem, "ab");
+        set_attribute(&ab, "type", "header");
+
+        // xml.py:202-204 — `parent = elem.getparent(); if parent is None: continue`.
+        let Some(p) = parent(&ab) else { continue };
+
+        // xml.py:205-208 — non-leaf head: complex-head conversion.
+        let cur = if !children(&ab).is_empty() {
+            let new_elem = _tei_handle_complex_head(&ab);
+            // parent.replace(elem, new_elem) — find ab in parent, swap.
+            if let Some(idx) = position_of(&p, &ab) {
+                dom::remove(&ab);
+                insert_child_at(&p, &new_elem, idx);
+            }
+            new_elem
+        } else {
+            ab
+        };
+
+        // xml.py:209-210 — head inside <p> -> move one level up.
+        let p_tag = local_name(&p).unwrap_or_default();
+        if p_tag == "p" {
+            _move_element_one_level_up(&cur);
+        }
+    }
+
+    // xml.py:212-214 — Pass 2: <lb> under <div> with text-bearing tail -> <p>.
+    // Python: `xmldoc.findall(".//text/body//div/lb")`.
+    let lbs = find_text_body_div_lb(xmldoc);
+    for lb in lbs {
+        let tail_text = tail(&lb).unwrap_or_default();
+        if !tail_text.trim().is_empty() {
+            // xml.py:214 — `elem.tag, elem.text, elem.tail = 'p', elem.tail, None`.
+            let p_new = dom::replace_element_tag(&lb, "p");
+            set_element_text(&p_new, Some(&tail_text));
+            set_tail(&p_new, None);
+        }
+    }
+
+    // xml.py:216-234 — Pass 3: walk descendants of text/body, scrub.
+    let body_descendants = find_text_body_descendants(xmldoc);
+    for elem in body_descendants {
+        let tag = local_name(&elem).unwrap_or_default();
+        // xml.py:218-223 — drop tags not in TEI_VALID_TAGS via merge_with_parent.
+        if !TEI_VALID_TAGS.contains(&tag.as_str()) {
+            merge_with_parent(&elem, false);
+            continue;
+        }
+        // xml.py:224-225 — TEI_REMOVE_TAIL: re-anchor tail.
+        if TEI_REMOVE_TAIL.contains(&tag.as_str()) {
+            _handle_unwanted_tails(&elem);
+        } else if tag == "div" {
+            // xml.py:226-228 — <div> housekeeping.
+            _handle_text_content_of_div_nodes(&elem);
+            _wrap_unwanted_siblings_of_div(&elem);
+        }
+        // xml.py:232-234 — pop invalid attributes.
+        let invalid_attrs: Vec<String> = dom::attributes_in_source_order(&elem)
+            .into_iter()
+            .map(|(k, _)| k)
+            .filter(|k| !TEI_VALID_ATTRS.contains(&k.as_str()))
+            .collect();
+        for attr in invalid_attrs {
+            dom::remove_attribute(&elem, &attr);
+        }
+    }
+
+    xmldoc
+}
+
+/// `xml.py:186-193` — `build_tei_output(docmeta) -> _Element`.
+///
+/// Top-level TEI build: [`write_teitree`] then [`check_tei`].
+fn build_tei_output(doc: &Document) -> NodeRef {
+    let output = write_teitree(doc);
+    let _ = check_tei(&output);
+    output
+}
+
+/// Post-process a TEI-serialised string to restore camel-case TEI tag names
+/// the rcdom lower-cased during construction. Faster than parsing — a
+/// per-tag substitution on element open/close tokens. Applied ONLY to TEI
+/// output (XML formatter does not need it).
+fn restore_tei_case(s: &str) -> String {
+    let mappings: &[(&str, &str)] = &[
+        ("<tei ", "<TEI "),
+        ("<tei>", "<TEI>"),
+        ("</tei>", "</TEI>"),
+        ("<teiheader", "<teiHeader"),
+        ("</teiheader>", "</teiHeader>"),
+        ("<filedesc", "<fileDesc"),
+        ("</filedesc>", "</fileDesc>"),
+        ("<titlestmt", "<titleStmt"),
+        ("</titlestmt>", "</titleStmt>"),
+        ("<publicationstmt", "<publicationStmt"),
+        ("</publicationstmt>", "</publicationStmt>"),
+        ("<notesstmt", "<notesStmt"),
+        ("</notesstmt>", "</notesStmt>"),
+        ("<sourcedesc", "<sourceDesc"),
+        ("</sourcedesc>", "</sourceDesc>"),
+        ("<biblfull", "<biblFull"),
+        ("</biblfull>", "</biblFull>"),
+        ("<profiledesc", "<profileDesc"),
+        ("</profiledesc>", "</profileDesc>"),
+        ("<textclass", "<textClass"),
+        ("</textclass>", "</textClass>"),
+        ("<encodingdesc", "<encodingDesc"),
+        ("</encodingdesc>", "</encodingDesc>"),
+        ("<appinfo", "<appInfo"),
+        ("</appinfo>", "</appInfo>"),
+    ];
+    let mut out = s.to_string();
+    for (from, to) in mappings {
+        if out.contains(from) {
+            out = out.replace(from, to);
+        }
+    }
+    // Self-closing variant: `<teiHeader/>` etc. — the `<tei ` mapping above
+    // doesn't catch `<teiheader/>`. Handle separately.
+    out = out.replace("<teiheader/>", "<teiHeader/>");
+    out = out.replace("<filedesc/>", "<fileDesc/>");
+    out = out.replace("<titlestmt/>", "<titleStmt/>");
+    out = out.replace("<publicationstmt/>", "<publicationStmt/>");
+    out = out.replace("<notesstmt/>", "<notesStmt/>");
+    out = out.replace("<sourcedesc/>", "<sourceDesc/>");
+    out = out.replace("<biblfull/>", "<biblFull/>");
+    out = out.replace("<profiledesc/>", "<profileDesc/>");
+    out = out.replace("<textclass/>", "<textClass/>");
+    out = out.replace("<encodingdesc/>", "<encodingDesc/>");
+    out = out.replace("<appinfo/>", "<appInfo/>");
+    out = out.replace("<tei/>", "<TEI/>");
+    out
+}
+
+// ---------------------------------------------------------------------------
+// TEI helper free fns (cross-cut: insertion at index, position lookup, etc.)
+// ---------------------------------------------------------------------------
+
+/// `parent.insert(index, child)` — splice `child` into `parent`'s children at
+/// position `idx`. Clamps to the children vector length. Detaches `child`
+/// from any prior parent first (no-op if already detached).
+///
+/// Python lxml `Element.insert(idx, child)` semantics.
+fn insert_child_at(parent: &NodeRef, child: &NodeRef, idx: usize) {
+    // Detach from prior parent (lxml semantics: insert moves the node).
+    dom::remove(child);
+    use std::rc::Rc;
+    let mut kids = parent.children.borrow_mut();
+    let clamped = idx.min(kids.len());
+    child.parent.set(Some(Rc::downgrade(parent)));
+    kids.insert(clamped, child.clone());
+}
+
+/// `parent.index(child)` — return the position of `child` in `parent`'s
+/// children list, or `None` if not a child.
+fn position_of(parent: &NodeRef, child: &NodeRef) -> Option<usize> {
+    parent
+        .children
+        .borrow()
+        .iter()
+        .position(|c| std::rc::Rc::ptr_eq(c, child))
+}
+
+/// `element.itersiblings()` — return the *following* ELEMENT siblings of
+/// `element` (those after it in the parent's child list, element-only).
+///
+/// lxml's `itersiblings()` yields *following* siblings by default. The Python
+/// callers here iterate elements only, ignoring intermixed Text siblings (the
+/// tail run that lives between siblings).
+fn following_element_siblings(element: &NodeRef) -> Vec<NodeRef> {
+    let Some((p, idx)) = (|| -> Option<(NodeRef, usize)> {
+        let p = parent(element)?;
+        let pos = position_of(&p, element)?;
+        Some((p, pos))
+    })() else {
+        return Vec::new();
+    };
+    p.children
+        .borrow()
+        .iter()
+        .skip(idx + 1)
+        .filter(|c| matches!(c.data, NodeData::Element { .. }))
+        .cloned()
+        .collect()
+}
+
+/// `xmldoc.findall(".//text/body//div/lb")` — Python XPath at `xml.py:212`.
+/// Returns every `<lb>` whose ancestor chain includes `text -> body -> ... -> div`.
+/// Faithful semantic: the `<lb>` must be a descendant of some `<div>` that is
+/// itself under `<text>/<body>`.
+fn find_text_body_div_lb(xmldoc: &NodeRef) -> Vec<NodeRef> {
+    let mut out = Vec::new();
+    // Walk text/body subtrees of xmldoc.
+    for textelem in get_elements_by_tag_name(xmldoc, "text") {
+        for bodyelem in get_elements_by_tag_name(&textelem, "body") {
+            // Every <div> under body.
+            for divelem in get_elements_by_tag_name(&bodyelem, "div") {
+                // Every <lb> directly under that <div> (Python XPath `div/lb`
+                // matches direct children).
+                for lb in children(&divelem) {
+                    if local_name(&lb).as_deref() == Some("lb") {
+                        out.push(lb);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `xmldoc.findall(".//text/body//*")` — Python XPath at `xml.py:216`.
+/// Returns every descendant of `<text>/<body>` in document order.
+fn find_text_body_descendants(xmldoc: &NodeRef) -> Vec<NodeRef> {
+    let mut out = Vec::new();
+    for textelem in get_elements_by_tag_name(xmldoc, "text") {
+        for bodyelem in get_elements_by_tag_name(&textelem, "body") {
+            out.extend(get_elements_by_tag_name(&bodyelem, "*"));
+        }
+    }
+    out
+}
+
+// ===========================================================================
 // control_xml_output (xml.py:159-175)
 // ===========================================================================
 
+/// Output-format discriminator the Stage-3 public entry-points use to drive
+/// [`control_xml_output`] (`xml.py:164`'s `options.format == "xmltei"` arm).
+///
+/// `xml.py:159-175`'s Python source switches on `options.format`:
+/// `"xml"` -> `build_xml_output`, `"xmltei"` -> `build_tei_output`. We encode
+/// the discriminator as a closed enum because the Stage 3 public surface
+/// (`extract_to_xml` / `extract_to_tei`) gives the caller a typed entry-point
+/// for each format and there is no third value.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum OutputFormat {
+    /// `xml.py:165` — Trafilatura's flat `<doc>` / `<main>` / `<comments>` shape.
+    Xml,
+    /// `xml.py:164` — Text Encoding Initiative conformant `<TEI>` tree.
+    Tei,
+}
+
 /// `xml.py:159-175` — `control_xml_output(document, options) -> str`.
 ///
-/// The Stage 3-D entry point: runs `strip_double_tags` + `remove_empty_elements`
-/// on `document.body`, calls [`build_xml_output`], then serialises with
-/// pretty-printing via [`serialize_xml_pretty`]. Returns the rendered XML
+/// The Stage 3-D/E entry point: runs `strip_double_tags` +
+/// `remove_empty_elements` on `document.body`, dispatches to
+/// [`build_xml_output`] or [`build_tei_output`] per `format`, then serialises
+/// with pretty-printing via [`serialize_xml_pretty`]. Returns the rendered XML
 /// string (Python `tostring(..., pretty_print=True, encoding='unicode').strip()`).
 ///
-/// # TEI branch — Stage 3-E (deferred)
+/// # Stage 3-E TEI dispatch
 ///
-/// Python `xml.py:164` dispatches to `build_tei_output` when
-/// `options.format == "xmltei"`. M4 Stage 3-E lands the TEI path; for Stage
-/// 3-D we only carry the XML branch. The signature takes no `format` switch
-/// because there's no second branch to discriminate yet.
+/// Python `xml.py:164` switches on `options.format`: `"xmltei"` dispatches
+/// through `build_tei_output` (which runs `write_teitree` + `check_tei` —
+/// `xml.py:186-235`); every other recognised XML format goes through
+/// `build_xml_output`. The Rust port carries the same dispatch on
+/// [`OutputFormat`].
 ///
 /// # `sanitize_tree` deferral
 ///
 /// Python `xml.py:167` runs `sanitize_tree(output_tree)` (utils.py:315-336)
 /// before `tostring`. That helper trims spaces, removes control chars, and
-/// normalises Unicode per-text-node. Our public `extract_to_xml` instead
-/// NFC-normalises the FINAL string (matching the same `extract_to_markdown`
-/// pattern in `core.py:98`). The resulting bytes are equivalent for the
-/// invariants tests assert — what reaches the user is NFC text.
+/// normalises Unicode per-text-node. Our public `extract_to_xml` /
+/// `extract_to_tei` instead NFC-normalises the FINAL string (matching the
+/// same `extract_to_markdown` pattern in `core.py:98`). The resulting bytes
+/// are equivalent for the invariants tests assert — what reaches the user is
+/// NFC text.
 ///
 /// # `remove_blank_text` reparse equivalence
 ///
@@ -1390,15 +2217,18 @@ pub(crate) fn build_xml_output(doc: &Document) -> NodeRef {
 /// before pretty-printing. We mirror this in [`serialize_xml_pretty`] by
 /// treating whitespace-only text/tail nodes as absent when deciding indent
 /// vs inline emission.
-pub(crate) fn control_xml_output(doc: &Document) -> String {
+pub(crate) fn control_xml_output(doc: &Document, format: OutputFormat) -> String {
     // xml.py:161-162 — `strip_double_tags(document.body); remove_empty_elements
     // (document.body)`. Both mutate in place.
     strip_double_tags(&doc.body);
     remove_empty_elements(&doc.body);
 
-    // xml.py:164-165 — `func = build_xml_output ...; output_tree = func(document)`.
-    // TODO Stage 3-E: switch on options.format to dispatch build_tei_output here.
-    let output_tree = build_xml_output(doc);
+    // xml.py:164-165 — `func = build_xml_output if ... else build_tei_output;
+    // output_tree = func(document)`.
+    let output_tree = match format {
+        OutputFormat::Xml => build_xml_output(doc),
+        OutputFormat::Tei => build_tei_output(doc),
+    };
 
     // xml.py:167-169 — sanitize_tree + reparse-through-CONTROL_PARSER. The
     // sanitize_tree behaviour is deferred (see fn doc); the reparse equivalent
@@ -1406,7 +2236,13 @@ pub(crate) fn control_xml_output(doc: &Document) -> String {
 
     // xml.py:175 — `tostring(output_tree, pretty_print=True, encoding='unicode'
     // ).strip()`.
-    serialize_xml_pretty(&output_tree)
+    let serialised = serialize_xml_pretty(&output_tree);
+    // TEI tags are XML camel-case (e.g. `<TEI>`, `<teiHeader>`); our HTML-
+    // backed rcdom lowers them. Map back at the surface for the TEI branch.
+    match format {
+        OutputFormat::Xml => serialised,
+        OutputFormat::Tei => restore_tei_case(&serialised),
+    }
 }
 
 // ===========================================================================
@@ -2287,7 +3123,7 @@ mod tests {
             commentsbody: None,
             raw_text: String::new(),
         };
-        let s = control_xml_output(&doc);
+        let s = control_xml_output(&doc, OutputFormat::Xml);
         // Exact match against lxml's pretty-print of the equivalent tree:
         //   '<doc>\n  <main/>\n  <comments/>\n</doc>'
         assert_eq!(s, "<doc>\n  <main/>\n  <comments/>\n</doc>");
@@ -2301,7 +3137,7 @@ mod tests {
             ..Metadata::default()
         };
         let doc = doc_with_simple_body(md);
-        let s = control_xml_output(&doc);
+        let s = control_xml_output(&doc, OutputFormat::Xml);
         // <doc title="T" url="https://e.com/">... — attribute presence and
         // ordering match add_xml_meta's xml.py:42-46 sequence (title before url).
         assert!(
@@ -2315,7 +3151,7 @@ mod tests {
     #[test]
     fn control_xml_output_without_metadata_has_bare_doc_root() {
         let doc = doc_with_simple_body(Metadata::default());
-        let s = control_xml_output(&doc);
+        let s = control_xml_output(&doc, OutputFormat::Xml);
         // No metadata attrs on <doc>.
         assert!(s.starts_with("<doc>\n"), "got: {s}");
         assert!(!s.contains("title="));
@@ -2337,7 +3173,7 @@ mod tests {
             commentsbody: Some(commentsbody),
             raw_text: String::new(),
         };
-        let s = control_xml_output(&doc);
+        let s = control_xml_output(&doc, OutputFormat::Xml);
         // The <comments> element holds the user-reply <p>.
         assert!(
             s.contains("<comments>") && s.contains("user reply"),
@@ -2356,7 +3192,7 @@ mod tests {
             commentsbody: None,
             raw_text: String::new(),
         };
-        let s = control_xml_output(&doc);
+        let s = control_xml_output(&doc, OutputFormat::Xml);
         assert!(s.contains("a &lt; b &amp; c &gt; d"), "got: {s}");
     }
 
@@ -2368,7 +3204,7 @@ mod tests {
             ..Metadata::default()
         };
         let doc = doc_with_simple_body(md);
-        let s = control_xml_output(&doc);
+        let s = control_xml_output(&doc, OutputFormat::Xml);
         // " -> &quot;, < -> &lt;, & -> &amp;, > -> &gt; (lxml escapes all four
         // inside double-quoted attribute values).
         assert!(
@@ -2381,7 +3217,7 @@ mod tests {
     fn control_xml_output_indents_nested_elements_two_spaces() {
         // Verify exact indentation: <doc>\n  <main>\n    <p>...</p>\n  </main>...
         let doc = doc_with_simple_body(Metadata::default());
-        let s = control_xml_output(&doc);
+        let s = control_xml_output(&doc, OutputFormat::Xml);
         // The <p> sits at depth 2 -> 4 spaces of indent.
         assert!(s.contains("\n    <p>Hello.</p>\n"), "got: {s}");
         // <main> sits at depth 1 -> 2 spaces of indent.
@@ -2404,7 +3240,7 @@ mod tests {
             commentsbody: None,
             raw_text: String::new(),
         };
-        let s = control_xml_output(&doc);
+        let s = control_xml_output(&doc, OutputFormat::Xml);
         // <hi rend="#b"> preserved (xml.py:39).
         assert!(s.contains("<hi rend=\"#b\">bold</hi>"), "got: {s}");
         // <p class="..."> stripped (p not whitelisted).
@@ -2427,7 +3263,7 @@ mod tests {
             commentsbody: None,
             raw_text: String::new(),
         };
-        let s = control_xml_output(&doc);
+        let s = control_xml_output(&doc, OutputFormat::Xml);
         // U+00E9 (NFC) survives.
         assert!(s.contains("café"), "got: {s}");
         // U+0065 U+0301 (NFD decomposed) would also pass `contains("café")`
@@ -2456,5 +3292,270 @@ mod tests {
         set_tail(&hi, Some(" tail"));
         let s = serialize_xml_pretty(&main);
         assert_eq!(s, "<main>Lead <hi>bold</hi> tail</main>");
+    }
+
+    // -------------------------------------------------------------------
+    // Stage 3-E: TEI helpers — xml.py:186-607.
+    // -------------------------------------------------------------------
+
+    /// `_define_publisher_string` — sitename + hostname picks combined form.
+    #[test]
+    fn tei_define_publisher_string_combines_sitename_and_hostname() {
+        let md = Metadata {
+            site_name: Some("Example Site".to_string()),
+            hostname: Some("example.com".to_string()),
+            ..Metadata::default()
+        };
+        assert_eq!(_define_publisher_string(&md), "Example Site (example.com)");
+    }
+
+    /// `_define_publisher_string` — hostname only.
+    #[test]
+    fn tei_define_publisher_string_falls_back_to_hostname() {
+        let md = Metadata {
+            hostname: Some("example.com".to_string()),
+            ..Metadata::default()
+        };
+        assert_eq!(_define_publisher_string(&md), "example.com");
+    }
+
+    /// `_define_publisher_string` — sitename only.
+    #[test]
+    fn tei_define_publisher_string_falls_back_to_sitename() {
+        let md = Metadata {
+            site_name: Some("Solo Site".to_string()),
+            ..Metadata::default()
+        };
+        assert_eq!(_define_publisher_string(&md), "Solo Site");
+    }
+
+    /// `_define_publisher_string` — neither set yields `N/A` sentinel.
+    #[test]
+    fn tei_define_publisher_string_returns_na_when_neither_set() {
+        assert_eq!(_define_publisher_string(&Metadata::default()), "N/A");
+    }
+
+    /// `_handle_text_content_of_div_nodes`: loose text on `<div>` is folded
+    /// onto the first `<p>` child.
+    #[test]
+    fn tei_handle_text_content_of_div_folds_into_first_p() {
+        let div = build_elem("div", Some("loose text"), vec![], &[]);
+        let p = build_elem("p", Some("body"), vec![], &[]);
+        append_child(&div, &p);
+        _handle_text_content_of_div_nodes(&div);
+        assert_eq!(element_text(&div), None);
+        let kids = children(&div);
+        assert_eq!(kids.len(), 1);
+        assert_eq!(element_text(&kids[0]).as_deref(), Some("loose text body"));
+    }
+
+    /// `_handle_text_content_of_div_nodes`: no `<p>` child -> inserts one.
+    #[test]
+    fn tei_handle_text_content_of_div_inserts_p_when_no_p_child() {
+        let div = build_elem("div", Some("just text"), vec![], &[]);
+        _handle_text_content_of_div_nodes(&div);
+        let kids = children(&div);
+        assert_eq!(kids.len(), 1);
+        assert_eq!(local_name(&kids[0]).as_deref(), Some("p"));
+        assert_eq!(element_text(&kids[0]).as_deref(), Some("just text"));
+    }
+
+    /// `_handle_unwanted_tails` on `<p>`: tail folds into element text.
+    #[test]
+    fn tei_handle_unwanted_tails_on_p_folds_into_text() {
+        let root = create_element("root");
+        let p = build_elem("p", Some("body"), vec![], &[]);
+        append_child(&root, &p);
+        set_tail(&p, Some("trailing"));
+        _handle_unwanted_tails(&p);
+        assert_eq!(element_text(&p).as_deref(), Some("body trailing"));
+        assert_eq!(tail(&p), None);
+    }
+
+    /// `_handle_unwanted_tails` on `<ab>`: tail becomes a new `<p>` sibling.
+    #[test]
+    fn tei_handle_unwanted_tails_on_ab_creates_p_sibling() {
+        let root = create_element("root");
+        let ab = build_elem("ab", Some("head"), vec![], &[]);
+        append_child(&root, &ab);
+        set_tail(&ab, Some("after"));
+        _handle_unwanted_tails(&ab);
+        // ab's tail is gone; root now has [ab, <p>after</p>].
+        assert_eq!(tail(&ab), None);
+        let kids = children(&root);
+        assert_eq!(kids.len(), 2);
+        assert_eq!(local_name(&kids[1]).as_deref(), Some("p"));
+        assert_eq!(element_text(&kids[1]).as_deref(), Some("after"));
+    }
+
+    /// `_tei_handle_complex_head`: `<head>` with `<p>` child flattens into
+    /// `<ab>` with `<lb/>` separators.
+    #[test]
+    fn tei_handle_complex_head_flattens_p_with_lb() {
+        // <ab>headtext<p>first</p><p>second</p></ab>
+        let head = build_elem("ab", Some("headtext"), vec![], &[("rend", "h2")]);
+        let p1 = build_elem("p", Some("first"), vec![], &[]);
+        let p2 = build_elem("p", Some("second"), vec![], &[]);
+        append_child(&head, &p1);
+        append_child(&head, &p2);
+        let new_ab = _tei_handle_complex_head(&head);
+        // The new <ab> retains its rend attribute.
+        assert_eq!(get_attribute(&new_ab, "rend").as_deref(), Some("h2"));
+        // No more <p> descendants in new_ab.
+        let ps = get_elements_by_tag_name(&new_ab, "p");
+        assert!(ps.is_empty(), "no <p> should remain: {:?}", ps.len());
+        // <lb/> separators present.
+        let lbs = get_elements_by_tag_name(&new_ab, "lb");
+        assert!(!lbs.is_empty(), "lb separators should exist");
+    }
+
+    /// `_wrap_unwanted_siblings_of_div`: TEI_DIV_SIBLINGS wrapped in fresh <div>.
+    #[test]
+    fn tei_wrap_unwanted_siblings_of_div_wraps_p_siblings() {
+        let body = create_element("body");
+        let div1 = build_elem("div", None, vec![], &[]);
+        let p_loose = build_elem("p", Some("loose"), vec![], &[]);
+        let div2 = build_elem("div", None, vec![], &[]);
+        append_child(&body, &div1);
+        append_child(&body, &p_loose);
+        append_child(&body, &div2);
+        _wrap_unwanted_siblings_of_div(&div1);
+        // After: body has [div, div(wrapper containing p), div].
+        let kids = children(&body);
+        assert_eq!(kids.len(), 3);
+        // Middle child is a div wrapping <p>.
+        let middle = &kids[1];
+        assert_eq!(local_name(middle).as_deref(), Some("div"));
+        let middle_kids = children(middle);
+        assert_eq!(middle_kids.len(), 1);
+        assert_eq!(local_name(&middle_kids[0]).as_deref(), Some("p"));
+    }
+
+    /// `_move_element_one_level_up`: `<ab>` nested under `<p>` moves up.
+    #[test]
+    fn tei_move_element_one_level_up_lifts_ab_from_p() {
+        // <body><p><ab>head</ab>tail</p></body>
+        let body = create_element("body");
+        let p = build_elem("p", None, vec![], &[]);
+        let ab = build_elem("ab", Some("head"), vec![], &[]);
+        append_child(&p, &ab);
+        append_child(&body, &p);
+        _move_element_one_level_up(&ab);
+        // After: <ab> is now a direct child of body (sibling of p).
+        let kids = children(&body);
+        // ab moved up to be after p; new_elem may not be inserted because empty.
+        assert!(kids.iter().any(|k| local_name(k).as_deref() == Some("ab")));
+    }
+
+    /// `check_tei`: non-whitelisted descendant is merged with parent.
+    #[test]
+    fn tei_check_tei_strips_non_whitelisted_descendant_tags() {
+        // Build a minimal TEI tree: <TEI><text><body><div type="entry">
+        //   <p>good <span>bad</span> end</p></div></body></text></TEI>
+        let tei = create_element("TEI");
+        let textel = create_element("text");
+        append_child(&tei, &textel);
+        let bodyel = create_element("body");
+        append_child(&textel, &bodyel);
+        let div = build_elem("div", None, vec![], &[("type", "entry")]);
+        append_child(&bodyel, &div);
+        let p = build_elem("p", Some("good "), vec![], &[]);
+        let span = build_elem("span", Some("bad"), vec![], &[]);
+        set_tail(&span, Some(" end"));
+        append_child(&p, &span);
+        append_child(&div, &p);
+
+        check_tei(&tei);
+        // <span> is not in TEI_VALID_TAGS — should be removed (merged).
+        let spans = get_elements_by_tag_name(&tei, "span");
+        assert!(spans.is_empty(), "span must be stripped: {}", spans.len());
+        // <p> still survives.
+        let ps = get_elements_by_tag_name(&tei, "p");
+        assert_eq!(ps.len(), 1);
+    }
+
+    /// `check_tei`: invalid attribute is popped from a valid tag.
+    #[test]
+    fn tei_check_tei_strips_non_whitelisted_attributes() {
+        let tei = create_element("TEI");
+        let textel = create_element("text");
+        append_child(&tei, &textel);
+        let bodyel = create_element("body");
+        append_child(&textel, &bodyel);
+        let div = build_elem("div", None, vec![], &[("type", "entry")]);
+        append_child(&bodyel, &div);
+        let p = build_elem(
+            "p",
+            Some("body"),
+            vec![],
+            &[("class", "lead"), ("rend", "italic")],
+        );
+        append_child(&div, &p);
+
+        check_tei(&tei);
+        // class is not in TEI_VALID_ATTRS — stripped.
+        let ps = get_elements_by_tag_name(&tei, "p");
+        assert_eq!(get_attribute(&ps[0], "class"), None);
+        // rend is in TEI_VALID_ATTRS — survives.
+        assert_eq!(get_attribute(&ps[0], "rend").as_deref(), Some("italic"));
+    }
+
+    /// `build_tei_output`: produces TEI root (lower-cased "tei" in the DOM;
+    /// upper-cased "TEI" only after `restore_tei_case` runs at serialise
+    /// time) with xmlns + teiHeader + text/body.
+    #[test]
+    fn build_tei_output_builds_full_tei_structure() {
+        let md = Metadata {
+            title: Some("Sample".to_string()),
+            ..Metadata::default()
+        };
+        let body = create_element("body");
+        let p = build_elem("p", Some("Hello."), vec![], &[]);
+        append_child(&body, &p);
+        let doc = Document {
+            metadata: md,
+            body,
+            commentsbody: None,
+            raw_text: String::new(),
+        };
+        let out = build_tei_output(&doc);
+        // The rcdom-backed create_element lower-cases tag names (HTML
+        // semantics); restore_tei_case upper-cases at serialise time.
+        assert_eq!(local_name(&out).as_deref(), Some("tei"));
+        assert_eq!(
+            get_attribute(&out, "xmlns").as_deref(),
+            Some("http://www.tei-c.org/ns/1.0")
+        );
+        // <teiHeader> child (lower-cased in DOM).
+        let headers = get_elements_by_tag_name(&out, "teiheader");
+        assert_eq!(headers.len(), 1);
+        // <text>/<body>/<div type="entry"> chain.
+        let textels = get_elements_by_tag_name(&out, "text");
+        assert_eq!(textels.len(), 1);
+        let bodies = get_elements_by_tag_name(&textels[0], "body");
+        assert_eq!(bodies.len(), 1);
+        let divs = get_elements_by_tag_name(&bodies[0], "div");
+        assert!(divs.iter().any(|d| get_attribute(d, "type")
+            .as_deref()
+            == Some("entry")));
+    }
+
+    /// `control_xml_output` with TEI format produces TEI serialised XML.
+    #[test]
+    fn control_xml_output_tei_branch_returns_tei_root() {
+        let body = create_element("body");
+        let p = build_elem("p", Some("Hello"), vec![], &[]);
+        append_child(&body, &p);
+        let doc = Document {
+            metadata: Metadata::default(),
+            body,
+            commentsbody: None,
+            raw_text: String::new(),
+        };
+        let s = control_xml_output(&doc, OutputFormat::Tei);
+        assert!(s.starts_with("<TEI"), "must start with <TEI: {s}");
+        assert!(s.contains("xmlns=\"http://www.tei-c.org/ns/1.0\""), "{s}");
+        assert!(s.contains("<teiHeader>"), "{s}");
+        assert!(s.ends_with("</TEI>"), "must end with </TEI>: {s}");
     }
 }
