@@ -2547,7 +2547,34 @@ name = "mdrcel"
 # sandbox we surface it as MINOR (matching M3 Stage 9's `comments` field
 # precedent at 0.9.0 -> 0.10.0). No new dependency; no public API removal;
 # `Options` unchanged.
-version = "0.15.14"
+#
+# M5 Stage 6h-a (2026-05-21): 0.15.14 -> 0.15.15 PATCH. `handle_table` non-
+# leaf cell branch (`main_extractor.rs:1166-1280`): the Stage 6d tail-
+# recovery gate trimmed whitespace-only tails before re-attaching them onto
+# the new cell-child element. That gate (added to avoid the d71ec714 POTD
+# regression where the `\n` BETWEEN two `<p>` cell-children leaked) was too
+# coarse — it also dropped the TRAILING `\n` after the LAST element-child
+# of `<td>...</td>`, which Python preserves on `last_child.tail` per lxml's
+# intrinsic `.tail` semantics. Without preservation, xmltotxt's
+# `process_element` skipped the after-tag tail emission for the last cell-
+# child, and `sanitize` collapsed the cell separator inline (no newline
+# before the closing `| `). Symptom: M5 fixture 86df4d2e (HTML entity
+# reference table) emitted `` `&` |\n`&` `` (inline pipe) while Python
+# emits `` `&`\n|\n`&` `` (pipe-on-own-line). Fix: extend the recovery
+# gate to ALSO preserve whitespace-only tails when `child` is the LAST
+# direct element-child of the source cell (so they survive as Python's
+# `last_child.tail` and break the rendered table cells onto separate
+# lines), while keeping the trim-and-drop behaviour for mid-position
+# siblings (so the d71ec714 regression stays fixed). Two new regression-
+# pin tests freeze the invariant: `handle_table_preserves_last_cell_child_
+# trailing_whitespace_tail` and `handle_table_drops_mid_cell_whitespace_
+# tail_between_siblings`. Gate movement: M5 markdown gate 40/51 + 5 ->
+# 40/51 + 5 substantive (86df4d2e diff position shifted forward 384 bytes
+# from 26846 to 27230; remaining diff is a separate `&ddagger;` entity-
+# decode issue + `<sup class="noprint">` discard quirk — not flipped this
+# stage, deferred to Stage 6i). No public-API change. No new dependency.
+# PATCH bump.
+version = "0.15.15"
 edition = "2024"
 
 # M5 Stage 6e-b (2026-05-21): 0.15.10 -> 0.15.11 PATCH. No source change —

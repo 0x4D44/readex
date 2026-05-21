@@ -1164,6 +1164,25 @@ pub fn handle_table(
                 // runs as a redundant no-op cleanup. The inner walk below
                 // therefore sees the original children.
                 let inner_descendants = descendant_elements(&subelement);
+                // M5 Stage 6h-a (2026-05-21): identify the LAST direct
+                // element-child of the original cell so the whitespace-only
+                // tail-recovery gate can distinguish "trailing whitespace
+                // before `</td>`" (preserve — Python sees it on the last
+                // child's `.tail`) from "whitespace separator between
+                // mid-cell siblings" (drop — Python's process_node trims
+                // this kind of tail). Without this distinction we either
+                // lose the trailing newline (86df4d2e — every multi-byte
+                // table cell renders pipe-inline instead of pipe-newline)
+                // or gain a stray newline mid-cell (d71ec714 — Wikipedia
+                // POTD `<td><p>The…</p>\n<p>Photograph credit…</p></td>`
+                // gains an empty line between the two <p>s).
+                let last_element_child_of_cell: Option<NodeRef> = subelement
+                    .children
+                    .borrow()
+                    .iter()
+                    .rev()
+                    .find(|c| matches!(c.data, NodeData::Element { .. }))
+                    .cloned();
                 for child in inner_descendants {
                     let child_tag = local_name(&child).unwrap_or_default();
                     // **M5 Stage 6d (2026-05-21) — capture original `child.tail`
@@ -1173,6 +1192,10 @@ pub fn handle_table(
                     // (rcdom models tail as a sibling Text node of the OLD parent).
                     // See the post-`define_newelem` tail-recovery block below.
                     let saved_child_tail = tail(&child);
+                    let is_last_direct_child = last_element_child_of_cell
+                        .as_ref()
+                        .map(|last| std::rc::Rc::ptr_eq(last, &child))
+                        .unwrap_or(false);
                     let mut processed_subchild: Option<NodeRef> = None;
 
                     if TABLE_ALL.contains(&child_tag.as_str()) {
@@ -1247,9 +1270,14 @@ pub fn handle_table(
                     if let Some(p) = processed_subchild.as_ref() {
                         define_newelem(Some(p), &new_child_elem);
                         // Stage 6d tail recovery (see comment above).
+                        // Stage 6h-a extension: keep whitespace-only tails when
+                        // `child` is the LAST direct element-child of the cell
+                        // (so they survive as Python's `last.tail` and render
+                        // as a newline before the cell's closing ` | `).
                         if let Some(t) = saved_child_tail.as_deref() {
                             let trimmed = crate::trafilatura::utils::trim(t);
-                            if !trimmed.is_empty() {
+                            let keep = !trimmed.is_empty() || is_last_direct_child;
+                            if keep {
                                 let kids = element_children(&new_child_elem);
                                 if let Some(last) = kids.last() {
                                     let last_tag = local_name(last).unwrap_or_default();
@@ -3919,6 +3947,94 @@ mod tests {
             tail(&cells[1]).as_deref(),
             Some("\n    "),
             "second non-leaf cell tail also preserved"
+        );
+    }
+
+    #[test]
+    fn handle_table_preserves_last_cell_child_trailing_whitespace_tail() {
+        // M5 Stage 6h-a regression pin. Python's lxml stores tails as
+        // intrinsic element attributes, so when `<td><code>x</code>\n</td>`
+        // is processed by Trafilatura's `handle_table` non-leaf branch, the
+        // `<code>` element retains its `.tail == "\n"` on the new cell-
+        // child. xmltotxt's `process_element` then emits the tail AFTER the
+        // `<code>` close (and before the closing `| `), so `sanitize`
+        // breaks the cell onto its own line in the rendered markdown table.
+        //
+        // mdrcel previously trimmed whitespace-only tails before recovering
+        // them onto the cell-child (Stage 6d gate, avoiding a d71ec714
+        // regression where the `\n` BETWEEN two `<p>` siblings would leak).
+        // This test pins the refined gate: whitespace-only tails on the
+        // LAST direct element-child of the source cell ARE preserved
+        // (matching lxml's intrinsic `.tail`), while mid-position tails on
+        // earlier children remain dropped.
+        let table = dom_create_element("table");
+        let tr = dom_create_element("tr");
+        let td = dom_create_element("td");
+        let code = dom_create_element("code");
+        dom_append_child(&code, &create_text_node("X"));
+        dom_append_child(&td, &code);
+        // Stage 6h-a target: trailing `\n` after the LAST element-child of
+        // the cell — should be preserved onto the output cell's <code>
+        // child (matches Python's lxml `.tail` semantics).
+        set_tail(&code, Some("\n"));
+        dom_append_child(&tr, &td);
+        dom_append_child(&table, &tr);
+
+        let pot = potential_tags(&["table"]);
+        let opts = Options::default();
+        let out = handle_table(&table, &pot, &opts).expect("non-empty → Some");
+        let cells = get_elements_by_tag_name(&out, "cell");
+        assert_eq!(cells.len(), 1, "one cell survives");
+        // Cell should contain a <code> with tail="\n".
+        let inner = element_children(&cells[0]);
+        assert_eq!(inner.len(), 1, "cell has one child");
+        assert_eq!(
+            local_name(&inner[0]).as_deref(),
+            Some("code"),
+            "child is <code>"
+        );
+        assert_eq!(
+            tail(&inner[0]).as_deref(),
+            Some("\n"),
+            "trailing whitespace tail of the last cell-child preserved (M5 Stage 6h-a)"
+        );
+    }
+
+    #[test]
+    fn handle_table_drops_mid_cell_whitespace_tail_between_siblings() {
+        // M5 Stage 6h-a gate regression: the WHITESPACE-ONLY tail of a
+        // mid-cell element (with a following element sibling) must NOT be
+        // preserved. Python's process_node trims tail and treats `"\n"`
+        // as empty for non-leaf paths, so emitting it duplicates the row's
+        // existing inter-cell separator. Symptom would be the d71ec714
+        // fixture POTD `<td><p>...</p>\n<p>...</p></td>` gaining a stray
+        // newline between the two `<p>` cell-children.
+        let table = dom_create_element("table");
+        let tr = dom_create_element("tr");
+        let td = dom_create_element("td");
+        let p1 = dom_create_element("p");
+        dom_append_child(&p1, &create_text_node("first paragraph"));
+        let p2 = dom_create_element("p");
+        dom_append_child(&p2, &create_text_node("second paragraph"));
+        dom_append_child(&td, &p1);
+        dom_append_child(&td, &p2);
+        // p1 is MID-position (has p2 as next sibling). Its `\n` tail must
+        // NOT be preserved (Python trims it).
+        set_tail(&p1, Some("\n"));
+        dom_append_child(&tr, &td);
+        dom_append_child(&table, &tr);
+
+        let pot = potential_tags(&["table"]);
+        let opts = Options::default();
+        let out = handle_table(&table, &pot, &opts).expect("non-empty → Some");
+        let cells = get_elements_by_tag_name(&out, "cell");
+        assert_eq!(cells.len(), 1, "one cell survives");
+        let inner_ps = element_children(&cells[0]);
+        assert_eq!(inner_ps.len(), 2, "two <p> children in the cell");
+        assert_eq!(
+            tail(&inner_ps[0]).as_deref(),
+            None,
+            "mid-position <p>'s whitespace-only tail dropped (matches Python's process_node trim)"
         );
     }
 
