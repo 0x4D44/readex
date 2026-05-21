@@ -23,3 +23,11 @@ pub mod settings;
 // (lines 258-260). Other `utils.py` helpers (`load_html`, `clean_html`,
 // `fetch_url`, encoding detection) are deferred to sub-stage G.
 pub mod utils;
+
+// Sub-stage B — date validators / plausibility / format parsing — verbatim
+// port of `htmldate/validators.py:1-216`. Adds an internal `DateTime` type
+// (year/month/day/hour/minute/second tuple) because Python `datetime`'s
+// `timestamp()` comparison at validators.py:53 requires hour-precision.
+// `chrono` is still NOT a crate dependency — see `validators.rs`'s
+// "Date typing" doc-comment.
+pub mod validators;

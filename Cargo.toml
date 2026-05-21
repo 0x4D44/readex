@@ -1887,7 +1887,100 @@ name = "mdrcel"
 # trafilatura_extract_smoke / trafilatura_extract_content_gate) remain
 # byte-identical green by construction (no existing module touched).
 # Lib test count 761 -> 771 (+10 new sub-stage-A unit tests).
-version = "0.11.0"
+#
+# M4 Stage 1 sub-stage B (2026-05-21): 0.11.0 -> 0.11.1 PATCH. Extends the
+# `#[doc(hidden)] pub mod htmldate` infrastructure surface ADDITIVELY with
+# `src/htmldate/validators.rs` — verbatim port of `htmldate/validators.py:
+# 1-216` (every public function in the file):
+# - `is_valid_date` (validators.py:22-57) — date+format+window validator.
+# - `validate_and_convert` (validators.py:60-73) — robust validation +
+#   strftime-emit shortcut.
+# - `is_valid_format` (validators.py:76-90) — two-step format check
+#   (round-trip 2017-09-01 + require '%').
+# - `plausible_year_filter` (validators.py:93-123) — Counter-style year
+#   scan with optional century-completion (incomplete=true).
+# - `compare_values` (validators.py:126-137) — reference-vs-attempt
+#   timestamp arbiter, honours `options.original`.
+# - `filter_ymd_candidate` (validators.py:140-167) — YMD match filter
+#   with `copyear` floor.
+# - `convert_date` (validators.py:170-180) — strptime + strftime
+#   conversion.
+# - `check_extracted_reference` (validators.py:183-192) — `mktime`
+#   inverse + format-and-validate.
+# - `check_date_input` (validators.py:195-206) — `datetime|str|None`
+#   normaliser with `default` fallback.
+# - `get_min_date` (validators.py:209-211) — wraps `check_date_input`
+#   with `MIN_DATE` default.
+# - `get_max_date` (validators.py:214-216) — wraps `check_date_input`
+#   with `datetime.now()` default; Rust port surfaces the wall-clock
+#   dependency explicitly via `get_max_date_with(now)` for testability.
+#
+# Supporting infrastructure added in the same file (no new dependency):
+# - `DateTime` struct (year/month/day/hour/minute/second). `chrono` is
+#   still NOT a crate dependency; the type is private to the htmldate
+#   port. Hour-precision is needed because validators.py:53 compares
+#   `dateobject.timestamp()` (Python's seconds-since-epoch) — the
+#   sub-stage-A `(i32, u32, u32)` tuple is insufficient.
+# - `DateInput<'a>` enum (`DateTime` | `&str`) — Rust encoding of
+#   Python's `Optional[Union[datetime, str]]` argument shape.
+# - Minimal `format_parse` / `format_emit` (`strptime`/`strftime`
+#   subset: `%Y`, `%m`, `%d`, `%H`, `%M`, `%S`, `%T`, `%%`, plus
+#   literals). The full Python format grammar is NOT ported — htmldate
+#   uses only this subset. If a later sub-stage's test demands more
+#   (e.g. `%B` English month names) the parser grows there.
+# - `days_from_civil` / `civil_from_days` (Howard Hinnant, public
+#   domain): monotonic-with-calendar-order seconds-since-1970 axis
+#   for `compare_values` / `check_extracted_reference` without a
+#   timezone-aware date library.
+#
+# Faithful divergences (recorded — HLD §4 anti-inversion):
+# - `@lru_cache` on `is_valid_date` / `filter_ymd_candidate` /
+#   `is_valid_format` is intentionally NOT ported. These are perf
+#   caches, not algorithmic; every cached call produces the same
+#   observable result as uncached. Documented in
+#   `validators.rs`'s module-level doc-comment.
+# - `get_max_date` defaults to a "very-future" sentinel
+#   (`9999-12-31 23:59:59`) when called with `None`. Python uses
+#   `datetime.now()` — a wall-clock read, making the result
+#   timestamp-of-call-dependent. The Rust port adds
+#   `get_max_date_with(max_date, now)` so callers that need real
+#   wall time inject it explicitly (better testability; identical
+#   semantics when called with the same `now` the Python
+#   `datetime.now()` would return). Documented in the function's
+#   doc-comment.
+# - `compare_values` returns `i64` (NOT `Tuple[int, datetime]` as the
+#   M4 Stage 1 sub-stage B brief item 7 suggests). The Python source
+#   at validators.py:126 returns `int`. Anti-inversion contract:
+#   Python source wins. Recorded as a brief/source discrepancy.
+# - `validate_and_convert`'s `date_input.strftime(...)` call in
+#   Python at validators.py:70 is unreachable from a `str` input
+#   (would AttributeError). The Rust port mirrors the only contract
+#   Python actually honours (datetime input) and additionally
+#   handles `Str` input via re-parse + re-emit, which is a no-op for
+#   the call sites Python supports.
+#
+# Per semver (CLAUDE.md "Version management") PATCH — extends the
+# `#[doc(hidden)] pub mod htmldate` module surface introduced by
+# sub-stage A; NO new TOP-LEVEL module declaration in `lib.rs`. Matches
+# the M3 Stage 4b precedent for "extending a previously-introduced
+# `#[doc(hidden)]` module's surface without creating a new module" being
+# PATCH-eligible. A strict reading of CLAUDE.md ("new public types =
+# MINOR") would support MINOR (`DateTime` / `DateInput` / `FormatError`
+# are net-new exported types); PATCH is the conservative call given
+# the in-progress nature of the htmldate sub-module — sub-stage A's
+# changelog entry already flagged sub-stages B-G as "to come".
+#
+# Backward compatibility: every prior public surface (`extract` /
+# `extract_with` / `Extracted` / `Options` / `ExtractError` and the M2
+# / M3 `#[doc(hidden)]` infrastructure modules, plus htmldate sub-stage
+# A's `settings` / `utils` modules) is byte-unchanged. The new
+# `validators` module is CONSUMED by no existing call site — sub-stage
+# C onwards wires it. All 4 BLOCKER gates (parser_equivalence_gate /
+# trafilatura_equivalence_gate / trafilatura_extract_smoke /
+# trafilatura_extract_content_gate) remain byte-identical green by
+# construction (no existing module touched).
+# Lib test count 771 -> 789 (+18 new sub-stage-B unit tests).
+version = "0.11.1"
 edition = "2024"
 
 [dependencies]
