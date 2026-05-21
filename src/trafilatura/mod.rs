@@ -108,3 +108,16 @@ pub mod justext_core;
 // is a NEW public type living under the same `#[doc(hidden)] pub mod
 // trafilatura` infrastructure surface as every other M3 stage.
 pub mod metadata;
+
+// Stage 7b — JSON-LD metadata extraction (`json_metadata.py:1-268` + the
+// `metadata.py:182-195` `extract_meta_json` orchestrator). Parses
+// `<script type="application/ld+json">` blocks for schema.org-shaped
+// structured metadata (Article / NewsArticle / Organization / Person /
+// WebPage etc.), then enriches the Stage-7a `Metadata` struct in place.
+// Article-like types contribute title / author / categories / tags /
+// date / image; Person types contribute author; Organization /
+// NewsMediaOrganization / WebPage / WebSite types contribute site_name
+// (with a length-prefers-longer rule). Wired into
+// `metadata::extract_metadata` between the OG/meta walk and the title
+// XPath fallback.
+pub mod metadata_jsonld;

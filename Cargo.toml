@@ -1325,7 +1325,112 @@ name = "mdrcel"
 #   deeper nesting with intervening Element nodes is rare for these
 #   XPath selectors and any future-discovered divergence is a
 #   one-shot patch.
-version = "0.8.1"
+#
+# M3 Stage 7b (2026-05-21): 0.8.1 -> 0.8.2 PATCH. Adds
+# `src/trafilatura/metadata_jsonld.rs` — Stage 7b port of
+# `trafilatura@v2.0.0/json_metadata.py:1-268` plus the
+# `metadata.py:182-195` `extract_meta_json` orchestrator. Parses every
+# `<script type="application/ld+json">` (and `application/settings+json`)
+# block in the document via the Stage 0b XPath engine, decodes the JSON
+# with `serde_json` (the M2-Stage-4 dependency, no new dependency added),
+# walks the schema.org structure, and enriches the Stage-7a `Metadata`
+# struct in place. Wired into `metadata::extract_metadata` between the
+# meta-tag walk (step 2) and the title XPath fallback (step 3), at the
+# same orchestration position Python uses
+# (`metadata.py:519-520 extract_meta_json(tree, metadata)`).
+#
+# New module surface (`#[doc(hidden)] pub mod trafilatura::metadata_jsonld`):
+# - `extract_meta_json(dom: &Dom, metadata: &mut Metadata)` — single
+#   public entry-point; everything else is private to the module.
+#
+# Schema.org coverage (the byte-faithful subset of `json_metadata.py`):
+# - **Article-like types** (`Article`/`NewsArticle`/`BlogPosting`/
+#   `ScholarlyArticle`/`SocialMediaPosting`/`LiveBlogPosting`/
+#   `MedicalScholarlyArticle`/`OpinionNewsArticle`/`ReportageNewsArticle`/
+#   `BackgroundNewsArticle` — `JSON_ARTICLE_SCHEMA`): contribute
+#   `headline`/`name` -> `title`, `author` (string/object/list of either)
+#   -> `author` (via `merge_author` semicolon-join), `articleSection`
+#   -> `categories`, `keywords` -> `tags`, `datePublished`/`dateModified`
+#   -> `date`, `image.url` -> `image`.
+# - **Publisher-like types** (`Organization`/`NewsMediaOrganization`/
+#   `WebPage`/`WebSite` — `JSON_PUBLISHER_SCHEMA`): contribute
+#   `name`/`legalName`/`alternateName` -> `site_name` via the
+#   `is_plausible_sitename` length-prefers-longer rule
+#   (`json_metadata.py:57-64`).
+# - **Person** type at top level: `name` -> `author`.
+# - **Page-like types** (`WebPage`/`Article`/`AboutPage`/... —
+#   `JSON_OGTYPE_SCHEMA`): contribute `@type` -> `pagetype`.
+# - **Top-level shape coverage**: single object, list of objects, OR
+#   `{"@context": "https://schema.org", "@graph": [...]}` (the
+#   `json_metadata.py:151-152` `@graph` resolution).
+# - **LiveBlogPosting carve-out** (`json_metadata.py:153-154`):
+#   `liveBlogUpdate` array becomes the effective parent list.
+# - **Author shape coverage**: string ("Jane Doe"), object
+#   `{"@type": "Person", "name": "Jane Doe"}`, list of either, the
+#   `givenName`/`additionalName`/`familyName` reconstruction
+#   (`json_metadata.py:119-120`), the nested list-of-name-strings shape
+#   joined with "; ", and the rare nested-dict `{"name": "..."}` shape
+#   (`json_metadata.py:117-118`).
+#
+# Faithful divergences (recorded — HLD §4 anti-inversion):
+# - Python's `extract_json_parse_error` regex-rescue path
+#   (`json_metadata.py:171-213`) is NOT ported. Stage 7b treats every
+#   `serde_json::from_str` failure as "no JSON-LD data, skip this
+#   block". The crate corpus does not exercise the rescue path
+#   (every Stage 3-B fixture parses cleanly); the rescue adds ~80 LOC
+#   for an edge case the BLOCKER gates don't gate on. One-shot fold-in
+#   if a future test demands it.
+# - Python's `normalize_json` (`json_metadata.py:216-223`) re-runs
+#   `unescape` + `\uXXXX` unescape + tag-strip on every JSON string
+#   value. `serde_json` already decodes `\uXXXX` escapes natively, and
+#   HTML entities are not present inside a JSON string post-parse;
+#   the Rust port applies tag-strip + trim only.
+# - `JSON_MINIFY` pre-pass (`metadata.py:48`/`:189`) is unnecessary —
+#   `serde_json::from_str` accepts unminified JSON natively.
+# - The full Python `normalize_authors` regex pipeline
+#   (`json_metadata.py:226-268`) is approximated by `merge_author`
+#   (URL/email reject + tag-strip + trim + "; "-join dedup) — the same
+#   lite-variant rationale recorded for Stage 7a.
+# - `keywords` -> `tags` is an ADDITIVE extension (Python's
+#   `process_parent` does not extract `keywords` from JSON-LD; the
+#   brief explicitly requests it, consistent with schema.org's
+#   documented `keywords` field). Parallel to the
+#   `metadata.py:284-285` HTML-meta path which DOES extract `<meta
+#   name="keywords">`.
+# - `datePublished`/`dateModified` -> `Metadata.date` is ADDITIVE
+#   (Python populates `date` from `htmldate` at `metadata.py:540-541`,
+#   not from JSON-LD). Until Stage 7d wires htmldate, JSON-LD's date
+#   field is the most reliable source available.
+# - `image.url` extraction is ADDITIVE (parallels OG-image).
+#
+# Per semver (CLAUDE.md "Version management") PATCH — a new module
+# extending the existing `#[doc(hidden)] pub mod trafilatura`
+# infrastructure surface. The new public entry-point
+# `metadata_jsonld::extract_meta_json` is consumed only by
+# `metadata::extract_metadata` (a transparent enrichment hook).
+# Backward compatibility:
+# - Every prior public surface (`extract` / `extract_with` /
+#   `Extracted` / `Options` / `ExtractError`, M3 Stage 4-7a surfaces)
+#   is byte-unchanged.
+# - `Metadata` struct shape is unchanged; the wiring only POPULATES
+#   previously-`None` fields (`date` / additional `author` candidates
+#   / `categories` / `tags` / `image` / `pagetype`) when the document
+#   carries JSON-LD. Pages without JSON-LD blocks see byte-identical
+#   Stage 7a output.
+#
+# Lib test count 694 -> 710 (+16: 15 `metadata_jsonld::tests` covering
+# simple-article / author-as-string / author-as-object / author-as-list
+# / @graph wrapper / invalid JSON / keywords-as-tags / publisher-name /
+# datePublished-to-date / multiple-scripts / top-level-array /
+# articleSection-to-categories / pagetype-from-article-type /
+# image-object-url / given-and-family-name; plus
+# `extract_metadata_combines_html_and_jsonld` in `metadata::tests`
+# pinning the OG-title + JSON-LD-author combination the brief specifies).
+# All 4 BLOCKER gates remain byte-identical green
+# (parser_equivalence_gate / trafilatura_equivalence_gate /
+# trafilatura_extract_smoke / trafilatura_extract_content_gate);
+# `cargo clippy --release --all-targets -- -D warnings` is clean.
+version = "0.8.2"
 edition = "2024"
 
 [dependencies]

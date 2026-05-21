@@ -798,7 +798,18 @@ pub fn extract_metadata(
         metadata.author = None;
     }
 
-    // (Stage 7b will land `extract_meta_json` here.)
+    // 2b. JSON-LD enrichment (Stage 7b — `metadata.py:519-520`
+    //     `extract_meta_json` after the meta-tag walk but before the
+    //     XPath fallbacks). JSON-LD fields overlay onto any still-empty
+    //     `Metadata` field; populated HTML-tag fields are NOT
+    //     overwritten (e.g. `metadata.title.is_none()` gate inside the
+    //     walker). Always-populated fields per `json_metadata.py:67-138`:
+    //     `site_name` (publisher.name unconditional overwrite at
+    //     `json_metadata.py:72`), `author` (`merge_author` extends),
+    //     `categories`/`tags` (extend when current empty), `date`
+    //     (Stage 7b additive — Stage 7d will refine via htmldate),
+    //     `image` (when empty), `pagetype` (when empty).
+    crate::trafilatura::metadata_jsonld::extract_meta_json(&dom, &mut metadata);
 
     // 3. Title XPath fallback (`metadata.py:523-525`).
     if metadata.title.is_none() {
@@ -1086,6 +1097,24 @@ mod tests {
             </head><body><p>x</p></body></html>"#;
         let m = extract_metadata(html, None, true, &[]);
         assert_eq!(m.pagetype.as_deref(), Some("article"));
+    }
+
+    #[test]
+    fn extract_metadata_combines_html_and_jsonld() {
+        // OG provides the title; JSON-LD provides the author.
+        // Both populated post-extract — verifies the Stage 7b wiring
+        // does not clobber Stage 7a's OG title.
+        let html = r#"<html><head>
+            <meta property="og:title" content="OG Title Wins">
+            <script type="application/ld+json">
+            {"@context": "https://schema.org", "@type": "NewsArticle",
+             "headline": "JSON-LD Title Loses",
+             "author": "Jane Doe"}
+            </script>
+            </head><body><p>x</p></body></html>"#;
+        let m = extract_metadata(html, None, true, &[]);
+        assert_eq!(m.title.as_deref(), Some("OG Title Wins"));
+        assert_eq!(m.author.as_deref(), Some("Jane Doe"));
     }
 
     #[test]
