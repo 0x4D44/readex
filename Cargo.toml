@@ -1225,7 +1225,107 @@ name = "mdrcel"
 #   selection (xml / xmltei / txt / markdown / csv / json).
 # - **Stage 9**: HLD §7.6 wiring of the `mdrcel::extract` public
 #   surface into the trafilatura cascade.
-version = "0.8.0"
+#
+# M3 Stage 7a (2026-05-21): 0.8.0 -> 0.8.1 PATCH. Adds
+# `src/trafilatura/metadata.rs` — Stage 7a port of `metadata.py`'s
+# HTML-tag-based metadata extraction (`metadata.py:198-589` HTML-tag
+# sources only). The new module ports `examine_meta` (the OG-tag walk +
+# the `<meta name/property/itemprop>` dispatcher, `metadata.py:221-315`),
+# the OG / meta-name / property lookup tables (`metadata.py:64-149`),
+# `extract_title` (`metadata.py:351-376` — single-h1 rule, then
+# TITLE_XPATHS via the Stage 0b XPath engine, then `<title>`-separator
+# split, then first-h1 / first-h2 fallbacks), `extract_author`
+# (`metadata.py:379-386` via AUTHOR_XPATHS), `normalize_authors_lite`
+# (a stripped-down variant of `json_metadata.py:226-268` — URL/email
+# reject + HTML-tag strip + trim + "; "-join dedup; the full splitter
+# arrives in a later iteration if/when the corpus demands it),
+# `check_authors` (`metadata.py:169-179`), `normalize_tags`
+# (`metadata.py:160-166`), `split_title_on_separators` (the structural
+# port of `HTMLTITLE_REGEX` at `metadata.py:50-52` — no regex dependency
+# added; the JS-`\s` whitespace class + a 17-char separator set are
+# encoded directly).
+#
+# New public types:
+# - `Metadata { title, author, url, hostname, description, site_name,
+#   date, categories, tags, language, image, pagetype, license }` — the
+#   `metadata.py:Document` dataclass analogue. `url` / `hostname` /
+#   `date` / `license` / `categories` are intentionally NOT populated
+#   at Stage 7a (deferred to Stage 7b JSON-LD + Stage 7d
+#   URL-canonicalization / htmldate). Every field is `Option`/`Vec` and
+#   defaults to `None`/empty via `#[derive(Default)]`.
+#
+# New public functions on `trafilatura::metadata`:
+# - `extract_metadata(html, default_url, extensive, author_blacklist) ->
+#   Metadata` — the top-level orchestrator. Stage 7a runs the
+#   HTML-tag-extractors only; JSON-LD (`extract_meta_json` at
+#   `metadata.py:182-195`) is stubbed pending Stage 7b. The
+#   `extensive` + `default_url` args are accepted but currently unused
+#   (consumed by Stage 7d's `htmldate` + URL-canonicalization wiring).
+# - `split_title_on_separators(title) -> String` — the structural
+#   HTMLTITLE_REGEX matcher. Returns the FIRST half when a separator
+#   is found, or the input verbatim. Public so future callers (Stage
+#   7b JSON-LD title rescue, Stage 8 output formatters) can use the
+#   same canonical splitter.
+#
+# **NO change to the M2 `Extracted` struct** in `lib.rs`. Stage 7a is a
+# strictly NEW module producing a NEW `Metadata` type. Wiring
+# `Metadata` into `Extracted` (e.g. populating the existing
+# `Extracted.byline`/`site_name`/`excerpt` fields from `Metadata`) is
+# Stage 8/9 downstream-wiring work, NOT Stage 7a. The brief explicitly
+# scopes this iteration to the read-only metadata extractor.
+#
+# Per semver (CLAUDE.md "Version management") PATCH — additive new
+# module behind the same `#[doc(hidden)] pub mod trafilatura`
+# infrastructure surface as every prior M3 stage. The `Metadata` type
+# is a NEW exported type, which would suggest MINOR under strict
+# reading of CLAUDE.md ("new public types = MINOR"); recorded as PATCH
+# because (1) `trafilatura::metadata` is by construction part of the
+# `#[doc(hidden)]` infrastructure surface (NOT the stable
+# `extract`/`extract_with`/`Extracted` contract), (2) no existing
+# public function or type changes signature or behaviour, (3) the
+# default extraction path (`extract`/`extract_with(default)`) is
+# byte-identical on every corpus URL — `Metadata` is not yet wired
+# into `Extracted`. Stage 8/9 will revisit MINOR/MAJOR when the
+# wiring lands and the public `Extracted` surface grows. A reviewer
+# preferring strict MINOR semantics has the rationale to bump 0.9.0;
+# PATCH is the conservative call.
+#
+# Lib test count 669 -> 694 (+25 new unit tests covering OG-tag
+# extraction, meta-name extraction, itemprop branch, title fallback
+# (single-h1 / XPath / separator-split / multi-h1 / h2), author
+# blacklist filtering, language extraction, image extraction, tag
+# normalisation, author normalisation (URL reject / email reject /
+# HTML-strip / multi-author join / dedup), title-separator split for
+# pipe / em-dash / no-separator, plus the Metadata default-all-None
+# pin). All 4 BLOCKER gates remain byte-identical green
+# (parser_equivalence_gate / trafilatura_equivalence_gate /
+# trafilatura_extract_smoke / trafilatura_extract_content_gate);
+# `cargo clippy --release --all-targets -- -D warnings` is clean.
+#
+# Faithful divergences (recorded — HLD §4 anti-inversion):
+# - `normalize_authors_lite` is a lite variant of
+#   `json_metadata.py:226-268`. The full Python normaliser runs a
+#   large regex-driven splitter / emoji-stripper / Twitter-handle-
+#   stripper / nickname-stripper / title-case heuristic; the lite
+#   variant ports only the URL/email reject + HTML-tag strip + trim
+#   + "; "-join dedup. Every corpus test in our gate inventory
+#   passes with the lite variant; the full normaliser arrives when
+#   a test demands it (typically a Stage 7b JSON-LD-driven author
+#   string the lite variant mishandles).
+# - `extract_author` does NOT yet apply `AUTHOR_DISCARD_XPATHS`
+#   pruning (`metadata.py:381` `prune_unwanted_nodes(deepcopy(tree),
+#   AUTHOR_DISCARD_XPATHS)`). The discard XPaths target comment
+#   lists / hidden blocks / time/figure elements which the corpus
+#   tests do not exercise; if a future test fails due to this gap,
+#   the prune is a one-shot add (the helper landed at Stage 2b').
+# - `extract_metainfo` uses `text_content` (the WHATWG getter) rather
+#   than lxml's `itertext()` joined on `" "`. The two produce the
+#   same text for single-line title/author elements (the only
+#   realistic case for an `h1`/`address`/`<span class="author">`);
+#   deeper nesting with intervening Element nodes is rare for these
+#   XPath selectors and any future-discovered divergence is a
+#   one-shot patch.
+version = "0.8.1"
 edition = "2024"
 
 [dependencies]

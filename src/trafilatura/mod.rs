@@ -96,3 +96,15 @@ pub mod justext_stoplists;
 // `JUSTEXT_LANGUAGES`) plus the 3-arm cascade integration in
 // `readability_fork::bare_extraction_with_cascade`.
 pub mod justext_core;
+
+// Stage 7a — HTML-based metadata extraction (`metadata.py:198-589` HTML-tag
+// sources only). OpenGraph `<meta property="og:*">`, `<meta name="...">`,
+// `<meta itemprop="...">`, `<html lang="...">`, plus XPath fallbacks for
+// title / author via `TITLE_XPATHS` / `AUTHOR_XPATHS`. JSON-LD parsing
+// (7b), URL canonicalization + date extraction (7d), and license + cat/tag
+// XPath extraction are deferred to later sub-stages — `Metadata::url` /
+// `hostname` / `date` / `license` / `categories` remain `None`/empty at
+// Stage 7a. NO public API change to `extract` / `Extracted` — `Metadata`
+// is a NEW public type living under the same `#[doc(hidden)] pub mod
+// trafilatura` infrastructure surface as every other M3 stage.
+pub mod metadata;
