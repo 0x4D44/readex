@@ -1667,7 +1667,166 @@ name = "mdrcel"
 #   metadata work.
 # - `sample_tokens` + `generate_bow_hash` (deduplication.py:35-55):
 #   `Simhash` supports; defer with it.
-version = "0.9.0"
+# M3 Stage 9 (2026-05-21): 0.9.0 -> 0.10.0 MINOR. **THE M3 FINALE.**
+# The public `extract` / `extract_with` functions now drive the FULL
+# Trafilatura cascade. Closes M3 (HLD `2026.05.19 - HLD - mdrcel
+# Trafilatura Port (M3)` §7.6).
+#
+# # What changes for callers
+#
+# The public type/signature surface is byte-unchanged EXCEPT for ONE
+# additive field on `Extracted`:
+# - **NEW** `Extracted.comments: String` (default `""`). Holds reader
+#   comments extracted by `main_extractor::extract_comments`
+#   (`main_extractor.py:657-688`). Empty for documents without a
+#   recognised comments section (the overwhelming majority of inputs).
+#
+# **Behaviour shift on the default path** (the load-bearing MINOR
+# trigger): `extract(h, base)` and `extract_with(h, base, &Options::
+# default())` now route through the Trafilatura pipeline, NOT the M2
+# Mozilla Readability port. The extraction algorithm is fundamentally
+# different (Trafilatura is XPath+heuristic + classifier-cascade;
+# Readability is single-top-candidate scoring), so the produced `text`
+# is observably DIFFERENT on the same input. This is the intended M3
+# finale: Trafilatura is the superior extraction algorithm for the M3
+# scope (HLD §1, §4 — Trafilatura is the project's stated default).
+#
+# The M2 Readability port is preserved verbatim under a NEW public
+# function `extract_via_readability(html, base_url, &Options)` for
+# callers who depend on the M2 extraction shape (e.g. anything
+# byte-pinned to M2 0.4.x / 0.5.x / 0.6.x / 0.7.x / 0.8.x / 0.9.x).
+#
+# # New public surface (`src/lib.rs`)
+#
+# - `pub fn extract_via_readability(html: &str, base_url: Option<&str>,
+#   opts: &Options) -> Result<Extracted, ExtractError>` — the M2-line
+#   default, kept byte-faithful to pre-Stage-9 `extract_with`.
+# - `Extracted.comments: String` — the new additive field documented
+#   above.
+#
+# # What the new `extract_with` does (mirroring `core.bare_extraction`,
+# core.py:130-358)
+#
+# 1. `trafilatura::metadata::extract_metadata(html, base_url, true, &[])`
+#    — full HTML-tag + JSON-LD + URL/date/cats-tags/license pipeline
+#    (Stages 7a/7b/7d).
+# 2. `trafilatura::readability_fork::bare_extraction_with_cascade(html,
+#    &cleaning::Options)` — parse + `tree_cleaning` + `convert_tags` +
+#    own arm (`extract_content`) + `compare_extraction` (own /
+#    readability_fork / jusText cascade, 7-branch arbiter, sanitize_tree
+#    post-pass). Stages 1b/2/3-B/4/5/6.
+# 3. `extract_comments_from_html` — fresh parse + clean + Stage 8's
+#    `main_extractor::extract_comments`. The fresh parse is necessary
+#    because Stage 2's cascade consumes its DOM (rcdom Drop quirk, HLD
+#    §m-3). Documented as the simplicity tradeoff.
+# 4. Final text is `trafilatura::utils::trim(text_content(&body))` —
+#    the sanitize_tree output's whitespace-collapsed form (matches
+#    `external.py:189`'s `text = trim(' '.join(cleaned_tree.itertext()))`).
+# 5. Assemble Extracted with the Metadata→Extracted mapping:
+#    - `Metadata.title`       → `Extracted.title`
+#    - `Metadata.author`      → `Extracted.byline`
+#    - `Metadata.description` → `Extracted.excerpt`
+#    - `Metadata.site_name`   → `Extracted.site_name`
+#    - `Metadata.date`        → `Extracted.published_time`
+#    - `Metadata.url`         → `Extracted.canonical_url`
+#    - `Metadata.language`    → `Extracted.language`
+# 6. `Options.min_word_count` threshold check fires AFTER assembly (M2
+#    Stage 4 behaviour preserved).
+#
+# # Backward compatibility
+#
+# - `extract == extract_with(&Options::default())` invariant preserved
+#   (extract delegates to extract_with).
+# - Bug-E2 preserved: an empty extraction returns `Ok(Extracted::default())`,
+#   never an error, never `NotImplemented`. Pinned by
+#   `extract_handles_empty_html`.
+# - `ExtractError` enum is byte-unchanged.
+# - Exhaustive struct-literal construction sites (the M2-Stage-4 caveat)
+#   need to add `comments: String::new()` OR use `..Default::default()`.
+#   In-workspace consumers (`benchmark/src/score.rs`, `crate_run.rs`)
+#   already use `..Extracted::default()` so they upgrade transparently.
+# - **Behaviour shift on the default path**: `extract`'s text output
+#   differs from M2 on every input where the algorithms disagree (most
+#   real-world inputs). This is the documented load-bearing MINOR
+#   trigger. Callers depending on M2's exact text shape can switch to
+#   `extract_via_readability` for byte-faithful M2 behaviour.
+#
+# # Metadata fields NOT yet mapped to `Extracted`
+#
+# `Metadata.{categories, tags, image, pagetype, license, hostname}` are
+# computed by the Trafilatura pipeline but are NOT surfaced on the
+# public `Extracted` struct. They remain accessible via the
+# `#[doc(hidden)] pub mod trafilatura::metadata::extract_metadata`
+# infrastructure surface. Surfacing them on the public struct is a
+# future MAJOR-or-MINOR-bump decision (the additive caveat on
+# `Extracted` makes incremental additions safe, but Stage 9 chose to
+# minimise the public-surface change scope).
+#
+# # Tests added (Stage 9 brief — 8 required + 1 sanity for M2 fallback)
+#
+# 1. `extract_returns_ok_for_simple_article` — minimal article -> Ok with
+#    non-empty text.
+# 2. `extract_populates_metadata_fields_from_og_tags` — OG title/author/
+#    description/site_name -> Extracted fields populated.
+# 3. `extract_uses_jsonld_when_og_absent` — JSON-LD headline/author/
+#    datePublished -> Extracted fields populated.
+# 4. `extract_handles_empty_html` — empty body -> Ok(Extracted) with
+#    empty text and comments (Bug-E2 pinned).
+# 5. `extract_invariant_default_options_match_no_options` — extract ≡
+#    extract_with(&Options::default()) across 4 fixtures.
+# 6. `extract_falls_back_to_readability_on_short_own_extraction` — page
+#    with many <p>s but no <article> -> cascade yields substantive text.
+# 7. `extract_populates_language_from_html_lang` — `<html lang="en">` ->
+#    Extracted.language = "en".
+# 8. `extract_doesnt_panic_on_malformed_html` — 5 broken HTML inputs ->
+#    all return Ok (possibly empty).
+# 9. `extract_via_readability_remains_available_for_m2_callers` —
+#    sanity-pin the M2 path is still reachable.
+#
+# # M3 GRAND TOTAL (Stages 0a-9)
+#
+# - Cargo: 0.4.0 (M2 Stage 4 end) → 0.10.0 (M3 finale). 8 MINOR bumps
+#   plus dozens of PATCH bumps across Stages 0a-9.
+# - LOC added: ~13000 across `src/trafilatura/` (xpath_engine, cleaning,
+#   settings_constants, baseline, xpaths_constants, utils,
+#   main_extractor, readability_fork, justext_core, justext_stoplists +
+#   stoplist data, metadata, metadata_jsonld, metadata_url,
+#   deduplication) plus additive extensions to `src/readability/dom.rs`.
+# - Tests: M2 end was 582 lib tests; M3 Stage 9 end is 761 (+179 across
+#   the full M3 umbrella; Stage 9 added +9).
+# - BLOCKER gates added: `trafilatura_equivalence_gate` (Stage 0c),
+#   `trafilatura_extract_smoke` (Stage 3-A),
+#   `trafilatura_extract_content_gate` (Stage 3-B). All 4 BLOCKER
+#   gates (incl. the M2-era `parser_equivalence_gate`) remained green
+#   through EVERY single commit of the M3 cascade.
+# - Algorithms ported: full XPath 1.0 evaluator (operator catalog DA-B-1
+#   revised, ~51 conformance rows); `tree_cleaning` + `convert_tags` +
+#   `prune_html` (htmlprocessing.py); `baseline` rescue extractor;
+#   `_extract` + `extract_content` orchestrators with all 12 block
+#   handlers (`handle_titles`/`handle_formatting`/`handle_lists`/
+#   `handle_code_blocks`/`handle_quotes`/`handle_other_elements`/
+#   `handle_paragraphs`/`handle_image`/`handle_table`/`handle_textelem`
+#   + dispatch hub); `prune_unwanted_sections` + `recover_wild_text`;
+#   `readability_lxml` fork (`Document::summary` ruthless/lenient retry,
+#   `sanitize`, `is_probably_readerable`); jusText port (paragraph
+#   segmentation, two-phase classifier, 100-language stoplists); full
+#   `compare_extraction` arbiter (7-branch + jusText override +
+#   sanitize_tree post-pass); metadata extraction (OG / meta-name /
+#   itemprop / JSON-LD / URL canonicalization / date / catstags /
+#   license); `extract_comments` + LRU_TEST deduplication; public
+#   surface wiring.
+# - Deferred: full `htmldate` (locale-aware date parsing, ~3000 LOC +
+#   `dateparser` ~5000 LOC dependency); `Simhash` + content fingerprint;
+#   `is_similar_domain`; relative-URL resolution in extract; full
+#   Trafilatura output formats (XML/XMLTEI/CSV/JSON/markdown) — these
+#   are all M4 candidates.
+#
+# Lib test count 752 -> 761 (+9 new lib tests). All 4 BLOCKER gates
+# remain byte-identical green (parser_equivalence_gate /
+# trafilatura_equivalence_gate / trafilatura_extract_smoke /
+# trafilatura_extract_content_gate). `cargo clippy --release
+# --all-targets -- -D warnings` is clean.
+version = "0.10.0"
 edition = "2024"
 
 [dependencies]

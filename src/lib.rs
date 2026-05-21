@@ -11,6 +11,20 @@
 //!
 //! # Milestone status
 //!
+//! **M3 Stage 9** (HLD `2026.05.19 - HLD - mdrcel Trafilatura Port (M3)` §7.6,
+//! THE M3 FINALE): the public [`extract`] / [`extract_with`] functions now
+//! drive the **full Trafilatura cascade** (`core.bare_extraction`,
+//! `core.py:130-358`) — parse + `tree_cleaning` + `convert_tags` +
+//! `bare_extraction_with_cascade` (own → readability_fork → jusText, with the
+//! 7-branch arbiter + dedup gate + sanitize post-pass) +
+//! `metadata::extract_metadata` (OG / meta-name / itemprop / JSON-LD / URL /
+//! date) + `extract_comments`. The M2 Readability port is preserved verbatim
+//! under [`extract_via_readability`] for callers who want the older path.
+//! Every public type and signature is byte-unchanged from M2 except for ONE
+//! additive field on [`Extracted`] (`comments: String`, defaulting to `""`)
+//! — additive only, exhaustive struct-literal callers upgrade via
+//! `..Extracted::default()` (the M2 Stage 4 pattern).
+//!
 //! **M2 Stage 1a/1b/1c/2** (HLD `2026.05.18 - HLD - mdrcel Readability Port
 //! (M2)` §7.1–§7.4): the public API is unchanged but [`extract`] /
 //! [`extract_with`] now run an idiomatic Rust port of Mozilla Readability
@@ -165,6 +179,17 @@ pub struct Extracted {
     ///
     /// Populated by M2 **Stage 4**; not scored.
     pub dir: Option<String>,
+    /// Reader comments extracted by the Trafilatura comments pipeline
+    /// (`main_extractor.extract_comments`, `main_extractor.py:657-688`).
+    /// Empty `""` when the document carried no recognised comment section
+    /// (Reddit-style `commentlist`, vBulletin `comment-list`, etc.) — every
+    /// non-comment page therefore lands here with `comments == ""`, which
+    /// is also the value M2-Readability-path callers see via
+    /// [`extract_via_readability`] (the M2 port has no comments concept).
+    ///
+    /// **M3 Stage 9 additive field.** Default is `""` (empty); old callers
+    /// using `..Extracted::default()` are forward-compatible.
+    pub comments: String,
 }
 
 /// Tuning knobs for [`extract_with`].
@@ -308,28 +333,191 @@ pub fn extract_with(
     base_url: Option<&str>,
     opts: &Options,
 ) -> Result<Extracted, ExtractError> {
-    // M2 Stage 1a/1c (HLD §7.1/§7.3): parse → Readability::new_from_html(html)
-    // .parse() → map Option<Article> to Result<Extracted, _>. Stage 1c takes
-    // the HTML string (not a pre-parsed Dom) because the retry/flag-sieve loop
-    // re-parses the original bytes per attempt (HLD §m-3).
+    // M3 Stage 9 (HLD §7.6, THE M3 FINALE) — `extract_with` is now the public
+    // entry-point into the **full Trafilatura cascade**. Mirrors Python's
+    // `core.bare_extraction` (core.py:130-358):
     //
-    // M2 Stage 4 wires `opts.include_html` (eager HTML serialization inside
-    // the Readability port) and `opts.min_word_count` (post-extract threshold
-    // check). `base_url` is still unused — relative-URL resolution is HLD
-    // §7.7 "deferred / out of M2" and was never the intended Stage-4 scope.
+    //   1. metadata = extract_metadata(html, base_url, extensive=True, [])
+    //   2. body     = bare_extraction_with_cascade(html, &cleaning_opts)
+    //                  // = tree_cleaning + convert_tags + own arm
+    //                  //   (extract_content) + compare_extraction
+    //                  //   (readability_fork + jusText cascade) +
+    //                  //   sanitize_tree (post-pass)
+    //   3. comments = extract_comments on a separately-cleaned tree
+    //   4. assemble Extracted (mapping Metadata.* → Extracted.* fields)
+    //
+    // The M2 Readability port is preserved verbatim under
+    // `extract_via_readability` — it is no longer the default but remains
+    // available for callers who depend on that specific extraction shape.
+    //
+    // `base_url` plumbs through cleaning::Options.url so the cascade's jusText
+    // arm can use it as a language/source hint (settings.py:91/155-158).
+    // Relative-URL resolution proper is HLD §7.7 deferred (out of M3 scope).
+
+    // 1. Metadata — Trafilatura's extract_metadata orchestrator
+    //    (metadata.py:482-589). Parses internally, walks OG / meta-name /
+    //    itemprop / JSON-LD / canonical-URL / date / cats-tags / license.
+    let metadata =
+        trafilatura::metadata::extract_metadata(html, base_url, true, &[]);
+
+    // 2. Body extraction via the cascade. Mirrors core.bare_extraction's
+    //    own → readability → jusText path (`trafilatura_sequence`,
+    //    core.py:101-127) plus the `compare_extraction` arbiter
+    //    (external.py:45-108) plus the `sanitize_tree` post-pass
+    //    (external.py:163-190). Stage 4d landed this entry-point; Stage 9
+    //    consumes it from the public API.
+    let cleaning_opts = trafilatura::cleaning::Options {
+        url: base_url.map(|s| s.to_string()),
+        ..trafilatura::cleaning::Options::default()
+    };
+    let body_opt =
+        trafilatura::readability_fork::bare_extraction_with_cascade(html, &cleaning_opts);
+
+    // The cascade's `sanitize_tree` already trimmed + collapsed the text
+    // via `' '.join(itertext()) + trim()` (external.py:189). We re-derive
+    // the final `text` by walking the returned `<body>` here — same
+    // semantics, no second-pass mutation. An empty body → empty text
+    // (Bug-E2: `Ok` with `text == ""` is the valid outcome, never an
+    // error).
+    let text = match &body_opt {
+        Some(body) => {
+            let raw = readability::dom::text_content(body);
+            trafilatura::utils::trim(&raw)
+        }
+        None => String::new(),
+    };
+
+    // `opts.include_html` (M2 Stage 4): when true, serialise the body's
+    // sanitised tree into the `html` field. M2 used Readability's eager
+    // serializer; Stage 9 uses `dom::serialize_converted_tree` (the
+    // Stage-1b facade) on the cascade's body. Skipped when extraction
+    // failed (Bug-E2: an empty body has no useful HTML to surface).
+    let html_field = if opts.include_html {
+        body_opt.as_ref().map(readability::dom::serialize_converted_tree)
+    } else {
+        None
+    };
+
+    // 3. Comments extraction (M3 Stage 8: `extract_comments`,
+    //    main_extractor.py:657-688). Re-parses + re-cleans the original
+    //    HTML — necessary because Stage 2 cascade above CONSUMED its DOM
+    //    (the `rcdom` Drop quirk, HLD §m-3). The double-parse cost is the
+    //    documented Stage-9 simplicity tradeoff; a future stage can lift
+    //    the comments call into the cascade orchestrator if perf demands
+    //    it.
+    let comments = extract_comments_from_html(html, &cleaning_opts);
+
+    // 4. Assemble the public Extracted. Mapping:
+    //    - Metadata.title         → Extracted.title
+    //    - Metadata.author        → Extracted.byline
+    //    - Metadata.description   → Extracted.excerpt
+    //    - Metadata.site_name     → Extracted.site_name
+    //    - Metadata.date          → Extracted.published_time
+    //    - Metadata.url           → Extracted.canonical_url
+    //    - Metadata.language      → Extracted.language
+    //
+    //    Metadata fields without a 1:1 Extracted slot
+    //    (categories / tags / image / pagetype / license / hostname) are
+    //    still computed and remain accessible via the
+    //    `trafilatura::metadata::extract_metadata` infrastructure surface;
+    //    they are intentionally NOT added to the public Extracted struct
+    //    here to keep the M3 finale backward-compatible (only `comments`
+    //    is added). Future MAJOR versions may surface them directly.
+    let word_count = text.split_whitespace().count();
+    let extracted = Extracted {
+        title: metadata.title,
+        text,
+        html: html_field,
+        word_count,
+        canonical_url: metadata.url,
+        language: metadata.language,
+        byline: metadata.author,
+        excerpt: metadata.description,
+        site_name: metadata.site_name,
+        published_time: metadata.date,
+        // `dir` (text direction) is a Mozilla-Readability concept that
+        // Trafilatura's metadata pipeline does not extract. Until a Stage-9
+        // follow-on wires `<html dir="...">` lookup into Metadata, this
+        // remains `None` for the Trafilatura path. Callers needing `dir`
+        // can opt into the M2 path via `extract_via_readability`.
+        dir: None,
+        comments,
+    };
+
+    // M2 Stage 4 (HLD §7.6) — `min_word_count`. The check fires AFTER the
+    // extraction succeeds; an empty `Ok` (Bug-E2) becomes `ContentTooShort`
+    // when the caller demanded a positive minimum, NOT silent emptiness.
+    // This is the documented harness compile-fence event (the new variant
+    // breaks `crate_run.rs`'s exhaustive no-wildcard match — by design).
+    if opts.min_word_count > 0 && extracted.word_count < opts.min_word_count {
+        return Err(ExtractError::ContentTooShort {
+            word_count: extracted.word_count,
+            threshold: opts.min_word_count,
+        });
+    }
+
+    Ok(extracted)
+}
+
+/// Helper: parse + tree_cleaning + convert_tags + extract_comments on a
+/// fresh DOM. Returns the joined trimmed comments text (`""` when no
+/// comment section was found). Mirrors Python's
+/// `extract_comments(cleaned_tree, options)` callsite at
+/// `core.py:288-290`, but on a freshly-parsed DOM rather than sharing the
+/// cascade's tree (the rcdom Drop quirk forbids cross-fn sharing of a
+/// `Dom`).
+fn extract_comments_from_html(
+    html: &str,
+    cleaning_opts: &trafilatura::cleaning::Options,
+) -> String {
+    let dom = readability::dom::Dom::parse(html);
+    let Some(html_root) = dom.root_element() else {
+        return String::new();
+    };
+    trafilatura::cleaning::tree_cleaning(&html_root, cleaning_opts);
+    trafilatura::cleaning::convert_tags(&html_root, cleaning_opts);
+    let Some(body) = dom.body() else {
+        return String::new();
+    };
+    let (cbody, ctext, _) =
+        trafilatura::main_extractor::extract_comments(&body, cleaning_opts);
+    // Keep `cbody` and `dom` alive until the function exits — rcdom Drop
+    // quirk: dropping `dom` iteratively drains every descendant's children
+    // Vec, even when the caller still holds a NodeRef. We need only the
+    // text, which is already a fresh String, so `cbody`/`dom` can drop
+    // here cleanly.
+    let _ = cbody;
+    drop(dom);
+    ctext
+}
+
+/// Extract via the **M2 Mozilla Readability port** (the previous default).
+///
+/// This is the pre-Stage-9 extraction path preserved verbatim. The M3
+/// Stage 9 finale shifts the default of [`extract`] / [`extract_with`] to
+/// the Trafilatura pipeline; callers depending on the M2 Readability
+/// shape — Mozilla `_grabArticle` + `_prepArticle` + the JSON-LD title
+/// rescue — can opt back in here without behavioural drift versus the
+/// M2 0.4.x / 0.5.x / 0.6.x / 0.7.x / 0.8.x / 0.9.x line.
+///
+/// Honors `opts.include_html` and `opts.min_word_count` identically to
+/// the pre-Stage-9 `extract_with`. `base_url` remains informational only.
+///
+/// # Errors
+///
+/// Same as [`extract_with`]: only [`ExtractError::ContentTooShort`] when
+/// `opts.min_word_count > 0` and the produced text fails the threshold.
+pub fn extract_via_readability(
+    html: &str,
+    base_url: Option<&str>,
+    opts: &Options,
+) -> Result<Extracted, ExtractError> {
     let _ = base_url;
 
     let extracted = match readability::Readability::new_from_html(html)
         .include_html(opts.include_html)
         .parse()
     {
-        // An article was produced — a real `Ok`. `text` is the article node's
-        // raw `text_content` (`Readability.js:2766` `articleContent.textContent`
-        // — the field the differential harness scores, HLD §2; the harness
-        // tokenizer does its own whitespace handling, so no pre-normalization
-        // here, keeping the scored text byte-faithful to the JS return object).
-        // `title` is `this._articleTitle`. Other metadata is Stage-4 populated
-        // (HLD §7.6) and **not scored** by the harness.
         Some(article) => {
             let text = article.text_content;
             let title = if article.title.is_empty() {
@@ -350,32 +538,12 @@ pub fn extract_with(
                 site_name: article.site_name,
                 published_time: article.published_time,
                 dir: article.dir,
+                comments: String::new(),
             }
         }
-        // `_grabArticle` returned `null` (no `<body>` to grab —
-        // `Readability.js:2748-2750`). Per Bug-E2 (HLD §7.1) "found nothing"
-        // is a **valid empty `Ok`**, NOT an error and NOT `NotImplemented`:
-        // never fabricate, never regress a real extraction to the M1 floor.
-        None => Extracted {
-            title: None,
-            text: String::new(),
-            html: None,
-            word_count: 0,
-            canonical_url: None,
-            language: None,
-            byline: None,
-            excerpt: None,
-            site_name: None,
-            published_time: None,
-            dir: None,
-        },
+        None => Extracted::default(),
     };
 
-    // M2 Stage 4 (HLD §7.6) — `min_word_count`. The check fires AFTER the
-    // extraction succeeds; an empty `Ok` (Bug-E2) becomes `ContentTooShort`
-    // when the caller demanded a positive minimum, NOT silent emptiness.
-    // This is the documented harness compile-fence event (the new variant
-    // breaks `crate_run.rs`'s exhaustive no-wildcard match — by design).
     if opts.min_word_count > 0 && extracted.word_count < opts.min_word_count {
         return Err(ExtractError::ContentTooShort {
             word_count: extracted.word_count,
@@ -497,6 +665,7 @@ mod tests {
             site_name: Some("Example Site".to_string()),
             published_time: Some("2024-01-02".to_string()),
             dir: Some("ltr".to_string()),
+            comments: String::new(),
         };
         assert_eq!(e.title.as_deref(), Some("Title"));
         assert_eq!(e.text, "body text");
@@ -533,6 +702,7 @@ mod tests {
             site_name: None,
             published_time: None,
             dir: None,
+            comments: String::new(),
         };
         assert!(e.text.is_empty());
         assert!(e.title.is_none());
@@ -696,5 +866,215 @@ mod tests {
             </head><body><p>some text</p></body></html>"#;
         let e = extract(html, None).expect("ok");
         assert_eq!(e.canonical_url.as_deref(), Some("https://example.com/x"));
+    }
+
+    // ====== M3 Stage 9 (HLD §7.6) — Trafilatura pipeline public-surface tests.
+
+    /// Stage 9 brief test #1 — a minimal article HTML yields an `Ok` with
+    /// non-empty text. Drives the full cascade through the public
+    /// `extract` entry point. The cascade's own-arm `extract_content` may
+    /// fall back to readability / jusText on tiny inputs; we only assert
+    /// that *some* text was extracted (the Trafilatura cascade is
+    /// non-strict in scope but never returns an error for a well-formed
+    /// short article).
+    #[test]
+    fn extract_returns_ok_for_simple_article() {
+        let html = "<html><head><title>An Article</title></head><body>\
+            <article><p>This is a real readable paragraph with quite a few words \
+            in it because the unlikely-candidate strip cares about minimum body length, \
+            and we want the cascade to surface SOMETHING from the Trafilatura pipeline. \
+            Adding more text here so the various length-threshold gates don't reject this \
+            fixture outright; the M3 cascade has min_extracted_size=250 by default and \
+            we want to clear it comfortably.</p></article></body></html>";
+        let e = extract(html, None).expect("simple article must extract");
+        assert!(!e.text.is_empty(), "expected non-empty text, got {:?}", e.text);
+        assert_eq!(e.title.as_deref(), Some("An Article"));
+    }
+
+    /// Stage 9 brief test #2 — OG / meta-name tags drive the populated
+    /// metadata fields. Pins the Metadata→Extracted mapping documented in
+    /// `extract_with`.
+    #[test]
+    fn extract_populates_metadata_fields_from_og_tags() {
+        let html = r#"<html><head>
+            <meta property="og:title" content="OG Title Wins Over Title Element">
+            <meta property="og:description" content="A brief description for OG">
+            <meta property="og:site_name" content="Example Site">
+            <meta property="article:author" content="Jane Author">
+            <title>Fallback Title</title>
+            </head><body><article>
+            <p>A real readable paragraph with enough words to extract; lorem ipsum dolor
+            sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut
+            labore et dolore magna aliqua ut enim ad minim veniam quis nostrud
+            exercitation.</p>
+            </article></body></html>"#;
+        let e = extract(html, None).expect("ok");
+        assert_eq!(
+            e.title.as_deref(),
+            Some("OG Title Wins Over Title Element"),
+            "og:title beats <title>"
+        );
+        assert_eq!(e.byline.as_deref(), Some("Jane Author"));
+        assert_eq!(e.excerpt.as_deref(), Some("A brief description for OG"));
+        assert_eq!(e.site_name.as_deref(), Some("Example Site"));
+    }
+
+    /// Stage 9 brief test #3 — JSON-LD drives metadata when OG / meta-name
+    /// tags are ABSENT. Mirrors `metadata.py:519-520` `extract_meta_json`
+    /// orchestration position.
+    #[test]
+    fn extract_uses_jsonld_when_og_absent() {
+        let html = r#"<html><head>
+            <title>Fallback Title</title>
+            <script type="application/ld+json">
+            {
+                "@context": "https://schema.org",
+                "@type": "Article",
+                "headline": "JSON-LD Headline Wins",
+                "author": {"@type": "Person", "name": "Alice JSONLD"},
+                "datePublished": "2024-06-01"
+            }
+            </script>
+            </head><body><article>
+            <p>A real readable paragraph with enough words to extract; lorem ipsum dolor
+            sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut
+            labore et dolore magna aliqua ut enim ad minim veniam quis nostrud
+            exercitation.</p>
+            </article></body></html>"#;
+        let e = extract(html, None).expect("ok");
+        assert_eq!(
+            e.title.as_deref(),
+            Some("JSON-LD Headline Wins"),
+            "JSON-LD headline beats <title>"
+        );
+        assert_eq!(e.byline.as_deref(), Some("Alice JSONLD"));
+        assert_eq!(
+            e.published_time.as_deref(),
+            Some("2024-06-01"),
+            "JSON-LD datePublished -> published_time"
+        );
+    }
+
+    /// Stage 9 brief test #4 — Bug-E2 preserved on the new default path.
+    /// `<html><body></body></html>` → `Ok(Extracted)` with empty text;
+    /// NEVER an error (mirrors the M2 contract the parent brief pins).
+    #[test]
+    fn extract_handles_empty_html() {
+        let e = extract("<html><body></body></html>", None)
+            .expect("empty body must be Ok per Bug-E2");
+        assert_eq!(e.text, "");
+        assert_eq!(e.word_count, 0);
+        // `comments` is the new Stage-9 additive field — must default to "".
+        assert_eq!(e.comments, "");
+    }
+
+    /// Stage 9 brief test #5 — pin the parent-brief invariant: `extract`
+    /// must be byte-for-byte equivalent to `extract_with(default)` on
+    /// every input.
+    #[test]
+    fn extract_invariant_default_options_match_no_options() {
+        let cases = [
+            "",
+            "<html><body></body></html>",
+            "<html><head><title>T</title></head><body><p>hello world</p></body></html>",
+            r#"<html><head><meta property="og:title" content="X"></head>
+               <body><article><p>body body body body body body body body body body body body
+               body body body body body body body body body body body body body body body body
+               body body body body body body body body body body body body body body body</p>
+               </article></body></html>"#,
+        ];
+        for html in cases {
+            let a = extract(html, None);
+            let b = extract_with(html, None, &Options::default());
+            assert_eq!(
+                a.is_ok(),
+                b.is_ok(),
+                "Ok-ness diverged for {html:?}"
+            );
+            if let (Ok(a), Ok(b)) = (a, b) {
+                assert_eq!(a, b, "Extracted diverged for {html:?}");
+            }
+        }
+    }
+
+    /// Stage 9 brief test #6 — when the own arm yields a short
+    /// extraction, the cascade's readability / jusText arms can rescue.
+    /// We don't pin WHICH arm wins (that's an implementation detail of
+    /// `compare_extraction`'s arbiter); we only pin that *some* text comes
+    /// out of a page with abundant paragraph content. Documents that
+    /// Stage 9 is wired into the full cascade, not the own-arm only.
+    #[test]
+    fn extract_falls_back_to_readability_on_short_own_extraction() {
+        // A page with many <p> elements but no single <article> — the
+        // own arm's BODY_XPATH may yield a thin result; readability picks
+        // up the bulk paragraphs via div-to-p transformation.
+        let mut html = String::from("<html><head><title>Multi-P Page</title></head><body>");
+        for _ in 0..20 {
+            html.push_str(
+                "<p>This is a long readable paragraph with substantial text content so the \
+                cascade's classifier can reliably pull it through. Lorem ipsum dolor sit amet, \
+                consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et \
+                dolore magna aliqua.</p>",
+            );
+        }
+        html.push_str("</body></html>");
+        let e = extract(&html, None).expect("ok");
+        assert!(
+            e.text.len() > 200,
+            "expected substantive cascade extraction, got {} chars: {:?}",
+            e.text.len(),
+            e.text
+        );
+    }
+
+    /// Stage 9 brief test #7 — `<html lang="...">` populates
+    /// Extracted.language via Trafilatura's metadata pipeline.
+    #[test]
+    fn extract_populates_language_from_html_lang() {
+        let html = "<html lang=\"en\"><head><title>X</title></head>\
+            <body><p>some text</p></body></html>";
+        let e = extract(html, None).expect("ok");
+        assert_eq!(e.language.as_deref(), Some("en"));
+    }
+
+    /// Stage 9 brief test #8 — malformed HTML must not panic. The
+    /// html5ever parser handles malformed input by inserting implied
+    /// elements; the cascade must consume that without unimplemented! /
+    /// panic / infinite loop. Empty extraction is a valid `Ok` (Bug-E2).
+    #[test]
+    fn extract_doesnt_panic_on_malformed_html() {
+        let cases = [
+            "<html><body><div><p>unclosed",
+            "<<<>><body><p>nested broken<<<</p></body>",
+            "<html><body><a href=\"unclosed quote</body>",
+            "<!DOCTYPE garbage><html><body>",
+            "",
+        ];
+        for html in cases {
+            let result = extract(html, None);
+            assert!(
+                result.is_ok(),
+                "malformed HTML must still be Ok, got Err for {html:?}: {:?}",
+                result.err()
+            );
+        }
+    }
+
+    /// Stage 9 sanity — the M2 Readability path is still reachable via
+    /// `extract_via_readability`. Pin the byte-faithful old default's
+    /// availability so the M3 finale doesn't silently DROP the previous
+    /// extraction shape (which would be a major regression for any
+    /// caller pinned to M2's `_grabArticle` semantics).
+    #[test]
+    fn extract_via_readability_remains_available_for_m2_callers() {
+        const SAMPLE_HTML: &str =
+            "<html><head><title>T</title></head>\
+             <body><article><p>hello world</p></article></body></html>";
+        let e = extract_via_readability(SAMPLE_HTML, None, &Options::default())
+            .expect("M2 Readability path must remain available");
+        assert!(e.text.contains("hello world"), "M2 path body text: {:?}", e.text);
+        assert_eq!(e.title.as_deref(), Some("T"));
+        // The M2 path has no comments concept.
+        assert_eq!(e.comments, "");
     }
 }
