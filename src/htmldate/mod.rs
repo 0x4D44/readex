@@ -31,3 +31,13 @@ pub mod utils;
 // `chrono` is still NOT a crate dependency — see `validators.rs`'s
 // "Date typing" doc-comment.
 pub mod validators;
+
+// Sub-stage C — regex catalogues + month tables — verbatim port of
+// `htmldate/extractors.py:47-213`. Pure-data constants: every regex lives
+// behind a `std::sync::OnceLock<Regex>` slot. Sub-stage C does NOT wire
+// runtime behaviour; the catalogues are consumed by sub-stage D's
+// date-extraction algorithm. SIMPLE_PATTERN's `(?<!w3.org)` negative
+// lookbehind is preserved as a separate `simple_pattern_post_filter`
+// helper (Rust `regex` is finite-automaton; no lookarounds). See
+// `regex_catalogues.rs`'s module-level docs for the divergence rationale.
+pub mod regex_catalogues;

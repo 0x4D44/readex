@@ -1980,7 +1980,81 @@ name = "mdrcel"
 # trafilatura_extract_content_gate) remain byte-identical green by
 # construction (no existing module touched).
 # Lib test count 771 -> 789 (+18 new sub-stage-B unit tests).
-version = "0.11.1"
+#
+# M4 Stage 1 sub-stage C (2026-05-21): 0.11.1 -> 0.11.2 PATCH. Extends the
+# `#[doc(hidden)] pub mod htmldate` infrastructure surface ADDITIVELY with
+# `src/htmldate/regex_catalogues.rs` — verbatim port of
+# `htmldate/extractors.py:47-213` (the module-level regex catalogues + month
+# tables + XPath prefix strings). Pure-data port: no runtime behaviour wired.
+# Sub-stage D's date-extraction algorithm is the consumer.
+#
+# Constants vendored (every line-cited verbatim to its Python source):
+# - String constants (`pub const`): FAST_PREPEND (extractors.py:47-48),
+#   SLOW_PREPEND (:49), DATE_EXPRESSIONS (:51-78), DAY_RE (:95),
+#   MONTH_RE (:96), YEAR_RE (:97), REGEX_MONTHS (:110-118), MONTHS (:140-153).
+# - Lazy `OnceLock<HashMap<...>>` accessor: `text_months()` for the
+#   `TEXT_MONTHS` dict (:155-157).
+# - Lazy `OnceLock<Regex>` accessors (each via a `pub fn name() -> &'static
+#   Regex` thin wrapper, matching the M3 Stage 4a readability_fork
+#   precedent): YMD_NO_SEP_PATTERN (:100), YMD_PATTERN (:101-104),
+#   YM_PATTERN (:105-108), LONG_TEXT_PATTERN (:119-127), COMPLETE_URL
+#   (:129), JSON_MODIFIED (:131), JSON_PUBLISHED (:132-134),
+#   TIMESTAMP_PATTERN (:135-137), TEXT_DATE_PATTERN (:159),
+#   DISCARD_PATTERNS (:161-171), TEXT_PATTERNS (:174-180),
+#   THREE_COMP_REGEX_A (:183), THREE_COMP_REGEX_B (:184-186),
+#   TWO_COMP_REGEX (:187), YEAR_PATTERN (:190), COPYRIGHT_PATTERN
+#   (:191-193), THREE_PATTERN (:194), THREE_CATCH (:195),
+#   THREE_LOOSE_PATTERN (:196), THREE_LOOSE_CATCH (:197),
+#   SELECT_YMD_PATTERN (:198), SELECT_YMD_YEAR (:199), YMD_YEAR (:200),
+#   DATESTRINGS_PATTERN (:201-203), DATESTRINGS_CATCH (:204),
+#   SLASHES_PATTERN (:205-207), SLASHES_YEAR (:208), YYYYMM_PATTERN
+#   (:209), YYYYMM_CATCH (:210), MMYYYY_PATTERN (:211), MMYYYY_YEAR
+#   (:212), SIMPLE_PATTERN (:213 — see lookbehind divergence below).
+#
+# Faithful divergences (recorded — HLD §4 anti-inversion):
+# - **SIMPLE_PATTERN lookbehind**: Python's `(?<!w3.org)\D({YEAR_RE})\D`
+#   uses a negative lookbehind, which the Rust `regex` crate (finite-
+#   automaton engine) does NOT support. Strategy: expose `simple_pattern()`
+#   without the lookbehind, plus a `simple_pattern_post_filter(haystack,
+#   match_start) -> bool` helper that runs a `w3.org$` regex on the
+#   6-character context immediately preceding the match. Sub-stage D
+#   callers MUST invoke the post-filter on every hit. Documented loudly
+#   in the module header. Tests pin both the matching case and the
+#   post-filter behaviour (incl. early-return for `match_start < 6`).
+# - **`match.lastgroup`**: Python uses `re.Match.lastgroup` at
+#   `extractors.py:267, 337, 364` (all in sub-stage D code paths, not the
+#   catalogues). Rust `regex::Captures` has no direct equivalent. Sub-stage
+#   C does NOT use `lastgroup` itself; the catalogue is pure data. A
+#   `// TODO sub-stage D: lastgroup helper` reminder is left in the file
+#   where the consumer's helper will land.
+# - **Quantifier lower-bound shorthand**: Python `re` accepts `{,n}` as a
+#   shorthand for `{0,n}` (no explicit lower bound). Rust `regex`
+#   REQUIRES an explicit lower bound `{m,n}`. `TEXT_PATTERNS` at
+#   `extractors.py:175` contains `date[^0-9"]{,20}` which becomes
+#   `date[^0-9"]{0,20}` in the Rust port — same semantics, faithful
+#   one-character translation. Documented at the call site.
+#
+# Per semver (CLAUDE.md "Version management") PATCH — extends the
+# `#[doc(hidden)] pub mod htmldate` module surface introduced by
+# sub-stage A; NO new TOP-LEVEL module declaration in `lib.rs`. Matches
+# the sub-stage B precedent for "extending a previously-introduced
+# `#[doc(hidden)]` module's surface without creating a new module" being
+# PATCH-eligible. The new public items (32 regex accessor fns, 1 HashMap
+# accessor, 6 `pub const` constants, 1 post-filter fn) are all consumed
+# by sub-stage D — none are wired into existing call sites at sub-stage C.
+#
+# Backward compatibility: every prior public surface (`extract` /
+# `extract_with` / `Extracted` / `Options` / `ExtractError` and the M2 /
+# M3 `#[doc(hidden)]` infrastructure modules, plus htmldate sub-stage
+# A's `settings` / `utils` modules + sub-stage B's `validators` module)
+# is byte-unchanged. All 4 BLOCKER gates (parser_equivalence_gate /
+# trafilatura_equivalence_gate / trafilatura_extract_smoke /
+# trafilatura_extract_content_gate) remain byte-identical green by
+# construction (no existing module touched).
+# Lib test count 789 -> 881 (+92 new sub-stage-C unit tests across 60+
+# matching/non-matching pairs, multilingual LONG_TEXT_PATTERN coverage,
+# MONTHS/TEXT_MONTHS lookups, SIMPLE_PATTERN+post_filter pair, etc.).
+version = "0.11.2"
 edition = "2024"
 
 [dependencies]
