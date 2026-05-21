@@ -66,6 +66,13 @@ const PYTHON_UNDER_EXTRACT_ALLOWLIST: &[&str] = &[
     // glyphs (U+2122 here); mdrcel follows the spec, lxml strips the
     // control character. ADR: wrk_docs/m5-allowlist/dc8ba3c0.md.
     "dc8ba3c086153274.html",
+    // Rust blog index page (blog.rust-lang.org). Python's link-density
+    // filter (`htmlprocessing.link_density_test_tables`) rejects the
+    // 76.8%-link-density `<table class="post-list">` that IS the page's
+    // content. Result: 162 chars (description only). mdrcel preserves
+    // the post listing (~17KB of post titles + URLs + dates). ADR:
+    // wrk_docs/m5-allowlist/9c64e8e3.md.
+    "9c64e8e3fcd844d4.html",
 ];
 
 /// All 51 corpus snapshots — enumerated literally from

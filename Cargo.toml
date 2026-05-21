@@ -2547,8 +2547,21 @@ name = "mdrcel"
 # sandbox we surface it as MINOR (matching M3 Stage 9's `comments` field
 # precedent at 0.9.0 -> 0.10.0). No new dependency; no public API removal;
 # `Options` unchanged.
-version = "0.15.10"
+version = "0.15.11"
 edition = "2024"
+
+# M5 Stage 6e-b (2026-05-21): 0.15.10 -> 0.15.11 PATCH. No source change —
+# allowlist-only: `9c64e8e3fcd844d4.html` (blog.rust-lang.org index) is
+# documented as a Python under-extract. Python's
+# `link_density_test_tables` (`htmlprocessing.py`) rejects the
+# 76.8%-link-density `<table class="post-list">` that IS the page's
+# substantive content (post listings). Result: Python emits 162 chars
+# (description only); mdrcel emits ~17 KB (full listing). ADR:
+# `wrk_docs/m5-allowlist/9c64e8e3.md`. Added to
+# `PYTHON_UNDER_EXTRACT_ALLOWLIST` in
+# `tests/trafilatura_markdown_gate.rs:52`. Gate movement: 38/51 -> 38/51
+# substantive + 4 allowlisted (content-mismatch 10 -> 9, allowlist 3 ->
+# 4). No public-API change. PATCH bump.
 
 # M5 Stage 6e-a (2026-05-21): 0.15.9 -> 0.15.10 PATCH. Bug fix only:
 # Python trafilatura's `load_html` uses
