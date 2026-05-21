@@ -1124,18 +1124,30 @@ pub fn handle_table(
             let is_header = sub_tag == "th" && !seen_header_row;
             seen_header = seen_header || is_header;
             let new_child_elem = define_cell_type(is_header);
+            // Pending tail to apply AFTER `append_child` — `set_tail` is a
+            // no-op on detached elements (rcdom stores tails as Text-node
+            // SIBLINGS, which require a parent). Python's lxml stores `.tail`
+            // on the element itself so the assignment sticks regardless of
+            // attachment. We mirror the assignment by deferring it until
+            // after the cell is appended to `newrow`. This preserves Python's
+            // process_element behaviour (xml.py:350-351) where the cell's
+            // `.tail` whitespace (`\n      ` between `<td>` elements in
+            // pretty-printed source) is emitted AFTER the closing ` | `
+            // separator — surviving `sanitize` (`utils.py:303-312`) as a
+            // newline that breaks mid-row cells onto separate lines.
+            let mut pending_tail: Option<String> = None;
 
             if element_child_count(&subelement) == 0 {
                 // main_extractor.py:397-400 — leaf cell.
                 if let Some(processed_cell) = process_node(&subelement, options) {
                     set_element_text(&new_child_elem, element_text(&processed_cell).as_deref());
-                    set_tail(&new_child_elem, tail(&processed_cell).as_deref());
+                    pending_tail = tail(&processed_cell);
                 }
             } else {
                 // main_extractor.py:402-424 — non-leaf cell: take text/tail
                 // from subelement directly, then walk inner descendants.
                 set_element_text(&new_child_elem, element_text(&subelement).as_deref());
-                set_tail(&new_child_elem, tail(&subelement).as_deref());
+                pending_tail = tail(&subelement);
 
                 // **rcdom Drop / replace_element_tag quirk** (Stage 3-B
                 // Cluster A fix, 2026-05-21): Python's `subelement.tag = "done"`
@@ -1211,6 +1223,15 @@ pub fn handle_table(
                 .unwrap_or(false);
             if has_text || element_child_count(&new_child_elem) > 0 {
                 append_child(&newrow, &new_child_elem);
+                // Apply the deferred tail now that the cell has a parent
+                // (see `pending_tail` doc above). Mirrors Python's
+                // `new_child_elem.tail = subelement.tail` /
+                // `processed_cell.tail` at main_extractor.py:400/403, but
+                // delayed past the `define_cell_type` orphan window so
+                // rcdom can realise the tail as a Text-node sibling.
+                if let Some(t) = pending_tail.as_deref() {
+                    set_tail(&new_child_elem, Some(t));
+                }
             }
         } else if sub_tag == "table" {
             // main_extractor.py:429-430 — break on nested table.
@@ -3736,6 +3757,63 @@ mod tests {
         assert!(
             !cell_text.contains("NESTED"),
             "nested table content not processed: {cell_text:?}"
+        );
+    }
+
+    #[test]
+    fn handle_table_preserves_non_leaf_cell_tail_whitespace_for_pipe_newline_render() {
+        // Regression for M5 Stage 5b: cell-pipe newline collapse. Python's
+        // `handle_table` non-leaf branch (main_extractor.py:403) copies the
+        // source `<td>`'s `.tail` onto the TEI `<cell>` element WITHOUT
+        // trimming (`process_node`'s trim only fires on the leaf branch at
+        // line 398). That tail — the whitespace between `<td>` elements in
+        // pretty-printed HTML — survives `xmltotxt` and `sanitize` to render
+        // as a newline that breaks multi-paragraph cells onto separate
+        // output lines:
+        //
+        //     | first cell content (with <p> child) |\nsecond cell |\n
+        //
+        // The Rust port previously called `set_tail` while the new cell was
+        // still detached (orphan) — and `set_tail` is a no-op on detached
+        // elements, because rcdom stores tails as Text-node SIBLINGS that
+        // require a parent. This test pins the post-append tail.
+        let table = dom_create_element("table");
+        let tbody = dom_create_element("tbody");
+        let tr = dom_create_element("tr");
+        let td_a = dom_create_element("td");
+        dom_append_child(&td_a, &create_text_node("A"));
+        // Inner <p> so we exercise the non-leaf branch (line 1137-1138).
+        let inner_p = dom_create_element("p");
+        dom_append_child(&inner_p, &create_text_node("inner"));
+        dom_append_child(&td_a, &inner_p);
+        let td_b = dom_create_element("td");
+        dom_append_child(&td_b, &create_text_node("B"));
+        let inner_p2 = dom_create_element("p");
+        dom_append_child(&inner_p2, &create_text_node("inner-b"));
+        dom_append_child(&td_b, &inner_p2);
+        dom_append_child(&tr, &td_a);
+        dom_append_child(&tr, &td_b);
+        dom_append_child(&tbody, &tr);
+        dom_append_child(&table, &tbody);
+        // set_tail requires a parent — apply AFTER the elements are
+        // attached.
+        set_tail(&td_a, Some("\n      "));
+        set_tail(&td_b, Some("\n    "));
+
+        let pot = potential_tags(&["table"]);
+        let opts = Options::default();
+        let out = handle_table(&table, &pot, &opts).expect("non-empty → Some");
+        let cells = get_elements_by_tag_name(&out, "cell");
+        assert_eq!(cells.len(), 2, "two cells survive");
+        assert_eq!(
+            tail(&cells[0]).as_deref(),
+            Some("\n      "),
+            "non-leaf cell tail preserved on the appended cell (Python copies subelement.tail verbatim — no trim — at main_extractor.py:403)"
+        );
+        assert_eq!(
+            tail(&cells[1]).as_deref(),
+            Some("\n    "),
+            "second non-leaf cell tail also preserved"
         );
     }
 

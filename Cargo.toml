@@ -2547,9 +2547,27 @@ name = "mdrcel"
 # sandbox we surface it as MINOR (matching M3 Stage 9's `comments` field
 # precedent at 0.9.0 -> 0.10.0). No new dependency; no public API removal;
 # `Options` unchanged.
-version = "0.15.4"
+version = "0.15.5"
 edition = "2024"
 
+# M5 Stage 5b (2026-05-21): 0.15.4 -> 0.15.5 PATCH. Bug fix only:
+# `handle_table`'s `set_tail` calls on the freshly-minted `<cell>` element
+# (`main_extractor.rs:1132/1138`) were no-ops because rcdom stores tails as
+# Text-node SIBLINGS (`dom.rs:512` `set_tail`) which require the element to
+# have a parent — and at that point the new cell is still orphan. Python's
+# lxml stores `.tail` on the element itself so the assignment sticks on
+# detached nodes, hiding the bug (`main_extractor.py:400, 403`). Fix:
+# capture the tail value in a `pending_tail` local, then apply it AFTER
+# `append_child` once the cell has a parent slot. This restores the
+# `<td>`-tail whitespace (`\n      ` between cells in pretty-printed HTML)
+# that Python's `process_element` (xml.py:350-351) emits after the cell's
+# closing ` | ` separator — the `\n` survives `sanitize` (utils.py:303-312)
+# and breaks multi-paragraph table cells onto separate output lines, the
+# pattern visible on UK-government PAYE tables. Surfaced by M5 Stage 5a's
+# gate report: whitespace-only bucket 4 -> 0 (all four fixtures fixed plus
+# one previously content-mismatch fixture); passing 21/51 -> 26/51. No
+# public API change; no signature change; no new dependency.
+#
 # M5 Stage 5a (2026-05-21): 0.15.3 -> 0.15.4 PATCH. Bug fix only: the
 # markdown formatting path (`extract_to_markdown`) now mirrors Python's
 # `core.py:95-96` commentsbody-strip branch. Python's `bare_extraction`
