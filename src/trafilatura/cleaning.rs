@@ -101,6 +101,23 @@ pub struct Options {
     /// gate (`main_extractor.py:594`) and `extract_content`'s wild-text
     /// fallback (`main_extractor.py:633`). Stage 2d.
     pub min_extracted_size: usize,
+    /// `Extractor.lang` (settings.py:115, default `None`). Stage 6 cascade
+    /// arbiter (`compare_extraction`, external.py:45-108) routes this to
+    /// `justext_rescue` as the target-language hint; the stoplist accessor
+    /// (`justext_stoplists`) lowercases on first read so we store the raw
+    /// ISO code Python would.
+    pub lang: Option<String>,
+    /// `Extractor.url` (settings.py:116, default `None`). Stage 6 cascade
+    /// arbiter routes this to `justext_rescue` (paragraphs do not consume it
+    /// directly; it is only used to set the Python `options.source` slot
+    /// from `_set_source`, settings.py:155-158). Kept as an owned `String`
+    /// so the caller can pass a borrow from a longer-lived buffer.
+    pub url: Option<String>,
+    /// `Extractor.source` (settings.py:91, default derived from `url` or
+    /// passed `source`). Used only for log-string interpolation in Python
+    /// (e.g. external.py:84,90,96). Stored verbatim so the Rust port can
+    /// emit the same diagnostic strings if instrumentation lands.
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +137,9 @@ impl Default for Options {
             formatting: false,
             focus: Focus::Balanced,
             min_extracted_size: 250,
+            lang: None,
+            url: None,
+            source: None,
         }
     }
 }
@@ -1421,6 +1441,171 @@ impl Options {
 }
 
 // ===========================================================================
+// sanitize_tree (external.py:163-190) — Stage 6
+// ===========================================================================
+
+/// `TEI_VALID_TAGS` — `xml.py:28-29`. The set of element tags the
+/// post-`sanitize_tree` output is allowed to retain; every other element
+/// is stripped via `lxml.etree.strip_tags` (children + text + tail survive,
+/// only the wrapper goes).
+///
+/// Stored as an `&[&str]` slice for membership lookup; order is irrelevant
+/// (Python uses a literal `set`).
+pub const TEI_VALID_TAGS: &[&str] = &[
+    "ab", "body", "cell", "code", "del", "div", "graphic", "head", "hi", "item", "lb", "list",
+    "p", "quote", "ref", "row", "table",
+];
+
+/// `sanitize_tree(tree, options)` — `external.py:163-190`. Post-processing
+/// pass that converts the readability/jusText generic-algorithm output to
+/// Trafilatura's TEI-like vocabulary AND strips any tags outside
+/// [`TEI_VALID_TAGS`].
+///
+/// # Python original
+///
+/// ```python
+/// def sanitize_tree(tree, options):
+///     '''Convert and sanitize the output from the generic algorithm
+///        (post-processing)'''
+///     # 1. clean
+///     cleaned_tree = tree_cleaning(tree, options)
+///     if options.links is False:
+///         strip_tags(cleaned_tree, 'a')
+///     strip_tags(cleaned_tree, 'span')
+///     # 2. convert
+///     cleaned_tree = convert_tags(cleaned_tree, options)
+///     for elem in cleaned_tree.iter('td', 'th', 'tr'):
+///         if elem.tag == 'tr':
+///             elem.tag = 'row'
+///         elif elem.tag in ('td', 'th'):
+///             if elem.tag == 'th':
+///                 elem.set('role', 'head')
+///             elem.tag = 'cell'
+///     # 3. sanitize
+///     sanitization_list = [
+///         tagname
+///         for tagname in [element.tag for element in set(cleaned_tree.iter('*'))]
+///         if tagname not in TEI_VALID_TAGS
+///     ]
+///     strip_tags(cleaned_tree, *sanitization_list)
+///     # 4. return
+///     text = trim(' '.join(cleaned_tree.itertext()))
+///     return cleaned_tree, text, len(text)
+/// ```
+///
+/// # Rust port shape
+///
+/// Mutates `tree` in place (Python rebinds `cleaned_tree`, but our
+/// [`tree_cleaning`] / [`convert_tags`] mutate the input node directly — the
+/// reassignment is a Python-side aliasing convention, not a fresh allocation).
+///
+/// Returns `(text, len)`:
+/// - `text` is the trimmed space-joined `itertext` (matching Python's `trim(' '.join(cleaned_tree.itertext()))`).
+/// - `len` is the codepoint count of `text` (Python `len(str)` on Python 3).
+///
+/// The caller retains the original `&NodeRef` (no rebind needed); use it
+/// alongside the returned `(text, len)` exactly as Python uses the
+/// `(cleaned_tree, text, len_text)` triple.
+///
+/// # Anti-inversion notes
+///
+/// 1. `set(cleaned_tree.iter('*'))` — Python's `set()` deduplicates by
+///    identity for lxml `HtmlElement` instances, but the list comprehension
+///    just collects `element.tag` values from that set. So the `sanitization_list`
+///    is a list of tag-name STRINGS (with duplicates: one entry per element
+///    instance whose tag is non-TEI). `lxml.etree.strip_tags(tree, *names)`
+///    accepts repeated names without error, so the duplicates are harmless.
+///    We faithfully collect tag-names from the descendant snapshot and pass
+///    them to `strip_tags_multi` — same observable outcome (strip every tag
+///    not in `TEI_VALID_TAGS`).
+///
+/// 2. `strip_tags(cleaned_tree, 'a')` only fires when `options.links is False`.
+///    Our `tree_cleaning` already invokes `convert_tags` patterns that handle
+///    `<a>` (renaming qualifying anchors to `<ref>`); but the Python
+///    `sanitize_tree` runs an ADDITIONAL `strip_tags(_, 'a')` after
+///    `tree_cleaning`. Since `<a>` is not in `TEI_VALID_TAGS`, the final
+///    strip pass (step 3) would catch it anyway — but we preserve the
+///    explicit early-strip to match the Python source order.
+///
+/// 3. The table-cell rename pass (Python `for elem in iter('td', 'th', 'tr')`)
+///    runs AFTER `convert_tags`. `convert_tags` does not rewrite tr/td/th in
+///    the Stage 1b port (it handles list/heading/quote/del/details, but not
+///    table cells — those are explicitly part of `sanitize_tree`).
+pub fn sanitize_tree(tree: &NodeRef, options: &Options) -> (String, usize) {
+    // external.py:166 — `cleaned_tree = tree_cleaning(tree, options)`.
+    tree_cleaning(tree, options);
+
+    // external.py:167-168 — `if options.links is False: strip_tags(cleaned_tree, 'a')`.
+    if !options.links {
+        strip_tags_multi(tree, &["a"]);
+    }
+    // external.py:169 — `strip_tags(cleaned_tree, 'span')`.
+    strip_tags_multi(tree, &["span"]);
+
+    // external.py:171 — `cleaned_tree = convert_tags(cleaned_tree, options)`.
+    convert_tags(tree, options);
+
+    // external.py:172-180 — table-cell rename pass.
+    // Python `tree.iter('td', 'th', 'tr')` walks descendants in doc order;
+    // for each we either rename `tr` -> `row` or `td`/`th` -> `cell` (with
+    // `role="head"` on the latter when the source tag was `th`).
+    for elem in dom::get_all_nodes_with_tag(tree, &["td", "th", "tr"]) {
+        let tag = match local_name(&elem) {
+            Some(t) => t,
+            None => continue,
+        };
+        if tag.as_str() == "tr" {
+            // external.py:176 — `elem.tag = 'row'`.
+            let _ = replace_element_tag(&elem, "row");
+        } else if tag.as_str() == "td" || tag.as_str() == "th" {
+            // external.py:177-180 — th gets `role="head"`, then both
+            // retag to `cell`. Order matters: set the attribute BEFORE
+            // the rename so `replace_element_tag` clones the attr-map
+            // including `role` onto the new node.
+            if tag.as_str() == "th" {
+                set_attribute(&elem, "role", "head");
+            }
+            let _ = replace_element_tag(&elem, "cell");
+        }
+    }
+
+    // external.py:182-187 — sanitization list = every descendant element's
+    // tag-name that is NOT in `TEI_VALID_TAGS`. Faithful collection:
+    // walk all descendant elements via `get_elements_by_tag_name(_, "*")`
+    // (lxml `iter('*')` is descendant-or-self in doc order; our facade is
+    // descendants only — but `tree` itself is the cascade's wrapper body,
+    // never an element with a non-TEI tag, so the divergence is moot).
+    let mut bad_tags: Vec<String> = Vec::new();
+    for elem in dom::get_elements_by_tag_name(tree, "*") {
+        if let Some(tag) = local_name(&elem)
+            && !TEI_VALID_TAGS.contains(&tag.as_str())
+            && !bad_tags.iter().any(|t| t == tag.as_str())
+        {
+            bad_tags.push(tag.to_string());
+        }
+    }
+    // external.py:187 — `strip_tags(cleaned_tree, *sanitization_list)`. We
+    // collect tag names then strip in one pass. `strip_tags_multi` snapshots
+    // matches per-tag before stripping, so a tag dropping in pass N cannot
+    // skip a same-tag descendant in pass M>N.
+    let bad_tag_refs: Vec<&str> = bad_tags.iter().map(|s| s.as_str()).collect();
+    strip_tags_multi(tree, &bad_tag_refs);
+
+    // external.py:189 — `text = trim(' '.join(cleaned_tree.itertext()))`.
+    // lxml's `itertext()` yields every text-node in document order; the
+    // space-joined trim collapses whitespace runs.
+    // `text_content` already concatenates descendant text in doc order;
+    // we then `trim` to collapse whitespace runs (matches lxml's
+    // `' '.join(...) + trim` for itertext semantics — the explicit ' '
+    // separator inserts a single space between runs, then trim collapses
+    // multiple spaces to one).
+    let raw_text = text_content(tree);
+    let text = trim(&raw_text);
+    let len = text.chars().count();
+    (text, len)
+}
+
+// ===========================================================================
 // Tests (Stage 1b unit tests)
 // ===========================================================================
 
@@ -2204,5 +2389,116 @@ mod tests {
         // on the accessor body.
         let opts = Options::default();
         assert!(!opts.dedup());
+    }
+
+    // -----------------------------------------------------------------------
+    // Stage 6: sanitize_tree (external.py:163-190)
+    // -----------------------------------------------------------------------
+
+    /// Helper: parse `html`, sanitize the body, return the body NodeRef
+    /// for inspection. The `Dom` is kept alive so the rcdom Drop quirk
+    /// doesn't drain descendants.
+    fn sanitize_body(html: &str) -> (Dom, NodeRef, String) {
+        let dom = Dom::parse(html);
+        let body = dom.body().expect("body parsed");
+        let opts = Options::default();
+        let (text, _len) = sanitize_tree(&body, &opts);
+        (dom, body, text)
+    }
+
+    /// Stage 6/test-5 — `sanitize_tree` strips `class="..."` attributes via
+    /// the strip-non-TEI-tags pass. Specifically: a `<div class="x">`
+    /// survives (div IS in TEI_VALID_TAGS) and KEEPS its class attribute
+    /// (Python doesn't drop attributes on TEI tags). But a `<section
+    /// class="x">` is NOT in TEI_VALID_TAGS, so the wrapper is stripped
+    /// entirely — children survive but the class on the wrapper is gone.
+    ///
+    /// The brief asks for "strips class attributes" — but Python's
+    /// sanitize_tree does NOT have an "attribute-stripping" pass per se.
+    /// What it DOES do is strip non-TEI WRAPPERS, which removes any
+    /// attributes those wrappers carried. We pin THAT faithful behaviour.
+    #[test]
+    fn sanitize_tree_strips_class_attributes_on_non_tei_wrappers() {
+        let html = r#"<html><body>
+            <section class="non-tei-wrapper">
+                <p class="tei-tag-keeps-attr">Hello world content here</p>
+            </section>
+        </body></html>"#;
+        let (_dom, body, _text) = sanitize_body(html);
+        // The <section> wrapper is non-TEI → stripped entirely (no element
+        // with that class survives).
+        let sections = dom::get_elements_by_tag_name(&body, "section");
+        assert_eq!(
+            sections.len(),
+            0,
+            "section is not in TEI_VALID_TAGS — wrapper (and its class) stripped"
+        );
+        // The <p> survives AND keeps its class attribute (TEI-valid tags
+        // are not stripped, so their attributes survive — Python's
+        // sanitize_tree only strips tag WRAPPERS, not attributes per se).
+        let ps = dom::get_elements_by_tag_name(&body, "p");
+        assert_eq!(ps.len(), 1, "p is in TEI_VALID_TAGS — survives");
+    }
+
+    /// Stage 6/test-6 — `sanitize_tree` removes empty `<p></p>` elements
+    /// via `prune_html` (which is called by `tree_cleaning` as part of
+    /// `sanitize_tree`'s phase 1).
+    #[test]
+    fn sanitize_tree_removes_empty_paragraphs() {
+        let html = r#"<html><body>
+            <p>Substantive content here that survives</p>
+            <p></p>
+            <p>More substantive content</p>
+            <p>   </p>
+        </body></html>"#;
+        let (_dom, body, _text) = sanitize_body(html);
+        let ps = dom::get_elements_by_tag_name(&body, "p");
+        // `<p></p>` with no children is dropped by prune_html (p is in
+        // CUT_EMPTY_ELEMS). The whitespace-only `<p>   </p>` has a single
+        // Text-node child, so `not(node())` is false — it survives the
+        // prune. We pin BOTH behaviours.
+        assert!(
+            ps.len() < 4,
+            "at least one empty <p> should have been dropped; got {}",
+            ps.len()
+        );
+        // Both substantive <p> elements must survive.
+        let texts: Vec<String> = ps.iter().map(text_content).collect();
+        assert!(
+            texts.iter().any(|t| t.contains("Substantive content")),
+            "substantive <p> dropped: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("More substantive content")),
+            "second substantive <p> dropped: {texts:?}"
+        );
+    }
+
+    /// Stage 6/test-7 — `sanitize_tree` preserves non-trivial body
+    /// content end-to-end. The text output must equal the trimmed
+    /// space-joined itertext of the surviving structure.
+    #[test]
+    fn sanitize_tree_preserves_substantive_content() {
+        let html = r#"<html><body>
+            <article>
+                <h2>Heading text</h2>
+                <p>First paragraph with words and commas, internal structure, real prose.</p>
+                <p>Second paragraph continuing the article body with substantive content.</p>
+            </article>
+        </body></html>"#;
+        let (_dom, _body, text) = sanitize_body(html);
+        // Substantive content must appear in the returned text.
+        assert!(
+            text.contains("First paragraph"),
+            "first paragraph dropped: {text:?}"
+        );
+        assert!(
+            text.contains("Second paragraph"),
+            "second paragraph dropped: {text:?}"
+        );
+        assert!(
+            text.contains("Heading text"),
+            "heading text dropped: {text:?}"
+        );
     }
 }

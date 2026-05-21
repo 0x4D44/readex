@@ -1225,7 +1225,7 @@ name = "mdrcel"
 #   selection (xml / xmltei / txt / markdown / csv / json).
 # - **Stage 9**: HLD §7.6 wiring of the `mdrcel::extract` public
 #   surface into the trafilatura cascade.
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 
 [dependencies]
