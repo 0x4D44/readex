@@ -2192,7 +2192,71 @@ name = "mdrcel"
 # over-max, search_pattern, compare_reference success/failure,
 # examine_abbr class-title, examine_time datetime/pubdate/text,
 # normalize_match 4/2-digit-year zfill, examine_text floor/happy).
-version = "0.11.4"
+#
+# M4 Stage 1 sub-stage F (2026-05-21): 0.11.4 -> 0.11.5 PATCH. Extends
+# `src/htmldate/core.rs` ADDITIVELY with `search_page` — port of
+# `htmldate@1.9.x/core.py:574-805` (the final regex cascade fallback
+# inside `find_date`). New public surface on `#[doc(hidden)] pub mod
+# htmldate::core`:
+# - `search_page(htmlstring, options) -> Option<String>` — opportunistic
+#   regex cascade running ten arms in Python source order: (1) copyright
+#   sets `copyear`, (2) THREE_COMP_PATTERNS loop (URL + loose), (3)
+#   SELECT_YMD_PATTERN normalised via THREE_COMP_REGEX_A, (4)
+#   DATESTRINGS_PATTERN, (5) SLASHES_PATTERN normalised via
+#   THREE_COMP_REGEX_B (incomplete=true century guess), (6) YYYYMM_PATTERN
+#   (two-component, day=1), (7) MMYYYY_PATTERN normalised via TWO_COMP_REGEX
+#   (incomplete=options.original), (8) regex_parse (LONG_TEXT_PATTERN
+#   multilingual), (9) copyright catchall (return `copyear-01-01`), (10)
+#   SIMPLE_PATTERN year-only last resort with the `(?<!w3.org)` Python
+#   lookbehind reproduced via `simple_pattern_post_filter`.
+#
+# Faithful divergences (recorded — HLD §4 anti-inversion, all in
+# `search_page`'s implementation comments):
+# - The `(?<!w3.org)` Python lookbehind on SIMPLE_PATTERN is enforced
+#   manually: the SIMPLE arm iterates `simple_pattern().captures_iter()`,
+#   skips matches where `simple_pattern_post_filter` returns false, and
+#   applies the year-range filter inline (replicating what
+#   `plausible_year_filter` would do, but with the post-filter inserted
+#   between match enumeration and the count tally). This mirrors the
+#   regex_catalogues.rs sub-stage C divergence note.
+# - The Python `bestmatch` returned by `select_candidate` is a `re.Match`
+#   whose groups 1/2/3 `filter_ymd_candidate` reads directly. Our Rust
+#   `select_candidate` returns the matched substring (`m.as_str()`); the
+#   sub-stage F port bridges this via a `recapture_ymd_groups` helper
+#   that re-runs the catch regex on the substring to pull groups 1/2/3.
+# - The `pattern` argument to `filter_ymd_candidate` (Python: used only
+#   for log messages at validators.py:160-166) is passed as `""` — the
+#   value is unused in the Rust port.
+#
+# Brief vs source discrepancy (recorded — anti-inversion contract):
+# - The sub-stage F brief named separate "THREE_COMP_REGEX_A match" and
+#   "THREE_COMP_REGEX_B match" arms. Source verification shows
+#   THREE_COMP_REGEX_A/B are NEVER used as primary scanners — they are
+#   used only as NORMALISERS inside the SELECT_YMD and SLASHES arms (the
+#   `match = THREE_COMP_REGEX_A.match(item)` lines at core.py:642 /
+#   :692). The Python primary scanners for the three-component arms are
+#   THREE_PATTERN and THREE_LOOSE_PATTERN, looped via THREE_COMP_PATTERNS.
+#   The Rust port follows the Python source verbatim.
+# - The brief omitted DATESTRINGS_PATTERN (arm 4) — present in source,
+#   ported faithfully.
+# - The brief omitted regex_parse / LONG_TEXT_PATTERN (arm 8) — present
+#   in source, ported faithfully.
+# - The brief omitted the copyright catchall (arm 9) — present in
+#   source, ported faithfully.
+#
+# Per semver (CLAUDE.md "Version management") PATCH — additive new
+# function on the same `#[doc(hidden)] pub mod htmldate::core` surface
+# (matches sub-stages A-E precedent). All four BLOCKER gates remain
+# green (parser_equivalence_gate / trafilatura_equivalence_gate /
+# trafilatura_extract_smoke / trafilatura_extract_content_gate).
+# Default extraction path byte-unchanged: `search_page` is consumed
+# only by `find_date` (deferred to a later sub-stage), not yet wired
+# into `extract` / `extract_with`. Lib test count 942 -> 955 (+13
+# sub-stage-F tests covering THREE_COMP arms A/B, SELECT_YMD,
+# DATESTRINGS, SLASHES, YYYYMM, MMYYYY, SIMPLE year-only +
+# w3.org-rejection, copyright catchall, no-match, min_date filter
+# rejection, custom outputformat).
+version = "0.11.5"
 edition = "2024"
 
 [dependencies]

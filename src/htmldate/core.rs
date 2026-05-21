@@ -25,9 +25,9 @@
 //! - `examine_abbr_elements`                                        (core.py:443-497)
 //! - `examine_time_elements`                                        (core.py:500-562)
 //! - `normalize_match`                                              (core.py:565-571)
+//! - `search_page` (sub-stage F)                                    (core.py:574-805)
 //!
-//! `search_page` and `find_date` (core.py:574-983) are deferred to sub-stage F
-//! (the orchestrator-level work).
+//! `find_date` (core.py:808-983) remains deferred to a later sub-stage.
 //!
 //! # Faithful divergences (recorded — HLD §4 anti-inversion)
 //!
@@ -66,16 +66,20 @@ use regex::Regex;
 use std::sync::OnceLock;
 
 use super::extractors::{
-    MAX_SEGMENT_LEN, extract_url_date, try_date_expr,
+    MAX_SEGMENT_LEN, extract_url_date, regex_parse, try_date_expr,
 };
 use super::regex_catalogues::{
-    three_catch, three_loose_catch, three_loose_pattern, three_pattern,
+    copyright_pattern, datestrings_catch, datestrings_pattern, mmyyyy_pattern, mmyyyy_year,
+    select_ymd_pattern, select_ymd_year, simple_pattern, simple_pattern_post_filter,
+    slashes_pattern, slashes_year, three_catch, three_comp_regex_a, three_comp_regex_b,
+    three_loose_catch, three_loose_pattern, three_pattern, two_comp_regex, year_pattern,
+    ymd_pattern, ymd_year, yyyymm_catch, yyyymm_pattern,
 };
 use super::settings::MAX_POSSIBLE_CANDIDATES;
 use super::utils::Extractor;
 use super::validators::{
-    DateInput, DateTime, check_extracted_reference, compare_values, is_valid_date,
-    plausible_year_filter,
+    DateInput, DateTime, check_extracted_reference, compare_values, filter_ymd_candidate,
+    is_valid_date, plausible_year_filter, validate_and_convert,
 };
 
 use crate::readability::dom::{
@@ -921,6 +925,400 @@ pub fn three_comp_patterns() -> [(&'static Regex, &'static Regex); 2] {
 }
 
 // ===========================================================================
+// search_page (core.py:574-805) — sub-stage F
+// ===========================================================================
+
+/// Re-capture (year, month, day) from a `select_candidate` substring using
+/// the supplied catch regex.
+///
+/// Python's `select_candidate` (core.py:355-407) returns a `re.Match` whose
+/// groups `[1]`/`[2]`/`[3]` `filter_ymd_candidate` reads directly. Our Rust
+/// `select_candidate` returns the matched substring instead (see core.rs's
+/// sub-stage E module header divergence note). To bridge to the Rust
+/// `filter_ymd_candidate(Option<(&str, &str, &str)>, ...)` contract, we
+/// re-run the catch regex on the substring and pull groups 1/2/3 in YMD
+/// order. Returns `None` if the recapture fails (regex anchored mismatch),
+/// matching the Python `bestmatch is None` short-circuit at
+/// `validators.py:144`.
+fn recapture_ymd_groups(s: &str, catch: &Regex) -> Option<(String, String, String)> {
+    let caps = catch.captures(s)?;
+    let y = caps.get(1)?.as_str().to_string();
+    let m = caps.get(2)?.as_str().to_string();
+    let d = caps.get(3)?.as_str().to_string();
+    Some((y, m, d))
+}
+
+/// Opportunistically search the HTML text for common date text patterns.
+///
+/// Ports `htmldate/core.py:574-805` — the final regex cascade fallback
+/// inside `find_date`. Runs the arms in **Python source order** (verbatim,
+/// per the M4 Stage 1 sub-stage F anti-inversion contract):
+///
+/// 1. **COPYRIGHT_PATTERN** (`core.py:589-605`) — sets `copyear`, does not
+///    return.
+/// 2. **THREE_COMP_PATTERNS** loop (`core.py:607-629`) — URL `/YYYY/MM/DD`
+///    + loose-separator `YYYY[/.-]MM[/.-]DD`.
+/// 3. **SELECT_YMD_PATTERN** (`core.py:631-658`) — `D?D[/.-]M?M[/.-]YYYY`
+///    normalised through `THREE_COMP_REGEX_A` + `normalize_match`.
+/// 4. **DATESTRINGS_PATTERN** (`core.py:660-678`) — compact `YYYYMMDD`.
+/// 5. **SLASHES_PATTERN** (`core.py:680-707`) — `D?D/M?M/YY` normalised
+///    through `THREE_COMP_REGEX_B` + `normalize_match` (incomplete=true).
+/// 6. **YYYYMM_PATTERN** (`core.py:709-732`) — `YYYY[/.-]MM` two-component.
+/// 7. **MMYYYY_PATTERN** (`core.py:734-765`) — `M?M[/.-]YYYY` two-component
+///    normalised through `TWO_COMP_REGEX` (incomplete=options.original).
+/// 8. **regex_parse** (`core.py:767-775`) — multilingual `LONG_TEXT_PATTERN`.
+/// 9. **Copyright catchall** (`core.py:777-781`) — if `copyear != 0`,
+///    return `copyear-01-01`.
+/// 10. **SIMPLE_PATTERN** (`core.py:783-803`) — year-only last resort
+///     with the `(?<!w3.org)` lookbehind reproduced via
+///     `simple_pattern_post_filter` (the Rust `regex` crate has no
+///     lookarounds — see `regex_catalogues.rs` module header).
+///
+/// Returns the first arm to produce a valid date, formatted per
+/// `options.format`. Returns `None` only if every arm misses.
+pub fn search_page(htmlstring: &str, options: &Extractor) -> Option<String> {
+    let min = DateTime::from_ymd(options.min);
+    let max = DateTime::from_ymd(options.max);
+
+    // -----------------------------------------------------------------------
+    // 1. core.py:589-605 — copyright sets `copyear`.
+    // -----------------------------------------------------------------------
+    let mut copyear: i32 = 0;
+    let bestmatch = search_pattern(
+        htmlstring,
+        copyright_pattern(),
+        year_pattern(),
+        year_pattern(),
+        options,
+    );
+    if let Some(s) = bestmatch
+        && let Ok(year) = s.parse::<i32>()
+    {
+        // core.py:601-605 — is_valid_date(datetime(year, 1, 1), "%Y", ...).
+        let dt = DateTime::from_ymd((year, 1, 1));
+        let di = DateInput::DateTime(dt);
+        if is_valid_date(Some(&di), "%Y", &min, &max) {
+            copyear = year;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 2. core.py:607-629 — THREE_COMP_PATTERNS loop.
+    // -----------------------------------------------------------------------
+    for (pattern, catch) in three_comp_patterns() {
+        let bestmatch = search_pattern(htmlstring, pattern, catch, year_pattern(), options);
+        // core.py:619-627 — filter_ymd_candidate. Recapture groups via catch.
+        let groups = bestmatch.as_deref().and_then(|s| recapture_ymd_groups(s, catch));
+        let result = filter_ymd_candidate(
+            groups.as_ref().map(|(y, m, d)| (y.as_str(), m.as_str(), d.as_str())),
+            "", // pattern name only used for logging in Python.
+            options.original,
+            copyear,
+            &options.format,
+            &min,
+            &max,
+        );
+        if result.is_some() {
+            return result;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 3. core.py:631-658 — SELECT_YMD_PATTERN with THREE_COMP_REGEX_A
+    // normalisation.
+    // -----------------------------------------------------------------------
+    let candidates = plausible_year_filter(
+        htmlstring,
+        select_ymd_pattern(),
+        select_ymd_year(),
+        &min,
+        &max,
+        false,
+    );
+    // core.py:639-645 — replace each candidate with normalize_match output.
+    let mut replacement: HashMap<String, usize> = HashMap::new();
+    for (item, count) in &candidates {
+        if let Some(caps) = three_comp_regex_a().captures(item) {
+            // THREE_COMP_REGEX_A groups: (day, month, year) per
+            // extractors.py:183. Python `match.groups()` includes ALL groups;
+            // `if g` filters empties. The regex has exactly 3 groups so we
+            // pull 1/2/3.
+            let day = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            let month = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+            let year = caps.get(3).map(|m| m.as_str()).unwrap_or("");
+            if !day.is_empty() && !month.is_empty() && !year.is_empty() {
+                let key = normalize_match(day, month, year);
+                replacement.insert(key, *count);
+            }
+        }
+    }
+    let bestmatch = select_candidate(&replacement, ymd_pattern(), ymd_year(), options);
+    let groups = bestmatch
+        .as_deref()
+        .and_then(|s| recapture_ymd_groups(s, ymd_pattern()));
+    let result = filter_ymd_candidate(
+        groups.as_ref().map(|(y, m, d)| (y.as_str(), m.as_str(), d.as_str())),
+        "",
+        options.original,
+        copyear,
+        &options.format,
+        &min,
+        &max,
+    );
+    if result.is_some() {
+        return result;
+    }
+
+    // -----------------------------------------------------------------------
+    // 4. core.py:660-678 — DATESTRINGS_PATTERN.
+    // -----------------------------------------------------------------------
+    let bestmatch = search_pattern(
+        htmlstring,
+        datestrings_pattern(),
+        datestrings_catch(),
+        year_pattern(),
+        options,
+    );
+    let groups = bestmatch
+        .as_deref()
+        .and_then(|s| recapture_ymd_groups(s, datestrings_catch()));
+    let result = filter_ymd_candidate(
+        groups.as_ref().map(|(y, m, d)| (y.as_str(), m.as_str(), d.as_str())),
+        "",
+        options.original,
+        copyear,
+        &options.format,
+        &min,
+        &max,
+    );
+    if result.is_some() {
+        return result;
+    }
+
+    // -----------------------------------------------------------------------
+    // 5. core.py:680-707 — SLASHES_PATTERN with THREE_COMP_REGEX_B
+    // normalisation (incomplete=true).
+    // -----------------------------------------------------------------------
+    let candidates = plausible_year_filter(
+        htmlstring,
+        slashes_pattern(),
+        slashes_year(),
+        &min,
+        &max,
+        true,
+    );
+    let mut replacement: HashMap<String, usize> = HashMap::new();
+    for (item, count) in &candidates {
+        // THREE_COMP_REGEX_B has 6 groups: two alternatives sharing
+        // (day, month, 2-digit-year). Python's `match.groups()` returns ALL
+        // groups; `if g` filters None entries. The Rust port iterates
+        // captures and takes the first three non-empty groups in declaration
+        // order, mirroring Python's filter-by-truthiness.
+        if let Some(caps) = three_comp_regex_b().captures(item) {
+            let mut parts: Vec<&str> = Vec::new();
+            for i in 1..caps.len() {
+                if let Some(m) = caps.get(i)
+                    && !m.as_str().is_empty()
+                {
+                    parts.push(m.as_str());
+                    if parts.len() == 3 {
+                        break;
+                    }
+                }
+            }
+            if parts.len() == 3 {
+                let key = normalize_match(parts[0], parts[1], parts[2]);
+                replacement.insert(key, *count);
+            }
+        }
+    }
+    let bestmatch = select_candidate(&replacement, ymd_pattern(), ymd_year(), options);
+    let groups = bestmatch
+        .as_deref()
+        .and_then(|s| recapture_ymd_groups(s, ymd_pattern()));
+    let result = filter_ymd_candidate(
+        groups.as_ref().map(|(y, m, d)| (y.as_str(), m.as_str(), d.as_str())),
+        "",
+        options.original,
+        copyear,
+        &options.format,
+        &min,
+        &max,
+    );
+    if result.is_some() {
+        return result;
+    }
+
+    // -----------------------------------------------------------------------
+    // 6. core.py:709-732 — YYYYMM_PATTERN (two-component, first option).
+    // -----------------------------------------------------------------------
+    let bestmatch = search_pattern(
+        htmlstring,
+        yyyymm_pattern(),
+        yyyymm_catch(),
+        year_pattern(),
+        options,
+    );
+    if let Some(s) = bestmatch.as_deref()
+        && let Some(caps) = yyyymm_catch().captures(s)
+    {
+        // YYYYMM_CATCH groups: (year, month). Python `bestmatch[1]`/`[2]`.
+        let year: i32 = caps.get(1).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+        let month: u32 = caps.get(2).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+        if let Some(dt) = make_date(year, month, 1)
+            && (copyear == 0 || dt.year >= copyear)
+        {
+            let di = DateInput::DateTime(dt);
+            if let Some(r) = validate_and_convert(Some(&di), &options.format, &min, &max) {
+                return Some(r);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 7. core.py:734-765 — MMYYYY_PATTERN (two-component, second option,
+    // incomplete=options.original).
+    // -----------------------------------------------------------------------
+    let candidates = plausible_year_filter(
+        htmlstring,
+        mmyyyy_pattern(),
+        mmyyyy_year(),
+        &min,
+        &max,
+        options.original,
+    );
+    let mut replacement: HashMap<String, usize> = HashMap::new();
+    for (item, count) in &candidates {
+        // TWO_COMP_REGEX: (month, year). Python builds `"-".join([year,
+        // zfilled_month, "01"])` per core.py:746-751.
+        if let Some(caps) = two_comp_regex().captures(item)
+            && let (Some(month_m), Some(year_m)) = (caps.get(1), caps.get(2))
+        {
+            let month_raw = month_m.as_str();
+            let year_s = year_m.as_str();
+            let month_padded = if month_raw.len() == 1 {
+                format!("0{}", month_raw)
+            } else {
+                month_raw.to_string()
+            };
+            let key = format!("{}-{}-01", year_s, month_padded);
+            replacement.insert(key, *count);
+        }
+    }
+    let bestmatch = select_candidate(&replacement, ymd_pattern(), ymd_year(), options);
+    let groups = bestmatch
+        .as_deref()
+        .and_then(|s| recapture_ymd_groups(s, ymd_pattern()));
+    let result = filter_ymd_candidate(
+        groups.as_ref().map(|(y, m, d)| (y.as_str(), m.as_str(), d.as_str())),
+        "",
+        options.original,
+        copyear,
+        &options.format,
+        &min,
+        &max,
+    );
+    if result.is_some() {
+        return result;
+    }
+
+    // -----------------------------------------------------------------------
+    // 8. core.py:767-775 — full-blown text regex (regex_parse / LONG_TEXT_PATTERN).
+    // -----------------------------------------------------------------------
+    let dateobject = regex_parse(htmlstring);
+    if (copyear == 0 || dateobject.map(|d| d.year >= copyear).unwrap_or(false))
+        && let Some(dt) = dateobject
+    {
+        let di = DateInput::DateTime(dt);
+        if let Some(r) = validate_and_convert(Some(&di), &options.format, &min, &max) {
+            return Some(r);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 9. core.py:777-781 — copyright catchall.
+    // -----------------------------------------------------------------------
+    if copyear != 0 {
+        let dt = DateTime::from_ymd((copyear, 1, 1));
+        // Python: `dateobject.strftime(options.format)`. Use validate_and_convert
+        // for format emission — copyear was already validated by is_valid_date.
+        let di = DateInput::DateTime(dt);
+        if let Some(r) = validate_and_convert(Some(&di), &options.format, &min, &max) {
+            return Some(r);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 10. core.py:783-803 — SIMPLE_PATTERN (one component, last resort).
+    // The (?<!w3.org) Python lookbehind is reproduced via
+    // simple_pattern_post_filter, per regex_catalogues.rs module header.
+    // -----------------------------------------------------------------------
+    // Manually iterate matches so we can apply the post-filter before
+    // feeding plausible_year_filter / select_candidate.
+    let mut occurrences: HashMap<String, usize> = HashMap::new();
+    for caps in simple_pattern().captures_iter(htmlstring) {
+        if let Some(m0) = caps.get(0) {
+            // The lookbehind in Python sits BEFORE the `\D` byte at
+            // simple_pattern's start: `(?<!w3.org)\D({YEAR_RE})\D`. The
+            // post-filter checks the 6 bytes preceding the WHOLE match
+            // (m0.start()), which is exactly what Python's lookbehind sees.
+            if !simple_pattern_post_filter(htmlstring, m0.start()) {
+                continue;
+            }
+        }
+        if let Some(g1) = caps.get(1) {
+            *occurrences.entry(g1.as_str().to_string()).or_insert(0) += 1;
+        }
+    }
+    // Apply plausible_year_filter's year-range filter manually since we
+    // already populated occurrences with the post-filtered results. The
+    // year_pattern() yearpat is anchored at the start so it works on bare
+    // 4-digit candidates.
+    let keys: Vec<String> = occurrences.keys().cloned().collect();
+    for k in keys {
+        if let Some(caps) = year_pattern().captures(&k)
+            && let Some(g) = caps.get(1)
+            && let Ok(y) = g.as_str().parse::<i32>()
+        {
+            if !(min.year <= y && y <= max.year) {
+                occurrences.remove(&k);
+            }
+        } else {
+            occurrences.remove(&k);
+        }
+    }
+    if let Some(bestmatch) = select_candidate(&occurrences, year_pattern(), year_pattern(), options)
+        && let Some(caps) = year_pattern().captures(&bestmatch)
+        && let Some(year_m) = caps.get(1)
+        && let Ok(year) = year_m.as_str().parse::<i32>()
+        && let Some(dt) = make_date(year, 1, 1)
+        && year >= copyear
+    {
+        // core.py:794-797 — is_valid_date(dateobject, "%Y-%m-%d", ...).
+        let synth = format!("{:04}-01-01", year);
+        let di = DateInput::Str(&synth);
+        if is_valid_date(Some(&di), "%Y-%m-%d", &min, &max) {
+            let di2 = DateInput::DateTime(dt);
+            if let Some(r) = validate_and_convert(Some(&di2), &options.format, &min, &max) {
+                return Some(r);
+            }
+        }
+    }
+
+    None
+}
+
+/// Tiny helper: construct a `DateTime` for the (Y, M, D) tuple, returning
+/// `None` if the calendar values are invalid. Mirrors Python's
+/// `datetime(year, month, day)` raising `ValueError`.
+fn make_date(year: i32, month: u32, day: u32) -> Option<DateTime> {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    Some(DateTime::from_ymd((year, month, day)))
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -1276,5 +1674,161 @@ mod tests {
         let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
         let r = examine_text("on 2024-06-15 today", &o);
         assert_eq!(r.as_deref(), Some("2024-06-15"));
+    }
+
+    // -----------------------------------------------------------------------
+    // search_page (sub-stage F — core.py:574-805)
+    // -----------------------------------------------------------------------
+
+    /// Ports core.py:607-629 — THREE_COMP_PATTERNS arm A (THREE_PATTERN,
+    /// URL-style `/YYYY/MM/DD/` fragment).
+    #[test]
+    fn search_page_three_pattern_url_form_match() {
+        let html = "<html><body><a href=\"/blog/2024/03/15/article\">Read more</a></body></html>";
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        let r = search_page(html, &o);
+        assert_eq!(r.as_deref(), Some("2024-03-15"));
+    }
+
+    /// Ports core.py:607-629 — THREE_COMP_PATTERNS arm B (THREE_LOOSE_PATTERN,
+    /// loose-separator `YYYY-MM-DD` substring).
+    #[test]
+    fn search_page_three_loose_pattern_match() {
+        let html = "<html><body><p>Published 2024.03.15 by an author</p></body></html>";
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        let r = search_page(html, &o);
+        assert_eq!(r.as_deref(), Some("2024-03-15"));
+    }
+
+    /// Ports core.py:631-658 — SELECT_YMD_PATTERN arm. Input is
+    /// `DD/MM/YYYY` which select_ymd_pattern catches, then normalised
+    /// to YYYY-MM-DD via THREE_COMP_REGEX_A.
+    #[test]
+    fn search_page_select_ymd_pattern_match() {
+        // Use a form that doesn't trip the THREE_LOOSE_PATTERN arm first.
+        // The SLASHES arm has 2-digit years; SELECT_YMD has 4-digit years.
+        // DD/MM/YYYY with separators not matching THREE_LOOSE (which is
+        // YYYY[/.-]MM[/.-]DD only) — confirmed by surrounding non-digits.
+        let html = "<html><body>Date posted: 15/03/2024 today!</body></html>";
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        let r = search_page(html, &o);
+        assert_eq!(r.as_deref(), Some("2024-03-15"));
+    }
+
+    /// Ports core.py:660-678 — DATESTRINGS_PATTERN arm: compact `YYYYMMDD`.
+    #[test]
+    fn search_page_datestrings_pattern_match() {
+        let html = "<html><body>archive id 20240315 reference</body></html>";
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        let r = search_page(html, &o);
+        assert_eq!(r.as_deref(), Some("2024-03-15"));
+    }
+
+    /// Ports core.py:680-707 — SLASHES_PATTERN arm: `DD/MM/YY` two-digit-year
+    /// rescue normalised via THREE_COMP_REGEX_B + century guesser.
+    #[test]
+    fn search_page_slashes_pattern_match() {
+        // 2-digit year 24 (not 9-prefixed) -> 20xx century per
+        // plausible_year_filter (incomplete=true).
+        let html = "<html><body>posted on 15/03/24 evening</body></html>";
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        let r = search_page(html, &o);
+        assert_eq!(r.as_deref(), Some("2024-03-15"));
+    }
+
+    /// Ports core.py:709-732 — YYYYMM_PATTERN arm (defaults day=1).
+    #[test]
+    fn search_page_yyyymm_pattern_match() {
+        // YYYYMM only — no full YMD anywhere. The arms above ALL miss
+        // (THREE_COMP wants D component; SELECT_YMD wants D; DATESTRINGS
+        // wants 8 digits; SLASHES wants 2-digit year), so flow reaches
+        // YYYYMM.
+        let html = "<html><body>archive bucket 2024/03 entries</body></html>";
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        let r = search_page(html, &o);
+        assert_eq!(r.as_deref(), Some("2024-03-01"));
+    }
+
+    /// Ports core.py:734-765 — MMYYYY_PATTERN arm. Pattern requires no
+    /// YYYYMM elsewhere, so use `03/2024` form (matches MMYYYY but not
+    /// YYYYMM since the 4-digit segment isn't the first).
+    #[test]
+    fn search_page_mmyyyy_pattern_match() {
+        let html = "<html><body>edition 03/2024 catalogue</body></html>";
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        let r = search_page(html, &o);
+        // MMYYYY defaults day=1; output ISO is 2024-03-01.
+        assert_eq!(r.as_deref(), Some("2024-03-01"));
+    }
+
+    /// Ports core.py:783-803 — SIMPLE_PATTERN year-only last resort.
+    #[test]
+    fn search_page_simple_pattern_year_only_match() {
+        // Bare year, no other dates anywhere; copyright catchall must not
+        // fire (no © / Copyright symbols) so SIMPLE arm gets reached.
+        let html = "<html><body>archive year 2024 catalog</body></html>";
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        let r = search_page(html, &o);
+        assert_eq!(r.as_deref(), Some("2024-01-01"));
+    }
+
+    /// Ports core.py:783-803 + regex_catalogues.rs `simple_pattern_post_filter`
+    /// — Python's `(?<!w3.org)` lookbehind: a year preceded by `w3.org` MUST
+    /// be rejected. With ONLY a w3.org-prefixed year and no copyright, the
+    /// SIMPLE arm must reject, and search_page must return None.
+    #[test]
+    fn search_page_simple_pattern_rejects_w3_org_prefix() {
+        // The w3.org token blocks SIMPLE_PATTERN's match; no other arm
+        // can extract a date.
+        let html = "<html><body>see w3.org 2024 specification</body></html>";
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        let r = search_page(html, &o);
+        // The w3.org year is filtered out; SIMPLE arm leaves no candidates.
+        // (Copyright catchall is gated on copyear != 0, which it isn't.)
+        assert_eq!(r, None);
+    }
+
+    /// Ports core.py:589-605 + core.py:777-781 — COPYRIGHT_PATTERN extracts
+    /// `copyear`; downstream arms all miss (only the © year is on the page),
+    /// then the copyright catchall returns `copyear-01-01`.
+    #[test]
+    fn search_page_copyright_catchall_match() {
+        let html = "<html><body><footer>© 2024 Acme Inc.</footer></body></html>";
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        let r = search_page(html, &o);
+        assert_eq!(r.as_deref(), Some("2024-01-01"));
+    }
+
+    /// Ports core.py:805 — no date anywhere ⇒ None.
+    #[test]
+    fn search_page_no_date_returns_none() {
+        let html = "<html><body>Just some text without any date markers</body></html>";
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        let r = search_page(html, &o);
+        assert_eq!(r, None);
+    }
+
+    /// Ports core.py:601-602 + validators.py:51-54 — min_date filter rejects
+    /// pages whose only date is below the configured floor.
+    #[test]
+    fn search_page_min_date_filter_rejects_old_year() {
+        // 2024 page but min_date = 2030 ⇒ every arm's is_valid_date rejects.
+        // No © so the catchall doesn't engage either.
+        let html = "<html><body>published 2024-03-15 today</body></html>";
+        let o = opts("%Y-%m-%d", (2030, 1, 1), (2030, 12, 31));
+        let r = search_page(html, &o);
+        assert_eq!(r, None);
+    }
+
+    /// Ports core.py:733 + validate_and_convert outputformat application —
+    /// custom outputformat (`%d.%m.%Y`) honoured on the YYYYMM rescue arm
+    /// (the only arm that goes through validate_and_convert with a
+    /// constructed DateTime — exercises format_emit path).
+    #[test]
+    fn search_page_respects_custom_outputformat() {
+        let html = "<html><body><p>Published 2024-03-15</p></body></html>";
+        let o = opts("%d.%m.%Y", (1995, 1, 1), (2030, 12, 31));
+        let r = search_page(html, &o);
+        assert_eq!(r.as_deref(), Some("15.03.2024"));
     }
 }
