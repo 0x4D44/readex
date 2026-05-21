@@ -1333,6 +1333,409 @@ fn ensure_candidate(candidates: &mut Vec<(NodeRef, Candidate)>, node: &NodeRef) 
 }
 
 // ===========================================================================
+// Stage 4d: is_probably_readerable + cascade integration (readability_lxml.py:454-512, external.py:32-108)
+// ===========================================================================
+//
+// Per the M3 Stage 4d dispatch brief, this section ports:
+//
+// 1. `is_node_visible` + `is_probably_readerable`
+//    (readability_lxml.py:459-512) — the visibility-gated paragraph-score
+//    accumulator used as a coarse pre-flight check on whether a page is
+//    worth running through the readability fork at all.
+//
+// 2. `try_readability(html)` (external.py:32-42) — the safety-net wrapper
+//    around `Document(...).summary()` returning the extracted body
+//    NodeRef (or `None` on failure). Faithful Rust shape: takes raw HTML
+//    bytes (Python takes an HtmlElement and re-serializes; we already
+//    own the source string so we skip the round-trip).
+//
+// 3. `compare_extraction` (external.py:45-108) — the cascade arbiter that
+//    chooses between own / readability / (justext, Stage 5) outputs based
+//    on text-length heuristics. **Stage 4d implements the 3-branch
+//    arbiter only**: own, readability, choose-longer; the justext arm is
+//    deferred to Stage 5 per the dispatch brief. The branches honoured
+//    are (in Python source order):
+//    - `len_algo in (0, len_text)` → use_own
+//    - `len_text == 0 and len_algo > 0` → use_readability
+//    - `len_text > 2 * len_algo` → use_own
+//    - `len_algo > 2 * len_text and not algo_text.startswith("{")` →
+//      use_readability
+//    - default → use_own
+//    (The `borderline` arms at external.py:75-82 rely on
+//    `body.xpath(...)` / `tree.find()` shapes and options.focus tuning
+//    that the bare cascade entry-point in this Stage doesn't need; they
+//    are honest deferrals to a later wiring point that has the full
+//    `options.focus` enum.)
+//
+// # Why this lives at a NEW entry-point, not inside `extract_content`
+//
+// Python's `extract_content` (main_extractor.py:620-640) is the
+// own-arm only. The cascade lives at `core.trafilatura_sequence`
+// (core.py:101-127) which calls `extract_content` first and then
+// `compare_extraction`. So the Rust cascade is wired into a
+// `bare_extraction_with_cascade` free function that mirrors
+// `trafilatura_sequence`'s shape — `extract_content` itself stays
+// pure (no readability fallback). This preserves the Stage 3-B
+// `trafilatura_extract_content_gate` invariant: the gate tests
+// `extract_content` directly, never the cascade.
+
+/// `is_node_visible(node)` — readability_lxml.py:459-472.
+///
+/// ```python
+/// def is_node_visible(node: HtmlElement) -> bool:
+///     if "style" in node.attrib and DISPLAY_NONE.search(node.get("style", "")):
+///         return False
+///     if "hidden" in node.attrib:
+///         return False
+///     if node.get("aria-hidden") == "true" and "fallback-image" not in node.get(
+///         "class", ""
+///     ):
+///         return False
+///     return True
+/// ```
+///
+/// Three short-circuit "not visible" checks; otherwise visible.
+/// `DISPLAY_NONE` is `re.compile(r"display:\s*none", re.I)` —
+/// readability_lxml.py:456.
+pub fn is_node_visible(node: &NodeRef) -> bool {
+    // readability_lxml.py:464 — style:display:none.
+    if let Some(style) = get_attribute(node, "style")
+        && display_none_re().is_match(&style)
+    {
+        return false;
+    }
+    // readability_lxml.py:466-467 — bare `hidden` attribute.
+    // Python's `"hidden" in node.attrib` is True for any presence of the
+    // attribute, regardless of value (HTML5 `hidden` is a boolean attr).
+    if get_attribute(node, "hidden").is_some() {
+        return false;
+    }
+    // readability_lxml.py:468-471 — aria-hidden="true" unless class
+    // contains "fallback-image".
+    if get_attribute(node, "aria-hidden").as_deref() == Some("true") {
+        let cls = class_name(node);
+        if !cls.contains("fallback-image") {
+            return false;
+        }
+    }
+    true
+}
+
+/// `re.compile(r"display:\s*none", re.I)` — readability_lxml.py:456.
+fn display_none_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)display:\s*none").expect("readability_lxml.py:456 DISPLAY_NONE compiles")
+    })
+}
+
+/// `is_probably_readerable(html, options={})` — readability_lxml.py:475-512.
+///
+/// A fast pre-flight: does the document have enough visible, non-obviously-
+/// boilerplate paragraph content to be worth extracting? Defaults:
+/// `min_content_length=140`, `min_score=20`.
+///
+/// ```python
+/// def is_probably_readerable(html, options={}) -> bool:
+///     doc = load_html(html)
+///     if doc is None:
+///         return False
+///     min_content_length = options.get("min_content_length", 140)
+///     min_score = options.get("min_score", 20)
+///     visibility_checker = options.get("visibility_checker", is_node_visible)
+///     nodes = set(doc.xpath(".//p | .//pre | .//article"))
+///     nodes.update(node.getparent() for node in doc.xpath(".//div/br"))
+///     score = 0.0
+///     for node in nodes:
+///         if not visibility_checker(node):
+///             continue
+///         class_and_id = f"{node.get('class', '')} {node.get('id', '')}"
+///         if REGEXPS["unlikelyCandidates"].search(class_and_id) and not REGEXPS[
+///             "okMaybeItsACandidate"
+///         ].search(class_and_id):
+///             continue
+///         if node.xpath("./parent::li/p"):
+///             continue
+///         text_content_length = len(node.text_content().strip())
+///         if text_content_length < min_content_length:
+///             continue
+///         score += sqrt(text_content_length - min_content_length)
+///         if score > min_score:
+///             return True
+///     return False
+/// ```
+///
+/// # Faithfulness notes
+///
+/// 1. `set(doc.xpath(...))` — Python `set` membership uses identity for
+///    lxml elements. We collect via `get_all_nodes_with_tag` + the
+///    `div/br` parent walk and dedupe by `Rc::ptr_eq`.
+/// 2. `node.xpath("./parent::li/p")` — "skip this node if its parent is
+///    `<li>` AND that `<li>` contains a `<p>`". Read literally: the
+///    expression returns a non-empty node-set iff `node.parent` is `<li>`
+///    AND there exists a `<p>` child of that `<li>`. We mirror with a
+///    parent-tag check + `get_elements_by_tag_name(parent, "p")`
+///    non-empty test.
+/// 3. The score uses `sqrt(text_len - min_content_length)`; we use Rust
+///    `f64::sqrt`. The early-exit (`score > min_score`) is faithful —
+///    once the score crosses the threshold, return immediately without
+///    visiting remaining nodes (matters for large pages).
+pub fn is_probably_readerable(html: &str) -> bool {
+    is_probably_readerable_with(html, 140, 20.0)
+}
+
+/// `is_probably_readerable` with custom `min_content_length` / `min_score`
+/// thresholds — readability_lxml.py:483-484 `options` parameter.
+pub fn is_probably_readerable_with(html: &str, min_content_length: usize, min_score: f64) -> bool {
+    // readability_lxml.py:479-481 — parse-failure short-circuit.
+    let dom = Dom::parse(html);
+    let doc = dom.document();
+
+    // readability_lxml.py:487-488 — collect <p>/<pre>/<article> +
+    // unique parents of <div><br>. We dedupe by Rc identity (Python `set`
+    // dedupes by identity for lxml HtmlElement instances).
+    let mut nodes: Vec<NodeRef> = get_all_nodes_with_tag(&doc, &["p", "pre", "article"]);
+    for br in get_elements_by_tag_name(&doc, "br") {
+        if let Some(parent_node) = parent(&br)
+            && local_name(&parent_node).as_deref() == Some("div")
+            && !nodes.iter().any(|n| Rc::ptr_eq(n, &parent_node))
+        {
+            nodes.push(parent_node);
+        }
+    }
+
+    let mut score = 0.0_f64;
+    for node in &nodes {
+        // readability_lxml.py:492-493 — visibility gate.
+        if !is_node_visible(node) {
+            continue;
+        }
+
+        // readability_lxml.py:495-499 — class/id unlikely-vs-okmaybe gate.
+        let cls = class_name(node);
+        let id_attr = id(node);
+        let class_and_id = format!("{cls} {id_attr}");
+        if unlikely_candidates_re().is_match(&class_and_id)
+            && !ok_maybe_re().is_match(&class_and_id)
+        {
+            continue;
+        }
+
+        // readability_lxml.py:501-502 — skip if node's parent is <li>
+        // AND that <li> contains a <p>. (The XPath
+        // `./parent::li/p` evaluates non-empty iff both hold.)
+        if let Some(parent_node) = parent(node)
+            && local_name(&parent_node).as_deref() == Some("li")
+            && !get_elements_by_tag_name(&parent_node, "p").is_empty()
+        {
+            continue;
+        }
+
+        // readability_lxml.py:504-506 — content-length gate.
+        let text = crate::readability::dom::text_content(node);
+        let text_len = text.trim().chars().count();
+        if text_len < min_content_length {
+            continue;
+        }
+
+        // readability_lxml.py:508 — accumulate sqrt-of-excess score.
+        let excess = (text_len - min_content_length) as f64;
+        score += excess.sqrt();
+        // readability_lxml.py:509-510 — early exit once threshold crossed.
+        if score > min_score {
+            return true;
+        }
+    }
+    false
+}
+
+/// `try_readability(htmlinput)` — external.py:32-42.
+///
+/// ```python
+/// def try_readability(htmlinput: HtmlElement) -> HtmlElement:
+///     '''Safety net: try with the generic algorithm readability'''
+///     try:
+///         doc = ReadabilityDocument(htmlinput, min_text_length=25, retry_length=250)
+///         summary = fromstring_bytes(doc.summary())
+///         return summary if summary is not None else HtmlElement()
+///     except Exception as err:
+///         LOGGER.warning('readability_lxml failed: %s', err)
+///         return HtmlElement()
+/// ```
+///
+/// Rust shape: returns `Option<NodeRef>` (the article subtree) instead of
+/// Python's "always return SOMETHING" sentinel `HtmlElement()`. Callers
+/// distinguish "no article" from "empty article" via `Option::is_some` and
+/// a length check.
+///
+/// The Python catches `Exception` defensively; the Rust port has no
+/// equivalent fallible paths (`Document::summary` returns `Option<NodeRef>`
+/// directly) so no try/except wrapper is required.
+pub fn try_readability(html: &str) -> Option<NodeRef> {
+    let mut doc = Document::new(html);
+    doc.summary()
+}
+
+/// Cascade arbiter — partial port of `compare_extraction(...)`
+/// from external.py:45-108. **Stage 4d implements the 3-branch slice**
+/// (own / readability / choose-longer); the justext fallback at
+/// external.py:94-102 + the `focus`-tuned borderline arms at
+/// external.py:75-82 land in Stage 5.
+///
+/// Inputs:
+/// - `own_text` / `own_len`: the own-arm extraction (typically the second
+///   element of `extract_content`'s `(NodeRef, String, usize)` tuple).
+/// - `algo_text` / `algo_len`: the readability-arm extraction (the text
+///   content of `try_readability`'s returned NodeRef, computed by the
+///   caller via `dom::text_content` + `trim`).
+///
+/// Returns `true` if the caller should USE the readability extraction;
+/// `false` if the own-arm wins.
+///
+/// The branches preserved verbatim from external.py:66-85:
+/// ```python
+/// if len_algo in (0, len_text):
+///     use_readability = False
+/// elif len_text == 0 and len_algo > 0:
+///     use_readability = True
+/// elif len_text > 2 * len_algo:
+///     use_readability = False
+/// elif len_algo > 2 * len_text and not algo_text.startswith("{"):
+///     use_readability = True
+/// else:
+///     use_readability = False
+/// ```
+///
+/// The `not algo_text.startswith("{")` guard at external.py:73 protects
+/// against the issue-#632 case where readability scoops up a JSON-LD
+/// block; we honour it verbatim.
+pub fn cascade_prefers_readability(
+    own_text: &str,
+    own_len: usize,
+    algo_text: &str,
+    algo_len: usize,
+) -> bool {
+    // external.py:66-67 — algo empty OR identical-length to own → keep own.
+    if algo_len == 0 || algo_len == own_len {
+        return false;
+    }
+    // external.py:68-69 — own empty, algo non-empty → take readability.
+    if own_len == 0 && algo_len > 0 {
+        return true;
+    }
+    // external.py:70-71 — own dwarfs algo → keep own.
+    if own_len > 2 * algo_len {
+        return false;
+    }
+    // external.py:72-74 — algo dwarfs own AND not a JSON-LD spill → take
+    // readability. (`not algo_text.startswith("{")` is the #632 guard.)
+    if algo_len > 2 * own_len && !algo_text.starts_with('{') {
+        return true;
+    }
+    // external.py:83-85 — default arm; ignore the `focus`-tuned
+    // borderline arms (deferred to Stage 5 wiring). Keep own.
+    //
+    // Honest deferral: the `not body.xpath('.//p//text()')` and
+    // table-vs-p ratio borderline arms at external.py:75-79 could rule
+    // FOR readability on `body`-shape grounds. Wiring them needs the
+    // caller's own-body NodeRef and an `options.focus` enum; deferred
+    // until Stage 5 lands the full options surface.
+    //
+    // The `own_text` arg is unused in this branch — silence the linter
+    // by referencing it.
+    let _ = own_text;
+    false
+}
+
+/// `bare_extraction_with_cascade(html, opts)` — partial faithful port of
+/// `core.trafilatura_sequence` (core.py:101-127).
+///
+/// Runs the full M3 cascade:
+/// 1. Parse + clean + convert via `cleaning::tree_cleaning` +
+///    `cleaning::convert_tags`.
+/// 2. Run own extraction via `main_extractor::extract_content`.
+/// 3. Run readability extraction via `try_readability` on the ORIGINAL
+///    `html` (matches Python's `try_readability(backup_tree)` — a
+///    snapshot taken before cleaning mutated the tree).
+/// 4. Arbitrate via `cascade_prefers_readability`.
+///
+/// Returns:
+/// - `Some(NodeRef)` if EITHER arm produced an article. The chosen arm
+///   is determined by `cascade_prefers_readability`.
+/// - `None` if both arms returned empty / no article (the caller wanting
+///   a baseline rescue should call `baseline()` separately — Stage 1c).
+///
+/// # Why this is a NEW entry-point (not a change to `extract_content`)
+///
+/// Python's `extract_content` (main_extractor.py:620) is the OWN ARM
+/// only — the cascade lives one level up at `trafilatura_sequence`.
+/// Wiring readability INSIDE `extract_content` would break Stage 3-B's
+/// equivalence gate (which pins `extract_content`'s output byte-for-byte
+/// against Python's own-arm extraction). So the cascade is its own
+/// callable and `extract_content` is untouched.
+///
+/// # Justext arm (Stage 5)
+///
+/// The Python source's third arm (`justext_rescue` at external.py:96)
+/// is deliberately omitted; it lands in Stage 5. The current return
+/// value remains a faithful 2-arm cascade (own + readability).
+pub fn bare_extraction_with_cascade(
+    html: &str,
+    opts: &crate::trafilatura::cleaning::Options,
+) -> Option<NodeRef> {
+    // core.py:108-109 — own arm (`extract_content`).
+    let dom = Dom::parse(html);
+    let html_root = dom.root_element()?;
+    crate::trafilatura::cleaning::tree_cleaning(&html_root, opts);
+    crate::trafilatura::cleaning::convert_tags(&html_root, opts);
+    let body = dom.body()?;
+    let (own_body, own_text, own_len) =
+        crate::trafilatura::main_extractor::extract_content(&body, opts);
+
+    // external.py:58 — readability arm. Python passes `backup_tree` (a
+    // pre-cleaning snapshot); we pass the original `html` bytes — same
+    // semantic (the readability fork re-parses internally on every
+    // retry attempt, HLD §m-3).
+    let algo_body = try_readability(html);
+    let (algo_text, algo_len) = match &algo_body {
+        Some(node) => {
+            // external.py:60-61 — Python serializes via
+            // `tostring(temppost_algo, method='text', encoding='utf-8')`
+            // then `trim`s. Our `text_content` + `trim` is the equivalent.
+            let raw = crate::readability::dom::text_content(node);
+            let trimmed = trim(&raw);
+            let len = trimmed.chars().count();
+            (trimmed, len)
+        }
+        None => (String::new(), 0),
+    };
+
+    // external.py:66-85 — arbiter.
+    let use_readability = cascade_prefers_readability(&own_text, own_len, &algo_text, algo_len);
+
+    // Both arms empty → no article.
+    if own_len == 0 && algo_len == 0 {
+        // Keep `dom` alive (rcdom Drop quirk) until both arms are
+        // measured; then drop it by returning None.
+        drop(dom);
+        return None;
+    }
+
+    if use_readability {
+        algo_body
+    } else {
+        // Keep the readability arm alive long enough for the arbiter to
+        // measure; then return the own-arm node. The own-arm `NodeRef`
+        // is rooted in `dom` which the caller now owns transitively
+        // through the returned `Rc` — but for safety against the rcdom
+        // Drop quirk on the readability side, we explicitly drop the
+        // arm we didn't pick.
+        let _ = algo_body;
+        Some(own_body)
+    }
+}
+
+// ===========================================================================
 // Unit tests
 // ===========================================================================
 
@@ -1983,6 +2386,215 @@ mod tests {
         assert!(
             text.contains("first paragraph"),
             "article body should be present, got: {text:.200}…"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Stage 4d: is_probably_readerable + cascade
+    // -----------------------------------------------------------------------
+
+    /// A long-form article with several substantive paragraphs accumulates
+    /// score quickly and crosses the default `min_score = 20.0` threshold.
+    ///
+    /// Each paragraph here is ~250 chars; `sqrt(250 - 140) ≈ 10.5`, so two
+    /// paragraphs easily clear `20.0`. We use four to leave headroom.
+    #[test]
+    fn is_probably_readerable_returns_true_for_long_article() {
+        let html = r#"<html><body><article>
+            <p>The first paragraph contains substantial prose with multiple clauses, real punctuation, several commas, and well over one hundred and forty characters of trimmed body text — enough to clear the content-length floor on its own merit.</p>
+            <p>A second paragraph continues the discussion at a similar length, with reflection, analysis, and conclusion-pointing remarks that demonstrably exceed the one hundred and forty character lower bound the heuristic enforces.</p>
+            <p>The third paragraph again surpasses the gate, with rhetorical structure, internal commas, and the kind of clause density that real articles exhibit, comfortably above the minimum content length floor.</p>
+            <p>A fourth and final paragraph caps the piece with concluding analysis, restating the thesis, and ensuring that the cumulative readability score crosses the default twenty-point threshold with margin.</p>
+        </article></body></html>"#;
+        assert!(
+            is_probably_readerable(html),
+            "long-form article should be deemed readerable"
+        );
+    }
+
+    /// A navigation page (one short nav `<ul>` of links) has no `<p>`/`<pre>`/
+    /// `<article>` with sufficient text — score stays at 0. Returns false.
+    #[test]
+    fn is_probably_readerable_returns_false_for_navigation_page() {
+        let html = r#"<html><body>
+            <nav class="topnav">
+                <ul>
+                    <li><a href="/a">Home</a></li>
+                    <li><a href="/b">About</a></li>
+                    <li><a href="/c">Contact</a></li>
+                </ul>
+            </nav>
+            <p>Short.</p>
+        </body></html>"#;
+        assert!(
+            !is_probably_readerable(html),
+            "link-heavy page with no substantive paragraphs should not be readerable"
+        );
+    }
+
+    /// `style="display: none"` on a candidate node makes it invisible —
+    /// its score contribution is zero. With NO `<article>` wrapper (so
+    /// only `<p>` candidates are enumerated), three visible paragraphs
+    /// at ~225 chars each accumulate ~3 * sqrt(85) ≈ 27.6 → above the
+    /// 20.0 threshold; hiding ONE drops the visible count to two
+    /// → ~2 * 9.2 = 18.4 → below threshold.
+    ///
+    /// The `<article>` wrapper is omitted deliberately — its
+    /// `text_content` would concatenate the hidden child's text and the
+    /// article element itself (which has no `display:none`) would alone
+    /// clear the threshold. Faithfully tracks readability_lxml.py:491-493
+    /// — visibility is checked PER candidate node, not transitively.
+    #[test]
+    fn is_probably_readerable_skips_hidden_elements() {
+        let visible_para = "<p>This paragraph holds enough article-shaped prose, with multiple commas, internal clauses, and well over the one hundred and forty character minimum to clear the threshold by a comfortable margin every time.</p>";
+        let html_all_visible = format!(
+            "<html><body>{visible_para}{visible_para}{visible_para}</body></html>"
+        );
+        assert!(
+            is_probably_readerable(&html_all_visible),
+            "three visible substantive paragraphs should clear the threshold"
+        );
+
+        // Hide one of the three via display:none → score drops below threshold.
+        let hidden_para = format!(
+            "<p style=\"display: none\">{}</p>",
+            visible_para.trim_start_matches("<p>").trim_end_matches("</p>")
+        );
+        let html_one_hidden = format!(
+            "<html><body>{visible_para}{visible_para}{hidden_para}</body></html>"
+        );
+        assert!(
+            !is_probably_readerable(&html_one_hidden),
+            "hiding one of three paragraphs via display:none should drop the score below threshold"
+        );
+    }
+
+    /// `try_readability` succeeds on minimal HTML where own extraction
+    /// would yield short text — the readability fork's `summary()` walks
+    /// the scored candidate set even when the input is sparse.
+    #[test]
+    fn try_readability_returns_summary_when_own_fails() {
+        let html = r#"<html><body>
+            <div class="article">
+                <p>First paragraph with substantive content, several commas, real prose, and enough length to score above twenty-five characters.</p>
+                <p>Second paragraph continues the discussion with similar density, comma counts, and overall length to support a strong candidate selection.</p>
+                <p>Third paragraph wraps the piece, restating the thesis, naming the conclusion, and closing out the discussion with clarity.</p>
+            </div>
+        </body></html>"#;
+        let summary = try_readability(html);
+        assert!(
+            summary.is_some(),
+            "readability should find an article subtree"
+        );
+        let node = summary.expect("summary returned None");
+        let text = crate::readability::dom::text_content(&node);
+        assert!(
+            text.contains("First paragraph") || text.contains("first paragraph"),
+            "summary text should include the article content, got: {:.200}…",
+            text
+        );
+    }
+
+    /// Cascade picks the longer extraction. We construct two extractions
+    /// directly (own=short, algo=long) and assert the arbiter rules for
+    /// readability — testing the pure arbiter function without the full
+    /// cascade pipeline (which is exercised in the e2e test below).
+    #[test]
+    fn cascade_picks_longer_extraction() {
+        // Own text very short, algo text well over 2x → readability wins.
+        let own = "tiny";
+        let algo =
+            "a much longer extraction text body that comfortably exceeds twice the length of the own arm so the dwarfing branch fires deterministically";
+        assert!(
+            cascade_prefers_readability(own, own.chars().count(), algo, algo.chars().count()),
+            "algo length > 2 * own length (and no JSON-LD spill) must select readability"
+        );
+
+        // Inverse case: own dwarfs algo → own wins.
+        let big_own = "the own arm extraction is large enough to dwarf the algorithm output by more than the two times factor that the arbiter checks in its dwarf branch, so own must win here even though algo is non-empty";
+        let small_algo = "small";
+        assert!(
+            !cascade_prefers_readability(
+                big_own,
+                big_own.chars().count(),
+                small_algo,
+                small_algo.chars().count()
+            ),
+            "own length > 2 * algo length must select own"
+        );
+
+        // JSON-LD guard: algo starts with `{` → keep own even though
+        // algo is long.
+        let json_algo = "{\"@context\":\"https://schema.org\",\"@type\":\"Article\",\"name\":\"…long JSON body…\",\"description\":\"a substantial JSON-LD spill that is more than 2x the own length\"}";
+        assert!(
+            !cascade_prefers_readability(
+                "short own",
+                "short own".chars().count(),
+                json_algo,
+                json_algo.chars().count()
+            ),
+            "JSON-LD-prefixed algo text must NOT win even when long (external.py:73 guard)"
+        );
+    }
+
+    /// `bare_extraction_with_cascade` returns `None` when both arms
+    /// produce empty output — minimal degenerate input.
+    #[test]
+    fn cascade_returns_none_when_both_arms_empty() {
+        // Truly empty input — no <body>, just a doctype.
+        let html = "<html><head></head><body></body></html>";
+        let opts = crate::trafilatura::cleaning::Options::default();
+        let result = bare_extraction_with_cascade(html, &opts);
+        // The own arm may still return an empty body NodeRef (Stage 2d's
+        // `extract_content` rescues with `recover_wild_text` which can
+        // return a fresh empty body). The CASCADE return must be None
+        // ONLY when BOTH arms produced zero-length text. Pin that —
+        // for empty input, both arms are zero-length, and the cascade
+        // returns None.
+        assert!(
+            result.is_none(),
+            "empty HTML body should yield None from the cascade (both arms zero-length)"
+        );
+    }
+
+    /// `is_node_visible` pins the three short-circuit "not visible" rules.
+    #[test]
+    fn is_node_visible_short_circuits() {
+        // display:none → hidden.
+        let html = r#"<html><body>
+            <p id="a" style="display: none">hidden by style</p>
+            <p id="b" style="color: red; display:none; foo:bar">also hidden</p>
+            <p id="c" style="color:red">visible</p>
+            <p id="d" hidden>hidden by attr</p>
+            <p id="e" aria-hidden="true">aria hidden</p>
+            <p id="f" aria-hidden="true" class="x fallback-image y">aria hidden but fallback</p>
+        </body></html>"#;
+        let dom = Dom::parse(html);
+        let body = dom.body().expect("body");
+        let ps = get_elements_by_tag_name(&body, "p");
+        let by_id = |target: &str| {
+            ps.iter()
+                .find(|p| id(p) == target)
+                .cloned()
+                .unwrap_or_else(|| panic!("no <p id={target}>"))
+        };
+        assert!(!is_node_visible(&by_id("a")), "display:none is hidden");
+        assert!(
+            !is_node_visible(&by_id("b")),
+            "display:none mid-string is hidden"
+        );
+        assert!(is_node_visible(&by_id("c")), "color-only style is visible");
+        assert!(
+            !is_node_visible(&by_id("d")),
+            "bare `hidden` attribute is hidden"
+        );
+        assert!(
+            !is_node_visible(&by_id("e")),
+            "aria-hidden=true is hidden when class has no fallback-image"
+        );
+        assert!(
+            is_node_visible(&by_id("f")),
+            "aria-hidden=true + class~=fallback-image is visible"
         );
     }
 }

@@ -781,7 +781,106 @@ name = "mdrcel"
 # - Optional: revisit `transform_misused_divs_into_paragraphs` rescue
 #   pass (Stage 4b deferred half) if a Stage 4d corpus divergence
 #   demands it.
-version = "0.5.2"
+#
+# M3 Stage 4d (2026-05-21): 0.5.2 -> 0.6.0 MINOR. Closes out M3 Stage 4 by
+# landing `is_probably_readerable` (readability_lxml.py:459-512) AND the
+# cascade integration entry-point (`bare_extraction_with_cascade`) that
+# wires `Document::summary()` into the M3 own/readability arbiter — a
+# partial faithful port of `core.trafilatura_sequence` (core.py:101-127)
+# + `external.compare_extraction` (external.py:45-108).
+#
+# New public functions on `readability_fork`:
+# - `is_node_visible(node) -> bool` (readability_lxml.py:459-472).
+# - `is_probably_readerable(html) -> bool` and
+#   `is_probably_readerable_with(html, min_content_length, min_score)`
+#   (readability_lxml.py:475-512). Score accumulator with early-exit
+#   semantics: visibility + class/id unlikely-vs-okmaybe + parent::li/p
+#   skip + content-length gate + `sqrt(text_len - min_content_length)`.
+# - `try_readability(html) -> Option<NodeRef>` (external.py:32-42). The
+#   safety-net wrapper around `Document::new(html).summary()`.
+# - `cascade_prefers_readability(own_text, own_len, algo_text, algo_len)
+#   -> bool` (partial port of external.py:66-85). The 3-branch arbiter:
+#   - `algo empty OR same-length as own` → false (keep own)
+#   - `own empty AND algo non-empty` → true (take readability)
+#   - `own > 2 * algo` → false (own dwarfs)
+#   - `algo > 2 * own AND !algo.starts_with('{')` → true (algo dwarfs,
+#     respecting the #632 JSON-LD guard at external.py:73)
+#   - default → false
+#   The `focus`-tuned borderline arms at external.py:75-82 are deferred
+#   to a later wiring point with the full options surface.
+# - `bare_extraction_with_cascade(html, &cleaning::Options)
+#   -> Option<NodeRef>` — partial faithful port of
+#   `core.trafilatura_sequence` (core.py:101-127). Runs the full M3
+#   own-arm pipeline (parse + cleaning::tree_cleaning +
+#   cleaning::convert_tags + main_extractor::extract_content), then the
+#   readability arm (`try_readability`), arbitrates via
+#   `cascade_prefers_readability`, and returns the chosen body NodeRef
+#   (or `None` if both arms are empty).
+#
+# # Why a NEW entry-point, not a change to `extract_content`
+#
+# Python's `extract_content` (main_extractor.py:620) is the own-arm
+# only. The cascade lives one level up at `trafilatura_sequence`. So
+# the Rust cascade is a NEW free function — `extract_content` stays
+# pure. This preserves the Stage 3-B `trafilatura_extract_content_gate`
+# invariant: the gate tests `extract_content` directly, never the
+# cascade, and the gate remains 10/10 green post-Stage 4d.
+#
+# # Justext arm (Stage 5)
+#
+# The Python source's third arm at external.py:96 (`justext_rescue`) is
+# deliberately omitted. Stage 5 will add the justext implementation +
+# the 4-branch arbiter (own / readability / justext / choose-longer).
+# `cascade_prefers_readability` will then be subsumed by a richer
+# arbiter (or remain as a building block); Stage 4d's surface is
+# additive enough that either path works without breaking the 4d API.
+#
+# Per semver (CLAUDE.md "Version management") **MINOR** — five new
+# public functions on the existing `#[doc(hidden)] pub mod
+# trafilatura::readability_fork` surface (is_node_visible,
+# is_probably_readerable, is_probably_readerable_with, try_readability,
+# cascade_prefers_readability, bare_extraction_with_cascade — that's
+# six counted strictly). Per the "new public functions = MINOR" rule
+# in CLAUDE.md, the bump is MINOR. (Stages 4a was MINOR for the same
+# reason — first new exports on the module; 4b/c were PATCH because
+# they only added a struct's methods + private helpers, not new free
+# functions on the module surface.)
+#
+# Backward compatibility: every prior public surface
+# (`extract`/`extract_with`/`Extracted`/`Options`/`ExtractError`,
+# Stage 4a's Candidate + scoring primitives, Stage 4b's Document +
+# select_best_candidate, Stage 4c's sanitize) is byte-unchanged. The
+# new cascade entry-point is OPT-IN — existing callers of
+# `extract_content` get the identical own-arm output as before
+# (Stage 3-B gate confirms this byte-for-byte on all 10 fixtures).
+#
+# Lib test count 621 -> 628 (+7 Stage-4d tests:
+# is_probably_readerable_returns_true_for_long_article,
+# is_probably_readerable_returns_false_for_navigation_page,
+# is_probably_readerable_skips_hidden_elements, is_node_visible_short_circuits,
+# try_readability_returns_summary_when_own_fails,
+# cascade_picks_longer_extraction, cascade_returns_none_when_both_arms_empty).
+# All four BLOCKER gates remain green (parser_equivalence_gate /
+# trafilatura_equivalence_gate / trafilatura_extract_smoke /
+# trafilatura_extract_content_gate); `cargo clippy --release
+# --all-targets -- -D warnings` is clean.
+#
+# Stage 4 — the entire `readability_lxml.py` port — is now complete.
+# What's left for the M3 umbrella:
+# - **Stage 5**: justext_rescue port (external.py:153-160) + the
+#   `custom_justext`/`try_justext` helpers (external.py:121-150). The
+#   third cascade arm.
+# - **Stage 6**: full `compare_extraction` arbiter (the borderline
+#   `focus`-tuned arms at external.py:75-82) + `sanitize_tree`
+#   post-processing (external.py:163-190).
+# - **Stage 7**: `bare_extraction` top-level entry-point
+#   (core.py:130-310) — metadata extraction (htmldate / authors /
+#   tags / categories / JSON-LD via Stage 4 M2 surface).
+# - **Stage 8**: `extract` public entry-point with output format
+#   selection (xml / xmltei / txt / markdown / csv / json).
+# - **Stage 9**: HLD §7.6 wiring of the `mdrcel::extract` public
+#   surface into the trafilatura cascade.
+version = "0.6.0"
 edition = "2024"
 
 [dependencies]
