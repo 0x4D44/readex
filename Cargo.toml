@@ -2126,7 +2126,73 @@ name = "mdrcel"
 # hit, empty/none, digit-floor, discard_patterns, stub-fallback), 2 on
 # img_search, 1 on pattern_search, 2 on json_search (published +
 # modified), 2 on idiosyncrasies_search).
-version = "0.11.3"
+#
+# M4 Stage 1 sub-stage E (2026-05-21): 0.11.3 -> 0.11.4 PATCH. Adds
+# `src/htmldate/core.rs` — Stage E port of `htmldate@1.9.x/core.py:80-571`
+# (header walker + element walkers + candidate selection). New public
+# surface on `#[doc(hidden)] pub mod htmldate::core`:
+# - `DATE_ATTRIBUTES` / `NAME_MODIFIED` / `PROPERTY_MODIFIED` /
+#   `ITEMPROP_ATTRS_ORIGINAL` / `ITEMPROP_ATTRS_MODIFIED` /
+#   `ITEMPROP_ATTRS` / `CLASS_ATTRS` (core.py:80-189) — lowercased
+#   slice-of-`&str` ports of Python's meta-tag attribute sets.
+# - `MIN_SEGMENT_LEN` (= 6) re-pinned from extractors.py:85 so
+#   examine_text self-cites.
+# - `examine_text(text, options)` (core.py:199-212).
+# - `examine_date_elements(tree, expression, options)` (core.py:215-232).
+# - `examine_header(tree, options)` (core.py:235-352) — the 117-line
+#   meta-tag dispatcher.
+# - `select_candidate(occurrences, catch, yearpat, options)`
+#   (core.py:355-407) — frequency + plausibility heuristics.
+# - `search_pattern(htmlstring, pattern, catch, yearpat, options)`
+#   (core.py:410-425).
+# - `compare_reference(reference, expression, options)`
+#   (core.py:428-440) — `@lru_cache` decorator deliberately not ported.
+# - `examine_abbr_elements(tree, options)` (core.py:443-497).
+# - `examine_time_elements(tree, options)` (core.py:500-562).
+# - `normalize_match(day, month, year)` (core.py:565-571) —
+#   signature divergence: takes the three pre-extracted non-empty
+#   capture groups rather than a `re.Match` (the only Python call
+#   sites at core.py:643 / :693 extract the non-empty groups before
+#   invoking, so the Rust port pushes that extraction one frame up).
+# - `three_comp_patterns()` (core.py:193-196) — the THREE_PATTERN /
+#   THREE_LOOSE_PATTERN pair table, surfaced as a `pub fn` since
+#   sub-stage F's `search_page` iterates it.
+#
+# Faithful divergences (recorded — HLD §4 anti-inversion, all in
+# `core.rs`'s module header):
+# - `Counter[str]` becomes `HashMap<String, usize>`; tie-break in
+#   `select_candidate` is by count DESC then key ASC (HashMap has no
+#   insertion order; CPython's dict order is implementation-defined
+#   contract since 3.7 but Rust deliberately doesn't replicate it).
+# - `@lru_cache` on `compare_reference` is not ported.
+# - `normalize_match` accepts (day, month, year) tuples rather than a
+#   `re.Match`.
+# - The `examine_header` dispatch ladder is preserved verbatim
+#   (`if-elif-elif-elif-elif` corresponds to Rust's `if-else-if-else
+#   -if`), including the "hurts precision" reserve handoff for
+#   PROPERTY_MODIFIED cross-mode hits.
+#
+# All XPath paths used by sub-stage E (`.//meta` / `.//abbr` /
+# `.//time` — implicitly via `get_elements_by_tag_name`, and the
+# explicit `examine_date_elements` callback for `.//abbr` rescue)
+# stay within the Stage 0b operator catalog. No engine extension.
+#
+# Per semver (CLAUDE.md "Version management") PATCH — additive new
+# module surface behind the same `#[doc(hidden)] pub mod htmldate`
+# infrastructure namespace (matches sub-stages A/B/C/D). All four
+# BLOCKER gates remain green (parser_equivalence_gate /
+# trafilatura_equivalence_gate / trafilatura_extract_smoke /
+# trafilatura_extract_content_gate). Default extraction path
+# byte-unchanged: `core.rs` is consumed only by sub-stage F's
+# `find_date` / `search_page` orchestrators, which are not yet wired
+# into `extract` / `extract_with`. Lib test count 916 -> 934
+# (+18 sub-stage-E tests covering DATE_ATTRIBUTES table content,
+# ITEMPROP_ATTRS union, examine_header on 5+ meta shapes incl.
+# copyrightYear reserve, select_candidate single/empty/tie/original/
+# over-max, search_pattern, compare_reference success/failure,
+# examine_abbr class-title, examine_time datetime/pubdate/text,
+# normalize_match 4/2-digit-year zfill, examine_text floor/happy).
+version = "0.11.4"
 edition = "2024"
 
 [dependencies]

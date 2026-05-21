@@ -52,3 +52,14 @@ pub mod regex_catalogues;
 // `dateparser.DateDataParser` is deferred indefinitely — see the
 // `extractors.rs` module header for the rationale).
 pub mod extractors;
+
+// Sub-stage E — header walker + element walkers + candidate selection
+// — verbatim port of `htmldate/core.py:80-571`. Adds the
+// `DATE_ATTRIBUTES` / `NAME_MODIFIED` / `PROPERTY_MODIFIED` /
+// `ITEMPROP_ATTRS` tables, `examine_text` / `examine_date_elements` /
+// `examine_header` / `select_candidate` / `search_pattern` /
+// `compare_reference` / `examine_abbr_elements` /
+// `examine_time_elements` / `normalize_match`. `search_page` and
+// `find_date` (the orchestrators at core.py:574-983) are deferred to
+// sub-stage F.
+pub mod core;
