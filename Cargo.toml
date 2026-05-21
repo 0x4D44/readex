@@ -2547,7 +2547,7 @@ name = "mdrcel"
 # sandbox we surface it as MINOR (matching M3 Stage 9's `comments` field
 # precedent at 0.9.0 -> 0.10.0). No new dependency; no public API removal;
 # `Options` unchanged.
-version = "0.15.0"
+version = "0.15.1"
 edition = "2024"
 
 # M4 Stage 6 (2026-05-21): 0.14.1 -> 0.15.0 MINOR. Lifts `deduplication.py`'s
@@ -2603,6 +2603,27 @@ edition = "2024"
 # blake2b directly with `digest_size=24` and has no consumer outside the
 # `Simhash._hash` call path. Porting it would force the blake2b dep we
 # explicitly avoided. Recorded per HLD §10 deferral discipline.
+#
+# M4 Stage 7 (2026-05-21): 0.15.0 -> 0.15.1 PATCH. Closes the deferred
+# regex-rescue branch in `metadata_jsonld::extract_meta_json`. The previous
+# code silently dropped any JSON-LD block that failed `serde_json::from_str`
+# (the Stage 7b "faithful-divergence note" explicitly flagged this as a
+# one-shot fold-in). Stage 7 ports `extract_json_parse_error`
+# (`json_metadata.py:174-213`) and its ten supporting regexes
+# (`json_metadata.py:19-34`: JSON_AUTHOR_REMOVE / JSON_AUTHOR_1 / JSON_AUTHOR_2
+# / JSON_PUBLISHER / JSON_TYPE / JSON_CATEGORY / JSON_NAME / JSON_HEADLINE /
+# JSON_REMOVE_HTML / JSON_UNICODE_REPLACE) plus the local `normalize_json`
+# helper, dispatching malformed JSON-LD to the rescue path instead of
+# dropping it. Behaviour change is OBSERVABLE ONLY on malformed JSON-LD
+# inputs (well-formed inputs hit the unchanged `extract_json` walker by the
+# pre-existing serde_json fast path); no API surface changes, no public
+# function signatures touched. Per CLAUDE.md "Version management" PATCH —
+# completion of a deferred sub-feature behind the existing public surface.
+# Lib test count 1139 -> 1149 (+10 tests in `metadata_jsonld::tests`
+# covering the eight brief items plus two extra pins on JSON_AUTHOR_1's
+# alternate-group capture path and the JSON_AUTHOR_REMOVE pre-strip).
+# All five BLOCKER gates remain green; `cargo clippy --lib --all-targets
+# -- -D warnings` is clean.
 
 [dependencies]
 # DEC-3 (M1): the library was a zero-dependency crate at the Milestone-1 floor;

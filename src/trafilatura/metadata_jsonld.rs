@@ -37,13 +37,14 @@
 //!
 //! # Faithful divergences (recorded honestly)
 //!
-//! - The Python `json_metadata.py:171-213` `extract_json_parse_error` is a
-//!   regex-based salvage path for malformed JSON. Stage 7b skips this path
-//!   and treats any `json::from_str` failure as "no JSON-LD data" — the
-//!   crate's corpus does not exercise the regex-salvage path (every Stage
-//!   3-B fixture parses cleanly), and a regex port adds ~80 LOC for a
-//!   rescue case the BLOCKER gates don't gate on. If a future test demands
-//!   it, the rescue is a one-shot fold-in.
+//! - The Python `json_metadata.py:174-213` `extract_json_parse_error` is a
+//!   regex-based salvage path for malformed JSON. **Stage M4-7 ports this
+//!   path**: `extract_meta_json` now dispatches malformed JSON-LD to
+//!   `extract_json_parse_error`, which extracts author / pagetype /
+//!   publisher / category / title via the
+//!   `JSON_AUTHOR_{REMOVE,1,2}` / `JSON_TYPE` / `JSON_PUBLISHER` /
+//!   `JSON_CATEGORY` / `JSON_NAME` / `JSON_HEADLINE` regexes vendored
+//!   below from `json_metadata.py:19-34`.
 //! - The Python `normalize_json` (`json_metadata.py:216-223`) re-runs HTML
 //!   entity unescape + tag-strip + unicode escape replacement on every
 //!   string read out of the JSON tree. `serde_json` already decodes `\uXXXX`
@@ -57,6 +58,9 @@
 //!   HTML-strip + trim + "; "-join dedup load that the schema.org `author`
 //!   field exercises in practice.
 
+use std::sync::OnceLock;
+
+use regex::Regex;
 use serde_json::Value;
 
 use crate::readability::dom::{Dom, NodeRef, element_text, get_attribute};
@@ -176,12 +180,13 @@ pub fn extract_meta_json(dom: &Dom, metadata: &mut Metadata) {
         // tolerates them as part of string values, so we apply tag-strip
         // per-field instead (see `normalize_json_string`).
         let parsed: serde_json::Result<Value> = serde_json::from_str(&raw_text);
-        if let Ok(value) = parsed {
-            extract_json(&value, metadata);
+        match parsed {
+            Ok(value) => extract_json(&value, metadata),
+            // `json_metadata.py:174-213` regex-rescue path: fires on
+            // `json.JSONDecodeError`. Stage M4-7 ports it; see
+            // [`extract_json_parse_error`].
+            Err(_) => extract_json_parse_error(&raw_text, metadata),
         }
-        // Malformed JSON: silently skip (faithful to Python's
-        // `json.JSONDecodeError` catch; the regex-rescue path is omitted
-        // per the module header's faithful-divergence note).
     }
     let _ = get_attribute as fn(&NodeRef, &str) -> Option<String>;
 }
@@ -683,6 +688,257 @@ fn strip_simple_html_tags(s: &str) -> String {
 }
 
 // ===========================================================================
+// extract_json_parse_error (json_metadata.py:174-213)
+// ===========================================================================
+//
+// Regex-rescue path for malformed JSON-LD. Fires when `serde_json::from_str`
+// returns `Err` (the Rust analogue of Python's `json.JSONDecodeError`
+// branch — see `extract_meta_json`). Crudely extracts author / pagetype /
+// publisher / category / title by pattern-matching the raw script text.
+//
+// All regexes below are byte-faithful ports of `json_metadata.py:19-34`.
+// Python's `re.DOTALL` becomes the inline `(?s)` flag in Rust; character
+// classes containing `[` are escaped as `\[` per Rust regex syntax (Python
+// tolerates `[^}[]` as "not `}` or `[`"; Rust's `regex-syntax` accepts both
+// `[^}[]` and `[^}\[]` but we escape for clarity).
+
+/// `JSON_AUTHOR_REMOVE` (`json_metadata.py:21`).
+fn json_author_remove_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| {
+        Regex::new(
+            r#",?(?:"\w+":?[:|,\[])?\{?"@type":"(?:[Ii]mageObject|[Oo]rganization|[Ww]eb[Pp]age)",[^}\[]+\}[\]|}]?"#,
+        )
+        .expect("JSON_AUTHOR_REMOVE compile")
+    })
+}
+
+/// `JSON_AUTHOR_1` (`json_metadata.py:19`). Two alternatives, two capture
+/// groups; the first non-empty group is the author candidate.
+fn json_author_1_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| {
+        Regex::new(
+            r#"(?s)"author":[^}\[]+?"name?\\?": ?\\?"([^"\\]+)|"author"[^}\[]+?"names?".+?"([^"]+)"#,
+        )
+        .expect("JSON_AUTHOR_1 compile")
+    })
+}
+
+/// `JSON_AUTHOR_2` (`json_metadata.py:20`).
+fn json_author_2_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| {
+        Regex::new(r#"(?s)"[Pp]erson"[^}]+?"names?".+?"([^"]+)"#)
+            .expect("JSON_AUTHOR_2 compile")
+    })
+}
+
+/// `JSON_PUBLISHER` (`json_metadata.py:22`).
+fn json_publisher_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| {
+        Regex::new(r#"(?s)"publisher":[^}]+?"name?\\?": ?\\?"([^"\\]+)"#)
+            .expect("JSON_PUBLISHER compile")
+    })
+}
+
+/// `JSON_TYPE` (`json_metadata.py:23`).
+fn json_type_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| {
+        Regex::new(r#"(?s)"@type"\s*:\s*"([^"]*)""#).expect("JSON_TYPE compile")
+    })
+}
+
+/// `JSON_CATEGORY` (`json_metadata.py:24`).
+fn json_category_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| {
+        Regex::new(r#"(?s)"articleSection": ?"([^"\\]+)"#).expect("JSON_CATEGORY compile")
+    })
+}
+
+/// `JSON_NAME` (`json_metadata.py:32`).
+fn json_name_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| {
+        Regex::new(r#"(?s)"@type":"[Aa]rticle", ?"name": ?"([^"\\]+)"#)
+            .expect("JSON_NAME compile")
+    })
+}
+
+/// `JSON_HEADLINE` (`json_metadata.py:33`).
+fn json_headline_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r#"(?s)"headline": ?"([^"\\]+)"#).expect("JSON_HEADLINE compile"))
+}
+
+/// `JSON_REMOVE_HTML` (`json_metadata.py:26`).
+fn json_remove_html_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r#"<[^>]+>"#).expect("JSON_REMOVE_HTML compile"))
+}
+
+/// `JSON_UNICODE_REPLACE` (`json_metadata.py:28`).
+fn json_unicode_replace_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r#"\\u([0-9a-fA-F]{4})"#).expect("JSON_UNICODE_REPLACE compile"))
+}
+
+/// `extract_json_author(elemtext, regex)` (`json_metadata.py:163-171`).
+///
+/// Repeatedly searches the supplied regex against `elemtext`, accumulating
+/// captured names containing a space (`' ' in mymatch[1]`), removing each
+/// match's text after consumption (`re.sub(r'', elemtext, count=1)`).
+///
+/// **Anti-inversion note**: the Python source indexes `mymatch[1]` even
+/// when the regex has two alternation groups (as in `JSON_AUTHOR_1`),
+/// which crashes when only group 2 matched. We mirror Python's lookup
+/// order — prefer group 1, fall back to group 2 — and treat absent
+/// captures as no-match (faithful behaviour on inputs that don't trip
+/// the latent Python crash).
+fn extract_json_author(elemtext: &str, regex: &Regex) -> Option<String> {
+    let mut authors: Option<String> = None;
+    let mut text = elemtext.to_string();
+    while let Some(caps) = regex.captures(&text) {
+        // Python: `mymatch[1]`. We prefer group 1; if it's absent (the
+        // second alternation matched), fall back to group 2.
+        let candidate = caps
+            .get(1)
+            .or_else(|| caps.get(2))
+            .map(|m| m.as_str().to_string());
+        let Some(candidate) = candidate else { break };
+        // `while mymatch and ' ' in mymatch[1]` — only loop while the
+        // candidate contains a space.
+        if !candidate.contains(' ') {
+            break;
+        }
+        // Python calls `normalize_authors(authors, mymatch[1])`. The
+        // regex-rescue path is rare enough that the Stage 7b
+        // `merge_author` semantic (URL/email reject + HTML-tag strip +
+        // "; "-join dedup) suffices — same approximation
+        // [`crate::trafilatura::metadata::normalize_authors_lite`] uses.
+        let cleaned = normalize_json(&candidate);
+        if !cleaned.is_empty() {
+            authors = merge_author(authors.as_deref(), &cleaned);
+        }
+        // Consume the match (`re.sub(r'', elemtext, count=1)`).
+        let mat = caps.get(0).expect("captures(0) on a successful match");
+        let mut next = String::with_capacity(text.len() - (mat.end() - mat.start()));
+        next.push_str(&text[..mat.start()]);
+        next.push_str(&text[mat.end()..]);
+        text = next;
+    }
+    authors
+}
+
+/// `normalize_json(string)` (`json_metadata.py:216-223`).
+///
+/// Decodes `\uXXXX` escapes, drops `\n` / `\r` / `\t` escape sequences,
+/// strips lone surrogates (BMP D800..DFFF), HTML-unescapes (handled here
+/// by `strip_simple_html_tags` for the tag form; the entity form is left
+/// to `unescape` — we omit the full entity decoder for the regex-rescue
+/// path, since the corpus does not exercise it), and trims.
+fn normalize_json(s: &str) -> String {
+    let processed = if s.contains('\\') {
+        let mut t = s.replace("\\n", "").replace("\\r", "").replace("\\t", "");
+        t = json_unicode_replace_re()
+            .replace_all(&t, |caps: &regex::Captures| {
+                let hex = &caps[1];
+                if let Ok(cp) = u32::from_str_radix(hex, 16) {
+                    if (0xD800..=0xDFFF).contains(&cp) {
+                        // Lone surrogate — drop.
+                        return String::new();
+                    }
+                    if let Some(c) = char::from_u32(cp) {
+                        return c.to_string();
+                    }
+                }
+                String::new()
+            })
+            .into_owned();
+        t
+    } else {
+        s.to_string()
+    };
+    let stripped = json_remove_html_re().replace_all(&processed, "");
+    trim(&stripped)
+}
+
+/// `extract_json_parse_error(elem, metadata)` (`json_metadata.py:174-213`).
+///
+/// Crudely extracts metadata from malformed JSON-LD blocks. Mirrors the
+/// Python ordering (author → pagetype → publisher → category → title)
+/// and the early-exit shape (each section gates on a cheap substring
+/// check before invoking its regex).
+fn extract_json_parse_error(elem: &str, metadata: &mut Metadata) {
+    // ── author info (`json_metadata.py:176-181`)
+    let element_text_author = json_author_remove_re().replace_all(elem, "").into_owned();
+    let author = extract_json_author(&element_text_author, json_author_1_re())
+        .or_else(|| extract_json_author(&element_text_author, json_author_2_re()));
+    if let Some(a) = author
+        && !a.is_empty()
+    {
+        metadata.author = Some(a);
+    }
+
+    // ── pagetype (`json_metadata.py:183-189`)
+    if elem.contains("@type")
+        && let Some(caps) = json_type_re().captures(elem)
+        && let Some(group) = caps.get(1)
+    {
+        let candidate = normalize_json(&group.as_str().to_ascii_lowercase());
+        if JSON_OGTYPE_SCHEMA.contains(&candidate.as_str()) {
+            metadata.pagetype = Some(candidate);
+        }
+    }
+
+    // ── publisher (`json_metadata.py:191-197`)
+    if elem.contains("\"publisher\"")
+        && let Some(caps) = json_publisher_re().captures(elem)
+        && let Some(group) = caps.get(1)
+        && !group.as_str().contains(',')
+    {
+        let candidate = normalize_json(group.as_str());
+        if is_plausible_sitename(metadata.site_name.as_deref(), &candidate, "") {
+            metadata.site_name = Some(candidate);
+        }
+    }
+
+    // ── category (`json_metadata.py:200-203`)
+    if elem.contains("\"articleSection\"")
+        && let Some(caps) = json_category_re().captures(elem)
+        && let Some(group) = caps.get(1)
+    {
+        let cleaned = normalize_json(group.as_str());
+        if !cleaned.is_empty() {
+            metadata.categories = vec![cleaned];
+        }
+    }
+
+    // ── title (`json_metadata.py:206-211`). `JSON_SEQ` ordering:
+    // (`"name"`, JSON_NAME), (`"headline"`, JSON_HEADLINE).
+    if metadata.title.is_none() {
+        for (key, regex) in [
+            ("\"name\"", json_name_re()),
+            ("\"headline\"", json_headline_re()),
+        ] {
+            if elem.contains(key)
+                && let Some(caps) = regex.captures(elem)
+                && let Some(group) = caps.get(1)
+            {
+                let cleaned = normalize_json(group.as_str());
+                if !cleaned.is_empty() {
+                    metadata.title = Some(cleaned);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -871,5 +1127,156 @@ mod tests {
         </script></head><body></body></html>"#;
         let m = run(html);
         assert_eq!(m.author.as_deref(), Some("Jane Doe"));
+    }
+
+    // ─── M4 Stage 7: extract_json_parse_error regex-rescue tests ───────────
+    //
+    // Each test feeds intentionally MALFORMED JSON-LD into a script block
+    // so `serde_json::from_str` returns `Err`, routing the input through
+    // `extract_json_parse_error` (`json_metadata.py:174-213`). The trailing
+    // garbage (e.g. an unterminated brace + stray `OOPS`) is what breaks the
+    // JSON parser without disturbing the regex matchers.
+
+    /// Brief test 1: author as Person object → recovers author.
+    #[test]
+    fn parse_error_recovers_person_author() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "author": {"@type": "Person", "name": "John Doe"} OOPS
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        // JSON_AUTHOR_2 ("[Pp]erson" branch) is what fires here, since
+        // JSON_AUTHOR_REMOVE strips the "Person" object's wrapper-less
+        // `"@type":"Person"` is preserved (the REMOVE regex targets only
+        // ImageObject / Organization / WebPage). Result: author recovered.
+        assert_eq!(m.author.as_deref(), Some("John Doe"));
+    }
+
+    /// Brief test 2: malformed JSON with headline → recovers title.
+    #[test]
+    fn parse_error_recovers_headline_as_title() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "headline": "Article Title" OOPS
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.title.as_deref(), Some("Article Title"));
+    }
+
+    /// Brief test 3: malformed JSON with `"name"` (no headline) under
+    /// `@type=Article` → recovers title via JSON_NAME.
+    #[test]
+    fn parse_error_recovers_name_as_title_when_no_headline() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type":"Article", "name": "Article Title" OOPS
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.title.as_deref(), Some("Article Title"));
+    }
+
+    /// Brief test 4: malformed JSON with publisher → recovers sitename.
+    #[test]
+    fn parse_error_recovers_publisher_as_sitename() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "NewsArticle",
+         "publisher": {"@type": "Organization", "name": "Acme News"} OOPS
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.site_name.as_deref(), Some("Acme News"));
+    }
+
+    /// Brief test 5: well-formed JSON should NOT invoke the regex-rescue
+    /// path — the standard `extract_json` walker handles it. Confirmed by
+    /// the structural shape (no `"@type":"Article", "name":` pattern that
+    /// JSON_NAME requires — `extract_json` uses `headline` instead).
+    #[test]
+    fn parse_error_not_invoked_on_well_formed_json() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "NewsArticle",
+         "headline": "Article Title",
+         "author": "Jane Doe"}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        // Well-formed → walker path → title and author set.
+        assert_eq!(m.title.as_deref(), Some("Article Title"));
+        assert_eq!(m.author.as_deref(), Some("Jane Doe"));
+    }
+
+    /// Brief test 6: malformed JSON with neither author nor title →
+    /// metadata unchanged. (We do allow other fields like `articleSection`
+    /// to flow through — this test only pins title/author/site_name to
+    /// `None` for an input that carries none of those.)
+    #[test]
+    fn parse_error_no_recoverable_fields_leaves_metadata_unchanged() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org" OOPS no recoverable fields here
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.author.is_none());
+        assert!(m.title.is_none());
+        assert!(m.site_name.is_none());
+    }
+
+    /// Brief test 7: multiple JSON-LD blocks, one valid one malformed:
+    /// both contribute to metadata.
+    #[test]
+    fn parse_error_mixed_blocks_each_contributes() {
+        let html = r#"<html><head>
+        <script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "headline": "Valid Title"}
+        </script>
+        <script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "author": {"@type": "Person", "name": "Rescue Author"} OOPS
+        </script>
+        </head><body></body></html>"#;
+        let m = run(html);
+        // Valid block populates title via the walker.
+        assert_eq!(m.title.as_deref(), Some("Valid Title"));
+        // Malformed block populates author via the regex-rescue path.
+        assert_eq!(m.author.as_deref(), Some("Rescue Author"));
+    }
+
+    /// Brief test 8: edge case — whitespace-only / non-JSON garbage.
+    /// Must not panic; metadata unchanged.
+    #[test]
+    fn parse_error_handles_garbage_input_without_panic() {
+        let html = r#"<html><head><script type="application/ld+json">
+        not actually anything resembling json or json-ld
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.author.is_none());
+        assert!(m.title.is_none());
+        assert!(m.site_name.is_none());
+        assert!(m.pagetype.is_none());
+        assert!(m.categories.is_empty());
+    }
+
+    /// Additional pin: JSON_AUTHOR_1's `"author":..."name"` alternative
+    /// fires when the input is a malformed author-object literal (not the
+    /// Person-typed shape that JSON_AUTHOR_2 catches).
+    #[test]
+    fn parse_error_recovers_author_via_author_1_alternative() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "author": {"name": "Sole Author"} OOPS
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.author.as_deref(), Some("Sole Author"));
+    }
+
+    /// Additional pin: JSON_AUTHOR_REMOVE strips an ImageObject wrapper
+    /// before author extraction, so a malformed payload mixing image +
+    /// author still surfaces the author.
+    #[test]
+    fn parse_error_strips_imageobject_before_author_extraction() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context":"https://schema.org","@type":"Article",
+         "image":{"@type":"ImageObject","url":"https://x/y.jpg","width":1200},
+         "author":{"@type":"Person","name":"Robust Reporter"} OOPS
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.author.as_deref(), Some("Robust Reporter"));
     }
 }
