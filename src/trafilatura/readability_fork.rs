@@ -71,8 +71,9 @@ use regex::Regex;
 
 use crate::readability::dom::{
     Dom, NodeRef, append_child, children, class_name, create_element, delete_with_tail_preserve_free,
-    element_text, get_all_nodes_with_tag, get_elements_by_tag_name, id, local_name, parent,
-    replace_element_tag, serialize_converted_tree,
+    element_text, get_all_nodes_with_tag, get_attribute, get_elements_by_tag_name, id, local_name,
+    next_element_sibling, parent, previous_element_sibling, replace_element_tag,
+    serialize_converted_tree, set_element_text, text_content,
 };
 use crate::trafilatura::utils::trim;
 
@@ -113,18 +114,23 @@ pub(crate) const BAD_ELEM_SCORES: &[&str] =
 pub(crate) const STRUCTURE_SCORES: &[&str] =
     &["h1", "h2", "h3", "h4", "h5", "h6", "th", "header", "footer", "nav"];
 
-/// `TEXT_CLEAN_ELEMS` — readability_lxml.py:60. Used by Stage 4c's
-/// `sanitize` cleanup pass.
-#[allow(dead_code)] // Stage 4c consumer
+/// `TEXT_CLEAN_ELEMS` — readability_lxml.py:60. Stage 4c's `sanitize`
+/// pass consumes it twice: (1) at readability_lxml.py:359-361 inside
+/// the conditional-clean loop, the `counts` dict is built by counting
+/// descendants of each of these tags so the dropping heuristics
+/// (`counts["li"] > counts["p"]`, `counts["input"] > counts["p"] / 3`,
+/// `counts["embed"]` checks) can fire.
 pub(crate) const TEXT_CLEAN_ELEMS: &[&str] = &["p", "img", "li", "a", "embed", "input"];
 
 /// `FRAME_TAGS` — readability_lxml.py:82. Top-level container tags that
 /// are *never* dropped by `remove_unlikely_candidates` (Stage 4b).
 pub(crate) const FRAME_TAGS: &[&str] = &["body", "html"];
 
-/// `LIST_TAGS` — readability_lxml.py:83. Consumed by Stage 4c's
-/// `sanitize` list-pruning path.
-#[allow(dead_code)] // Stage 4c consumer
+/// `LIST_TAGS` — readability_lxml.py:83. Stage 4c's `sanitize`
+/// consumes it at readability_lxml.py:379: when `counts["li"] >
+/// counts["p"]`, the element is dropped ONLY if its own tag is NOT in
+/// `LIST_TAGS` (the carve-out keeps actual `<ol>` / `<ul>` lists alive
+/// even though they have many `<li>` descendants).
 pub(crate) const LIST_TAGS: &[&str] = &["ol", "ul"];
 
 // ---------------------------------------------------------------------------
@@ -206,9 +212,8 @@ pub(crate) fn div_to_p_elements_re() -> &'static Regex {
 
 /// `videoRe` — readability_lxml.py:79. Matches YouTube/Vimeo iframe
 /// `src` URLs; Stage 4c's `sanitize` keeps these iframes (with
-/// `text = "VIDEO"`) instead of dropping them. Exercised by a Stage 4a
-/// regex-literal sanity test below.
-#[allow(dead_code)] // Stage 4c consumer (production); test-only at Stage 4a
+/// `text = "VIDEO"`) instead of dropping them
+/// (readability_lxml.py:334-338).
 pub(crate) fn video_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -615,11 +620,12 @@ impl Document {
                 }
             };
 
-            // readability_lxml.py:160-161 — sanitize stub for Stage 4b
-            // (Stage 4c fills this in; today it serializes the article
-            // and returns its length so the retry-trigger gate below
-            // still fires on a quantitative signal).
-            let cleaned_article = self.stage4b_sanitize_stub(&article);
+            // readability_lxml.py:160-161 — sanitize (Stage 4c). Mutates
+            // `article` in place (drops noisy descendants) and returns the
+            // serialized result; we keep both `article` (the NodeRef the
+            // caller wants) and `cleaned_article` (the byte string used for
+            // the retry-trigger gate below).
+            let cleaned_article = self.sanitize(&article, &candidates);
             let article_length = cleaned_article.chars().count();
 
             // readability_lxml.py:162-165 — too-short → retry leniently.
@@ -932,23 +938,300 @@ impl Document {
         output
     }
 
-    /// Stage-4b PLACEHOLDER for `sanitize` (readability_lxml.py:326-438).
+    /// `sanitize(node, candidates)` — readability_lxml.py:326-438.
     ///
-    /// Stage 4c will replace this with the faithful sanitize port. Today
-    /// it serializes the article to a string so [`summary`]'s retry-trigger
-    /// `article_length < retry_length` gate still has a quantitative
-    /// signal to fire on. This is INTENTIONALLY a stub — the retry-loop
-    /// SHAPE is faithful (the gate exists and is checked); the THRESHOLD
-    /// behaviour will tighten as Stage 4c's real sanitize narrows the
-    /// output.
+    /// The readability fork's noise-removal pass. Faithfully ports each of
+    /// the four phases in the Python source, in order:
     ///
-    /// HLD §10 anti-inversion: marking this as `_stage4b_` (leading
-    /// underscore) keeps it discoverable + greppable for the Stage 4c
-    /// implementer to delete in one stroke.
-    fn stage4b_sanitize_stub(&self, article: &NodeRef) -> String {
-        serialize_converted_tree(article)
+    /// 1. **Header strip (readability_lxml.py:327-329).** For every
+    ///    `<h1>`-`<h6>` descendant: drop if `class_weight < 0` OR
+    ///    `link_density > 0.33`.
+    /// 2. **Form/textarea strip (readability_lxml.py:331-332).** Drop every
+    ///    `<form>` and `<textarea>` descendant outright.
+    /// 3. **Iframe filter (readability_lxml.py:334-338).** Keep iframes
+    ///    whose `src` matches `videoRe` (YouTube/Vimeo) — and set their
+    ///    text to `"VIDEO"` so the serializer emits a balanced
+    ///    `<iframe>VIDEO</iframe>` instead of a self-closing tag — and
+    ///    drop every other iframe.
+    /// 4. **Conditional clean (readability_lxml.py:340-435).** Iterate the
+    ///    `<table>` / `<ul>` / `<div>` / `<aside>` / `<header>` /
+    ///    `<footer>` / `<section>` descendants in REVERSE document order
+    ///    (innermost-first so dropping an outer element after its inner
+    ///    elements have been processed is safe). For each:
+    ///    - If already in the `allowed` set (a no-content element kept
+    ///      alive by the long-siblings rescue), skip.
+    ///    - If `class_weight + (candidate score if present) < 0`, drop.
+    ///    - Else if `text_content` has fewer than 10 commas, run the big
+    ///      heuristic block: count `TEXT_CLEAN_ELEMS` descendants, measure
+    ///      content length / link density / parent score, and either drop
+    ///      with a reason (too many images, too many `<li>` for non-list
+    ///      tags, too many `<input>`, too short, too many links, too many
+    ///      `<embed>`, no content) or set the rescue flag and add
+    ///      `elem.iter("table", "ul", "div", "section")` to `allowed`
+    ///      when the "no content but long siblings" carve-out triggers.
+    ///
+    /// # Return value
+    ///
+    /// Python returns `_tostring(self.doc)` (the serialized article HTML).
+    /// We mirror that — returning a `String` — both so the caller can use
+    /// it for the `article_length < retry_length` retry-trigger gate AND so
+    /// the function's observable contract matches the Python source. The
+    /// mutated `article` NodeRef is also still available to the caller
+    /// (we mutate in place via `delete_with_tail_preserve_free`).
+    ///
+    /// # rcdom Drop quirk
+    ///
+    /// `delete_with_tail_preserve_free` is the M3 Stage 0a primitive that
+    /// removes an element AND merges its tail Text-node run into the
+    /// previous sibling's tail / parent text (lxml `elem.drop_tree()`
+    /// semantics, `dom.rs:1191`). It does NOT iteratively drain
+    /// descendants, so no `dones_alive` pin is required for this pass (unlike
+    /// `replace_element_tag`-based renames). The `for elem in
+    /// reversed(...)` over a SNAPSHOT (built once via
+    /// `get_all_nodes_with_tag`) is safe even though we drop elements
+    /// mid-loop — the snapshot is an owned `Vec` so a removed entry's
+    /// `NodeRef` is still valid for the `Rc::ptr_eq` `allowed`-membership
+    /// test (HLD §5 / Stage 0a precedent).
+    // The if/elif chain at readability_lxml.py:389-396 contains two
+    // arms with IDENTICAL bodies (both produce the same "too many links
+    // {link_d} for its weight {weight}" reason string). That is a quirk
+    // of the Python source — the two arms differ only in their GUARDS
+    // (`weight < 25 and link_density > 0.2` vs `weight >= 25 and
+    // link_density > 0.5`). The `to_remove` outcome is identical, but we
+    // preserve the two-arm shape verbatim for line-cite review. Without
+    // this allow clippy's `if_same_then_else` fires.
+    #[allow(clippy::if_same_then_else)]
+    fn sanitize(&mut self, node: &NodeRef, candidates: &[(NodeRef, Candidate)]) -> String {
+        // readability_lxml.py:327-329 — header strip.
+        // Python's `node.iter("h1", ...)` includes `node` itself if it
+        // matches. In the orchestration flow `node` is either the
+        // get_article-built <div> (never an <hN>) or the body fallback,
+        // so descendant-only iteration is equivalent here; if a future
+        // caller passes an <h1> node directly the divergence would be a
+        // single edge case worth a follow-up.
+        for header in get_all_nodes_with_tag(node, &["h1", "h2", "h3", "h4", "h5", "h6"]) {
+            // The snapshot was taken once up-front; if an earlier
+            // iteration's drop detached `header`, skip — Python's
+            // `drop_tree()` on a detached element is a no-op but our
+            // `delete_with_tail_preserve_free` does the same already.
+            if class_weight(&header) < 0.0 || link_density(&header) > 0.33 {
+                delete_with_tail_preserve_free(&header);
+            }
+        }
+
+        // readability_lxml.py:331-332 — form / textarea strip.
+        for elem in get_all_nodes_with_tag(node, &["form", "textarea"]) {
+            delete_with_tail_preserve_free(&elem);
+        }
+
+        // readability_lxml.py:334-338 — iframe filter (keep YouTube/Vimeo,
+        // drop everything else).
+        for elem in get_all_nodes_with_tag(node, &["iframe"]) {
+            let src = get_attribute(&elem, "src").unwrap_or_default();
+            if !src.is_empty() && video_re().is_match(&src) {
+                // Python sets `elem.text = "VIDEO"` so the serializer emits
+                // `<iframe>VIDEO</iframe>` instead of `<iframe/>`. Our
+                // `set_element_text` honours the lxml `.text =` semantic
+                // exactly (dom.rs:469).
+                set_element_text(&elem, Some("VIDEO"));
+            } else {
+                delete_with_tail_preserve_free(&elem);
+            }
+        }
+
+        // readability_lxml.py:340 — allowed = set() (the long-siblings
+        // rescue carve-out set). Identity-keyed (Python `set` of lxml
+        // HtmlElements uses `__hash__`/`__eq__` falling back to `id()`),
+        // mirrored by `Rc::ptr_eq`.
+        let mut allowed: Vec<NodeRef> = Vec::new();
+
+        // readability_lxml.py:342-344 — `for elem in reversed(node.xpath(
+        // "//table|//ul|//div|//aside|//header|//footer|//section"))`. On a
+        // detached element lxml's `//` resolves against the subtree root,
+        // which is identical to descendant-or-self in document order.
+        // `get_all_nodes_with_tag` is descendants only — since `node` (the
+        // get_article-built <div>) is never one of these tags, the
+        // distinction is moot for the orchestration flow.
+        let mut conditional: Vec<NodeRef> =
+            get_all_nodes_with_tag(node, &["table", "ul", "div", "aside", "header", "footer", "section"]);
+        conditional.reverse();
+
+        for elem in &conditional {
+            // readability_lxml.py:345-346 — skip allowed.
+            if allowed.iter().any(|a| Rc::ptr_eq(a, elem)) {
+                continue;
+            }
+            // readability_lxml.py:347-348 — weight + score.
+            let weight = class_weight(elem);
+            let mut score = find_candidate(candidates, elem)
+                .map(|c| c.score)
+                .unwrap_or(0.0);
+
+            // readability_lxml.py:349-356 — weight+score < 0 → drop.
+            if weight + score < 0.0 {
+                delete_with_tail_preserve_free(elem);
+                continue;
+            }
+
+            // readability_lxml.py:357 — `elem.text_content().count(",") < 10`.
+            // Note this is the *raw* text_content, not trimmed — we replicate
+            // exactly (Python `str.count`).
+            let raw_text = text_content(elem);
+            if raw_text.matches(',').count() >= 10 {
+                continue;
+            }
+
+            // readability_lxml.py:358-425 — the big heuristic block.
+            let mut to_remove = true;
+
+            // readability_lxml.py:359-363 — counts dict over TEXT_CLEAN_ELEMS.
+            let mut counts: [i64; TEXT_CLEAN_ELEMS_LEN] = [0; TEXT_CLEAN_ELEMS_LEN];
+            for (i, kind) in TEXT_CLEAN_ELEMS.iter().enumerate() {
+                counts[i] = get_elements_by_tag_name(elem, kind).len() as i64;
+            }
+            // Indices match TEXT_CLEAN_ELEMS = ["p", "img", "li", "a", "embed", "input"].
+            counts[2] -= 100; // counts["li"] -= 100
+            // counts["input"] -= len(elem.findall('.//input[@type="hidden"]'))
+            let hidden_inputs = get_elements_by_tag_name(elem, "input")
+                .iter()
+                .filter(|i| get_attribute(i, "type").as_deref() == Some("hidden"))
+                .count() as i64;
+            counts[5] -= hidden_inputs;
+
+            // Named bindings for readability (matches the Python `counts["x"]`
+            // shape).
+            let count_p = counts[0];
+            let count_img = counts[1];
+            let count_li = counts[2];
+            let _count_a = counts[3];
+            let count_embed = counts[4];
+            let count_input = counts[5];
+
+            // readability_lxml.py:365-374 — content_length / link_density
+            // / parent score (the parent score overwrites the local score
+            // ONLY when the parent IS in candidates — faithfully replicating
+            // the Python's variable-overwrite semantics).
+            let content_length = text_length(elem);
+            let link_d = link_density(elem);
+            if let Some(parent_node) = parent(elem) {
+                score = find_candidate(candidates, &parent_node)
+                    .map(|c| c.score)
+                    .unwrap_or(0.0);
+            }
+
+            let elem_tag_owned = local_name(elem);
+            let elem_tag = elem_tag_owned.as_deref().unwrap_or("");
+
+            // readability_lxml.py:377-404 — the if/elif removal-reason chain.
+            // We preserve EXACT order (Python's `if/elif` is short-circuit
+            // and the order matters for which "reason" fires; the OBSERVABLE
+            // outcome is just `to_remove = True`, but the source-order is
+            // faithful for line-cite review).
+            let mut _reason: Option<String> = None;
+            if count_p > 0 && count_img as f64 > 1.0 + (count_p as f64) * 1.3 {
+                _reason = Some(format!("too many images ({count_img})"));
+            } else if count_li > count_p && !LIST_TAGS.contains(&elem_tag) {
+                _reason = Some("more <li>s than <p>s".to_string());
+            } else if count_input as f64 > (count_p as f64) / 3.0 {
+                _reason = Some("less than 3x <p>s than <input>s".to_string());
+            } else if content_length < self.min_text_length && count_img == 0 {
+                _reason = Some(format!(
+                    "too short content length {content_length} without a single image"
+                ));
+            } else if content_length < self.min_text_length && count_img > 2 {
+                _reason = Some(format!(
+                    "too short content length {content_length} and too many images"
+                ));
+            } else if weight < 25.0 && link_d > 0.2 {
+                _reason = Some(format!(
+                    "too many links {link_d:.3} for its weight {weight}"
+                ));
+            } else if weight >= 25.0 && link_d > 0.5 {
+                _reason = Some(format!(
+                    "too many links {link_d:.3} for its weight {weight}"
+                ));
+            } else if (count_embed == 1 && content_length < 75) || count_embed > 1 {
+                _reason = Some(
+                    "<embed>s with too short content length, or too many <embed>s".to_string(),
+                );
+            } else if content_length == 0 {
+                _reason = Some("no content".to_string());
+
+                // readability_lxml.py:406-423 — "no content" rescue: scan
+                // siblings forward + backward, sum non-empty content
+                // lengths, and if total > 1000 keep the element AND mark
+                // every `table`/`ul`/`div`/`section` descendant (including
+                // self) as `allowed` so subsequent iterations don't drop
+                // them.
+                let mut sibling_lengths: Vec<usize> = Vec::new();
+                // Forward iter (until first non-empty content).
+                let mut cur = next_element_sibling(elem);
+                while let Some(sib) = cur {
+                    let len = text_length(&sib);
+                    if len > 0 {
+                        sibling_lengths.push(len);
+                        // The Python `break` is unconditional after the
+                        // first non-empty forward sibling (the `if
+                        // len(siblings) >= 1` guard is inside the `if
+                        // sib_content_length:` block but precedes `break`
+                        // unconditionally).
+                        break;
+                    }
+                    cur = next_element_sibling(&sib);
+                }
+                let limit = sibling_lengths.len() + 1;
+                // Backward iter (preceding=True).
+                let mut cur = previous_element_sibling(elem);
+                while let Some(sib) = cur {
+                    let len = text_length(&sib);
+                    if len > 0 {
+                        sibling_lengths.push(len);
+                        if sibling_lengths.len() >= limit {
+                            break;
+                        }
+                    }
+                    cur = previous_element_sibling(&sib);
+                }
+                if !sibling_lengths.is_empty()
+                    && sibling_lengths.iter().sum::<usize>() > 1000
+                {
+                    to_remove = false;
+                    // readability_lxml.py:423 — `allowed.update(elem.iter(
+                    // "table", "ul", "div", "section"))`. Python `iter`
+                    // INCLUDES self when self matches; our
+                    // `get_all_nodes_with_tag` is descendants-only, so we
+                    // explicitly add `elem` itself first if it matches.
+                    if ["table", "ul", "div", "section"].contains(&elem_tag) {
+                        allowed.push(elem.clone());
+                    }
+                    for d in get_all_nodes_with_tag(elem, &["table", "ul", "div", "section"]) {
+                        allowed.push(d);
+                    }
+                }
+            } else {
+                // readability_lxml.py:424-425 — fell off the if/elif
+                // chain → keep.
+                to_remove = false;
+            }
+
+            if to_remove {
+                delete_with_tail_preserve_free(elem);
+            }
+        }
+
+        // readability_lxml.py:437 — `self.doc = node`. The Rust side keeps
+        // `node` as the caller's NodeRef; `self.dom` is the working DOM the
+        // retry-loop will discard. No mirror needed.
+        // readability_lxml.py:438 — return serialized.
+        serialize_converted_tree(node)
     }
 }
+
+/// Length of [`TEXT_CLEAN_ELEMS`] — used as a `const` index bound for the
+/// fixed-size `counts` array in [`Document::sanitize`]. Mirrored from the
+/// vendored slice so any future edit to `TEXT_CLEAN_ELEMS` is a one-edit
+/// fan-out via the `.len()` `const fn`.
+const TEXT_CLEAN_ELEMS_LEN: usize = TEXT_CLEAN_ELEMS.len();
 
 // ---------------------------------------------------------------------------
 // `select_best_candidate` (readability_lxml.py:209-218) + helpers
@@ -1301,18 +1584,32 @@ mod tests {
     }
 
     /// Stage 4b/test-2 — lenient fallback fires when the ruthless pass
-    /// would strip the article entirely. The article div carries a
-    /// `sidebar` class that matches `unlikelyCandidatesRe` — the ruthless
+    /// would strip the article entirely. The article div carries an
+    /// `extra` class that matches `unlikelyCandidatesRe` — the ruthless
     /// pass strips it, leaving no scoreable paragraphs. The lenient
     /// retry keeps the div in the tree and produces an article
     /// (readability_lxml.py:146-152).
+    ///
+    /// # `extra` vs `sidebar` — Stage 4c note
+    ///
+    /// Originally written at Stage 4b against `class="sidebar"`. Stage 4c
+    /// replaced the sanitize stub with the real port — `sidebar` matches
+    /// BOTH `unlikelyCandidatesRe` AND `negativeRe`, so even after the
+    /// lenient retry keeps the sidebar div in the tree, the real
+    /// `sanitize`'s `weight + score < 0` arm drops it (class_weight =
+    /// -25 from `negativeRe`, easily overwhelming the paragraph score).
+    /// `extra` matches `unlikelyCandidatesRe` only (not `negativeRe`),
+    /// exercising the SAME lenient-retry path without the secondary
+    /// sanitize-drop — which is the actual invariant this test is meant
+    /// to pin (the retry shape, not the sanitize numeric weight).
     #[test]
     fn document_summary_falls_back_to_lenient_when_ruthless_fails() {
         // The ONLY content sits inside a div whose class matches
-        // `unlikelyCandidatesRe` (sidebar) but NOT `okMaybeItsACandidateRe`.
-        // Ruthless drops it; lenient keeps it.
+        // `unlikelyCandidatesRe` (extra) but NOT `okMaybeItsACandidateRe`
+        // and NOT `negativeRe`. Ruthless drops it; lenient keeps it; the
+        // sanitize pass does not have grounds to drop it again.
         let html = r#"<html><body>
-            <div class="sidebar">
+            <div class="extra">
                 <p>This paragraph holds the only article-shaped content on the page, with commas, length, and structure to score above the minimum length threshold.</p>
                 <p>A second paragraph adds more text, more commas, and enough length to push the parent score well into the candidate-selection range.</p>
                 <p>A third paragraph cements the candidate, with explicit reflective analysis, careful word choice, and a satisfying conclusion to the thought.</p>
@@ -1323,7 +1620,7 @@ mod tests {
         let text = crate::readability::dom::text_content(&article);
         assert!(
             text.contains("article-shaped content"),
-            "lenient retry should preserve the sidebar paragraph, got: {text:.200}…"
+            "lenient retry should preserve the extra-class paragraph, got: {text:.200}…"
         );
     }
 
@@ -1473,5 +1770,219 @@ mod tests {
         let doc = Document::new("<html><body></body></html>");
         assert_eq!(doc.min_text_length, 25);
         assert_eq!(doc.retry_length, 250);
+    }
+
+    // -----------------------------------------------------------------------
+    // Stage 4c: sanitize (readability_lxml.py:326-438)
+    // -----------------------------------------------------------------------
+
+    /// Driver helper: build a `Document` from `html`, snapshot the article
+    /// node corresponding to the body's first element child (i.e. the
+    /// element under test), and invoke `sanitize` with an empty candidates
+    /// map so we exercise the WEIGHT-ONLY arm (class_weight + 0) without
+    /// the orchestrator-built candidate scores. Returns the (mutated)
+    /// article NodeRef for direct inspection.
+    fn sanitize_one(html: &str) -> (Dom, NodeRef) {
+        let dom = Dom::parse(html);
+        let body = dom.body().expect("body parsed");
+        // Wrap body in a fresh detached <div> mimicking get_article's
+        // construction — we move the body's elements into it so that
+        // `sanitize`'s `parent(elem)` resolves to a stable container.
+        let article = create_element("div");
+        for child in children(&body) {
+            append_child(&article, &child);
+        }
+        let candidates: Vec<(NodeRef, Candidate)> = Vec::new();
+        // We need a Document instance for `sanitize`'s `&mut self`. The
+        // HTML passed to `Document::new` is incidental here (sanitize does
+        // not re-read `self.html` or `self.dom`); we use a minimal stub.
+        let mut doc = Document::new("<html><body></body></html>");
+        doc.sanitize(&article, &candidates);
+        (dom, article)
+    }
+
+    /// `<div class="comments">` has class_weight = -25 (negativeRe hit on
+    /// "comment"). With empty candidates `weight + score = -25 + 0 < 0`,
+    /// so the conditional-clean arm drops it
+    /// (readability_lxml.py:349-356).
+    #[test]
+    fn sanitize_drops_negative_weighted_text_clean_elem() {
+        let html = r#"<html><body>
+            <div class="comments"><p>some text inside a comments div</p></div>
+            <div class="article-body"><p>keep this article body</p></div>
+        </body></html>"#;
+        let (_dom, article) = sanitize_one(html);
+        // After sanitize, the "comments" div should be gone; the
+        // "article-body" div may also be gone if its own weight+score
+        // chain trips a removal arm — but we only assert what this test
+        // pins: the comments div is removed.
+        let kids = children(&article);
+        let classes: Vec<String> = kids.iter().map(class_name).collect();
+        assert!(
+            !classes.iter().any(|c| c == "comments"),
+            "comments div should have been removed, classes left: {classes:?}"
+        );
+    }
+
+    /// `<img src="...">` is preserved (the iframe filter at
+    /// readability_lxml.py:334-338 doesn't touch <img>; the <img> is one
+    /// of the `TEXT_CLEAN_ELEMS` only via the inner-counts dict, never
+    /// directly removed by sanitize).
+    #[test]
+    fn sanitize_keeps_img_with_src() {
+        let html = r#"<html><body>
+            <div class="content"><img src="x.jpg" alt="cat"/><p>caption with enough text content for the sanitize content-length floor of 25 chars</p></div>
+        </body></html>"#;
+        let (_dom, article) = sanitize_one(html);
+        let imgs = get_elements_by_tag_name(&article, "img");
+        assert_eq!(imgs.len(), 1, "img should survive sanitize");
+        assert_eq!(
+            get_attribute(&imgs[0], "src").as_deref(),
+            Some("x.jpg")
+        );
+    }
+
+    /// Python's sanitize does NOT drop `<img>` elements without a `src`
+    /// attribute — that bullet in the brief was a misreading. The
+    /// `readability_lxml.py:326-438` source body has no `<img>` removal
+    /// clause at all; the `<img>` count only feeds the *parent's*
+    /// drop-decision heuristics. So an `<img>` without `src` survives the
+    /// sanitize pass (only the parent's chain might decide to drop it as
+    /// part of a noisy container). This test pins THAT behaviour — i.e.
+    /// the absence of an over-eager "drop bare `<img>`" rule.
+    ///
+    /// (Brief item 2 expected a "drop img without src" check; we encode
+    /// the FAITHFUL Python behaviour instead. Out-cleaning Python is
+    /// inversion — HLD §4.)
+    #[test]
+    fn sanitize_keeps_img_without_src_faithful_to_python() {
+        let html = r#"<html><body>
+            <div class="content"><p>This paragraph holds article text with enough length to not trip the short-content drop arm at all.</p><img/></div>
+        </body></html>"#;
+        let (_dom, article) = sanitize_one(html);
+        // The <img/> should survive — sanitize has no clause that targets
+        // bare <img>. (If the parent div is dropped by another rule, this
+        // test would need rework, but with class="content" and good
+        // content-length there's no drop trigger.)
+        let imgs = get_elements_by_tag_name(&article, "img");
+        assert_eq!(imgs.len(), 1, "img survives sanitize even without src");
+    }
+
+    /// `<iframe src="https://youtube.com/...">` is preserved AND its
+    /// text becomes "VIDEO" (readability_lxml.py:335-336).
+    #[test]
+    fn sanitize_keeps_youtube_iframe() {
+        let html = r#"<html><body>
+            <div class="content"><iframe src="https://www.youtube.com/embed/abc"></iframe><p>Caption text for the embedded video that gives the parent enough content to not trip removal.</p></div>
+        </body></html>"#;
+        let (_dom, article) = sanitize_one(html);
+        let iframes = get_elements_by_tag_name(&article, "iframe");
+        assert_eq!(iframes.len(), 1, "video iframe should survive");
+        let txt = element_text(&iframes[0]).unwrap_or_default();
+        assert_eq!(txt, "VIDEO");
+    }
+
+    /// `<iframe src="https://example.com/ad">` is dropped — `src` is
+    /// present but does NOT match `videoRe`
+    /// (readability_lxml.py:337-338).
+    #[test]
+    fn sanitize_drops_iframe_without_video_src() {
+        let html = r#"<html><body>
+            <div class="content"><iframe src="https://ads.example.com/x"></iframe><p>Text content with enough length to avoid the short-content drop arm of the cleaner.</p></div>
+        </body></html>"#;
+        let (_dom, article) = sanitize_one(html);
+        let iframes = get_elements_by_tag_name(&article, "iframe");
+        assert_eq!(iframes.len(), 0, "non-video iframe should be dropped");
+    }
+
+    /// `<form>` is dropped (readability_lxml.py:331-332).
+    #[test]
+    fn sanitize_drops_form_element() {
+        let html = r#"<html><body>
+            <div class="content"><form><input type="text"/></form><p>Article paragraph text long enough to keep the parent alive through the sanitize gates.</p></div>
+        </body></html>"#;
+        let (_dom, article) = sanitize_one(html);
+        let forms = get_elements_by_tag_name(&article, "form");
+        assert_eq!(forms.len(), 0, "form should be dropped");
+    }
+
+    /// `<table class="data">` — class_weight = 0 (no positive/negative
+    /// keyword match), and with no candidate score the
+    /// `weight + score < 0` arm doesn't fire. The next arm
+    /// (`text_content.count(',') < 10` plus the heuristic block) is
+    /// inspected; with content_length above min_text_length, no embed,
+    /// reasonable link density, the table is kept
+    /// (readability_lxml.py:357 onward).
+    ///
+    /// NOTE: a `<table>` with `class="data"` does NOT trigger any of the
+    /// special "data-table KEEP" branches the Mozilla Readability port
+    /// has — Trafilatura's readability fork doesn't carry that logic.
+    /// The keep here is incidental on content length, not a marked-table
+    /// rescue.
+    #[test]
+    fn sanitize_keeps_data_table_via_class_weight() {
+        let html = r#"<html><body>
+            <table class="data"><tr><td>Cell A with several words of content here</td><td>Cell B with several words of content here too</td></tr><tr><td>Cell C is similarly populated with content text</td><td>Cell D continues the data table example pattern</td></tr></table>
+        </body></html>"#;
+        let (_dom, article) = sanitize_one(html);
+        let tables = get_elements_by_tag_name(&article, "table");
+        assert_eq!(tables.len(), 1, "data table should survive");
+        assert_eq!(class_name(&tables[0]), "data");
+    }
+
+    /// A `<div>` whose content is overwhelmingly links (90% link
+    /// density) is dropped by the `weight < 25 and link_density > 0.2`
+    /// arm (readability_lxml.py:389-391).
+    #[test]
+    fn sanitize_high_link_density_div_removed() {
+        // 90% link density: 90 chars of <a> text vs 10 chars of plain
+        // text. class is neutral (weight = 0 < 25 triggers the arm).
+        // (Note: avoid raw `href="#"` patterns immediately followed by
+        // `>` next to a `"` — Rust 2024 reserves the `#"…"` sequence.
+        // We use `href="/x"` placeholders to sidestep the lexer reserve.)
+        let html = r#"<html><body>
+            <div class="nav"><a href="/x">aaaaaaaaaa</a><a href="/x">bbbbbbbbbb</a><a href="/x">cccccccccc</a><a href="/x">dddddddddd</a><a href="/x">eeeeeeeeee</a><a href="/x">ffffffffff</a><a href="/x">gggggggggg</a><a href="/x">hhhhhhhhhh</a><a href="/x">iiiiiiiiii</a> xx</div>
+        </body></html>"#;
+        let (_dom, article) = sanitize_one(html);
+        let divs = get_elements_by_tag_name(&article, "div");
+        // The nav div should be gone (class "nav" matches neither
+        // positive nor negative — weight = 0 — and link_density ≈ 0.97
+        // > 0.2 with weight < 25 → drop).
+        assert!(
+            !divs.iter().any(|d| class_name(d) == "nav"),
+            "nav div with high link density should be removed"
+        );
+    }
+
+    /// End-to-end: a page with a `<nav class="topnav"><ul>...</ul></nav>`
+    /// next to an article body — after `Document::summary()` runs, the
+    /// returned article must not contain the nav's link text.
+    ///
+    /// The nav is dropped via the chain: `remove_unlikely_candidates`
+    /// strips it under ruthless mode (`unlikelyCandidatesRe` matches
+    /// `header|nav|menu`); if for some reason it survives that, the
+    /// sanitize header-strip arm catches `<header>`/`<footer>`/`<nav>`
+    /// candidates with bad weight. Together they ensure the nav is gone.
+    #[test]
+    fn document_summary_strips_navigation_before_returning() {
+        let html = r#"<html><body>
+            <nav class="topnav"><ul><li><a href="/a">Home</a></li><li><a href="/b">About</a></li><li><a href="/c">Contact</a></li></ul></nav>
+            <div class="article">
+                <p>This is the first paragraph of an article body, containing several commas, multiple clauses, and well over twenty-five characters to score above the threshold.</p>
+                <p>A second paragraph continues the body, with reflection, analysis, and conclusion-pointing remarks supporting the main thesis of the piece.</p>
+                <p>A third paragraph wraps up the discussion, restating the thesis, naming the conclusion, and closing out the article cleanly.</p>
+            </div>
+        </body></html>"#;
+        let mut doc = Document::new(html);
+        let article = doc.summary().expect("summary returns Some");
+        let text = crate::readability::dom::text_content(&article);
+        assert!(
+            !text.contains("Home") && !text.contains("Contact"),
+            "navigation links should have been stripped, got: {text:.200}…"
+        );
+        assert!(
+            text.contains("first paragraph"),
+            "article body should be present, got: {text:.200}…"
+        );
     }
 }

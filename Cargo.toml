@@ -692,7 +692,96 @@ name = "mdrcel"
 # green (parser_equivalence_gate / trafilatura_equivalence_gate /
 # trafilatura_extract_smoke / trafilatura_extract_content_gate);
 # `cargo clippy --release --all-targets -- -D warnings` is clean.
-version = "0.5.1"
+#
+# M3 Stage 4c (2026-05-21): 0.5.1 -> 0.5.2 PATCH. REPLACES the Stage 4b
+# `_stage4b_sanitize_stub` pass-through with the real `sanitize` port
+# from `readability_lxml.py:326-438` — the largest single function in
+# the readability fork (~110 LOC source) and the heart of its
+# noise-removal pass. The Stage 4b stub serialized the article and
+# returned its length so the `summary()` retry-trigger gate had a
+# quantitative signal; Stage 4c lands the faithful four-phase pruning
+# logic the stub deferred. No new public surface (`sanitize` is private
+# to `Document::summary`), so PATCH per CLAUDE.md.
+#
+# Four phases ported, in order, each line-cited:
+# 1. Header strip (readability_lxml.py:327-329) — drop <h1>..<h6>
+#    descendants whose class_weight < 0 OR link_density > 0.33.
+# 2. Form/textarea strip (readability_lxml.py:331-332) — drop every
+#    <form> and <textarea> outright.
+# 3. Iframe filter (readability_lxml.py:334-338) — keep iframes whose
+#    src matches `videoRe` (YouTube/Vimeo, with text="VIDEO" so the
+#    serializer emits a balanced tag); drop all other iframes.
+# 4. Conditional clean (readability_lxml.py:340-435) — iterate
+#    <table>/<ul>/<div>/<aside>/<header>/<footer>/<section> in REVERSE
+#    document order. For each:
+#    - skip if already in the `allowed` set (long-siblings rescue);
+#    - drop if `class_weight + candidate_score < 0`;
+#    - else if raw `text_content.count(',') < 10`, run the big
+#      heuristic block: count TEXT_CLEAN_ELEMS descendants (with the
+#      `counts["li"] -= 100` and hidden-input subtraction quirks),
+#      compute content_length / link_density, then walk the eight-arm
+#      if/elif chain (too many images, more <li>s than <p>s, too many
+#      <input>s, too short with no/many images, too many links for
+#      weight, too many <embed>s, no content) — drop on any hit, with
+#      the "no content" arm having a long-siblings rescue carve-out
+#      (sum non-empty sibling text lengths; if > 1000, mark every
+#      table/ul/div/section descendant as `allowed`).
+#
+# Constants/regexes activated (Stage 4a vendored, dead-code-annotated):
+# - `TEXT_CLEAN_ELEMS` — now read by the counts dict.
+# - `LIST_TAGS` — the carve-out for "more <li>s than <p>s" drop arm.
+# - `video_re` — the iframe-src filter regex.
+# (`DIV_TO_P_ELEMS` remains Stage-4b-only and stays dead-code-annotated.)
+#
+# New dom-facade imports (no new dom.rs surface): `get_attribute`,
+# `next_element_sibling`, `previous_element_sibling`,
+# `set_element_text`, `text_content`. All landed in earlier Stages.
+#
+# Stage 4b test adjustment (HONESTLY recorded): the
+# `document_summary_falls_back_to_lenient_when_ruthless_fails` test was
+# originally written against `class="sidebar"` because that token
+# triggers `unlikelyCandidatesRe` (driving the ruthless drop the test
+# pins). But `sidebar` ALSO matches `negativeRe`, so under the real
+# sanitize the post-lenient article div still gets dropped
+# (`weight + score = -25 + low_score < 0`). Adjusted the test fixture
+# to `class="extra"` — same `unlikelyCandidatesRe` trigger, no
+# `negativeRe` hit — which exercises the SAME lenient-retry shape
+# without the secondary sanitize-drop. The test's inline rationale
+# documents the swap.
+#
+# Lib test count 612 -> 621 (+9 sanitize tests:
+# sanitize_drops_negative_weighted_text_clean_elem,
+# sanitize_keeps_img_with_src,
+# sanitize_keeps_img_without_src_faithful_to_python,
+# sanitize_keeps_youtube_iframe, sanitize_drops_iframe_without_video_src,
+# sanitize_drops_form_element, sanitize_keeps_data_table_via_class_weight,
+# sanitize_high_link_density_div_removed,
+# document_summary_strips_navigation_before_returning). All four
+# BLOCKER gates remain green (parser_equivalence_gate /
+# trafilatura_equivalence_gate / trafilatura_extract_smoke /
+# trafilatura_extract_content_gate); `cargo clippy --release
+# --all-targets -- -D warnings` is clean (with one targeted
+# `#[allow(clippy::if_same_then_else)]` on the sanitize function body
+# documenting the Python source's two-arm "too many links" branch with
+# identical bodies but different guards — a faithful preservation, not
+# duplicated logic).
+#
+# Faithful divergence note (HLD §4 anti-inversion): brief item 2
+# requested a `sanitize_drops_img_without_src` test, but the Python
+# source has NO `<img>` removal clause at all — the image count only
+# feeds the parent's drop-decision heuristics. Encoded the
+# **observed Python behaviour** as
+# `sanitize_keeps_img_without_src_faithful_to_python` instead; the
+# alternative (out-cleaning Python) would be inversion.
+#
+# What's left for Stage 4d:
+# - `is_probably_readerable` (readability_lxml.py:475-512).
+# - Cascade integration: wire `Document::summary()` into the M3
+#   arbiter as the second-arm rescue extractor (HLD §7.7).
+# - Optional: revisit `transform_misused_divs_into_paragraphs` rescue
+#   pass (Stage 4b deferred half) if a Stage 4d corpus divergence
+#   demands it.
+version = "0.5.2"
 edition = "2024"
 
 [dependencies]
