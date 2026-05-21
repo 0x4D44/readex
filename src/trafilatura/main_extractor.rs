@@ -1166,6 +1166,13 @@ pub fn handle_table(
                 let inner_descendants = descendant_elements(&subelement);
                 for child in inner_descendants {
                     let child_tag = local_name(&child).unwrap_or_default();
+                    // **M5 Stage 6d (2026-05-21) — capture original `child.tail`
+                    // BEFORE dispatch.** handle_textelem may route through
+                    // handle_quotes → handle_code_blocks whose `iter("*")` rename
+                    // detaches `child`, after which `tail(&child)` returns None
+                    // (rcdom models tail as a sibling Text node of the OLD parent).
+                    // See the post-`define_newelem` tail-recovery block below.
+                    let saved_child_tail = tail(&child);
                     let mut processed_subchild: Option<NodeRef> = None;
 
                     if TABLE_ALL.contains(&child_tag.as_str()) {
@@ -1207,9 +1214,51 @@ pub fn handle_table(
                             .collect();
                         processed_subchild = handle_textelem(&child, &pot_union, options);
                     }
+                    // **M5 Stage 6d (2026-05-21) — tail-recovery across deep_clone.**
+                    // lxml's `deepcopy(elem)` (used by `handle_code_blocks` at
+                    // main_extractor.py:220) retains `elem.tail` because lxml
+                    // stores `.tail` intrinsically on the element. rcdom stores
+                    // tail as a Text-node sibling in the original parent, so
+                    // `deep_clone` (`dom.rs:1460`) loses it. By the time
+                    // `define_newelem` (line 1212/2457) reads `tail(processed)`,
+                    // it returns None and the inter-element separator is lost.
+                    // Symptom: Wikipedia infobox `<td><code>.rs</code>, <code>.rlib</code></td>`
+                    // → Rust emits `` `.rs` `.rlib` `` (no `, ` separator),
+                    // Python emits `` `.rs` , `.rlib` `` (f76ec833 fixture).
+                    //
+                    // `saved_child_tail` was captured BEFORE handle_textelem (which
+                    // detaches child via `iter("*")` renames in handle_code_blocks /
+                    // handle_quotes / handle_paragraphs). Apply AFTER define_newelem
+                    // if the just-appended cell-child has no tail AND its tag matches
+                    // the source child's tag (same-tag guard mirrors `_extract`'s
+                    // Stage 6a pattern at line 1784 — for wrapper transforms like
+                    // `<lb>`→`<p>` or `<div>`→`<p>` the tail's flow position has
+                    // already been re-encoded into the wrapper's text).
+                    //
+                    // Whitespace-only tails (e.g. the `\n` between adjacent `<p>`s in
+                    // pretty-printed Wikipedia source) are SKIPPED — Python's
+                    // process_node (htmlprocessing.py:274) trims tail and treats
+                    // `trim("\n")` as empty, so no recovery is warranted for those.
+                    // Symptom of NOT gating on trim: Wikipedia POTD `<td><p>The…</p>\n<p>Photograph credit…</p></td>`
+                    // gains a stray `\n` between the two `<p>` cell-children
+                    // (d71ec714 fixture regression).
+                    let child_local_name = child_tag.clone();
                     // main_extractor.py:422-423 — define_newelem dispatch.
                     if let Some(p) = processed_subchild.as_ref() {
                         define_newelem(Some(p), &new_child_elem);
+                        // Stage 6d tail recovery (see comment above).
+                        if let Some(t) = saved_child_tail.as_deref() {
+                            let trimmed = crate::trafilatura::utils::trim(t);
+                            if !trimmed.is_empty() {
+                                let kids = element_children(&new_child_elem);
+                                if let Some(last) = kids.last() {
+                                    let last_tag = local_name(last).unwrap_or_default();
+                                    if last_tag == child_local_name && tail(last).is_none() {
+                                        set_tail(last, Some(t));
+                                    }
+                                }
+                            }
+                        }
                     }
                     // main_extractor.py:424 — child.tag = "done". Pin alive.
                     dones_alive.push(replace_element_tag(&child, "done"));

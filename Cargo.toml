@@ -2547,8 +2547,28 @@ name = "mdrcel"
 # sandbox we surface it as MINOR (matching M3 Stage 9's `comments` field
 # precedent at 0.9.0 -> 0.10.0). No new dependency; no public API removal;
 # `Options` unchanged.
-version = "0.15.8"
+version = "0.15.9"
 edition = "2024"
+
+# M5 Stage 6d (2026-05-21): 0.15.8 -> 0.15.9 PATCH. Bug fix only:
+# `handle_table`'s non-leaf cell loop (`main_extractor.rs:1166-1216`) lost
+# the inter-element tail of every `<code>`/`<quote>` cell-child that went
+# through `handle_quotes` → `handle_code_blocks`. lxml's `deepcopy(elem)`
+# (`main_extractor.py:220`) retains `elem.tail` because lxml stores `.tail`
+# intrinsically on the element; rcdom models tail as a sibling Text node
+# in the OLD parent, so `deep_clone` (`dom.rs:1460`) loses it and
+# `define_newelem` (`main_extractor.rs:2457`) ends up reading `None`.
+# Fix: capture `tail(&child)` BEFORE handle_textelem (which detaches
+# child), then re-attach to the just-appended cell-child AFTER
+# `define_newelem` when the tags match AND the saved tail has any
+# non-whitespace content (`trim(tail) != ""` mirrors Python's process_node
+# tail-trim at `htmlprocessing.py:274`, so the whitespace-only `\n`
+# between adjacent `<p>` siblings doesn't trip the recovery). Symptom:
+# Wikipedia infobox `<td><code>.rs</code>, <code>.rlib</code></td>` —
+# Rust emitted `` `.rs` `.rlib` `` (no separator), Python emits
+# `` `.rs` , `.rlib` ``. Gate movement: M5 markdown gate 36/51 -> 37/51
+# (content-mismatch 12 -> 11, +1 fixture green, 0 newly red). No
+# public-API change. No new dependency. PATCH bump.
 
 # M5 Stage 6a (2026-05-21): 0.15.5 -> 0.15.6 PATCH. Bug fix only:
 # `_extract` / `recover_wild_text` (`main_extractor.rs:1742-1761,
