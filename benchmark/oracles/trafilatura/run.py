@@ -11,6 +11,15 @@ governed by ../contract.schema.json; the behavioural contract (the
 ok/error/exit tri-state, same-machine determinism, the well-formed `text`
 primitive) is HLD section 3.
 
+Three additive oracle modes (mutually exclusive) bypass the JSON envelope
+and emit a raw payload directly on stdout for use by per-stage equivalence
+gates:
+
+  --convert-tags-only   M3 Stage 1b — post-`convert_tags` tree as XML.
+  --extract-content     M3 Stage 3-B — `extract_content` result body as XML.
+  --markdown            M5 Stage 2  — `extract(output_format="markdown")`
+                                       as raw UTF-8 (None → "").
+
 Self-correcting interpreter (HLD section 4, B2 spike resolution): the harness
 invokes BARE `python` from PATH and activates no venv. `requirements.txt` only
 reproduces under the matching interpreter (lxml ships per-CPython-ABI wheels
@@ -169,11 +178,12 @@ def _word_count(text):
 
 def _parse_args(argv):
     """Positional <abs.html> plus optional --base-url <URL> plus optional
-    --convert-tags-only / --extract-content (mutually exclusive).
+    --convert-tags-only / --extract-content / --markdown (mutually exclusive).
 
     No argparse: a fixed CLI; argparse would print to stdout on error.
 
-    Returns (path, base_url, convert_tags_only, extract_content_only, err).
+    Returns (path, base_url, convert_tags_only, extract_content_only,
+             markdown_only, err).
 
     `--convert-tags-only` (M3 Stage 1b additive — HLD §6.2 / Trafilatura-
     equivalence BLOCKER gate): when set, run.py SKIPS the full
@@ -196,17 +206,28 @@ def _parse_args(argv):
     Options are at DEFAULT (matching Rust `cleaning::Options::default()`).
     Mutually exclusive with --convert-tags-only — if both are passed, this
     returns an error; the gate only ever needs one.
+
+    `--markdown` (M5 Stage 2 additive — corpus-wide markdown equivalence
+    gate): when set, run.py runs the full `trafilatura.extract(raw,
+    output_format="markdown")` and emits the returned string (or `""` when
+    Python returns `None`) as raw UTF-8 bytes on stdout — NOT the contract
+    JSON envelope. This is the markdown corpus-diff gate's Python-side
+    oracle. Mutually exclusive with --convert-tags-only and
+    --extract-content.
     """
     path = None
     base_url = None
     convert_tags_only = False
     extract_content_only = False
+    markdown_only = False
     i = 0
     while i < len(argv):
         a = argv[i]
         if a == "--base-url":
             if i + 1 >= len(argv):
-                return None, None, False, False, "--base-url requires a URL argument"
+                return None, None, False, False, False, (
+                    "--base-url requires a URL argument"
+                )
             base_url = argv[i + 1]
             i += 2
             continue
@@ -218,18 +239,26 @@ def _parse_args(argv):
             extract_content_only = True
             i += 1
             continue
+        if a == "--markdown":
+            markdown_only = True
+            i += 1
+            continue
         if path is None:
             path = a
             i += 1
             continue
-        return None, None, False, False, f"unexpected extra argument: {a!r}"
+        return None, None, False, False, False, f"unexpected extra argument: {a!r}"
     if path is None:
-        return None, None, False, False, "missing required <abs.html> argument"
-    if convert_tags_only and extract_content_only:
-        return None, None, False, False, (
-            "--convert-tags-only and --extract-content are mutually exclusive"
+        return None, None, False, False, False, "missing required <abs.html> argument"
+    exclusive_count = sum(
+        (convert_tags_only, extract_content_only, markdown_only)
+    )
+    if exclusive_count > 1:
+        return None, None, False, False, False, (
+            "--convert-tags-only, --extract-content, and --markdown are "
+            "mutually exclusive"
         )
-    return path, base_url, convert_tags_only, extract_content_only, None
+    return path, base_url, convert_tags_only, extract_content_only, markdown_only, None
 
 
 def main():
@@ -247,6 +276,7 @@ def main():
             base_url,
             convert_tags_only,
             extract_content_only,
+            markdown_only,
             arg_err,
         ) = _parse_args(sys.argv[1:])
         if arg_err is not None:
@@ -392,6 +422,43 @@ def main():
             sys.stdout.buffer.flush()
             sys.exit(0)
         # --- end --extract-content branch ---------------------------------
+
+        # --- M5 Stage 2: --markdown mode (corpus markdown diff gate) ------
+        # Run the FULL `trafilatura.extract(raw, output_format="markdown")`
+        # pipeline and emit the returned string (UTF-8 bytes, no JSON
+        # envelope). `trafilatura.extract` returns either a `str` or `None`
+        # — the latter when nothing extractable was found (Bug-E2 valid
+        # empty result). We collapse `None` → `""` so the Rust gate can
+        # strict byte-compare unconditionally. The Python pipeline already
+        # NFC-normalises (core.py:98); the Rust harness re-NFC-normalises
+        # on its side belt-and-braces. Uses the same committed config
+        # (`trafilatura.cfg`) the bare_extraction path uses below, so the
+        # algorithm and timeout/dedup posture match.
+        if markdown_only:
+            from trafilatura import extract as trafi_extract
+            from trafilatura.settings import use_config
+
+            cfg = use_config(
+                os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    "trafilatura.cfg",
+                )
+            )
+            md = trafi_extract(
+                raw,
+                url=base_url,
+                output_format="markdown",
+                with_metadata=False,
+                deduplicate=False,
+                include_comments=False,
+                config=cfg,
+            )
+            if md is None:
+                md = ""
+            sys.stdout.buffer.write(md.encode("utf-8"))
+            sys.stdout.buffer.flush()
+            sys.exit(0)
+        # --- end --markdown branch ----------------------------------------
 
         # Explicit committed config, never ambient (HLD section 4).
         # EXTRACTION_TIMEOUT=0 disables the signal-based timeout: SIGALRM is

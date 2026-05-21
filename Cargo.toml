@@ -2547,7 +2547,7 @@ name = "mdrcel"
 # sandbox we surface it as MINOR (matching M3 Stage 9's `comments` field
 # precedent at 0.9.0 -> 0.10.0). No new dependency; no public API removal;
 # `Options` unchanged.
-version = "0.15.1"
+version = "0.15.2"
 edition = "2024"
 
 # M4 Stage 6 (2026-05-21): 0.14.1 -> 0.15.0 MINOR. Lifts `deduplication.py`'s
@@ -2624,6 +2624,20 @@ edition = "2024"
 # alternate-group capture path and the JSON_AUTHOR_REMOVE pre-strip).
 # All five BLOCKER gates remain green; `cargo clippy --lib --all-targets
 # -- -D warnings` is clean.
+#
+# M5 Stage 2 (2026-05-21): 0.15.1 -> 0.15.2 PATCH. Adds the corpus-wide
+# markdown equivalence diff harness (`tests/trafilatura_markdown_gate.rs`)
+# plus a `--markdown` mode on the trafilatura oracle adapter
+# (`benchmark/oracles/trafilatura/run.py`). The harness runs
+# `extract_to_markdown` against Python's `trafilatura.extract(raw,
+# output_format="markdown")` on all 51 corpus snapshots, NFC-normalises
+# both sides, and strict byte-compares. Divergences are bucketed
+# (empty-vs-non / whitespace-only / content-mismatch) and reported with
+# first-diff windows so Stage 3 can pick the highest-value fix target.
+# Stage 2 success = "harness compiles, runs to completion, emits an
+# actionable diff report" — NOT all-green; triage is Stage 3 work. No
+# production-code change (test file + oracle CLI flag only); per CLAUDE.md
+# PATCH.
 
 [dependencies]
 # DEC-3 (M1): the library was a zero-dependency crate at the Milestone-1 floor;
