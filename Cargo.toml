@@ -572,7 +572,60 @@ name = "mdrcel"
 # test `handle_lists_emits_phantom_duplicate_for_nested_list_with_quote_child`
 # pins the behaviour. Per semver PATCH: defensive emission in
 # already-public function, no API change.
-version = "0.4.20"
+#
+# M3 Stage 4a (2026-05-21): 0.4.20 -> 0.5.0 MINOR. Introduces a NEW
+# public module (`#[doc(hidden)] pub mod trafilatura::readability_fork`)
+# — Trafilatura's INTERNAL FORK of readability-lxml, **distinct from
+# `crate::readability`** (which is the M2 port of Mozilla Readability.js;
+# the two algorithms use different scoring constants and different
+# orchestration shapes). Source of truth:
+# `trafilatura@v2.0.0/readability_lxml.py:42-303`. Stage 4a lands the
+# **data-structures + scoring-primitives** half only (the orchestration
+# `Document::summary()`, `sanitize`, and the cascade integration arrive
+# in Stages 4b / 4c / 4d).
+#
+# New public types:
+# - `Candidate { score: f64, elem: NodeRef }` — readability_lxml.py:92-99.
+#
+# New public functions:
+# - `text_length(elem) -> usize` (readability_lxml.py:87-89)
+# - `class_weight(elem) -> f64` (readability_lxml.py:261-268)
+# - `score_node(elem) -> Candidate` (readability_lxml.py:270-282)
+# - `score_paragraph_text(text) -> f64` (readability_lxml.py:245)
+# - `link_density(elem) -> f64` (readability_lxml.py:220-223)
+#
+# Module-level constants + REGEXES dict (readability_lxml.py:42-84)
+# vendored as `pub(crate)` (DIV_TO_P_ELEMS / DIV_SCORES / BLOCK_SCORES /
+# BAD_ELEM_SCORES / STRUCTURE_SCORES / TEXT_CLEAN_ELEMS / FRAME_TAGS /
+# LIST_TAGS, plus the six `re.compile(..., re.I)` patterns lazily
+# memoised through `OnceLock<Regex>` accessors). The case-insensitive
+# `re.I` flag is honoured via inline `(?i)` prefixes — `regex` interprets
+# this identically to Python `re.I` for the ASCII alternations vendored.
+#
+# Per semver (CLAUDE.md "Version management") MINOR — a new module with
+# new public types and functions, **additive only**: every existing
+# public surface (`extract` / `extract_with` / `Extracted` / `Options` /
+# `ExtractError` and the `#[doc(hidden)]` infrastructure modules) is
+# byte-unchanged. The Trafilatura-equivalence BLOCKER gate
+# (`tests/trafilatura_equivalence_gate.rs`) remains 8/8 green; the M2
+# parser-equivalence gate (`tests/parser_equivalence_gate.rs`) is
+# byte-identical to commit 149c686; the extract_content gate
+# (`tests/trafilatura_extract_content_gate.rs`) remains green; the
+# end-to-end smoke gate (`tests/trafilatura_extract_smoke.rs`) remains
+# green. Lib test count 583 -> 603 (20 new unit tests covering
+# class_weight / score_node / score_paragraph_text / link_density /
+# text_length / regex-literal sanity). `cargo clippy --release
+# --all-targets -- -D warnings` is clean.
+#
+# Stage 4a is the FIRST commit on M3 to bump MINOR; every prior M3
+# Stage was PATCH (additive infrastructure behind `#[doc(hidden)]`
+# surfaces). 4a graduates `readability_fork` to the same `#[doc(hidden)]`
+# infrastructure surface but with a NEW exported type (`Candidate`) and
+# five new exported functions — that crosses the MINOR threshold per the
+# CLAUDE.md "new public types/functions = MINOR" rule. Stages 4b / 4c /
+# 4d will likely be PATCH (extending the same module's internal
+# surfaces) but each will state its own semver rationale at bump time.
+version = "0.5.0"
 edition = "2024"
 
 [dependencies]

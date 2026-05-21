@@ -60,3 +60,18 @@ pub mod utils;
 // citation; Stage 2c-ii replaces that stub with the full port
 // (`main_extractor.py:161-205`).
 pub mod main_extractor;
+
+// Stage 4a — Trafilatura's INTERNAL FORK of readability-lxml: data
+// structures + scoring primitives. Source of truth:
+// `trafilatura@v2.0.0/readability_lxml.py:42-303`. Ports the module-level
+// constants (DIV_SCORES / BLOCK_SCORES / BAD_ELEM_SCORES /
+// STRUCTURE_SCORES / FRAME_TAGS / LIST_TAGS / TEXT_CLEAN_ELEMS /
+// REGEXES dict), the `Candidate` dataclass, and the five leaf scoring
+// primitives (`text_length`, `class_weight`, `score_node`,
+// `score_paragraph_text`, `link_density`). NO orchestration logic — that
+// arrives in Stage 4b (`Document::summary()` core), Stage 4c (`sanitize`
+// + ruthless/lenient retry), Stage 4d (`is_probably_readerable` +
+// cascade integration). Distinct from `crate::readability` (which is
+// the M2 port of Mozilla Readability.js — different algorithm, different
+// scoring constants).
+pub mod readability_fork;
