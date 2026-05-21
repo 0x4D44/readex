@@ -1430,7 +1430,107 @@ name = "mdrcel"
 # (parser_equivalence_gate / trafilatura_equivalence_gate /
 # trafilatura_extract_smoke / trafilatura_extract_content_gate);
 # `cargo clippy --release --all-targets -- -D warnings` is clean.
-version = "0.8.2"
+#
+# M3 Stage 7d (2026-05-21): 0.8.2 -> 0.8.3 PATCH. Closes Stage 7 by landing
+# the final three deferred metadata extractors plus the URL canonicalization
+# layer that the Stage 7a orchestrator stubbed:
+# - **URL canonicalization** (`metadata.py:389-413` + `courlan/urlutils.py:
+#   14-62`): `extract_url(dom, default_url)` walks `URL_SELECTORS`
+#   (`metadata.py:153-157`) — `<link rel="canonical">` / `<base>` /
+#   `<link rel="alternate" hreflang="x-default">` — under `<head>`, falls
+#   through to `default_url` if no match. Relative URLs are repaired by
+#   sniffing `og:`/`twitter:` content for a base URL (`metadata.py:
+#   397-406`). Validity is gated by a minimal `is_valid_url` (http/https
+#   scheme + non-empty host with at least one `.`), and `normalize_url`
+#   lowercases scheme + netloc. The full courlan query-tracker stripper
+#   is deferred — no Stage 3-B fixture exercises it.
+# - **`extract_domain(url)`** (`urlutils.py:49-62`, fast-path subset):
+#   structural port of the `DOMAIN_REGEX` regex-fast path Trafilatura's
+#   metadata pipeline calls at `metadata.py:543`. Returns the full
+#   domain including subdomain (e.g. `"www.example.com"` for
+#   `https://www.example.com/foo`) — Python's slow-path `CLEAN_FLD_REGEX`
+#   `^www[0-9]*\.` stripping only runs on the slow path (via the `tld`
+#   library), not on the fast path the metadata pipeline calls into.
+#   Stage 7d's fast-path-only choice is faithful to the call site.
+# - **`extract_date(dom)` — STUB**: looks at the obvious HTML hints
+#   Python's `htmldate` package would also find on the easy path
+#   (`<meta property="article:published_time">`, `<meta name="date">`,
+#   `<meta itemprop="datePublished">`, `<time datetime="...">`). Returns
+#   `None` for cases where `htmldate` would fall back to
+#   `dateparser`/`dateutil` for locale-aware fuzzy parsing of free-text
+#   date strings. The full `htmldate` port is deferred — that package is
+#   ~3000 LOC and depends on `dateparser` (another ~5000 LOC), neither
+#   of which the Stage 3-B BLOCKER corpus exercises. Documented in the
+#   function header.
+# - **`extract_catstags(dom, metatype)`** (`metadata.py:422-446`): walks
+#   CATEGORIES_XPATHS (`metatype = "category"`) or TAGS_XPATHS
+#   (`metatype = "tag"`) under `<body>` via the Stage 0b XPath engine,
+#   collecting the `text_content` of every matched `<a href="...">`
+#   whose `href` passes the `/{metatype}[s|ies]?/` Python-quirk filter
+#   (the `[s|ies]?` is a single-character class per Python re semantics,
+#   not the alternation `s` OR `ies` — replicated faithfully). The
+#   first XPath that yields any results wins. Category fallback to
+#   `<meta property="article:section">` / `<meta name="*subject*">`
+#   (`metadata.py:437-441`) is preserved.
+# - **`extract_license(dom)`** (`metadata.py:465-479`): walks `<a
+#   rel="license">` links anywhere in the document, parsing each via
+#   `parse_license_element` in non-strict mode (returns trimmed text or
+#   `"CC {token} {version}"` on LICENSE_REGEX match). Falls back to
+#   footer / div.footer links in strict mode (text must match
+#   TEXT_LICENSE_REGEX). LICENSE_REGEX (`metadata.py:56-58`) and
+#   TEXT_LICENSE_REGEX (`metadata.py:59-62`) are implemented structurally
+#   — no new regex deps; the token alternation table is vendored as a
+#   `const &[&str]` array iterated in source-listed order.
+#
+# All five functions are wired into `metadata::extract_metadata` (the
+# Stage 7d additions at steps 9-14 of the orchestrator):
+# - step 9: `extract_url(dom, default_url)` — only when `metadata.url.is_none()`
+# - step 10: `extract_domain(url)` — unconditional when URL is present
+# - step 11: `extract_date(dom)` — only when `metadata.date.is_none()`
+#   (additive over JSON-LD's `datePublished` extraction from Stage 7b)
+# - step 12: `extract_catstags(dom, "category")` — only when categories empty
+# - step 13: `extract_catstags(dom, "tag")` — only when tags empty
+# - step 14: `extract_license(dom)` — unconditional (Python at line 583
+#   re-derives unconditionally)
+#
+# Per semver (CLAUDE.md "Version management") PATCH — additive
+# orchestration of new extractors within the same `#[doc(hidden)] pub
+# mod trafilatura::metadata_url` infrastructure surface. The `Metadata`
+# struct shape (Stage 7a) is byte-unchanged — Stage 7d only POPULATES
+# previously-`None`/empty fields (`url` / `hostname` / `date` (when
+# JSON-LD didn't fill it) / `categories` / `tags` (when meta walk didn't
+# fill them) / `license`). Pages without URL/date/category hints see
+# byte-identical Stage 7a/7b output.
+#
+# Public surface added (`#[doc(hidden)] pub mod trafilatura::metadata_url`):
+# - `extract_url(dom: &Dom, default_url: Option<&str>) -> Option<String>`
+# - `extract_domain(url: &str) -> Option<String>`
+# - `extract_date(dom: &Dom) -> Option<String>` — documented STUB
+# Plus `pub(crate)` extractors consumed by `metadata::extract_metadata`:
+# - `extract_catstags(dom: &Dom, metatype: &str) -> Vec<String>`
+# - `extract_license(dom: &Dom) -> Option<String>`
+#
+# Lib test count 710 -> 735 (+25 new tests across the metadata_url::tests
+# module covering extract_url canonical / og:url fallback / default_url
+# fallback / scheme-case normalisation / relative-URL repair;
+# extract_domain simple / port-strip / userinfo-strip / no-scheme / empty;
+# extract_date article:published_time / time-element / meta-name-date /
+# pure-text-deferral; extract_catstags meta-keywords integration /
+# link-based-tag; extract_license rel=license CC-regex / rel=license
+# text-fallback; comprehensive e2e populates_all_fields_when_present;
+# plus six internal helper tests for href_matches_metatype /
+# normalize_url / is_valid_url). All 4 BLOCKER gates remain
+# byte-identical green (parser_equivalence_gate /
+# trafilatura_equivalence_gate / trafilatura_extract_smoke /
+# trafilatura_extract_content_gate); `cargo clippy --release --all-targets
+# -- -D warnings` is clean.
+#
+# Stage 7 COMPLETE (across 7a/7b/7d): total ~1900 LOC, 3 commits
+# (9555eb0 + 013d6f1 + this), test delta 583+ -> 735 (+~50 across the
+# three sub-stages). The full HTML-tag + JSON-LD + URL/date metadata
+# surface is now wired; the only deferred piece is the full `htmldate`
+# locale-aware date parser (documented in `extract_date`'s header).
+version = "0.8.3"
 edition = "2024"
 
 [dependencies]

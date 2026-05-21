@@ -121,3 +121,13 @@ pub mod metadata;
 // `metadata::extract_metadata` between the OG/meta walk and the title
 // XPath fallback.
 pub mod metadata_jsonld;
+
+// Stage 7d — minimal URL canonicalization (`metadata.py:389-413` +
+// `courlan/urlutils.py:14-62`) + date stub (subset of `htmldate`'s easy
+// path: <meta property="article:published_time">, <meta name="date">,
+// <time datetime="...">) + the previously-deferred Stage 7a extractors
+// `extract_catstags` (`metadata.py:422-446`) and `extract_license`
+// (`metadata.py:465-479`). Wired into `metadata::extract_metadata` so
+// `Metadata::url` / `hostname` / `date` / `categories` / `tags` / `license`
+// populate additively (JSON-LD values from Stage 7b keep precedence).
+pub mod metadata_url;

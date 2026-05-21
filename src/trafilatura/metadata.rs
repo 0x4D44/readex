@@ -768,7 +768,6 @@ pub fn extract_metadata(
     author_blacklist: &[String],
 ) -> Metadata {
     let _ = extensive;
-    let _ = default_url;
 
     let dom = Dom::parse(html);
     let mut metadata = Metadata::default();
@@ -855,6 +854,42 @@ pub fn extract_metadata(
             }
         }
     }
+
+    // 9. URL fallback (Stage 7d, `metadata.py:538-539`). Only fires when
+    //    earlier passes (og:url / twitter:url / JSON-LD) didn't already
+    //    populate `metadata.url`.
+    if metadata.url.is_none() {
+        metadata.url = crate::trafilatura::metadata_url::extract_url(&dom, default_url);
+    }
+
+    // 10. Hostname from URL (Stage 7d, `metadata.py:542-543`). Always fires
+    //     when a URL is present (Python overwrites unconditionally).
+    if let Some(ref url) = metadata.url {
+        metadata.hostname = crate::trafilatura::metadata_url::extract_domain(url);
+    }
+
+    // 11. Date fallback (Stage 7d, `metadata.py:546-547`). Stage 7d is an
+    //     additive STUB — only fires when JSON-LD (Stage 7b) didn't already
+    //     populate `metadata.date`.
+    if metadata.date.is_none() {
+        metadata.date = crate::trafilatura::metadata_url::extract_date(&dom);
+    }
+
+    // 12. Categories fallback (Stage 7d, `metadata.py:575-576`).
+    if metadata.categories.is_empty() {
+        metadata.categories = crate::trafilatura::metadata_url::extract_catstags(&dom, "category");
+    }
+
+    // 13. Tags fallback (Stage 7d, `metadata.py:579-580`).
+    if metadata.tags.is_empty() {
+        metadata.tags = crate::trafilatura::metadata_url::extract_catstags(&dom, "tag");
+    }
+
+    // 14. License (Stage 7d, `metadata.py:583`). Unconditional in Python
+    //     (the assignment always runs); Stage 7d preserves that — license
+    //     is always re-derived from the document, since it's not populated
+    //     anywhere else.
+    metadata.license = crate::trafilatura::metadata_url::extract_license(&dom);
 
     metadata
 }
