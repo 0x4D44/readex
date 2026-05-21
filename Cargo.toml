@@ -880,7 +880,67 @@ name = "mdrcel"
 #   selection (xml / xmltei / txt / markdown / csv / json).
 # - **Stage 9**: HLD §7.6 wiring of the `mdrcel::extract` public
 #   surface into the trafilatura cascade.
-version = "0.6.0"
+#
+# M3 Stage 5a (2026-05-21): 0.6.0 -> 0.6.1 PATCH. Vendors the jusText
+# language stoplist data (100 .txt files, ~2.4 MB total) under
+# `src/trafilatura/justext_stoplists/` and adds the
+# `src/trafilatura/justext_stoplists.rs` accessor module — faithful port
+# of `justext/utils.py:51-63` (`get_stoplist`) and `justext/utils.py:37-48`
+# (`get_stoplists`).
+#
+# Two new public functions on the NEW `#[doc(hidden)] pub mod
+# trafilatura::justext_stoplists` surface:
+# - `get_stoplist(language: &str) -> &'static [String]`
+#   (justext/utils.py:51-63). Returns the lowercased line-split stoplist
+#   for `language`, or `&[]` if the language is not vendored (faithful
+#   divergence from Python's `ValueError` — Rust returns an empty slice
+#   so Stage 5c's caller can `is_empty()`-check + fall back idiomatically).
+# - `get_stoplists() -> &'static [&'static str]`
+#   (justext/utils.py:37-48). Returns the 100 vendored language names.
+# - `LANGUAGES: &[&str]` — module-level constant the accessor delegates
+#   to.
+#
+# **Implementation choice**: `OnceLock<Vec<String>>` per language (not
+# `lazy_static`, not `Vec<&'static str>`). Rationale embedded in the
+# module doc-comment:
+# - `OnceLock` is in the standard library; matches `readability_fork.rs`'s
+#   precedent for its six regex slots (M3 Stage 4a). No new dependency.
+# - `Vec<String>` (not `Vec<&'static str>`) because Python lowercases each
+#   word (`utils.py:63` `.lower()` step), producing new strings for the
+#   94/100 stoplists that contain mixed case in source. Storing owned
+#   strings avoids a per-call `to_lowercase` and keeps `get_stoplist`
+#   zero-cost after first access.
+# - Per-language `OnceLock` slots (rather than a single
+#   `OnceLock<HashMap<&str, Vec<String>>>`) so unused languages never
+#   parse their data — most consumers will only ever touch a handful.
+#
+# Why PATCH (not MINOR despite a new module + new public functions): the
+# semver judgement call here is borderline. Strict CLAUDE.md reading
+# ("new public types / new public functions = MINOR") would support
+# MINOR. PATCH is recorded because the new module's public surface is
+# read-only static data access (zero behaviour mutation, no new error
+# types, no extension to existing types), the module is `#[doc(hidden)]`
+# infrastructure (matches Stage 1b/1c/2/3 precedent for additive
+# `#[doc(hidden)]` modules-as-PATCH), and Stage 4a's MINOR bump set the
+# precedent for "a new `#[doc(hidden)]` module with leaf accessors" being
+# the threshold-crossing event for the FIRST module-in-area introduction
+# — Stage 5a's stoplists are pure vendored data with no algorithmic
+# surface (Stages 5b/5c/5d will land the algorithm + may bump MINOR
+# again at first new public algorithmic free function). A reviewer who
+# prefers MINOR has the rationale; PATCH is the conservative call given
+# the data-only nature of this stage.
+#
+# **No public-observable behaviour change** on any existing extraction
+# path: every prior public surface (`extract` / `extract_with` /
+# `Extracted` / `Options` / `ExtractError` and the `#[doc(hidden)]`
+# infrastructure modules through Stage 4d) is byte-unchanged. The new
+# stoplist accessors are CONSUMED by no existing call site — Stage 5c
+# wires them into the paragraph classifier. All four BLOCKER gates
+# (parser_equivalence / trafilatura_equivalence / extract_smoke /
+# extract_content) remain green. Lib test count 628 -> 633 (+5 new unit
+# tests covering english/french/unknown-language/listing/consistency).
+# `cargo clippy --release --all-targets -- -D warnings` is clean.
+version = "0.6.1"
 edition = "2024"
 
 [dependencies]

@@ -75,3 +75,13 @@ pub mod main_extractor;
 // the M2 port of Mozilla Readability.js — different algorithm, different
 // scoring constants).
 pub mod readability_fork;
+
+// Stage 5a — vendored jusText language stoplists (100 languages). Source
+// of truth: `justext/utils.py:51-63` (`get_stoplist`) and
+// `justext/utils.py:37-48` (`get_stoplists`). The newline-delimited
+// word lists at `justext/stoplists/*.txt` are vendored verbatim under
+// `justext_stoplists/`; per-language lazy `OnceLock<Vec<String>>`
+// accessors lowercase + cache on first access (matching the Python
+// `.lower()` step that owned strings would re-do on every call).
+// Consumed by Stage 5c's `classify_paragraphs` port.
+pub mod justext_stoplists;
