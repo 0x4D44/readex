@@ -2054,7 +2054,79 @@ name = "mdrcel"
 # Lib test count 789 -> 881 (+92 new sub-stage-C unit tests across 60+
 # matching/non-matching pairs, multilingual LONG_TEXT_PATTERN coverage,
 # MONTHS/TEXT_MONTHS lookups, SIMPLE_PATTERN+post_filter pair, etc.).
-version = "0.11.2"
+#
+# M4 Stage 1 sub-stage D (2026-05-21): 0.11.2 -> 0.11.3 PATCH. Adds
+# `src/htmldate/extractors.rs` — faithful port of the non-dateparser
+# parsing layer of `htmldate@1.9.x/extractors.py:216-508`. Sub-stages A
+# (settings + Extractor + trim_text), B (validators), and C (regex
+# catalogues + month tables) supply the building blocks; this sub-stage
+# wires them into the post-line-216 algorithm:
+#
+# - `discard_unwanted`        (extractors.py:216-222)
+# - `extract_url_date`        (extractors.py:225-242)
+# - `correct_year`            (extractors.py:245-249)
+# - `try_swap_values`         (extractors.py:252-254)
+# - `regex_parse`             (extractors.py:257-283)
+# - `custom_parse`            (extractors.py:286-383)
+# - `external_date_parser`    (extractors.py:386-396) — STUB returning None
+# - `try_date_expr`           (extractors.py:399-437) — LEAF orchestrator
+# - `img_search`              (extractors.py:440-451)
+# - `pattern_search`          (extractors.py:454-466)
+# - `json_search`             (extractors.py:469-483)
+# - `idiosyncrasies_search`   (extractors.py:486-508)
+#
+# Plus the `last_named_group` helper deferred from sub-stage C
+# (Python `re.Match.lastgroup` analogue used by `custom_parse` /
+# `regex_parse`) and the `MAX_SEGMENT_LEN = 52` constant
+# (extractors.py:86) consumed by `try_date_expr`.
+#
+# Faithful divergences (recorded — HLD §4 anti-inversion):
+# - **`external_date_parser` STUB**: the real `dateparser.DateDataParser`
+#   call (extractors.py:390) is deferred indefinitely per the M4 Stage 1
+#   scoping report (~10k LOC + 200 locale YAML files). The Rust stub
+#   returns `None` unconditionally. The downstream gate in `try_date_expr`
+#   at extractors.py:429 requires `extensive_search=True` AND
+#   `TEXT_DATE_PATTERN` match before reaching the stub — the dateparser
+#   fallback rarely fires on real corpora.
+# - **`dateutil.parser.parse(fuzzy=False)` cascade**: Python's
+#   `extractors.py:310` falls through to `dateutil_parse` after
+#   `fromisoformat` fails. The Rust port replaces this with a small
+#   explicit format list driven through sub-stage B's `format_parse`
+#   (`%Y-%m-%d`, `%Y/%m/%d`, `%Y.%m.%d`, `%d.%m.%Y`, `%d/%m/%Y`,
+#   `%d-%m-%Y`, `%Y-%m-%dT%H:%M:%S`, `%Y-%m-%d %H:%M:%S`). Extend the
+#   list if a corpus regression surfaces — documented in the call site.
+# - **`datetime.fromisoformat`** (Python 3.11+ accepts arbitrary ISO 8601
+#   incl. `"+00:00"` and `"Z"`): implemented as `try_fromisoformat`
+#   handling bare `YYYY-MM-DD`, `YYYY-MM-DDTHH:MM:SS`,
+#   `YYYY-MM-DDTHH:MM:SS+ZZ:ZZ`, `...Z`, and `YYYY-MM-DD HH:MM:SS`.
+#   Time-zone offsets are accepted and ignored (the validators only
+#   consume Y/M/D, so the truncation is observation-equivalent).
+# - **`@lru_cache(maxsize=CACHE_SIZE)` on `try_date_expr`** is NOT ported.
+#   Matches sub-stage B's `@lru_cache`-deferral precedent: pure perf
+#   optimisation, identical observable result.
+#
+# Per semver (CLAUDE.md "Version management") PATCH — additive new module
+# (`htmldate::extractors`) extending the existing `#[doc(hidden)] pub mod
+# htmldate` infrastructure surface. Backward compatibility:
+# - Every prior public surface (`extract` / `extract_with` / `Extracted`
+#   / `Options` / `ExtractError` and the M2/M3 + htmldate sub-stage A/B/C
+#   `#[doc(hidden)]` modules) is byte-unchanged.
+# - The new public functions are consumed by no existing call site — the
+#   `find_date` orchestrator that drives the full htmldate algorithm is
+#   the next sub-stage's responsibility.
+# - All 4 BLOCKER gates (parser_equivalence_gate /
+#   trafilatura_equivalence_gate / trafilatura_extract_smoke /
+#   trafilatura_extract_content_gate) remain byte-identical green by
+#   construction (no existing module touched).
+#
+# Lib test count 881 -> 916 (+35 new sub-stage-D unit tests: 2 on
+# discard_unwanted, 5 on extract_url_date, 4 on correct_year, 3 on
+# try_swap_values, 4 on custom_parse, 1 on external_date_parser stub, 4
+# on regex_parse (EN/DE/FR + no-match), 5 on try_date_expr (custom_parse
+# hit, empty/none, digit-floor, discard_patterns, stub-fallback), 2 on
+# img_search, 1 on pattern_search, 2 on json_search (published +
+# modified), 2 on idiosyncrasies_search).
+version = "0.11.3"
 edition = "2024"
 
 [dependencies]

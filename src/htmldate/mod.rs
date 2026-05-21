@@ -41,3 +41,14 @@ pub mod validators;
 // helper (Rust `regex` is finite-automaton; no lookarounds). See
 // `regex_catalogues.rs`'s module-level docs for the divergence rationale.
 pub mod regex_catalogues;
+
+// Sub-stage D — non-dateparser parsing layer — verbatim port of
+// `htmldate/extractors.py:216-508`. Wires sub-stages A/B/C into the
+// `discard_unwanted` / `extract_url_date` / `correct_year` /
+// `try_swap_values` / `regex_parse` / `custom_parse` / `try_date_expr` /
+// `img_search` / `pattern_search` / `json_search` /
+// `idiosyncrasies_search` algorithm. The `external_date_parser`
+// function is shipped as a STUB returning `None` (Python's call into
+// `dateparser.DateDataParser` is deferred indefinitely — see the
+// `extractors.rs` module header for the rationale).
+pub mod extractors;
