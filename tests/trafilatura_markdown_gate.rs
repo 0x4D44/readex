@@ -73,6 +73,14 @@ const PYTHON_UNDER_EXTRACT_ALLOWLIST: &[&str] = &[
     // the post listing (~17KB of post titles + URLs + dates). ADR:
     // wrk_docs/m5-allowlist/9c64e8e3.md.
     "9c64e8e3fcd844d4.html",
+    // Hacker News front page (news.ycombinator.com). Python over-extracts
+    // the `<td class="pagetop">` site-nav block ("Hacker News | new | past
+    // | comments | ask | show | jobs | submit | login") as the opening
+    // ~215 chars of output and emits the story listing flat (one cell per
+    // line, literal `|` pipes between). mdrcel emits the listing as a
+    // proper markdown table and omits the nav chrome. ADR:
+    // wrk_docs/m5-allowlist/0f63a2a5.md.
+    "0f63a2a5a5620b74.html",
 ];
 
 /// All 51 corpus snapshots — enumerated literally from
