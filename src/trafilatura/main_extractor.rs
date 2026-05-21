@@ -263,7 +263,63 @@ pub fn handle_lists(element: &NodeRef, options: &Options) -> Option<NodeRef> {
                 // second append is a no-op move-back into the same parent).
                 append_child(&processed_element, &new_child_elem);
             }
+        }
+        // ----------------------------------------------------------------
+        // **Cluster D — lxml iterdescendants precompute quirk** (Apple_Inc
+        // Wiki fixture, token 2407). Python's `for child in
+        // element.iterdescendants("item"):` precomputes the next-pointer at
+        // yield time. When the loop body recursively calls handle_lists on a
+        // nested list (via process_nested_elements), the recursive call sets
+        // every descendant <item>'s tag to "done". BUT the outer iter's
+        // precomputed pointer ALREADY points at the FIRST descendant item, so
+        // the outer iter yields it AGAIN despite the mutation. Subsequent
+        // descendants are skipped (the tag filter IS evaluated on advance).
+        //
+        // Net effect in Python: handle_lists's outer iter visits the first
+        // inner item of every nested-list-in-item ONE EXTRA TIME, processing
+        // it via the non-leaf else branch (since lxml preserves text +
+        // children through tag mutation). The duplicate emission has
+        // `text = inner_item.text` (the cite text that tree_cleaning's
+        // strip_tags merged in) and NO children (PNE's descendants are all
+        // "done" so handle_textnode returns None for each).
+        //
+        // In Rust, get_elements_by_tag_name's snapshot is even more eager
+        // (it includes EVERY descendant item), but replace_element_tag drains
+        // children, so the OLD snapshot ref has nothing to emit. We must
+        // snapshot the first descendant item's text + has-children flag
+        // BEFORE the recursive HL drains it, then emit the duplicate manually
+        // after the normal append/rename steps below.
+        //
+        // Empirical proof (lxml 6.0.2):
+        //   xml = '<list><item id="x"><list><item id="y1"/><item id="y2"/></list></item></list>'
+        //   for elem in tree.iterdescendants('item'):
+        //       print(elem.get('id'), elem.tag)
+        //       if elem.get('id') == 'x':
+        //           for it in elem.iterdescendants('item'):
+        //               it.tag = 'done'
+        //   # x item ; y1 done   (y1 yielded despite mutation; y2 skipped)
+        //
+        // The phantom is emitted iff (matching Python's gate condition for
+        // the phantom visit): the snapshotted item has non-empty text AND
+        // had element-children (so Python takes the else branch, not the
+        // leaf if branch where process_node returns None for tag="done").
+        // ----------------------------------------------------------------
+        let phantom_dup: Option<String> = if element_child_count(&child) > 0 {
+            let descendant_items = get_elements_by_tag_name(&child, "item");
+            descendant_items.first().and_then(|first| {
+                let text = element_text(first).unwrap_or_default();
+                let has_kids = element_child_count(first) > 0;
+                if has_kids && !text.is_empty() {
+                    Some(text)
+                } else {
+                    None
+                }
+            })
         } else {
+            None
+        };
+
+        if element_child_count(&child) > 0 {
             // main_extractor.py:180-189 — non-leaf <item>: rewire descendants
             // into new_child_elem, then handle the tail-merge.
             process_nested_elements(&child, &new_child_elem, options);
@@ -302,6 +358,17 @@ pub fn handle_lists(element: &NodeRef, options: &Options) -> Option<NodeRef> {
         // main_extractor.py:193 — rename child to "done", unconditional.
         // Pin alive (rcdom Drop quirk).
         dones_alive.push(replace_element_tag(&child, "done"));
+
+        // **Cluster D phantom emission** — see the long comment above. After
+        // appending and renaming the normal item, also append the precompute-
+        // quirk duplicate if the snapshot qualified. This is the Rust analogue
+        // of lxml's outer iter yielding the first inner item AGAIN despite its
+        // tag having been mutated to "done" by the recursive handle_lists.
+        if let Some(text) = phantom_dup {
+            let dup_item = create_element("item");
+            set_element_text(&dup_item, Some(&text));
+            append_child(&processed_element, &dup_item);
+        }
     }
     // main_extractor.py:194 — rename element to "done", unconditional.
     dones_alive.push(replace_element_tag(element, "done"));
@@ -3812,6 +3879,90 @@ mod tests {
         assert!(
             block_text.contains("rustup update stable"),
             "the surviving top-level code is the block, not the empty inline orphan: {block_text:?}"
+        );
+    }
+
+    #[test]
+    fn handle_lists_emits_phantom_duplicate_for_nested_list_with_quote_child() {
+        // **Stage 3-B Cluster D regression pin (2026-05-21).**
+        //
+        // Apple_Inc Wikipedia fixture, token 2407 divergence. Python's
+        // `for child in element.iterdescendants("item"):` precomputes the
+        // next-pointer at yield time. The loop body recursively calls
+        // handle_lists on a nested list (via process_nested_elements),
+        // which sets every descendant <item>'s tag to "done". But the
+        // outer iter's precomputed pointer already points at the FIRST
+        // inner item — so the outer iter YIELDS IT AGAIN despite the
+        // mutation. That phantom yield emits a duplicate <item> whose
+        // text is the inner item's text (cite-text merged in by
+        // tree_cleaning's strip_tags) and which has no children
+        // (descendants are all "done", handle_textnode returns None).
+        //
+        // Lxml empirical proof (already documented in handle_lists):
+        //   xml = '<list><item id="x"><list><item id="y1"/><item id="y2"/></list></item></list>'
+        //   for elem in tree.iterdescendants('item'):
+        //       print(elem.get('id'), elem.tag)
+        //       if elem.get('id') == 'x':
+        //           for it in elem.iterdescendants('item'):
+        //               it.tag = 'done'
+        //   # x item ; y1 done   (y1 yielded despite mutation; y2 skipped)
+        //
+        // Repro: Wikipedia-style cite_note `<li>` wrapping an inner `<ul>`
+        // whose items have BOTH cite text AND a blockquote (the cite is
+        // strip_tags'd, merging its text into the inner-li.text; the
+        // blockquote survives as a `<quote>` element-child making the
+        // outer iter's else branch fire on the phantom visit).
+        //
+        // The fix: snapshot the FIRST descendant item's text +
+        // has-children flag BEFORE process_nested_elements drains it,
+        // then emit a phantom `<item>` afterward iff both conditions hold.
+        let (_d, body) = parse_body(
+            r##"<html><body><article>
+            <h1>Test</h1>
+            <p>Substantive paragraph so the article is recognised as having
+            content. Lorem ipsum dolor sit amet, consectetur adipiscing elit,
+            sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.</p>
+            <ol class="references">
+              <li id="cite_note-A">
+                <span class="mw-cite-backlink"><a href="#cite_ref-A">^</a></span>
+                <span class="reference-text">
+                  <div class="plainlist">
+                    <ul>
+                      <li><cite class="citation">First inner citation text content for A with words.</cite> <blockquote>quote text for A goes on long enough to pass the length filter that drops short content.</blockquote></li>
+                      <li><cite class="citation">Second inner citation text content for A also wordy.</cite> <blockquote>quote text for A second also long enough to survive the textfilter cleanup pass.</blockquote></li>
+                    </ul>
+                  </div>
+                </span>
+              </li>
+            </ol>
+            <p>More substantive content. Lorem ipsum dolor sit amet, consectetur
+            adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore
+            magna aliqua.</p>
+            </article></body></html>"##,
+        );
+        // Apply the full pipeline that the gate runs: tree_cleaning +
+        // convert_tags before extract_content.
+        let html_root = _d.root_element().expect("html5ever synthesises <html>");
+        let copts = crate::trafilatura::cleaning::Options::default();
+        crate::trafilatura::cleaning::tree_cleaning(&html_root, &copts);
+        crate::trafilatura::cleaning::convert_tags(&html_root, &copts);
+        let body_after = _d.body().expect("body present after cleaning");
+        let opts = Options::default();
+        let (result_body, _text, _pot) = extract_content(&body_after, &opts);
+        let xml = crate::readability::dom::serialize_converted_tree(&result_body);
+        // Avoid the unused-var warning on the original body NodeRef.
+        let _ = body;
+
+        // The phantom duplicate has the FIRST inner item's cite text.
+        // We expect to see "First inner citation text content for A" appearing
+        // TWICE in the output: once inside the outer <item>'s inner <list>,
+        // and once as a separate sibling <item> (the phantom).
+        let count = xml.matches("First inner citation text content for A").count();
+        assert!(
+            count >= 2,
+            "phantom duplicate not emitted — expected first inner item text to \
+             appear at least twice (once in inner list, once as phantom sibling). \
+             Output XML:\n{xml}"
         );
     }
 

@@ -79,10 +79,8 @@ const FIXTURES: &[&str] = &[
     // ---- phase 4 (Cluster C fix, commit b54e02d) ----
     "benchmark/corpus/snapshots/5714710c8c9a3e8a.html", // de.wikipedia Rust
     "benchmark/corpus/snapshots/65e1c5b5502a5c81.html", // Rust 1.83 release blog
-    // ---- pending: Apple_Inc Wiki (token 2407, deep nested-list-in-item
-    // semantics — process_nested_elements rcdom-Drop pin helped but a
-    // residual double-append / list-flatten-into-sibling-item issue
-    // remains; needs fresh-context investigation) ----
+    // ---- phase 4 (Cluster D fix, commit TBD) ----
+    "benchmark/corpus/snapshots/ae2c2184beb6d264.html", // en.wikipedia Apple_Inc
 ];
 
 #[test]

@@ -547,7 +547,32 @@ name = "mdrcel"
 # issue remains in handle_lists's outer loop and needs fresh-context
 # investigation. Per semver PATCH: defensive fix in already-public
 # function, no API change.
-version = "0.4.19"
+#
+# M3 Stage 3-B Cluster D (2026-05-21): 0.4.19 -> 0.4.20 PATCH. Pins the
+# Apple_Inc Wikipedia fixture — Stage 3-B gate corpus is now 10/10
+# (up from 9/10). Roots in an lxml `iterdescendants` precompute quirk:
+# `for child in element.iterdescendants("item"):` precomputes the next-
+# pointer at yield time. When the loop body recursively calls
+# `handle_lists` on a nested list (via `process_nested_elements`), the
+# recursive call sets every descendant <item>'s tag to "done". But the
+# outer iter's precomputed pointer ALREADY points at the FIRST inner
+# item, so the outer iter yields it AGAIN despite the mutation; the tag
+# filter is only re-checked on the NEXT advance, so subsequent
+# descendants ARE skipped. The phantom yield produces a duplicate
+# emission with text=inner_item.text (the cite text that
+# tree_cleaning's strip_tags merged in) and no children (descendants
+# are all tag="done" and handle_textnode short-circuits). Rust's
+# `replace_element_tag` drains children, so the OLD snapshot ref is
+# childless and our phantom path produced nothing. Fix: in
+# `handle_lists`'s outer loop, snapshot the first descendant <item>'s
+# text + has-children flag BEFORE process_nested_elements runs, then
+# emit a phantom-duplicate <item> afterwards if both conditions hold.
+# This is a faithful replication of Python's documented quirk
+# (necessary for the gate's structural-token equivalence). Regression
+# test `handle_lists_emits_phantom_duplicate_for_nested_list_with_quote_child`
+# pins the behaviour. Per semver PATCH: defensive emission in
+# already-public function, no API change.
+version = "0.4.20"
 edition = "2024"
 
 [dependencies]
