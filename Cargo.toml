@@ -2547,8 +2547,62 @@ name = "mdrcel"
 # sandbox we surface it as MINOR (matching M3 Stage 9's `comments` field
 # precedent at 0.9.0 -> 0.10.0). No new dependency; no public API removal;
 # `Options` unchanged.
-version = "0.14.1"
+version = "0.15.0"
 edition = "2024"
+
+# M4 Stage 6 (2026-05-21): 0.14.1 -> 0.15.0 MINOR. Lifts `deduplication.py`'s
+# Simhash + content_fingerprint + is_similar_domain trio off the M3 Stage 8
+# deferred list (the doc-block at the top of `src/trafilatura/deduplication.rs`
+# previously marked them "NOT ported"). Source of truth:
+# `trafilatura@v2.0.0/deduplication.py:22-143` (140 LOC source).
+#
+# New PUBLIC surface on `#[doc(hidden)] pub mod trafilatura::deduplication`:
+# - `pub struct Simhash { hash: u64, length: u32 }` — Charikar simhash with
+#   `new`, `with_length`, `hamming_distance`, `similarity`, `to_hex` methods.
+# - `pub fn sample_tokens(inputstring: &str, length: usize) -> Vec<String>` —
+#   `deduplication.py:35-48` (the token preprocessor Simhash consumes).
+# - `pub fn content_fingerprint(content: &str) -> String` —
+#   `deduplication.py:141-143`.
+# - `pub fn is_similar_domain(reference: &str, new_string: &str) -> bool` and
+#   `pub fn is_similar_domain_with(reference, new_string, threshold) -> bool` —
+#   `deduplication.py:27-32`.
+# - `pub const IS_SIMILAR_DOMAIN_DEFAULT_THRESHOLD: f64 = 0.5`.
+#
+# Per semver (CLAUDE.md "Version management") MINOR — new public types and
+# functions, additive only. Every existing surface (extract / extract_with /
+# Extracted / Options / ExtractError plus the entire `#[doc(hidden)]`
+# infrastructure) is byte-unchanged. The Stage 8 LRU surface (LruCache,
+# duplicate_test, put_in_cache, with_lru_test, clear_lru_test) is frozen.
+#
+# HASH FUNCTION CHOICE (honest divergence, anti-inversion recorded): Python's
+# Simhash uses `blake2b(token.encode(), digest_size=8)` as the per-token hash
+# (deduplication.py:72-76). The Rust port uses a hand-rolled FNV-1a 64-bit
+# hash instead. The brief explicitly authorised this: *"for a 64-bit Simhash
+# hash function, a hand-rolled FNV-1a or djb2 might be sufficient — verify
+# what Python uses"*, and the M3 Stage 8 docs flagged simhash as NOT on the
+# `bare_extraction` path (only consumed by `meta.py:11,29` for LRU-cache
+# clearing, which mdrcel does not drive). Consequence: the numeric `hash`
+# value for a given input string is NOT byte-identical to Python's. The
+# Simhash PROPERTIES hold (deterministic, similar tokens → low Hamming
+# distance, dissimilar → ≈ length/2). Avoided pulling in `blake2`/`sha2`
+# as a new top-level dependency for one self-contained function.
+#
+# ANTI-INVERSION CATCHES recorded:
+# 1. `STRIP_EXTENSION = re.compile(r"\.[^/?#]{2,63}$")` is a SINGLE-PASS TLD
+#    strip — `"www.example.com"` → `"www.example"` (NOT `"www"`). The brief
+#    incorrectly said the function "www-strips"; what actually happens is
+#    SequenceMatcher of `"www.example"` vs `"example"` scores 7/18 ≈ 0.78,
+#    which trips the 0.5 threshold ⇒ TRUE. Brief verdict correct, mechanism
+#    wrong; ported faithfully to Python.
+# 2. `is_similar_domain("example.com", "example.org")` is TRUE in Python
+#    because both strip to `"example"` (identical post-strip ⇒ ratio 1.0).
+# 3. `SequenceMatcher(None, '', '').ratio()` returns 1.0 in CPython (size-
+#    guard special case); our hand-rolled `sequence_ratio` matches.
+#
+# `generate_bow_hash` (`deduplication.py:51-55`) is NOT ported — it uses
+# blake2b directly with `digest_size=24` and has no consumer outside the
+# `Simhash._hash` call path. Porting it would force the blake2b dep we
+# explicitly avoided. Recorded per HLD §10 deferral discipline.
 
 [dependencies]
 # DEC-3 (M1): the library was a zero-dependency crate at the Milestone-1 floor;
