@@ -132,6 +132,16 @@ pub mod metadata_jsonld;
 // populate additively (JSON-LD values from Stage 7b keep precedence).
 pub mod metadata_url;
 
+// M4 Stage 3-A — output-format helpers + internal `Document` carrier struct.
+// Source of truth: `trafilatura@v2.0.0/xml.py:28-352` (shared helpers every
+// formatter consumes) and `settings.py:207-303` (Document dataclass-analogue).
+// Sub-stage A is INTERNAL infrastructure only — no public surface yet. Stage
+// 3-B onwards consumes this module's `delete_element` / `merge_with_parent`
+// / `remove_empty_elements` / `strip_double_tags` / `clean_attributes` /
+// `replace_element_text` / `process_element` helpers from the eventual
+// `extract_to_xml` / `extract_to_tei` / `extract_to_markdown` formatters.
+pub(crate) mod output;
+
 // Stage 8 — LRU cache + `duplicate_test` (`deduplication.py:146-254`).
 // Lands the LRU dedup the Stage 2b' stub deferred. New public surface:
 // `LruCache` + `duplicate_test` (text-level) + `duplicate_test_node`

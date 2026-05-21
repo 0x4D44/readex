@@ -2385,7 +2385,7 @@ name = "mdrcel"
 # Per semver (CLAUDE.md "Version management") PATCH — feature extension
 # to an existing code path documented as a STUB pending Stage 2. The new
 # `pub(crate)` surfaces are additive on already-`#[doc(hidden)]` modules.
-version = "0.12.1"
+version = "0.12.2"
 edition = "2024"
 
 [dependencies]
