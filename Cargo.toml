@@ -1826,7 +1826,68 @@ name = "mdrcel"
 # trafilatura_equivalence_gate / trafilatura_extract_smoke /
 # trafilatura_extract_content_gate). `cargo clippy --release
 # --all-targets -- -D warnings` is clean.
-version = "0.10.0"
+#
+# M4 Stage 1 sub-stage A (2026-05-21): 0.10.0 -> 0.11.0 MINOR. Opens the M4
+# umbrella with the FIRST piece of the htmldate port — a new `#[doc(hidden)]
+# pub mod htmldate` infrastructure surface sibling to `trafilatura`. Sub-stage
+# A scope:
+# - `src/htmldate/settings.rs` — verbatim port of `htmldate/settings.py:1-41`:
+#   `CACHE_SIZE` (8192), `MAX_FILE_SIZE` (20_000_000), `MIN_DATE` ((1995,1,1)
+#   tuple — `chrono` is not a crate dependency, see `settings.rs`'s
+#   "Date-typing note"), `MAX_POSSIBLE_CANDIDATES` (1000), `CLEANING_LIST`
+#   (18-element tag list, source order preserved).
+# - `src/htmldate/utils.rs` — verbatim port of `htmldate/utils.py:47-65`
+#   (`Extractor` options struct with five fields matching the Python
+#   `__slots__` — `extensive` / `format` / `max` / `min` / `original`) and
+#   lines 258-260 (`trim_text` whitespace normalizer).
+# - `src/htmldate/mod.rs` — module root with `pub mod settings;` +
+#   `pub mod utils;` declarations.
+# - `src/lib.rs` — `#[doc(hidden)] pub mod htmldate;` wired alongside the
+#   existing trafilatura declaration.
+#
+# Faithful divergences (recorded — HLD §4 anti-inversion):
+# - Python's `Extractor.__init__` has NO default values for any of its five
+#   parameters (every argument is positional and required). Rust's
+#   `Default` impl is a convenience-only construct for tests; documented
+#   verbatim in the struct's doc-comment. The `extractor_default_matches_
+#   documented_rust_defaults` test asserts the Rust-side defaults, NOT a
+#   Python-faithfulness claim.
+# - The M4 Stage 1 sub-stage A brief named seven fields on `Extractor`
+#   (including `outputformat` and `url`); the Python source defines only
+#   five (`__slots__ = ["extensive", "format", "max", "min", "original"]`).
+#   Python source wins per the anti-inversion contract. `outputformat` was
+#   the brief's mention of Python's __init__ *parameter* name for the
+#   `format` *attribute*; `url` is not on this class at all and may belong
+#   to a different `htmldate` config surface (sub-stage B/G).
+# - `MIN_DATE` is a `(i32, u32, u32)` tuple rather than a `chrono::NaiveDate`
+#   because `chrono` is not a dependency of this crate (per the brief:
+#   "if `chrono` is already a dep, otherwise a simple `(i32, u32, u32)`
+#   tuple constant"). Sub-stage B's date-parsing layer can grow a richer
+#   date type if the algorithm ever needs hour/minute/second precision; the
+#   Python source's sole use of `MIN_DATE` is as a calendar-date lower
+#   bound, so the tuple is semantically sufficient.
+#
+# Per semver (CLAUDE.md "Version management") MINOR — a NEW `#[doc(hidden)]
+# pub mod htmldate` module with NEW public types (`Extractor`) and NEW
+# public functions (`Extractor::new`, `trim_text`) and NEW public constants
+# (`CACHE_SIZE` / `MAX_FILE_SIZE` / `MIN_DATE` / `MAX_POSSIBLE_CANDIDATES` /
+# `CLEANING_LIST`). Matches the M3 Stage 4a / Stage 5a precedent for "first
+# module-in-area introduction = MINOR bump". Subsequent htmldate sub-stages
+# (B through G) will likely be PATCH (extending the same module's internal
+# surfaces) but each will state its own semver rationale at bump time.
+#
+# Backward compatibility: every prior public surface (`extract` /
+# `extract_with` / `Extracted` / `Options` / `ExtractError` and the M2 /
+# M3 `#[doc(hidden)]` infrastructure modules) is byte-unchanged. The new
+# `htmldate` module is CONSUMED by no existing call site — sub-stage B
+# onwards wires its date-parsing algorithm; M4 Stage 4 ("Metadata →
+# Extracted mapping" — task #59) wires the eventual `find_date` result
+# into the `Extracted.published_time` field. All 4 BLOCKER gates
+# (parser_equivalence_gate / trafilatura_equivalence_gate /
+# trafilatura_extract_smoke / trafilatura_extract_content_gate) remain
+# byte-identical green by construction (no existing module touched).
+# Lib test count 761 -> 771 (+10 new sub-stage-A unit tests).
+version = "0.11.0"
 edition = "2024"
 
 [dependencies]

@@ -115,6 +115,16 @@ pub mod readability;
 #[doc(hidden)]
 pub mod trafilatura;
 
+// M4 Stage 1 sub-stage A (HLD M4 — htmldate port). New `#[doc(hidden)] pub
+// mod htmldate` infrastructure surface mirroring the M3 `trafilatura` shape.
+// Sub-stage A lands the module-level settings constants (`MIN_DATE`,
+// `MAX_FILE_SIZE`, `CACHE_SIZE`, `MAX_POSSIBLE_CANDIDATES`, `CLEANING_LIST`)
+// from `htmldate/settings.py` and the `Extractor` + `trim_text` helpers from
+// `htmldate/utils.py`. Sub-stages B onwards add the date-parsing algorithm
+// itself; the public `extract` / `extract_with` surface is byte-unchanged.
+#[doc(hidden)]
+pub mod htmldate;
+
 /// The extracted main content of an HTML document, plus light metadata.
 ///
 /// Every field is owned so the result outlives the input `&str`. `title`,
