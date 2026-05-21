@@ -136,6 +136,24 @@ impl Dom {
             ..ParseOpts::default()
         };
         let dom = parse_document(RcDom::default(), opts).one(html);
+        // M5 Stage 6e-a: strip HTML comments and processing instructions
+        // immediately after parse, mirroring Python trafilatura's source-truth
+        // parser config:
+        //   utils.py:70 -- HTMLParser(remove_comments=True, remove_pis=True)
+        // lxml removes the Comment/PI node AND promotes its `.tail` into the
+        // preceding sibling's tail (or the parent's `.text` when the comment
+        // had no preceding sibling). rcdom's tree representation models
+        // sibling text as separate Text nodes (not an intrinsic `.tail`
+        // string), so removing the Comment is sufficient: the
+        // already-following Text nodes simply become adjacent to the
+        // preceding Text/element, and the dom-facade accessors
+        // (`element_text`, `tail`) already coalesce consecutive Text siblings
+        // (dom.rs:404-422, 436-453). Without this strip, comment-adjacent
+        // text was being read past the comment differently from Python --
+        // e.g. `<p>x<!-- -->...</p>` exposed `x` for `.text` and missed the
+        // `...` run that comes after the Comment (M5 fixture
+        // 859b46bf108e3db4.html, byte 383).
+        strip_comments_and_pis(&dom.document);
         Dom {
             dom,
             content_score: HashMap::new(),
@@ -681,6 +699,43 @@ pub fn remove(node: &NodeRef) {
     if let Some((parent, idx)) = parent_and_index(node) {
         parent.children.borrow_mut().remove(idx);
         node.parent.set(None);
+    }
+}
+
+/// Recursively strip every `NodeData::Comment` and
+/// `NodeData::ProcessingInstruction` from the subtree rooted at `root`,
+/// mirroring lxml `HTMLParser(remove_comments=True, remove_pis=True)`
+/// (Python trafilatura `utils.py:70`).
+///
+/// lxml's semantics: when a Comment/PI is removed, its `.tail` is promoted
+/// into the preceding sibling's `.tail` (or, if it was the first child,
+/// into the parent's `.text`). rcdom does not model `.tail` as an intrinsic
+/// string — adjacent Text content is stored as separate `NodeData::Text`
+/// sibling nodes. Removing the Comment/PI therefore IS the tail merge:
+/// the Text node sitting immediately after the Comment becomes adjacent to
+/// whatever preceded the Comment, and the facade accessors
+/// ([`tail`], [`element_text`]) already concatenate consecutive Text
+/// siblings (dom.rs:404-422, 436-453). No explicit string-splice is needed.
+///
+/// We snapshot each level's children **before** mutation so a `remove` does
+/// not invalidate the iteration index (same safe-walk pattern used by
+/// `prune_html`, `cleaning.rs:422`).
+pub(crate) fn strip_comments_and_pis(root: &NodeRef) {
+    // Snapshot children at this level; recurse into surviving children
+    // afterwards. Order matters less than correctness here -- comments
+    // never have children of their own in the HTML5 parse output (rcdom
+    // models them as leaf nodes with empty `.children`), so removing them
+    // discards no nested content.
+    let kids: Vec<NodeRef> = root.children.borrow().iter().cloned().collect();
+    for child in &kids {
+        match &child.data {
+            NodeData::Comment { .. } | NodeData::ProcessingInstruction { .. } => {
+                remove(child);
+            }
+            _ => {
+                strip_comments_and_pis(child);
+            }
+        }
     }
 }
 
@@ -1723,14 +1778,64 @@ mod tests {
 
     #[test]
     fn text_content_of_comment_node_is_empty() {
-        let dom = Dom::parse("<div><!--x--></div>");
-        let div = get_elements_by_tag_name(&dom.body().unwrap(), "div")
+        // M5 Stage 6e-a: `Dom::parse` now strips Comment nodes at parse time
+        // (mirroring lxml `HTMLParser(remove_comments=True)`), so we cannot
+        // fish a Comment out of a parsed tree. Construct one directly to pin
+        // the semantic that `text_content` of a Comment is empty.
+        let comment = Node::new(NodeData::Comment {
+            contents: "x".into(),
+        });
+        assert!(matches!(comment.data, NodeData::Comment { .. }));
+        assert_eq!(text_content(&comment), "");
+    }
+
+    #[test]
+    fn parse_strips_html_comments() {
+        // M5 Stage 6e-a: `Dom::parse` matches Python trafilatura's
+        // `HTMLParser(remove_comments=True, remove_pis=True)` (utils.py:70).
+        // After parse, NO Comment nodes remain in the body subtree.
+        let dom = Dom::parse("<div>a<!-- gone -->b<!-- and gone -->c</div>");
+        let body = dom.body().unwrap();
+        let mut stack = vec![body.clone()];
+        let mut found_comment = false;
+        while let Some(n) = stack.pop() {
+            if matches!(n.data, NodeData::Comment { .. }) {
+                found_comment = true;
+            }
+            for c in n.children.borrow().iter() {
+                stack.push(c.clone());
+            }
+        }
+        assert!(!found_comment, "Dom::parse left a Comment in the tree");
+        // And the tail/text merge: textContent reads `abc`.
+        assert_eq!(text_content(&body), "abc");
+    }
+
+    #[test]
+    fn parse_strips_comment_tail_into_element_text() {
+        // The load-bearing tail-merge case (M5 fixture 859b46bf108e3db4.html,
+        // byte 383): `<p>foo<!-- -->bar</p>` -- lxml's `<p>.text` reads
+        // `"foobar"`, mdrcel must agree. Verified via `element_text`, which
+        // concatenates the leading Text run.
+        let dom = Dom::parse("<p>foo<!-- -->bar</p>");
+        let p = get_elements_by_tag_name(&dom.body().unwrap(), "p")
             .into_iter()
             .next()
             .unwrap();
-        let comment = child_nodes(&div).into_iter().next().unwrap();
-        assert!(matches!(comment.data, NodeData::Comment { .. }));
-        assert_eq!(text_content(&comment), "");
+        assert_eq!(element_text(&p).as_deref(), Some("foobar"));
+    }
+
+    #[test]
+    fn parse_strips_comment_promotes_tail_to_sibling() {
+        // `<div><p>x</p><!-- -->trailing</div>` -- after strip, `<p>`'s tail
+        // is `"trailing"` (lxml semantics: Comment's tail promoted into the
+        // preceding sibling's tail when it was an element).
+        let dom = Dom::parse("<div><p>x</p><!-- -->trailing</div>");
+        let p = get_elements_by_tag_name(&dom.body().unwrap(), "p")
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(tail(&p).as_deref(), Some("trailing"));
     }
 
     // ---- inner_text: trim then JS \s{2,} -> single space (HLD §8) ----
@@ -1798,8 +1903,10 @@ mod tests {
         assert_eq!(el.len(), 2, "only <span> and <b> are element children");
         assert_eq!(tag_name(&el[0]).as_deref(), Some("SPAN"));
         assert_eq!(tag_name(&el[1]).as_deref(), Some("B"));
-        // child_nodes: t1, span, comment, t2, b = 5
-        assert_eq!(child_nodes(&div).len(), 5);
+        // child_nodes: t1, span, t2, b = 4 (the Comment is stripped at
+        // parse time per M5 Stage 6e-a, matching Python lxml
+        // HTMLParser(remove_comments=True), utils.py:70).
+        assert_eq!(child_nodes(&div).len(), 4);
     }
 
     // ---- traversal: first_element_child / next_element_sibling / parent ----
@@ -2217,10 +2324,16 @@ mod tests {
     }
 
     #[test]
-    fn tail_next_sibling_is_comment_then_text_is_none() {
-        // A Comment terminates the Text-run just like an element does.
+    fn tail_next_sibling_is_comment_then_text_promotes() {
+        // M5 Stage 6e-a: Comments are stripped at parse time
+        // (utils.py:70 `HTMLParser(remove_comments=True)`), so the Comment
+        // in `<div><p>x</p><!--c-->z</div>` is removed and `z` becomes the
+        // sole tail-positioned Text after <p>. <p>'s tail is now `"z"`,
+        // matching lxml's tail-promotion semantics. Pre-strip, this test
+        // pinned the rcdom raw behaviour (Comment terminated the tail run);
+        // post-strip the lxml behaviour is the contract.
         let (_d, _div, p) = first_p_in_div("<div><p>x</p><!--c-->z</div>");
-        assert_eq!(tail(&p), None);
+        assert_eq!(tail(&p).as_deref(), Some("z"));
     }
 
     #[test]

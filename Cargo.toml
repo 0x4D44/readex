@@ -2547,8 +2547,29 @@ name = "mdrcel"
 # sandbox we surface it as MINOR (matching M3 Stage 9's `comments` field
 # precedent at 0.9.0 -> 0.10.0). No new dependency; no public API removal;
 # `Options` unchanged.
-version = "0.15.9"
+version = "0.15.10"
 edition = "2024"
+
+# M5 Stage 6e-a (2026-05-21): 0.15.9 -> 0.15.10 PATCH. Bug fix only:
+# Python trafilatura's `load_html` uses
+# `lxml.html.HTMLParser(remove_comments=True, remove_pis=True)` (`utils.py:70`),
+# so every `<!-- comment -->` is dropped at parse time AND its `.tail` is
+# promoted into the preceding sibling's tail (lxml semantics). mdrcel's
+# rcdom parser preserved comments, so comment-adjacent text was positioned
+# differently from Python — e.g. `<p>x<!-- -->...</p>` left `.text == "x"`
+# on the `<p>` and dropped the trailing `...`. Fix: added
+# `strip_comments_and_pis` (`dom.rs:716-735`) called from `Dom::parse`
+# (`dom.rs:153`) which walks the freshly-parsed tree and removes every
+# `NodeData::Comment` / `NodeData::ProcessingInstruction` node. The
+# already-following `Text` siblings become adjacent to whatever preceded
+# the comment; the dom-facade accessors (`element_text` / `tail`,
+# `dom.rs:404-422, 436-453`) already coalesce consecutive Text siblings,
+# so this IS the lxml tail-promotion semantic. Symptom: M5 fixture
+# `859b46bf108e3db4.html` (Cloudflare blog) diverged at byte 383 over
+# `it.<!-- -->...</p>` (Rust dropped `...`). Gate movement: M5 markdown
+# gate 37/51 -> 38/51 substantive + 3 allowlisted (content-mismatch 11
+# -> 10, +1 fixture green, 0 newly red). No public-API change. No new
+# dependency. PATCH bump.
 
 # M5 Stage 6d (2026-05-21): 0.15.8 -> 0.15.9 PATCH. Bug fix only:
 # `handle_table`'s non-leaf cell loop (`main_extractor.rs:1166-1216`) lost

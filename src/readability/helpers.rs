@@ -655,16 +655,17 @@ mod tests {
 
     #[test]
     fn next_sibling_all_node_types() {
+        // M5 Stage 6e-a: Comments are stripped at parse time
+        // (`HTMLParser(remove_comments=True)`, utils.py:70). The original
+        // pre-strip tree was `[text"a", comment, <b>]`; post-strip the
+        // Comment is gone, leaving `[text"a", <b>]` — `next_sibling` of the
+        // text node is the `<b>` element directly.
         let dom = Dom::parse("<div>a<!--c--><b>x</b></div>");
         let div = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
-        let kids = child_nodes(&div); // [text"a", comment, <b>]
+        let kids = child_nodes(&div); // [text"a", <b>]
+        assert_eq!(kids.len(), 2);
         let s1 = next_sibling(&kids[0]).unwrap();
-        assert!(matches!(
-            s1.data,
-            markup5ever_rcdom::NodeData::Comment { .. }
-        ));
-        let s2 = next_sibling(&s1).unwrap();
-        assert_eq!(tag_name(&s2).as_deref(), Some("B"));
-        assert!(next_sibling(&kids[2]).is_none());
+        assert_eq!(tag_name(&s1).as_deref(), Some("B"));
+        assert!(next_sibling(&kids[1]).is_none());
     }
 }
