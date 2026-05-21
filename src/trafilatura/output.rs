@@ -993,6 +993,13 @@ fn unescape_html(s: &str) -> String {
             "bdquo" => Some("\u{201E}".to_string()),
             "dagger" => Some("\u{2020}".to_string()),
             "Dagger" => Some("\u{2021}".to_string()),
+            // CPython's `html.entities.html5` recognises `ddagger;` as a
+            // case-insensitive alias for `Dagger;` (both decode to
+            // U+2021 DOUBLE DAGGER). HTML5 spec permits both spellings.
+            // Without this row mdrcel passes `&ddagger;` through verbatim
+            // (e.g. surfaced on M5 fixture 86df4d2e's HTML-entity
+            // reference table) while Python's `unescape` decodes it.
+            "ddagger" => Some("\u{2021}".to_string()),
             "bull" => Some("\u{2022}".to_string()),
             "hellip" => Some("\u{2026}".to_string()),
             "permil" => Some("\u{2030}".to_string()),

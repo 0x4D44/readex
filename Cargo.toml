@@ -2574,7 +2574,21 @@ name = "mdrcel"
 # decode issue + `<sup class="noprint">` discard quirk — not flipped this
 # stage, deferred to Stage 6i). No public-API change. No new dependency.
 # PATCH bump.
-version = "0.15.15"
+#
+# M5 Stage 6h-b (2026-05-21): 0.15.15 -> 0.15.16 PATCH. Add `ddagger` HTML
+# entity to `unescape_html`'s table (`output.rs:828`). CPython's
+# `html.entities.html5` recognises `ddagger;` as a case-insensitive alias
+# for `Dagger;`, both decoding to U+2021 (DOUBLE DAGGER). HTML5 spec
+# permits both spellings. Without the row mdrcel passes `&ddagger;`
+# through verbatim while Python's `unescape` step decodes it. Surfaced on
+# M5 fixture 86df4d2e (Wikipedia HTML entity reference table) where the
+# pre-fix 6h-a remainder included `` `&ddagger;` `` while Python emits
+# `` `‡` ``. Gate movement: M5 markdown gate 40/51 + 5 -> 40/51 + 5
+# substantive (86df4d2e diff position shifted forward 3061 bytes from
+# 27230 to 30291; remaining diff is the `<sup class="noprint">`
+# `[citation needed]` discard quirk — not flipped this stage, deferred
+# to Stage 6i). No public-API change. No new dependency. PATCH bump.
+version = "0.15.16"
 edition = "2024"
 
 # M5 Stage 6e-b (2026-05-21): 0.15.10 -> 0.15.11 PATCH. No source change —
