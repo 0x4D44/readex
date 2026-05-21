@@ -511,7 +511,26 @@ name = "mdrcel"
 # `handle_paragraphs_preserves_lb_tail_text` (lib test 581). Stage 3-B
 # gate goes 5/10 -> 7/10 (added gov.uk PAYE + Fed reserve). Per semver
 # PATCH: bugfix in handler, no API change.
-version = "0.4.17"
+#
+# M3 Stage 3-B Cluster C (2026-05-21): 0.4.17 -> 0.4.18 PATCH. `_extract`
+# orphan-skip fix. Python's flow renames already-processed elements to
+# `tag = "done"` via in-place tag mutation, so subsequent iterdescendants
+# walks visit those elements and `handle_other_elements` returns None
+# (tag not in potential_tags). Our `replace_element_tag` (`dom.rs:1361`)
+# doesn't mutate the OLD node's tag (rcdom's NodeData::Element::name is
+# not Cell-wrapped) — but it DOES detach the OLD node. So our equivalent
+# skip-signal is "OLD node has no parent". Before this fix, `_extract`'s
+# outer loop re-processed orphan elements drained by prior iterations,
+# emitting extra empty `<code></code>` placeholders. Visible on Rust
+# 1.83 release blog where every inline `<code>rustup</code>` inside a
+# `<p>` was being re-emitted as a top-level empty orphan after
+# `handle_paragraphs` drained it. Fix: skip detached elements in the
+# `_extract` outer loop. New regression-pin test
+# `_extract_skips_detached_orphan_elements_from_cluster_c` (lib test
+# 582). Stage 3-B gate goes 7/10 -> 9/10 (added de.wikipedia Rust + Rust
+# 1.83 release blog). Per semver PATCH: bugfix in `_extract`, no API
+# change.
+version = "0.4.18"
 edition = "2024"
 
 [dependencies]

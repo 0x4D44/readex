@@ -1634,7 +1634,27 @@ pub fn _extract(tree: &NodeRef, options: &Options) -> (NodeRef, String, HashSet<
         }
 
         // main_extractor.py:608 — handle_textelem dispatch + append.
+        //
+        // **Stage 3-B Cluster C fix (2026-05-21):** skip detached
+        // (orphan) elements. Python's flow renames already-processed
+        // elements to `tag = "done"` via in-place tag mutation
+        // (e.g. main_extractor.py:340 inside handle_paragraphs,
+        // line 222 inside handle_code_blocks), so subsequent
+        // iterdescendants walks visit those elements and they fall
+        // through `handle_other_elements` → `tag not in potential_tags`
+        // → returns None. Our `replace_element_tag` doesn't mutate the
+        // OLD node's tag (it can't — rcdom's `NodeData::Element::name`
+        // is not wrapped in a cell), but it DOES detach the OLD node
+        // (drains children + clears parent pointer). So our equivalent
+        // skip-signal is "the OLD node is now detached". This avoids
+        // emitting extra empty `<code>` placeholders (visible on the
+        // Rust 1.83 blog where inline `<code>rustup</code>` inside a
+        // `<p>` was being re-emitted as a top-level orphan after
+        // handle_paragraphs drained it).
         for e in subelems {
+            if crate::readability::dom::parent(&e).is_none() {
+                continue;
+            }
             if let Some(new_elem) = handle_textelem(&e, &potential_tags, options) {
                 append_child(&result_body, &new_elem);
             }
@@ -3713,6 +3733,71 @@ mod tests {
         assert!(pot.contains("tr"));
         assert!(pot.contains("graphic"));
         assert!(pot.contains("ref"));
+    }
+
+    #[test]
+    fn _extract_skips_detached_orphan_elements_from_cluster_c() {
+        // **Stage 3-B Cluster C regression pin (2026-05-21).**
+        //
+        // Before the fix, `_extract` walked the subtree's `.//*` snapshot
+        // without checking whether each element had already been drained
+        // by a prior iteration's handler. Python's flow renames already-
+        // processed elements to `tag = "done"` via in-place tag mutation
+        // (e.g. `handle_paragraphs` line 340, `handle_code_blocks` line
+        // 222), so subsequent iterdescendants visits fall through
+        // `handle_other_elements` → `tag not in potential_tags` → return
+        // None. Our `replace_element_tag` (`dom.rs:1361`) doesn't mutate
+        // the OLD node's tag — but it DOES detach the OLD node (drains
+        // children + clears parent). So our equivalent skip-signal is
+        // "OLD node is now detached".
+        //
+        // Visible on Rust 1.83 blog where `<code>rustup</code>` inline
+        // inside a `<p>` was being re-emitted as a top-level orphan
+        // `<code></code>` after `handle_paragraphs` drained it.
+        //
+        // Verifies the test fixture
+        //   <article>
+        //     <p>via <code>rustup</code>!</p>
+        //     <code class="block">$ rustup update stable</code>
+        //   </article>
+        // produces exactly TWO top-level children: the processed `<p>`
+        // (with the inline code inside it) and the standalone code block
+        // — NOT three (the inline code re-emitted as a stray top-level
+        // `<code>` between them).
+        let (_d, body) = parse_body(
+            r#"<html><body><article>
+            <p>via <code>rustup</code>! Some more text after the inline code so the
+            paragraph is long enough to survive the recover_wild_text fallback.</p>
+            <code class="block">$ rustup update stable</code>
+            <p>Some more body text padding so the article is substantive enough
+            that _extract takes the main path instead of the recover_wild_text
+            fallback. Lorem ipsum dolor sit amet, consectetur adipiscing elit.
+            Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.
+            Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris.</p>
+            </article></body></html>"#,
+        );
+        let opts = Options::default();
+        let (result_body, _text, _pot) = _extract(&body, &opts);
+
+        // Count the top-level code elements in result_body — they should
+        // be exactly ONE (the block), NOT two (block + stray empty
+        // orphan). The inline `<code>rustup</code>` should be NESTED
+        // inside its parent `<p>`, not a top-level sibling.
+        let top_level_codes: Vec<NodeRef> = element_children(&result_body)
+            .into_iter()
+            .filter(|c| local_name(c).as_deref() == Some("code"))
+            .collect();
+        assert_eq!(
+            top_level_codes.len(),
+            1,
+            "exactly one top-level <code> (the block); no empty orphan from drained inline code"
+        );
+        // And the block has the text content.
+        let block_text = element_text(&top_level_codes[0]).unwrap_or_default();
+        assert!(
+            block_text.contains("rustup update stable"),
+            "the surviving top-level code is the block, not the empty inline orphan: {block_text:?}"
+        );
     }
 
     // -------------------------------------------------------------------
