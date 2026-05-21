@@ -76,10 +76,13 @@ const FIXTURES: &[&str] = &[
     // ---- phase 3 (Cluster B fix, commit 6462060) ----
     "benchmark/corpus/snapshots/803b534a50a3f584.html", // gov.uk income tax (PAYE)
     "benchmark/corpus/snapshots/e339ce76eb1cba73.html", // Fed reserve open-market
-    // ---- phase 4 (Cluster C fix) ----
+    // ---- phase 4 (Cluster C fix, commit b54e02d) ----
     "benchmark/corpus/snapshots/5714710c8c9a3e8a.html", // de.wikipedia Rust
     "benchmark/corpus/snapshots/65e1c5b5502a5c81.html", // Rust 1.83 release blog
-    // ---- pending: Apple_Inc Wiki (token 2407, nested-list-in-item bug) ----
+    // ---- pending: Apple_Inc Wiki (token 2407, deep nested-list-in-item
+    // semantics — process_nested_elements rcdom-Drop pin helped but a
+    // residual double-append / list-flatten-into-sibling-item issue
+    // remains; needs fresh-context investigation) ----
 ];
 
 #[test]

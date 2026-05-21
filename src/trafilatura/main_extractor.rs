@@ -2019,6 +2019,20 @@ pub fn process_nested_elements(child: &NodeRef, new_child_elem: &NodeRef, option
     // main_extractor.py:130 — child.iterdescendants("*") snapshot.
     let descendants = descendant_elements(child);
 
+    // **rcdom Drop quirk pin** (Stage 3-B Apple_Inc Wiki fix, 2026-05-21):
+    // `replace_element_tag` returns a fresh "done" node owning the
+    // drained subtree of `subelem`. If we discard that handle as a
+    // `let _renamed = ...` binding, the temporary's Drop fires at the
+    // statement end and rcdom's iterative `impl Drop for Node`
+    // (`markup5ever_rcdom-0.39.0/lib.rs:268-284`) mem::take's the
+    // children Vec of EVERY descendant. The outer-snapshot still holds
+    // NodeRefs to those descendants; on subsequent iterations they
+    // appear childless and handle_lists / handle_textnode produce
+    // incorrect output. Pin every returned "done" handle alive for the
+    // duration of this function. Same pattern as `handle_lists`,
+    // `handle_paragraphs`, and `handle_code_blocks`.
+    let mut dones_alive: Vec<NodeRef> = Vec::new();
+
     for subelem in descendants {
         let tag = local_name(&subelem).unwrap_or_default();
         if tag == "list" {
@@ -2036,8 +2050,9 @@ pub fn process_nested_elements(child: &NodeRef, new_child_elem: &NodeRef, option
             }
         }
         // main_extractor.py:139 — subelem.tag = "done", unconditionally.
-        let _renamed = replace_element_tag(&subelem, "done");
+        dones_alive.push(replace_element_tag(&subelem, "done"));
     }
+    let _ = &dones_alive;
 }
 
 // ===========================================================================

@@ -530,7 +530,24 @@ name = "mdrcel"
 # 582). Stage 3-B gate goes 7/10 -> 9/10 (added de.wikipedia Rust + Rust
 # 1.83 release blog). Per semver PATCH: bugfix in `_extract`, no API
 # change.
-version = "0.4.18"
+#
+# M3 Stage 3-B follow-on (2026-05-21): 0.4.18 -> 0.4.19 PATCH. Defensive
+# rcdom-Drop pin in `process_nested_elements`. The function called
+# `replace_element_tag(&subelem, "done")` with `let _renamed = ...`,
+# discarding the returned handle. The temporary's Drop fires at the
+# statement end and rcdom's iterative `impl Drop for Node` mem::take's
+# every descendant's children Vec. The outer-snapshot still holds
+# NodeRefs to those descendants; on subsequent iterations they appear
+# childless and handle_lists / handle_textnode produce incorrect output.
+# Fix: keep a `dones_alive: Vec<NodeRef>` for the function duration
+# (same pattern as `handle_lists`, `handle_paragraphs`,
+# `handle_code_blocks`). This was contributing to the Apple_Inc Wiki
+# nested-list-in-item divergence (token 2407); helped but didn't fully
+# resolve — a residual double-append / list-flatten-into-sibling-item
+# issue remains in handle_lists's outer loop and needs fresh-context
+# investigation. Per semver PATCH: defensive fix in already-public
+# function, no API change.
+version = "0.4.19"
 edition = "2024"
 
 [dependencies]
