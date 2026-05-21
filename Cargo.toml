@@ -1530,7 +1530,144 @@ name = "mdrcel"
 # three sub-stages). The full HTML-tag + JSON-LD + URL/date metadata
 # surface is now wired; the only deferred piece is the full `htmldate`
 # locale-aware date parser (documented in `extract_date`'s header).
-version = "0.8.3"
+#
+# M3 Stage 8 (2026-05-21): 0.8.3 -> 0.9.0 MINOR. Closes M3 Stage 8 by
+# landing TWO pieces in one commit — the LRU-backed `duplicate_test`
+# port that the Stage 2b' stub deferred (`deduplication.py:146-254`),
+# and the comments extractor (`main_extractor.py:643-688`). Both halves
+# add new PUBLIC functions / types to the `#[doc(hidden)] pub mod
+# trafilatura` infrastructure surface, which crosses the MINOR threshold
+# per CLAUDE.md "new public types/functions = MINOR".
+#
+# New module: `src/trafilatura/deduplication.rs` (~340 LOC).
+# - `LruCache { capacity, recency, counts }` struct + `LruCache::new` /
+#   `contains` / `count` / `put` / `clear` / `len` / `is_empty` —
+#   faithful port of Python's `LRUCache` (deduplication.py:149-229)
+#   with the same observable semantics (move-to-front on touch, evict
+#   oldest on full, increment-on-existing-key). Implementation uses
+#   `Vec<String>` for recency + `HashMap<String, u32>` for counts (vs
+#   Python's circular doubly linked list); the surface contract holds.
+# - `duplicate_test(text, min_size, max_repetitions) -> bool` — text-
+#   based entry point. Faithfully ports `deduplication.py:243-254` with
+#   line-cites for every branch (min-size gate, strict `>` repetition
+#   gate, fall-through-records-anyway).
+# - `duplicate_test_node(element, options) -> bool` — element wrapper
+#   matching Python's `duplicate_test(element, options)` signature. The
+#   per-element call sites in `cleaning::handle_textnode` /
+#   `cleaning::process_node` (htmlprocessing.py:262, :282) and the
+#   body-level site in `readability_fork::compare_extraction`
+#   (core.py:330) all route through this helper.
+# - `LRU_SIZE: usize = 4096` (settings.py:308) + process-wide
+#   `Mutex<LruCache>` singleton via `OnceLock`. Lock is module-private
+#   (callers reach for `with_lru_test` / `clear_lru_test`).
+# - `put_in_cache(text)`, `with_lru_test(closure)`, `clear_lru_test()`
+#   public helpers mirroring Python's `put_in_cache`, `LRU_TEST.put` /
+#   `LRU_TEST.clear` shapes.
+#
+# New `Options` fields (cleaning.rs:121-141):
+# - `dedup: bool` (default `false`, settings.py:114)
+# - `min_duplcheck_size: usize` (default `100`, settings.cfg:41)
+# - `max_repetitions: usize` (default `2`, settings.cfg:42)
+# `Options::dedup()` accessor now reads the field instead of the
+# Stage-2b' stubbed `false` constant. The two call sites
+# (`handle_textnode` :1333, `process_node` :1408) become live: with
+# `Options::default()` (dedup=false) they short-circuit on the AND,
+# so the default extraction path remains byte-unchanged.
+#
+# New module addition (main_extractor.rs):
+# - `process_comments_node(elem, potential_tags, options) -> Option<NodeRef>`
+#   (private — `main_extractor.py:643-654`). Per-element comment
+#   processor: tag-membership gate, `handle_textnode(_, _, comments_fix=true)`,
+#   `clear_attributes` on survivors.
+# - `extract_comments(tree, options) -> (NodeRef, String, usize)` (pub —
+#   `main_extractor.py:657-688`). Walks `COMMENTS_XPATH` for the first
+#   matching subtree, prunes `COMMENTS_DISCARD_XPATH` discards, strips
+#   inline `<a>`/`<ref>`/`<span>` wrappers, dispatches descendants
+#   through `process_comments_node`, removes the consumed subtree from
+#   `tree`, returns `(body, joined_text, len)`. The Python return tuple
+#   includes a fourth element `tree` (the mutated input) — the Rust
+#   port omits it (callers still hold the `&NodeRef`); recorded as a
+#   faithful divergence in the function header.
+#
+# Wiring in `readability_fork::compare_extraction` (Stage 6 carrier):
+# When `options.dedup` is true AND `duplicate_test_node(&winning_body,
+# options)` returns true, the function returns `(empty_body, "", 0)` —
+# faithful to Python's `core.py:330-332` `raise ValueError` → outer
+# catch → `None` return shape. `bare_extraction_with_cascade` then
+# sees `winning_len == 0` and returns `None`.
+#
+# All three call sites share the process-wide `LRU_TEST` singleton
+# (deduplication.py:232) with capacity `LRU_SIZE = 4096`.
+#
+# Per semver (CLAUDE.md "Version management") MINOR — net-new public
+# surface (`LruCache`, `duplicate_test`, `duplicate_test_node`,
+# `put_in_cache`, `with_lru_test`, `clear_lru_test`, `LRU_SIZE`,
+# `extract_comments`, plus three new fields on `Options`). The
+# additive-field-on-public-struct caveat applies (struct-literal
+# construction with field listing breaks); recorded once as the
+# precedent for `M2 Stage 4`'s `Extracted` field additions established
+# the harness's `..Default::default()` upgrade pattern.
+#
+# Backward compatibility:
+# - `extract` / `extract_with` / `Extracted` / `ExtractError` are
+#   byte-unchanged (public top-level surface).
+# - `Options::default()` keeps `dedup = false`, so the per-paragraph
+#   AND body-level dedup paths both short-circuit on the default
+#   extraction path. All 4 BLOCKER gates remain byte-identical green
+#   (lib tests 735 -> 752, all 4 gates green: parser_equivalence_gate
+#   / trafilatura_equivalence_gate / trafilatura_extract_smoke /
+#   trafilatura_extract_content_gate).
+# - The Stage-2b' `utils::duplicate_test` stub is replaced by a
+#   one-line forward to `deduplication::duplicate_test_node`. The
+#   call-site shape `options.dedup() && duplicate_test(elem, options)`
+#   in `cleaning::handle_textnode` / `cleaning::process_node` is
+#   unchanged.
+#
+# Lib test count 735 -> 752 (+17): 10 in `deduplication::tests`
+# (LruCache basics + contains/put + eviction + touch-promotion +
+# capacity-zero + clear + duplicate_test repeat / default /
+# short-text-skip / min-size-strict-greater / records-short-text +
+# node-wrapper + LRU_TEST singleton shared), 3 in
+# `main_extractor::tests` (extract_comments_finds_reddit_style /
+# returns_empty / strips_discard_xpaths), 1 in `readability_fork
+# ::tests` (compare_extraction_uses_lru_dedup_when_options_dedup_set),
+# 3 sundry coverage tests in deduplication for clear/short-text
+# accounting. All 4 BLOCKER gates remain byte-identical green;
+# `cargo clippy --release --all-targets -- -D warnings` is clean.
+#
+# Public surface added (`#[doc(hidden)] pub mod
+# trafilatura::deduplication`):
+# - `pub struct LruCache` + `LruCache::new(capacity)` /
+#   `LruCache::contains(&str)` / `LruCache::count(&str)` /
+#   `LruCache::put(String)` / `LruCache::clear()` / `LruCache::len()`
+#   / `LruCache::is_empty()`
+# - `pub fn duplicate_test(text: &str, min_size: usize,
+#   max_repetitions: u32) -> bool`
+# - `pub fn duplicate_test_node(element: &NodeRef, options: &Options)
+#   -> bool`
+# - `pub fn put_in_cache(text: &str)`
+# - `pub fn with_lru_test(closure)`
+# - `pub fn clear_lru_test()`
+# - `pub const LRU_SIZE: usize = 4096`
+# Plus on `main_extractor`:
+# - `pub fn extract_comments(tree: &NodeRef, options: &Options) ->
+#   (NodeRef, String, usize)`
+# Plus on `Options`:
+# - `pub dedup: bool` (default false)
+# - `pub min_duplcheck_size: usize` (default 100)
+# - `pub max_repetitions: usize` (default 2)
+#
+# Faithful deferrals (recorded here for the Stage-9 owner):
+# - `Simhash` + `content_fingerprint` (deduplication.py:58-143): not
+#   on the `bare_extraction` path; only consumed by `meta.py:11,29`
+#   (which clears LRU_TEST). Standalone port; lands when the meta
+#   pipeline needs it.
+# - `is_similar_domain` (deduplication.py:27-32): domain similarity
+#   helper; not in any current call path. Defer with the courlan-y
+#   metadata work.
+# - `sample_tokens` + `generate_bow_hash` (deduplication.py:35-55):
+#   `Simhash` supports; defer with it.
+version = "0.9.0"
 edition = "2024"
 
 [dependencies]

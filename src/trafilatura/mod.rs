@@ -131,3 +131,15 @@ pub mod metadata_jsonld;
 // `Metadata::url` / `hostname` / `date` / `categories` / `tags` / `license`
 // populate additively (JSON-LD values from Stage 7b keep precedence).
 pub mod metadata_url;
+
+// Stage 8 — LRU cache + `duplicate_test` (`deduplication.py:146-254`).
+// Lands the LRU dedup the Stage 2b' stub deferred. New public surface:
+// `LruCache` + `duplicate_test` (text-level) + `duplicate_test_node`
+// (element wrapper) + `put_in_cache` + `with_lru_test` + `clear_lru_test`.
+// Wired into `cleaning::handle_textnode` / `cleaning::process_node`
+// (per-element gate, htmlprocessing.py:262,:282) and into
+// `readability_fork::compare_extraction` (body-level gate, core.py:330).
+// The shared `LRU_TEST` singleton matches Python's process-wide cache
+// (deduplication.py:232) with capacity `LRU_SIZE = 4096`
+// (settings.py:308).
+pub mod deduplication;

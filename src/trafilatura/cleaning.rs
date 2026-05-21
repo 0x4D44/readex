@@ -118,6 +118,27 @@ pub struct Options {
     /// (e.g. external.py:84,90,96). Stored verbatim so the Rust port can
     /// emit the same diagnostic strings if instrumentation lands.
     pub source: Option<String>,
+    /// `Extractor.dedup` (settings.py:114, default `False`). Stage 8.
+    /// When true:
+    /// - `cleaning::handle_textnode` / `process_node` gate per-element
+    ///   on `duplicate_test` (htmlprocessing.py:262, :282).
+    /// - `compare_extraction` runs a body-level `duplicate_test` on the
+    ///   winning extraction (core.py:330) and returns an empty body when
+    ///   the entire postbody was already seen recently.
+    ///
+    /// All three call sites share the process-wide
+    /// [`crate::trafilatura::deduplication`] module's `LRU_TEST` cache.
+    pub dedup: bool,
+    /// `Extractor.min_duplcheck_size` (settings.cfg:41 =
+    /// `MIN_DUPLCHECK_SIZE`, default `100`). Texts shorter than this are
+    /// never tested or remembered by `duplicate_test`
+    /// (deduplication.py:247). Stage 8.
+    pub min_duplcheck_size: usize,
+    /// `Extractor.max_repetitions` (settings.cfg:42 = `MAX_REPETITIONS`,
+    /// default `2`). `duplicate_test` reports a hit only AFTER the cache
+    /// count for a given text exceeds this threshold
+    /// (deduplication.py:250). Stage 8.
+    pub max_repetitions: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,6 +161,10 @@ impl Default for Options {
             lang: None,
             url: None,
             source: None,
+            // settings.py:114 / settings.cfg:41-42 — Trafilatura defaults.
+            dedup: false,
+            min_duplcheck_size: 100,
+            max_repetitions: 2,
         }
     }
 }
@@ -1420,23 +1445,18 @@ pub fn process_node(elem: &NodeRef, options: &Options) -> Option<NodeRef> {
 
 impl Options {
     /// `Options.dedup` accessor (settings.py:114, default `False`). Stage
-    /// 2b' does not yet store this as a field on `Options` — the Stage 1b
-    /// struct's documented slot list is `tables` / `images` / `links` /
-    /// `formatting` / `focus`. When Stage 2c-i adds `dedup` (and the rest
-    /// of the `Extractor` slots that handlers consume), this accessor's
-    /// body changes to read the field; until then it returns the Python
-    /// default `false`. The accessor exists so Stage 2b' callers
-    /// (`handle_textnode` / `process_node`) compile against the future
-    /// shape without inverting the `Options` API.
+    /// 8 promoted the dedup slot from the Stage-2b' stub to a real field
+    /// (`pub dedup: bool`). This accessor remains as a thin getter so that
+    /// existing call sites continue to read `options.dedup()` — the
+    /// Stage-2b' / Stage-2c-i / Stage-2c-ii / Stage-2c-iii call sites
+    /// (`handle_textnode`, `process_node`, and friends) keep their
+    /// already-line-cited shape. Rename to a direct field access in a
+    /// future refactor stage if desired.
     pub fn dedup(&self) -> bool {
-        // HLD §10 / Stage 2b' stub — `Options.dedup` field is NOT YET present.
-        // When Stage 2c-i adds `pub dedup: bool` to the `Options` struct, DELETE
-        // this method and let field access drive the predicate at call sites.
-        // The Rust borrow-checker will surface the rename automatically because
-        // every Stage 2b' caller writes `options.dedup()` (with parens).
-        //
-        // TODO(M3-stage-2c-i): delete this method when the field is added.
-        false
+        // Stage 8 (deduplication.py + LRU_TEST wiring). Reads the field
+        // landed on `Options` alongside `min_duplcheck_size` and
+        // `max_repetitions`. Default `false` per settings.py:114.
+        self.dedup
     }
 }
 

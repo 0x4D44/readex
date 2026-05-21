@@ -1902,6 +1902,28 @@ pub fn compare_extraction(
         winning_len = sanitized_len;
     }
 
+    // Stage 8 — body-level LRU dedup (`core.py:330`). Python performs the
+    // postbody dedup at the trafilatura_sequence call site (one layer
+    // outside `compare_extraction`); the Rust port plumbs it here for
+    // the same observable effect on the winning extraction. When
+    // `options.dedup` is true AND the winning body's trimmed text is
+    // already in the process-wide LRU_TEST cache with count >
+    // `options.max_repetitions`, return an empty body — the caller
+    // (`bare_extraction_with_cascade`) treats `winning_len == 0` as "no
+    // article". This faithfully replicates Python's
+    // `LOGGER.debug("discarding duplicate document: %s", options.source)
+    // ; raise ValueError` short-circuit (`core.py:331-332`).
+    if options.dedup
+        && crate::trafilatura::deduplication::duplicate_test_node(&winning_body, options)
+    {
+        // Surface as "empty extraction" so the cascade entry-point
+        // returns None — Python raises ValueError which the outer
+        // try/except (`core.py:343-345`) catches and returns None.
+        let empty_body = crate::readability::dom::create_element("body");
+        let _ = temppost_algo;
+        return (empty_body, String::new(), 0);
+    }
+
     // Keep `temppost_algo` alive for the rcdom Drop quirk — see
     // `bare_extraction_with_cascade` docs for the same pattern.
     let _ = temppost_algo;
@@ -3244,5 +3266,85 @@ mod tests {
             text.contains("substantive"),
             "Stage 6 arbiter must still route short-arm input to jusText, got {text:.200?}"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Stage 8 — body-level LRU dedup wiring in compare_extraction
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn compare_extraction_uses_lru_dedup_when_options_dedup_set() {
+        // Stage 8 brief test #8 — verify that when `Options.dedup = true`
+        // and the SAME extracted body has been seen often enough that
+        // its joined itertext trips the LRU cache, `compare_extraction`
+        // returns an empty `(body, "", 0)` tuple (faithful to
+        // core.py:330's `if options.dedup and duplicate_test(postbody,
+        // options): raise ValueError` short-circuit).
+        //
+        // Drive the function directly rather than through
+        // `bare_extraction_with_cascade`: that way we control the
+        // postbody text precisely and don't double-tap the cache via
+        // the per-paragraph `duplicate_test` path the `handle_textnode`
+        // gate also hits when `options.dedup = true`. The body-level
+        // wiring is what this test pins; the per-element wiring has
+        // its own coverage in `deduplication::tests`.
+        use crate::readability::dom::{
+            Dom, append_child, create_element, set_element_text, text_content,
+        };
+        let dom = Dom::parse("<html><body></body></html>");
+
+        // Build a self-contained `<body><p>...</p></body>` whose
+        // joined itertext exceeds the default min_duplcheck_size=100.
+        let make_body = || {
+            let body = create_element("body");
+            let p = create_element("p");
+            set_element_text(
+                &p,
+                Some(
+                    "This is a paragraph long enough to clear the \
+                     min_duplcheck_size gate of one hundred codepoints \
+                     so the LRU cache treats it as substantive content.",
+                ),
+            );
+            append_child(&body, &p);
+            body
+        };
+
+        let opts = crate::trafilatura::cleaning::Options {
+            dedup: true,
+            max_repetitions: 1, // 3rd compare_extraction call trips
+            ..crate::trafilatura::cleaning::Options::default()
+        };
+
+        // Reset cache for test isolation.
+        crate::trafilatura::deduplication::clear_lru_test();
+
+        // Use a parsed HTML root as the readability backup; readability
+        // returning None doesn't matter — the dedup gate fires on the
+        // winning body regardless.
+        let backup_html = "<html><body></body></html>";
+        let html_root = dom.root_element().expect("parsed");
+
+        // Each call: extract_content not invoked; we synthesise the
+        // own arm body + text directly so the only dedup tap is the
+        // body-level one at the end of compare_extraction.
+        let body1 = make_body();
+        let text1 = text_content(&body1);
+        let len1 = text1.chars().count();
+        let (_w1, t1, l1) = compare_extraction(&html_root, backup_html, &body1, text1, len1, &opts);
+        assert!(l1 > 0 && !t1.is_empty(), "first call: body kept (count goes 0→1)");
+
+        let body2 = make_body();
+        let text2 = text_content(&body2);
+        let len2 = text2.chars().count();
+        let (_w2, t2, l2) = compare_extraction(&html_root, backup_html, &body2, text2, len2, &opts);
+        assert!(l2 > 0 && !t2.is_empty(), "second call: body kept (count=1, 1>1 false; goes 1→2)");
+
+        let body3 = make_body();
+        let text3 = text_content(&body3);
+        let len3 = text3.chars().count();
+        let (_w3, t3, l3) = compare_extraction(&html_root, backup_html, &body3, text3, len3, &opts);
+        assert_eq!(l3, 0, "third call: cacheval=2 > 1 ⇒ empty body returned");
+        assert_eq!(t3, "", "third call: text emptied");
     }
 }

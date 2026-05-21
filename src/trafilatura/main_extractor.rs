@@ -1824,6 +1824,199 @@ pub fn extract_content(cleaned_tree: &NodeRef, options: &Options) -> (NodeRef, S
 }
 
 // ===========================================================================
+// process_comments_node (main_extractor.py:643-654) — Stage 8
+// ===========================================================================
+
+/// `process_comments_node(elem, potential_tags, options)` —
+/// `main_extractor.py:643-654`.
+///
+/// Per-element comment processor: when the element's tag is in
+/// `potential_tags`, run it through `handle_textnode(elem, options,
+/// comments_fix=True)` then clear all attributes on the survivor.
+///
+/// # Python original
+///
+/// ```python
+/// def process_comments_node(elem, potential_tags, options):
+///     '''Process comment node and determine how to deal with its content'''
+///     if elem.tag in potential_tags:
+///         processed_element = handle_textnode(elem, options, comments_fix=True)
+///         if processed_element is not None:
+///             processed_element.attrib.clear()
+///             return processed_element
+///     return None
+/// ```
+///
+/// # Faithfulness notes
+///
+/// 1. `elem.tag in potential_tags` — Python `in set` lookup ⇒ Rust
+///    `HashSet::contains`. Tag is read via `dom::local_name`.
+/// 2. `handle_textnode(elem, options, comments_fix=True)` (line 647) —
+///    note Python passes `comments_fix=True` (the inverse of
+///    `_extract`'s `handle_textelem` → `handle_textnode` default which
+///    is False for the BODY arm). The `True` flag means `<lb>`
+///    elements get renamed to `<p>` when they have a tail-but-no-text
+///    (htmlprocessing.py:248-249) — a comment-thread cosmetic the
+///    BODY arm doesn't want.
+/// 3. `processed_element.attrib.clear()` (line 650) — strip every
+///    attribute on the survivor (matches
+///    `cleaning::clear_attributes` from dom.rs).
+fn process_comments_node(
+    elem: &NodeRef,
+    potential_tags: &HashSet<String>,
+    options: &Options,
+) -> Option<NodeRef> {
+    // main_extractor.py:645 — tag membership gate.
+    let tag = local_name(elem).unwrap_or_default();
+    if !potential_tags.contains(&tag) {
+        return None;
+    }
+    // main_extractor.py:647 — handle_textnode with comments_fix=True.
+    // preserve_spaces=false matches the Python default (htmlprocessing.py:225).
+    let processed = handle_textnode(elem, options, true, false)?;
+    // main_extractor.py:650 — strip ALL attributes on the survivor.
+    clear_attributes(&processed);
+    Some(processed)
+}
+
+// ===========================================================================
+// extract_comments (main_extractor.py:657-688) — Stage 8
+// ===========================================================================
+
+/// `extract_comments(tree, options)` — `main_extractor.py:657-688`.
+///
+/// Walk `COMMENTS_XPATH` patterns over the cleaned tree, looking for the
+/// first subtree that matches. When found, prune the subtree's
+/// `COMMENTS_DISCARD_XPATH` matches, strip inline `<a>`/`<ref>`/`<span>`
+/// wrappers, then per-descendant route through `process_comments_node`
+/// and append survivors onto a fresh `<body>`. If anything was kept,
+/// remove the consumed subtree from `tree` (so the body-arm extractor
+/// won't double-process it).
+///
+/// Returns `(comments_body, joined_text, text_len)` — parallel shape to
+/// `extract_content`. The Python signature also returns the (mutated)
+/// `tree` for fluent chaining; the Rust port mutates `tree` in place
+/// (the caller still holds the same `&NodeRef`), so the return tuple is
+/// 3-elem instead of 4.
+///
+/// # Python original
+///
+/// ```python
+/// def extract_comments(tree, options):
+///     "Try to extract comments out of potential sections in the HTML."
+///     comments_body = Element("body")
+///     potential_tags = set(TAG_CATALOG)
+///     for expr in COMMENTS_XPATH:
+///         subtree = next((s for s in expr(tree) if s is not None), None)
+///         if subtree is None:
+///             continue
+///         subtree = prune_unwanted_nodes(subtree, COMMENTS_DISCARD_XPATH)
+///         strip_tags(subtree, "a", "ref", "span")
+///         comments_body.extend(filter(lambda x: x is not None,
+///             (process_comments_node(e, potential_tags, options)
+///              for e in subtree.xpath(".//*"))))
+///         if len(comments_body) > 0:
+///             delete_element(subtree, keep_tail=False)
+///             break
+///     temp_comments = " ".join(comments_body.itertext()).strip()
+///     return comments_body, temp_comments, len(temp_comments), tree
+/// ```
+///
+/// # Faithfulness notes
+///
+/// 1. `potential_tags = set(TAG_CATALOG)` (line 661) — note Python
+///    does NOT add `div` (commented-out at line 662 — `# trouble with
+///    <div class="comment-author meta">`). We match.
+/// 2. `next((s for s in expr(tree) if s is not None), None)` (line 665)
+///    — the XPath result's first non-None element. lxml node iteration
+///    never yields None for an axis result, so this is just `first()`.
+/// 3. `prune_unwanted_nodes(subtree, COMMENTS_DISCARD_XPATH)` (line 669)
+///    — Python rebinds `subtree`; we use the SAME shape with a `let
+///    subtree = ...` shadow. `with_backup=False` (no positional arg,
+///    Python default).
+/// 4. `strip_tags(subtree, "a", "ref", "span")` (line 671) — unwrap
+///    these three tag wrappers (children + text + tail survive). lxml's
+///    `strip_tags` with a multi-arg list maps to `strip_tags_multi`.
+/// 5. `subtree.xpath(".//*")` (line 679) — every descendant element,
+///    in document order. Maps to `get_elements_by_tag_name(_, "*")`.
+/// 6. `len(comments_body) > 0` (line 681) — `> 0` is element-child
+///    count truthy; maps to `element_child_count(&body) > 0`.
+/// 7. `delete_element(subtree, keep_tail=False)` (line 684) — the
+///    Rust port maps to `dom::remove(&subtree)`. The subtree is
+///    detached from its parent; any following-sibling tail run on the
+///    subtree itself goes with it.
+/// 8. `temp_comments = " ".join(comments_body.itertext()).strip()`
+///    (line 687) — same join+strip shape as `extract_content`. Uses
+///    the local `itertext` helper.
+/// 9. Python returns `(comments_body, temp_comments, len(temp_comments),
+///    tree)` — Rust returns `(comments_body, temp_comments, len)`. The
+///    fourth element is the mutated tree, which Rust callers still own
+///    by reference; honest divergence recorded here.
+pub fn extract_comments(tree: &NodeRef, options: &Options) -> (NodeRef, String, usize) {
+    use crate::readability::dom::create_element;
+    use crate::trafilatura::cleaning::prune_unwanted_nodes;
+    use crate::trafilatura::xpath_engine;
+    use crate::trafilatura::xpaths_constants::{COMMENTS_DISCARD_XPATH, COMMENTS_XPATH};
+
+    // main_extractor.py:659 — fresh <body> container.
+    let comments_body = create_element("body");
+
+    // main_extractor.py:661 — potential_tags = set(TAG_CATALOG).
+    // Note: Python does NOT add 'div' (the `# trouble with <div
+    // class="comment-author meta">` comment at line 662 explains why).
+    let potential_tags: HashSet<String> =
+        TAG_CATALOG.iter().map(|s| s.to_string()).collect();
+
+    // main_extractor.py:663 — iterate COMMENTS_XPATH expressions.
+    for expr in COMMENTS_XPATH {
+        // main_extractor.py:665 — first matching subtree (or skip).
+        let matches = xpath_engine::evaluate(expr, tree).unwrap_or_default();
+        let Some(subtree) = matches.into_iter().next() else {
+            continue;
+        };
+
+        // main_extractor.py:669 — prune COMMENTS_DISCARD_XPATH matches.
+        // Python rebinds `subtree`; Rust shadows.
+        let subtree = prune_unwanted_nodes(&subtree, COMMENTS_DISCARD_XPATH, false);
+
+        // main_extractor.py:671 — strip a/ref/span wrappers.
+        strip_tags_multi(&subtree, &["a", "ref", "span"]);
+
+        // main_extractor.py:679 — for every descendant, route through
+        // process_comments_node; append survivors to comments_body.
+        // `.//*` ⇒ every Element descendant in document order.
+        let descendants = get_elements_by_tag_name(&subtree, "*");
+        for elem in descendants {
+            // Defensive: skip detached elements (the prune step may
+            // have orphaned some via `dom::remove` — mirrors the
+            // `_extract` Cluster-C orphan-skip pattern).
+            if crate::readability::dom::parent(&elem).is_none() {
+                continue;
+            }
+            if let Some(new_elem) = process_comments_node(&elem, &potential_tags, options) {
+                append_child(&comments_body, &new_elem);
+            }
+        }
+
+        // main_extractor.py:681-685 — break on first non-empty body.
+        if element_child_count(&comments_body) > 0 {
+            // main_extractor.py:684 — `delete_element(subtree, keep_tail=False)`.
+            // Remove the consumed subtree from `tree` so the body-arm
+            // extractor won't process it again.
+            crate::readability::dom::remove(&subtree);
+            break;
+        }
+    }
+
+    // main_extractor.py:687 — temp_comments = ' '.join(...).strip()
+    let texts = itertext(&comments_body);
+    let temp_comments = texts.join(" ").trim().to_string();
+    let len = temp_comments.chars().count();
+
+    (comments_body, temp_comments, len)
+}
+
+// ===========================================================================
 // handle_titles (main_extractor.py:43-66)
 // ===========================================================================
 
@@ -3999,6 +4192,75 @@ mod tests {
         assert!(
             get_elements_by_tag_name(&result_body, "done").is_empty(),
             "no <done> elements in output"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Stage 8 — extract_comments (main_extractor.py:657-688)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn extract_comments_finds_reddit_style_comments() {
+        // Stage 8 brief test #1 — Reddit-style threaded comments
+        // (`<div class="commentlist"><p>...`) match the first
+        // COMMENTS_XPATH expression `contains(@id|@class, 'commentlist')`.
+        // Per main_extractor.py:661, the `potential_tags` set is
+        // `TAG_CATALOG` (which includes `<p>`), so the inner `<p>`
+        // elements survive `process_comments_node`.
+        let (_d, body) = parse_body(
+            "<html><body><div class=\"commentlist\">\
+             <p>This is a substantial first comment with some opinion.</p>\
+             <p>Reply: I agree with the previous comment entirely.</p>\
+             </div></body></html>",
+        );
+        let opts = Options::default();
+        let (comments_body, text, len) = extract_comments(&body, &opts);
+        assert_eq!(local_name(&comments_body).as_deref(), Some("body"));
+        assert!(
+            text.contains("substantial first comment"),
+            "first comment extracted; got {text:?}"
+        );
+        assert!(len > 0, "comments len > 0");
+    }
+
+    #[test]
+    fn extract_comments_returns_empty_when_no_comments() {
+        // Stage 8 brief test #2 — article without any comment containers.
+        // No COMMENTS_XPATH match ⇒ the inner for loop never breaks ⇒
+        // comments_body stays a fresh empty <body>, text empty, len 0.
+        let (_d, body) = parse_body(
+            "<html><body><article><p>Just a body article with no comments anywhere.</p></article></body></html>",
+        );
+        let opts = Options::default();
+        let (comments_body, text, len) = extract_comments(&body, &opts);
+        assert_eq!(element_child_count(&comments_body), 0, "empty body");
+        assert_eq!(text, "");
+        assert_eq!(len, 0);
+    }
+
+    #[test]
+    fn extract_comments_strips_comment_discard_xpaths() {
+        // Stage 8 brief test #3 — a `<div class="comment-list">` outer
+        // (matches COMMENTS_XPATH expr 1, the `comment-list` substring)
+        // wraps a `<div class="message">` inner. The COMMENTS_DISCARD_XPATH
+        // third expression discards any descendant whose class contains
+        // `message` (xpaths.py:201-205). So the `<p>` inside the message
+        // div should NOT make it into comments_body.
+        let (_d, body) = parse_body(
+            "<html><body><div class=\"comment-list\">\
+             <p>Genuine comment kept after the discard pass.</p>\
+             <div class=\"message\"><p>Boilerplate ad text dropped.</p></div>\
+             </div></body></html>",
+        );
+        let opts = Options::default();
+        let (_comments_body, text, _len) = extract_comments(&body, &opts);
+        assert!(
+            text.contains("Genuine comment"),
+            "kept the genuine comment; got {text:?}"
+        );
+        assert!(
+            !text.contains("Boilerplate ad text"),
+            "discarded the message-class child; got {text:?}"
         );
     }
 }

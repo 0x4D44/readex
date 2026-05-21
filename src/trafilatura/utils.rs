@@ -347,36 +347,28 @@ pub fn text_chars_test(string: Option<&str>) -> bool {
 }
 
 // ===========================================================================
-// duplicate_test STUB (deduplication.py:243-254)
+// duplicate_test (deduplication.py:243-254) — Stage 8 (live)
 // ===========================================================================
 
 /// `duplicate_test(element, options)` — deduplication.py:243-254.
 ///
-/// **HLD §10 / Stage 2b' stub.** Trafilatura's `Options.dedup` defaults to
-/// `False` (settings.py:114), so the only call site (`handle_textnode`
-/// :262, `process_node` :282) is gated on `options.dedup && duplicate_test(
-/// elem, options)` and therefore short-circuits before ever invoking this
-/// function on the default extraction path the Stage 0c gate exercises.
-/// Returning `false` is the faithful behaviour on that path.
+/// **Stage 8** activates this surface: the call sites in
+/// `cleaning::handle_textnode` (htmlprocessing.py:262) and
+/// `cleaning::process_node` (htmlprocessing.py:282) now route into the
+/// real LRU-cache port at [`crate::trafilatura::deduplication`]. The
+/// Stage 2b' stub returned `false` unconditionally because
+/// `Options.dedup` defaulted to `false` and had no field backing; both
+/// of those gaps closed in Stage 8 (the field landed on `Options` and
+/// the LRU port landed in `deduplication.rs`).
 ///
-/// The full LRU-cache port (deduplication.py:160-240) is deferred to a
-/// future stage; activating `dedup` will require that stage to land first.
-/// To prevent a silent-lie if `dedup` is wired before the cache port, this
-/// stub `debug_assert!`s that `options.dedup()` is false on entry.
-///
-/// TODO(M3-stage-deferred): port the `LRUCache` + `put_in_cache` +
-/// `duplicate_test` proper alongside the rest of `deduplication.py`.
-pub fn duplicate_test(_element: &NodeRef, options: &crate::trafilatura::cleaning::Options) -> bool {
-    // HLD §10 / Stage 2b' stub — see Options::dedup() TODO. If a caller passes
-    // dedup=true before the LRU port lands, the stub silently lies. Surface
-    // the gap loudly in debug builds.
-    debug_assert!(
-        !options.dedup(),
-        "duplicate_test stub called with dedup=true — the LRU cache port \
-         (deduplication.py:160-240) is not yet implemented. Activate Stage \
-         M3-stage-deferred before passing Options::dedup=true."
-    );
-    false
+/// This thin wrapper preserves the per-element call shape every Stage
+/// 2b' caller already writes — `duplicate_test(elem, options)` — by
+/// forwarding to [`crate::trafilatura::deduplication::duplicate_test_node`].
+pub fn duplicate_test(element: &NodeRef, options: &crate::trafilatura::cleaning::Options) -> bool {
+    // Stage 8 wiring — forward into the real LRU-backed implementation.
+    // The Python source signature `duplicate_test(element, options) -> bool`
+    // is preserved at every call site in cleaning.rs.
+    crate::trafilatura::deduplication::duplicate_test_node(element, options)
 }
 
 // ===========================================================================
@@ -628,16 +620,20 @@ mod tests {
         assert!(!is_image_element(&img));
     }
 
-    // ---- duplicate_test stub ----
+    // ---- duplicate_test (Stage 8 — live via deduplication::duplicate_test_node)
 
     #[test]
-    fn duplicate_test_stub_returns_false() {
-        // Pin: until the LRU cache port lands, duplicate_test returns false
-        // unconditionally — and only when Options::dedup() is false (the
-        // debug_assert! makes the dedup=true case panic in debug). Stage
-        // 2b' notes the deferral; do not change this expectation without
-        // that stage's review.
+    fn duplicate_test_empty_node_returns_false() {
+        // Pin: a `<p>` with no text gives an empty `itertext` join, which
+        // is below any sensible `min_duplcheck_size` (default 100) — so
+        // `duplicate_test` records the empty string but never returns
+        // true. Stage 2b' returned false unconditionally via a stub;
+        // Stage 8 now returns false because the text gate (Python
+        // `len(teststring) > min_duplcheck_size`) does not trip on empty
+        // input. Same observable result on the default-Options path.
         use crate::trafilatura::cleaning::Options;
+        use crate::trafilatura::deduplication::clear_lru_test;
+        clear_lru_test();
         let p = create_element("p");
         let opts = Options::default();
         assert!(!duplicate_test(&p, &opts));
