@@ -2069,6 +2069,43 @@ pub fn bare_extraction_with_cascade(
     let (winning_body, winning_text, winning_len) =
         compare_extraction(&body, html, &own_body, own_text, own_len, opts);
 
+    // core.py:123-125 — baseline rescue.
+    //
+    //     if len_text < options.min_extracted_size and not options.focus == "precision":
+    //         postbody, temp_text, len_text = baseline(deepcopy(tree_backup))
+    //
+    // M5 Stage 6c: this was the missing limb of `trafilatura_sequence` in
+    // mdrcel. Without it, the link-only `<p>` cluster (example.com,
+    // `0f115db062b7c0dd.html` / `8198d1bac40a1033.html`) saw `_extract` +
+    // `recover_wild_text` return only the first paragraph (101 chars,
+    // below the 250 default `min_extracted_size`), the cascade arbiter
+    // kept that 101-char own arm, and the second `<p><a>Learn more</a></p>`
+    // was lost. Python rescues via `baseline()` (baseline.py:78-86 tag-set
+    // path: iter `blockquote|code|p|pre|q|quote`, dedupe by text), which
+    // picks up BOTH paragraphs (combined 112 chars > 100 char return gate),
+    // yielding the canonical 113-char markdown body
+    // `This domain ...\n\nLearn more`. We mirror Python by replacing the
+    // winning arm whenever its length is still below the threshold and
+    // focus is not precision — the same gate Python applies at core.py:123.
+    use crate::trafilatura::cleaning::Focus;
+    let (winning_body, winning_text, winning_len) =
+        if winning_len < opts.min_extracted_size && opts.focus != Focus::Precision {
+            let baseline_out = crate::trafilatura::baseline::baseline(html);
+            // Python `baseline()` returns `(postbody, temp_text, len(text))`
+            // with `postbody` carrying one or more `<p>` children (or one
+            // newline-joined `<p>` for the body-itertext fallback). The
+            // returned NodeRef is the freshly synthesised `<body>`, owned
+            // by a detached element graph — safe to hand back as the
+            // cascade's body without touching the cleaned tree.
+            if baseline_out.length > 0 {
+                (baseline_out.postbody, baseline_out.text, baseline_out.length)
+            } else {
+                (winning_body, winning_text, winning_len)
+            }
+        } else {
+            (winning_body, winning_text, winning_len)
+        };
+
     // All three arms empty → no article. Keep `dom` alive until the
     // function exits (rcdom Drop quirk), then return None.
     if winning_len == 0 {
