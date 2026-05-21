@@ -323,7 +323,11 @@ fn strip_port(authority: &str) -> &str {
 ///
 /// Returns `None` for malformed inputs (no recognised scheme), otherwise
 /// `Some("https://host[:port]")` etc.
-fn get_base_url(url: &str) -> Option<String> {
+///
+/// Visibility: `pub(crate)` so the `cleaning::convert_tags` `links=true` branch
+/// (M4 Stage 2; `htmlprocessing.py:397`) can derive `base_url` from
+/// `options.url` without duplicating the parsing logic.
+pub(crate) fn get_base_url(url: &str) -> Option<String> {
     let after_scheme_start = url
         .find("://")
         .filter(|i| *i > 0)
@@ -338,6 +342,188 @@ fn get_base_url(url: &str) -> Option<String> {
         return None;
     }
     Some(format!("{scheme}://{netloc}"))
+}
+
+/// `fix_relative_urls(baseurl, url)` (`courlan/urlutils.py:110-123`).
+///
+/// "Prepend protocol and host information to relative links." Used by
+/// `convert_tags` when `options.links = true` to rewrite the `href`
+/// attribute on `<a>`/`<ref>` elements into an absolute URL.
+///
+/// # Python original
+///
+/// ```python
+/// def fix_relative_urls(baseurl: str, url: str) -> str:
+///     "Prepend protocol and host information to relative links."
+///     if url.startswith("{"):
+///         return url
+///     base_netloc = urlsplit(baseurl).netloc
+///     split_url = urlsplit(url)
+///     if split_url.netloc not in (base_netloc, ""):
+///         if split_url.scheme:
+///             return url
+///         return urlunsplit(split_url._replace(scheme="http"))
+///     return urljoin(baseurl, url)
+/// ```
+///
+/// # Hand-rolled scope
+///
+/// The `url` crate is NOT a dependency of `mdrcel` (Cargo.toml lists only
+/// `html5ever` / `markup5ever_rcdom` / `tendril` / `regex` / `serde_json`;
+/// DEC-3 "deferred until the algorithm needs it" — relative-URL resolution
+/// at `convert_tags`'s anchor branch is too small a surface to justify a
+/// new dependency). The covered cases mirror Python's `urljoin` for the
+/// shapes Trafilatura encounters in real HTML anchors:
+///
+/// - `url` starts with `{`  → return unchanged (template-literal guard,
+///   `urlutils.py:112-113`).
+/// - `url` has a scheme + netloc differing from baseurl's → return unchanged.
+/// - `url` has a netloc but no scheme (`//other.com/x`) → prepend `http:`.
+/// - `url` starts with `//` (protocol-relative) → `<scheme>://<...>`.
+/// - `url` starts with `/` (absolute path) → `<scheme>://<netloc><url>`.
+/// - `url` starts with `?` or `#` → splice the query/fragment onto the base
+///   (matches RFC 3986's reference-resolution algorithm).
+/// - Otherwise relative path → strip the basename from baseurl's path,
+///   append the relative url.
+pub(crate) fn fix_relative_urls(baseurl: &str, url: &str) -> String {
+    // 112-113: template-literal escape (e.g. Jinja2 / Mustache `{{...}}`).
+    if url.starts_with('{') {
+        return url.to_string();
+    }
+
+    let (url_scheme, url_after_scheme) = split_scheme(url);
+    let (url_netloc, url_path_etc) = split_netloc(url_after_scheme, url_scheme.is_some());
+
+    // 118-121: url has a netloc differing from baseurl's netloc.
+    if let Some(unetloc) = url_netloc {
+        let base_netloc = split_netloc(split_scheme(baseurl).1, true).0.unwrap_or("");
+        if !unetloc.is_empty() && unetloc != base_netloc {
+            if url_scheme.is_some() {
+                // Different host with a real scheme — leave as-is.
+                return url.to_string();
+            }
+            // Scheme-less `//other.com/x` — Python `urlunsplit(_replace(
+            // scheme="http"))` returns `http://other.com/x`.
+            return format!("http:{url}");
+        }
+        // Same netloc as base — fall through to urljoin behaviour.
+    }
+
+    // 123: urljoin(baseurl, url) — RFC 3986 reference resolution.
+    urljoin(baseurl, url, url_scheme, url_netloc, url_path_etc)
+}
+
+/// Split a URL into `(Some(scheme), rest_after_colon_slash_slash)` when it
+/// has a recognised scheme followed by `://`, or `(None, whole_input)`
+/// otherwise. The Python `urlsplit` is more permissive (it accepts
+/// `mailto:foo`); `fix_relative_urls` only sees `http(s)`-shaped URLs in
+/// Trafilatura's `<a>` anchors, so we restrict to the `<scheme>://` form.
+fn split_scheme(url: &str) -> (Option<&str>, &str) {
+    if let Some(idx) = url.find("://") {
+        // Scheme must be non-empty + alphanumeric/`+`/`-`/`.` (RFC 3986).
+        let scheme = &url[..idx];
+        if !scheme.is_empty()
+            && scheme.chars().all(|c| {
+                c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.'
+            })
+        {
+            return (Some(scheme), &url[idx + 3..]);
+        }
+    }
+    (None, url)
+}
+
+/// Given the portion of a URL after the `<scheme>://` prefix (or the whole
+/// URL when there was no scheme), split off the netloc.
+///
+/// When `had_scheme` is true the netloc is everything up to the first `/`,
+/// `?`, or `#`. When `had_scheme` is false the input may be `//netloc/path`
+/// (protocol-relative) — handled here — or a plain relative path — netloc
+/// is `None`.
+fn split_netloc(s: &str, had_scheme: bool) -> (Option<&str>, &str) {
+    if had_scheme {
+        let end = s.find(['/', '?', '#']).unwrap_or(s.len());
+        return (Some(&s[..end]), &s[end..]);
+    }
+    // No scheme — check for protocol-relative form `//netloc/path`.
+    if let Some(rest) = s.strip_prefix("//") {
+        let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        return (Some(&rest[..end]), &rest[end..]);
+    }
+    (None, s)
+}
+
+/// `urljoin(base, ref)` mirroring Python's `urllib.parse.urljoin` for the
+/// shapes `fix_relative_urls` encounters. `ref_scheme` / `ref_netloc` /
+/// `ref_path_etc` are the pre-computed splits of `ref`.
+fn urljoin(
+    base: &str,
+    reference: &str,
+    ref_scheme: Option<&str>,
+    ref_netloc: Option<&str>,
+    ref_path_etc: &str,
+) -> String {
+    // If the reference has its own scheme, it wins outright.
+    if ref_scheme.is_some() {
+        return reference.to_string();
+    }
+
+    let (base_scheme, base_after) = split_scheme(base);
+    let Some(base_scheme) = base_scheme else {
+        // Base has no scheme — Python's urljoin returns the reference verbatim.
+        return reference.to_string();
+    };
+    let (base_netloc, base_path_etc) = split_netloc(base_after, true);
+    let base_netloc = base_netloc.unwrap_or("");
+
+    // If the reference has a netloc (scheme-less `//foo.com/x`) it inherits
+    // base's scheme but overrides netloc + path.
+    if let Some(rnetloc) = ref_netloc {
+        return format!("{base_scheme}://{rnetloc}{ref_path_etc}");
+    }
+
+    // Reference is purely a path / query / fragment.
+    if reference.is_empty() {
+        return base.to_string();
+    }
+    // Absolute path: replace base's path entirely.
+    if let Some(stripped_path) = ref_path_etc.strip_prefix('/') {
+        let _ = stripped_path; // unused — included for clarity
+        return format!("{base_scheme}://{base_netloc}{ref_path_etc}");
+    }
+    // Query-only reference: splice onto base's path (drop base's query/fragment).
+    if let Some(query_or_frag) = ref_path_etc.strip_prefix('?') {
+        let _ = query_or_frag;
+        let base_path_only = strip_query_and_fragment(base_path_etc);
+        return format!("{base_scheme}://{base_netloc}{base_path_only}{ref_path_etc}");
+    }
+    // Fragment-only reference: keep base's path + query, replace fragment.
+    if let Some(frag) = ref_path_etc.strip_prefix('#') {
+        let _ = frag;
+        let base_no_frag = strip_fragment(base_path_etc);
+        return format!("{base_scheme}://{base_netloc}{base_no_frag}{ref_path_etc}");
+    }
+
+    // Relative path — strip basename from base's path, then append.
+    let base_path_only = strip_query_and_fragment(base_path_etc);
+    let parent_end = base_path_only.rfind('/').map(|i| i + 1).unwrap_or(0);
+    let parent = &base_path_only[..parent_end];
+    if parent.is_empty() {
+        // Base had no path — synthesise a leading `/`.
+        format!("{base_scheme}://{base_netloc}/{ref_path_etc}")
+    } else {
+        format!("{base_scheme}://{base_netloc}{parent}{ref_path_etc}")
+    }
+}
+
+fn strip_query_and_fragment(s: &str) -> &str {
+    let end = s.find(['?', '#']).unwrap_or(s.len());
+    &s[..end]
+}
+
+fn strip_fragment(s: &str) -> &str {
+    let end = s.find('#').unwrap_or(s.len());
+    &s[..end]
 }
 
 /// Minimal URL validity gate (`courlan.filters.validate_url` reduced to the
@@ -1068,5 +1254,76 @@ mod tests {
     #[test]
     fn is_valid_url_rejects_no_scheme() {
         assert!(!is_valid_url("example.com/x"));
+    }
+
+    // ---- fix_relative_urls (M4 Stage 2, urlutils.py:110-123) -----------
+
+    #[test]
+    fn fix_relative_urls_passes_absolute_other_host_through_unchanged() {
+        // Python: split_url.netloc != base_netloc AND split_url.scheme is
+        // set → return url verbatim (urlutils.py:118-120).
+        assert_eq!(
+            fix_relative_urls("https://e.com/a", "https://o.com/b"),
+            "https://o.com/b"
+        );
+    }
+
+    #[test]
+    fn fix_relative_urls_joins_relative_path_against_base_directory() {
+        // urljoin("https://e.com/a/b", "x") -> "https://e.com/a/x" — the
+        // basename `b` of base path is dropped, then `x` is appended.
+        assert_eq!(
+            fix_relative_urls("https://e.com/a/b", "x"),
+            "https://e.com/a/x"
+        );
+    }
+
+    #[test]
+    fn fix_relative_urls_joins_relative_path_against_base_with_trailing_slash() {
+        // urljoin("https://e.com/a/b/", "x") -> "https://e.com/a/b/x".
+        assert_eq!(
+            fix_relative_urls("https://e.com/a/b/", "x"),
+            "https://e.com/a/b/x"
+        );
+    }
+
+    #[test]
+    fn fix_relative_urls_joins_absolute_path_against_base_root() {
+        // urljoin("https://e.com/a/b", "/x") -> "https://e.com/x".
+        assert_eq!(
+            fix_relative_urls("https://e.com/a/b", "/x"),
+            "https://e.com/x"
+        );
+    }
+
+    #[test]
+    fn fix_relative_urls_promotes_protocol_relative_to_http() {
+        // Python: split_url.netloc set, scheme empty → urlunsplit with
+        // scheme="http" (urlutils.py:121). NOTE: Python's urlsplit treats
+        // `//other.com/x` as netloc-only, then `_replace(scheme="http")`
+        // yields `http://other.com/x`. Trafilatura uses http, not
+        // baseurl's scheme — faithful to source.
+        assert_eq!(
+            fix_relative_urls("https://e.com", "//other.com/x"),
+            "http://other.com/x"
+        );
+    }
+
+    #[test]
+    fn fix_relative_urls_passes_template_literal_through_unchanged() {
+        // urlutils.py:112-113 — `if url.startswith("{"): return url`.
+        assert_eq!(fix_relative_urls("https://e.com", "{...}"), "{...}");
+        assert_eq!(fix_relative_urls("https://e.com", "{"), "{");
+    }
+
+    #[test]
+    fn fix_relative_urls_same_host_with_scheme_resolves_via_urljoin() {
+        // When ref scheme + netloc match base's, urljoin returns the
+        // reference; this exercises the "same netloc" branch falling
+        // through to urljoin (urlutils.py:123).
+        assert_eq!(
+            fix_relative_urls("https://e.com/a", "https://e.com/b"),
+            "https://e.com/b"
+        );
     }
 }

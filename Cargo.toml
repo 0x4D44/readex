@@ -2351,7 +2351,41 @@ name = "mdrcel"
 # RENAMED `extract_date_from_pure_text_date_works_with_htmldate` and
 # flipped to assert `Some("2024-01-15")` — the htmldate port now covers
 # what was previously deferred.
-version = "0.12.0"
+#
+# M4 Stage 2 (2026-05-21): 0.12.0 -> 0.12.1 PATCH. Wires the previously-
+# documented STUB at `cleaning.rs:530-538` (`options.links = true` branch
+# of `convert_tags`) into a faithful port of
+# `htmlprocessing.py:395-399`'s `for elem in tree.iter("a", "ref"):
+# convert_link(elem, base_url)` loop. New surfaces:
+# - `pub(crate) fn cleaning::convert_link(elem, base_url)` —
+#   `htmlprocessing.py:369-378`. Renames `<a>`/`<ref>` to `<ref>`, clears
+#   attributes, sets `target` from the (optionally relative-URL-resolved)
+#   `href`.
+# - `pub(crate) fn metadata_url::fix_relative_urls(baseurl, url)` —
+#   `courlan/urlutils.py:110-123`. Hand-rolled (the `url` crate is not a
+#   dependency; DEC-3 "deferred until the algorithm needs it" still holds
+#   for relative-URL resolution at this scope). Covers the cases
+#   Trafilatura's anchor pipeline encounters: `{`-prefixed template
+#   literals pass through, different-host references stay verbatim,
+#   scheme-less `//host/x` gets `http:` prepended, absolute-path / query-
+#   only / fragment-only / relative-path resolutions follow RFC 3986.
+# - `metadata_url::get_base_url` widened from `fn` to `pub(crate)` so the
+#   `convert_tags` branch can derive `base_url` from `options.url`.
+#
+# Backward compatibility:
+# - Every existing public surface (`extract` / `extract_with` /
+#   `Extracted` / `Options` / `ExtractError`) byte-unchanged.
+# - The Stage-1b STUB was deliberately reachable only via `Options::links
+#   = true`; default `Options::default()` keeps `links = false`, so the
+#   default extraction path is byte-unchanged on every input.
+# - All 5 M4 BLOCKER gates remain green (parser_equivalence_gate /
+#   trafilatura_equivalence_gate / trafilatura_extract_smoke /
+#   trafilatura_extract_content_gate / htmldate_parity_gate).
+#
+# Per semver (CLAUDE.md "Version management") PATCH — feature extension
+# to an existing code path documented as a STUB pending Stage 2. The new
+# `pub(crate)` surfaces are additive on already-`#[doc(hidden)]` modules.
+version = "0.12.1"
 edition = "2024"
 
 [dependencies]

@@ -528,13 +528,20 @@ pub fn convert_tags(tree: &NodeRef, options: &Options) {
         // strip_tags(tree, "a") — strip any remaining <a> wrappers.
         strip_tags_multi(tree, &["a"]);
     } else {
-        // Stage 1b: links=true path not exercised by the default gate. The
-        // logic would be:
+        // M4 Stage 2 (htmlprocessing.py:395-399):
+        //   base_url = url and get_base_url(url)
         //   for elem in tree.iter("a", "ref"):
         //       convert_link(elem, base_url)
-        // which renames <a> to <ref> and folds href→target. Wire when Stage 2
-        // needs it; the default Options::default() does NOT take this branch.
-        let _ = options.links;
+        // Renames <a>/<ref> to <ref> and folds href→target, repairing
+        // relative URLs against `options.url`'s base when supplied.
+        let base_url: Option<String> = options
+            .url
+            .as_deref()
+            .and_then(crate::trafilatura::metadata_url::get_base_url);
+        let anchors = get_elements_in_any(tree, &["a", "ref"]);
+        for elem in anchors {
+            convert_link(&elem, base_url.as_deref());
+        }
     }
 
     // ---- htmlprocessing.py:401-407 — REND_TAG_MAPPING handling ----
@@ -625,6 +632,58 @@ pub fn convert_tags(tree: &NodeRef, options: &Options) {
         for img in imgs {
             let _ = replace_element_tag(&img, "graphic");
         }
+    }
+}
+
+/// `convert_link(elem, base_url)` (`htmlprocessing.py:369-378`).
+///
+/// "Replace link tags and href attributes, delete the rest." Renames `<a>`
+/// (or already-renamed `<ref>`) to `<ref>`, drops all attributes, then —
+/// when the original had an `href` — sets `target` to the (relative-URL-
+/// resolved, when `base_url` is supplied) URL.
+///
+/// # Python original
+///
+/// ```python
+/// def convert_link(elem: HtmlElement, base_url: Optional[str]) -> None:
+///     "Replace link tags and href attributes, delete the rest."
+///     elem.tag = "ref"
+///     target = elem.get("href")  # defaults to None
+///     elem.attrib.clear()
+///     if target:
+///         if base_url:
+///             target = fix_relative_urls(base_url, target)
+///         elem.set("target", target)
+/// ```
+///
+/// # Rust port shape
+///
+/// Mutates `elem`'s replacement in place. Because `replace_element_tag`
+/// allocates a fresh node (Rust rcdom can't mutate `NodeData::Element::name`
+/// — Stage 1b precedent), the new `<ref>` element is the one we clear /
+/// `set_attribute("target", ...)` on. The caller (in `convert_tags`) does
+/// not consume the returned handle; the surrounding `tree.iter("a", "ref")`
+/// walk operates on the snapshot taken *before* the rename, so already-
+/// renamed elements aren't revisited.
+pub(crate) fn convert_link(elem: &NodeRef, base_url: Option<&str>) {
+    // 371-372: read href off the original element BEFORE renaming.
+    let target = get_attribute(elem, "href");
+    // 371: elem.tag = "ref" — under rcdom this allocates a new <ref> node
+    // and moves the original's children into it. The old `elem` becomes
+    // detached. We operate on the new node from here on.
+    let new = replace_element_tag(elem, "ref");
+    // 373: elem.attrib.clear() — the rename copies attributes by default,
+    // so we must clear them off the new node to match Python.
+    clear_attributes(&new);
+    // 374-378: if href was present, resolve + set target.
+    if let Some(href) = target
+        && !href.is_empty()
+    {
+        let resolved = match base_url {
+            Some(base) => crate::trafilatura::metadata_url::fix_relative_urls(base, &href),
+            None => href,
+        };
+        set_attribute(&new, "target", &resolved);
     }
 }
 
@@ -2520,5 +2579,76 @@ mod tests {
             text.contains("Heading text"),
             "heading text dropped: {text:?}"
         );
+    }
+
+    // ---- M4 Stage 2: convert_link + convert_tags(links=true) -----------
+
+    #[test]
+    fn convert_link_renames_a_to_ref_and_resolves_relative_href() {
+        // htmlprocessing.py:369-378 — `<a href="/x">` under base
+        // `https://e.com` → `<ref target="https://e.com/x">`.
+        let dom = parse(r#"<html><body><a href="/x">click</a></body></html>"#);
+        let b = body(&dom);
+        let a = get_elements_by_tag_name(&b, "a")[0].clone();
+        convert_link(&a, Some("https://e.com"));
+        // The original <a> is detached; the new <ref> lives under <body>.
+        let refs = get_elements_by_tag_name(&b, "ref");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(
+            crate::readability::dom::get_attribute(&refs[0], "target").as_deref(),
+            Some("https://e.com/x")
+        );
+        // href attribute must be cleared (Python: elem.attrib.clear()).
+        assert_eq!(
+            crate::readability::dom::get_attribute(&refs[0], "href"),
+            None
+        );
+    }
+
+    #[test]
+    fn convert_link_passes_absolute_href_through_unchanged() {
+        // `<a href="https://other.com/y">` → `<ref target="https://other.com/y">`.
+        let dom = parse(
+            r#"<html><body><a href="https://other.com/y">link</a></body></html>"#,
+        );
+        let b = body(&dom);
+        let a = get_elements_by_tag_name(&b, "a")[0].clone();
+        convert_link(&a, Some("https://e.com"));
+        let refs = get_elements_by_tag_name(&b, "ref");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(
+            crate::readability::dom::get_attribute(&refs[0], "target").as_deref(),
+            Some("https://other.com/y")
+        );
+    }
+
+    #[test]
+    fn convert_tags_links_true_resolves_relative_anchors_against_options_url() {
+        // End-to-end: doc with two relative anchors gets two
+        // `<ref target="https://e.com/...">` after `convert_tags` with
+        // `Options { links: true, url: Some("https://e.com"), ..default() }`.
+        let dom = parse(
+            r#"<html><body><div>
+                <a href="/foo">A</a>
+                <a href="/bar">B</a>
+            </div></body></html>"#,
+        );
+        let b = body(&dom);
+        let opts = Options {
+            links: true,
+            url: Some("https://e.com".to_string()),
+            ..Options::default()
+        };
+        convert_tags(&b, &opts);
+        let refs = get_elements_by_tag_name(&b, "ref");
+        assert_eq!(refs.len(), 2, "expected two <ref>, got {:?}", refs.len());
+        let targets: Vec<String> = refs
+            .iter()
+            .filter_map(|r| crate::readability::dom::get_attribute(r, "target"))
+            .collect();
+        assert!(targets.contains(&"https://e.com/foo".to_string()));
+        assert!(targets.contains(&"https://e.com/bar".to_string()));
+        // No `<a>` should remain — convert_link renames all of them.
+        assert!(get_elements_by_tag_name(&b, "a").is_empty());
     }
 }
