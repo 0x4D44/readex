@@ -2508,7 +2508,28 @@ name = "mdrcel"
 # from `control_xml_output` via a new `OutputFormat` enum slot (XmlTei
 # branch); the prior XML-only callers are signature-compatible. No new
 # dependency; no public API removal; `Options` unchanged.
-version = "0.13.3"
+#
+# M4 Stage 4 (2026-05-21): 0.13.3 -> 0.14.0 MINOR. Additive **public surface
+# expansion**: six new fields are appended to `Extracted` — `categories:
+# Vec<String>`, `tags: Vec<String>`, `image: Option<String>`,
+# `pagetype: Option<String>`, `license: Option<String>`,
+# `hostname: Option<String>`. Each value flows verbatim out of the
+# already-computed `trafilatura::metadata::Metadata` (`metadata.py:422-446`
+# `extract_catstags`, `metadata.py:465-479` `extract_license`,
+# `metadata.py:542-543` `extract_domain`, and the OG `assign_og_property`
+# branches at `metadata.py:141-149` for image/pagetype) — no second
+# extraction pass. `Extracted` is `#[derive(Default)]`, so the existing
+# `..Extracted::default()` callsites in `benchmark/src/score.rs:1058` and
+# `benchmark/src/crate_run.rs:343` continue to compile transparently with
+# the new fields silently defaulted. The `extract_via_readability` path
+# (M2 Mozilla port) populates the new fields with their defaults (the
+# Readability fork has no categories/tags/image/pagetype/license/hostname
+# concept of its own). Per Rust SemVer convention, appending fields to a
+# non-`#[non_exhaustive]` struct is technically breaking — in this pre-1.0
+# sandbox we surface it as MINOR (matching M3 Stage 9's `comments` field
+# precedent at 0.9.0 -> 0.10.0). No new dependency; no public API removal;
+# `Options` unchanged.
+version = "0.14.0"
 edition = "2024"
 
 [dependencies]

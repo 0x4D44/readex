@@ -200,6 +200,69 @@ pub struct Extracted {
     /// **M3 Stage 9 additive field.** Default is `""` (empty); old callers
     /// using `..Extracted::default()` are forward-compatible.
     pub comments: String,
+    /// Article section / category labels (`Metadata.categories`). Empty
+    /// `Vec` when no source yielded a category. Populated by the metadata
+    /// pipeline's `<meta property="article:section">` walk plus
+    /// JSON-LD `articleSection` and the URL/XPath fallback at
+    /// `metadata.py:575-576` (`extract_catstags("category", tree)`).
+    ///
+    /// Ports `Document.categories` (`metadata.py:422-446`).
+    ///
+    /// **M4 Stage 4 additive field.** Default is the empty `Vec`; old
+    /// callers using `..Extracted::default()` are forward-compatible.
+    pub categories: Vec<String>,
+    /// Article keyword/tag labels (`Metadata.tags`). Empty `Vec` when no
+    /// source yielded tags. Populated from `<meta property="article:tag">`,
+    /// `<meta name="keywords">`, JSON-LD `keywords`, and the URL/XPath
+    /// fallback at `metadata.py:579-580` (`extract_catstags("tag", tree)`).
+    ///
+    /// Ports `Document.tags` (`metadata.py:422-446`).
+    ///
+    /// **M4 Stage 4 additive field.** Default is the empty `Vec`; old
+    /// callers using `..Extracted::default()` are forward-compatible.
+    pub tags: Vec<String>,
+    /// Lead/social image URL (`Metadata.image`). Sourced from `og:image`,
+    /// `og:image:url`, `og:image:secure_url`, `twitter:image`,
+    /// `twitter:image:src`, or `<meta name="image">` — see
+    /// `METANAME_IMAGE` (`metadata.py:126-133`) and the `og:image*`
+    /// branches of `assign_og_property` (`metadata.py:141-149`).
+    /// Returned verbatim as the document provided it (no URL resolution).
+    ///
+    /// Ports `Document.image`.
+    ///
+    /// **M4 Stage 4 additive field.** Default is `None`; old callers using
+    /// `..Extracted::default()` are forward-compatible.
+    pub image: Option<String>,
+    /// Open Graph page type (`Metadata.pagetype`). Sourced from
+    /// `<meta property="og:type">` — see the `og:type` branch of
+    /// `assign_og_property` (`metadata.py:141-149`). Typical values:
+    /// `"article"`, `"website"`, `"video.other"`. `None` when absent.
+    ///
+    /// Ports `Document.pagetype`.
+    ///
+    /// **M4 Stage 4 additive field.** Default is `None`; old callers using
+    /// `..Extracted::default()` are forward-compatible.
+    pub pagetype: Option<String>,
+    /// Document licence string (`Metadata.license`). Sourced by scanning
+    /// the footer (and similar regions) for `rel="license"` links, plus
+    /// CC-licence URL pattern matching — ports `extract_license` at
+    /// `metadata.py:465-479`. `None` when no licence was identified.
+    ///
+    /// Ports `Document.license`.
+    ///
+    /// **M4 Stage 4 additive field.** Default is `None`; old callers using
+    /// `..Extracted::default()` are forward-compatible.
+    pub license: Option<String>,
+    /// Hostname extracted from the page's canonical URL
+    /// (`Metadata.hostname`). `None` when no URL was discovered or when
+    /// the URL had no netloc.
+    ///
+    /// Ports the `extract_domain(url, fast=True)` call at
+    /// `metadata.py:542-543`.
+    ///
+    /// **M4 Stage 4 additive field.** Default is `None`; old callers using
+    /// `..Extracted::default()` are forward-compatible.
+    pub hostname: Option<String>,
 }
 
 /// Tuning knobs for [`extract_with`].
@@ -441,13 +504,19 @@ pub fn extract_with(
     //    - Metadata.url           → Extracted.canonical_url
     //    - Metadata.language      → Extracted.language
     //
-    //    Metadata fields without a 1:1 Extracted slot
-    //    (categories / tags / image / pagetype / license / hostname) are
-    //    still computed and remain accessible via the
-    //    `trafilatura::metadata::extract_metadata` infrastructure surface;
-    //    they are intentionally NOT added to the public Extracted struct
-    //    here to keep the M3 finale backward-compatible (only `comments`
-    //    is added). Future MAJOR versions may surface them directly.
+    //    M4 Stage 4 additive fields (HLD §7.6 trailing follow-on) wire the
+    //    six remaining Metadata slots straight through (same field names —
+    //    no rename), making them visible on the public Extracted surface:
+    //    - Metadata.categories    → Extracted.categories
+    //    - Metadata.tags          → Extracted.tags
+    //    - Metadata.image         → Extracted.image
+    //    - Metadata.pagetype      → Extracted.pagetype
+    //    - Metadata.license       → Extracted.license
+    //    - Metadata.hostname      → Extracted.hostname
+    //    These are pure value-moves out of the *already-computed* Metadata
+    //    (no second `extract_metadata` call). Old callers using
+    //    `..Extracted::default()` remain byte-equivalent for every
+    //    pre-Stage-4 field — the additions are strictly forward.
     let word_count = text.split_whitespace().count();
     let extracted = Extracted {
         title: metadata.title,
@@ -467,6 +536,12 @@ pub fn extract_with(
         // can opt into the M2 path via `extract_via_readability`.
         dir: None,
         comments,
+        categories: metadata.categories,
+        tags: metadata.tags,
+        image: metadata.image,
+        pagetype: metadata.pagetype,
+        license: metadata.license,
+        hostname: metadata.hostname,
     };
 
     // M2 Stage 4 (HLD §7.6) — `min_word_count`. The check fires AFTER the
@@ -1093,6 +1168,19 @@ pub fn extract_via_readability(
                 published_time: article.published_time,
                 dir: article.dir,
                 comments: String::new(),
+                // M4 Stage 4 additive fields: the M2 Readability port does
+                // not derive these (Mozilla Readability has no
+                // categories/tags/image/pagetype/license/hostname concept
+                // beyond what's already folded into byline/excerpt/etc.),
+                // so they default. `..Extracted::default()` would be
+                // cleaner but the existing literal is exhaustive — staying
+                // exhaustive matches the surrounding style.
+                categories: Vec::new(),
+                tags: Vec::new(),
+                image: None,
+                pagetype: None,
+                license: None,
+                hostname: None,
             }
         }
         None => Extracted::default(),
@@ -1226,6 +1314,12 @@ mod tests {
             published_time: Some("2024-01-02".to_string()),
             dir: Some("ltr".to_string()),
             comments: String::new(),
+            categories: vec!["Tech".to_string()],
+            tags: vec!["rust".to_string(), "web".to_string()],
+            image: Some("https://example.com/img.png".to_string()),
+            pagetype: Some("article".to_string()),
+            license: Some("CC BY 4.0".to_string()),
+            hostname: Some("example.com".to_string()),
         };
         assert_eq!(e.title.as_deref(), Some("Title"));
         assert_eq!(e.text, "body text");
@@ -1241,6 +1335,13 @@ mod tests {
         assert_eq!(e.site_name.as_deref(), Some("Example Site"));
         assert_eq!(e.published_time.as_deref(), Some("2024-01-02"));
         assert_eq!(e.dir.as_deref(), Some("ltr"));
+        // M4 Stage 4 additive fields.
+        assert_eq!(e.categories, vec!["Tech".to_string()]);
+        assert_eq!(e.tags, vec!["rust".to_string(), "web".to_string()]);
+        assert_eq!(e.image.as_deref(), Some("https://example.com/img.png"));
+        assert_eq!(e.pagetype.as_deref(), Some("article"));
+        assert_eq!(e.license.as_deref(), Some("CC BY 4.0"));
+        assert_eq!(e.hostname.as_deref(), Some("example.com"));
         // Clone + PartialEq are part of the public contract (the harness
         // boxes and compares Extracted).
         assert_eq!(e.clone(), e);
@@ -1263,6 +1364,12 @@ mod tests {
             published_time: None,
             dir: None,
             comments: String::new(),
+            categories: Vec::new(),
+            tags: Vec::new(),
+            image: None,
+            pagetype: None,
+            license: None,
+            hostname: None,
         };
         assert!(e.text.is_empty());
         assert!(e.title.is_none());
@@ -2612,5 +2719,175 @@ mod tests {
             }
             other => panic!("expected ContentTooShort, got {other:?}"),
         }
+    }
+
+    // ====================================================================
+    // M4 Stage 4 — Metadata -> Extracted public-surface mapping.
+    //
+    // Six new fields (`categories`, `tags`, `image`, `pagetype`, `license`,
+    // `hostname`) flow straight through from
+    // `trafilatura::metadata::extract_metadata`. Each test pins one source
+    // → field path; the negative tests pin the additive guarantee.
+    // ====================================================================
+
+    /// Test 1 — `Metadata.hostname` (`metadata.py:542-543` —
+    /// `extract_domain(url, fast=True)`) lands on `Extracted.hostname`
+    /// when the page carries a `<link rel="canonical">`.
+    #[test]
+    fn extracted_hostname_from_canonical_link() {
+        let html = r#"<html><head>
+            <link rel="canonical" href="https://example.com/page">
+            <title>T</title></head>
+            <body><article><p>Body text that is long enough to extract reliably.</p></article></body></html>"#;
+        let e = extract(html, None).expect("must extract");
+        assert_eq!(e.canonical_url.as_deref(), Some("https://example.com/page"));
+        assert_eq!(e.hostname.as_deref(), Some("example.com"));
+    }
+
+    /// Test 2 — `Metadata.categories`
+    /// (`metadata.py:422-446` `extract_catstags("category", tree)` —
+    /// `<meta property="article:section">` category fallback).
+    #[test]
+    fn extracted_categories_from_article_section_meta() {
+        let html = r#"<html><head>
+            <meta property="article:section" content="Tech">
+            <title>T</title></head>
+            <body><article><p>Body text long enough to extract reliably.</p></article></body></html>"#;
+        let e = extract(html, None).expect("must extract");
+        assert_eq!(e.categories, vec!["Tech".to_string()]);
+    }
+
+    /// Test 3 — `Metadata.tags` (`metadata.py:422-446` `extract_catstags("tag", tree)`,
+    /// `<meta property="article:tag">` content split / dedup).
+    #[test]
+    fn extracted_tags_from_article_tag_meta() {
+        let html = r#"<html><head>
+            <meta property="article:tag" content="rust">
+            <title>T</title></head>
+            <body><article><p>Body text long enough to extract reliably.</p></article></body></html>"#;
+        let e = extract(html, None).expect("must extract");
+        // examine_meta routes article:tag content verbatim into Metadata.tags
+        // (metadata.py:483-498). One value, so one element.
+        assert_eq!(e.tags, vec!["rust".to_string()]);
+    }
+
+    /// Test 4 — `Metadata.image` from `og:image`
+    /// (`assign_og_property` at `metadata.py:141-149`). Stored verbatim —
+    /// no URL resolution at metadata time (Python parity).
+    #[test]
+    fn extracted_image_from_og_image_meta() {
+        let html = r#"<html><head>
+            <meta property="og:image" content="https://cdn.example.com/img.jpg">
+            <title>T</title></head>
+            <body><article><p>Body text long enough to extract reliably.</p></article></body></html>"#;
+        let e = extract(html, Some("https://example.com/page"))
+            .expect("must extract");
+        assert_eq!(
+            e.image.as_deref(),
+            Some("https://cdn.example.com/img.jpg")
+        );
+    }
+
+    /// Test 5 — `Metadata.pagetype` from `og:type` — `assign_og_property`'s
+    /// `og:type` branch at `metadata.py:141-149`.
+    #[test]
+    fn extracted_pagetype_from_og_type_meta() {
+        let html = r#"<html><head>
+            <meta property="og:type" content="article">
+            <title>T</title></head>
+            <body><article><p>Body text long enough to extract reliably.</p></article></body></html>"#;
+        let e = extract(html, None).expect("must extract");
+        assert_eq!(e.pagetype.as_deref(), Some("article"));
+    }
+
+    /// Test 6 — `Metadata.license` from a `rel="license"` link
+    /// (`extract_license` at `metadata.py:465-479` — non-strict mode
+    /// returns the trimmed link text when no LICENSE_REGEX hit).
+    #[test]
+    fn extracted_license_from_rel_license_link() {
+        let html = r#"<html><head><title>T</title></head>
+            <body><article><p>Body text long enough to extract reliably.</p></article>
+            <footer><a rel="license" href="https://example.com/terms">My Custom Licence</a></footer>
+            </body></html>"#;
+        let e = extract(html, None).expect("must extract");
+        assert_eq!(e.license.as_deref(), Some("My Custom Licence"));
+    }
+
+    /// Test 7 — Negative: when no metadata is provided, all six new
+    /// fields default to their empty/None values. Confirms additive
+    /// guarantee (no spurious population).
+    #[test]
+    fn extracted_new_fields_default_when_no_metadata() {
+        let html = r#"<html><head><title>T</title></head>
+            <body><article><p>Body text long enough to extract reliably.</p></article></body></html>"#;
+        let e = extract(html, None).expect("must extract");
+        assert!(e.categories.is_empty(), "categories: {:?}", e.categories);
+        assert!(e.tags.is_empty(), "tags: {:?}", e.tags);
+        assert!(e.image.is_none(), "image: {:?}", e.image);
+        assert!(e.pagetype.is_none(), "pagetype: {:?}", e.pagetype);
+        assert!(e.license.is_none(), "license: {:?}", e.license);
+        assert!(e.hostname.is_none(), "hostname: {:?}", e.hostname);
+    }
+
+    /// Test 8 — Backward compat: `Extracted::default()` produces sensible
+    /// defaults for every new field. Anchors the additive invariant.
+    #[test]
+    fn extracted_default_covers_new_fields() {
+        let e = Extracted::default();
+        assert!(e.categories.is_empty());
+        assert!(e.tags.is_empty());
+        assert!(e.image.is_none());
+        assert!(e.pagetype.is_none());
+        assert!(e.license.is_none());
+        assert!(e.hostname.is_none());
+    }
+
+    /// Test 9 — Backward compat: `..Extracted::default()` callsites still
+    /// compile and populate the new fields with their defaults. This
+    /// mirrors the in-repo callsites at `benchmark/src/score.rs:1058` and
+    /// `benchmark/src/crate_run.rs:343`, which the supervisor relies on
+    /// continuing to compile transparently.
+    #[test]
+    fn extracted_partial_struct_literal_compiles() {
+        let e = Extracted {
+            title: Some("X".to_string()),
+            text: "hello".to_string(),
+            ..Extracted::default()
+        };
+        assert_eq!(e.title.as_deref(), Some("X"));
+        // The new M4 Stage 4 fields are silently defaulted.
+        assert!(e.categories.is_empty());
+        assert!(e.tags.is_empty());
+        assert!(e.image.is_none());
+        assert!(e.pagetype.is_none());
+        assert!(e.license.is_none());
+        assert!(e.hostname.is_none());
+    }
+
+    /// Test 10 — Byte-identity sanity for the pre-Stage-4 fields: the M3
+    /// finale's `extract` invariant (`extract == extract_with(default)`)
+    /// remains intact when the new fields are populated. Reuses the
+    /// canonical sample HTML used by `extract_is_extract_with_default_options`
+    /// so any drift would surface there too.
+    #[test]
+    fn extracted_existing_fields_unchanged_with_new_fields_present() {
+        let html = r#"<html><head>
+            <meta property="og:type" content="article">
+            <meta property="og:image" content="https://cdn.example.com/img.jpg">
+            <meta property="article:section" content="Tech">
+            <link rel="canonical" href="https://example.com/page">
+            <title>T</title></head>
+            <body><article><p>hello world</p></article></body></html>"#;
+        let a = extract(html, None).expect("a");
+        let b = extract_with(html, None, &Options::default()).expect("b");
+        // PartialEq covers every field (old + new). If any pre-Stage-4
+        // field drifted on the trafilatura path the comparison would
+        // catch it.
+        assert_eq!(a, b);
+        // And: the new fields actually landed.
+        assert_eq!(a.pagetype.as_deref(), Some("article"));
+        assert_eq!(a.image.as_deref(), Some("https://cdn.example.com/img.jpg"));
+        assert_eq!(a.categories, vec!["Tech".to_string()]);
+        assert_eq!(a.hostname.as_deref(), Some("example.com"));
     }
 }
