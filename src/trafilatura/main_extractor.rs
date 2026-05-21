@@ -1577,9 +1577,23 @@ pub fn recover_wild_text(
     let subelems = xpath_engine::evaluate(&search_expr, &search_tree).unwrap_or_default();
 
     // main_extractor.py:528-529 — filter + extend.
+    //
+    // M5 Stage 6a: see `_extract` above for the rationale. In Python's
+    // lxml the element's `tail` attribute is intrinsic so
+    // `result_body.extend([el])` moves it along; mdrcel's tail is a
+    // sibling Text node in the OLD parent, so `append_child` leaves it
+    // behind. Re-attach when the returned element shares the source's
+    // tag (same-tag heuristic — see _extract's comment for the wrapped-
+    // tag rejection list).
     for e in subelems {
+        let src_tag = local_name(&e);
         if let Some(new_elem) = handle_textelem(&e, &pot, options) {
+            let new_tag = local_name(&new_elem);
+            let saved_tail = if src_tag == new_tag { tail(&e) } else { None };
             append_child(result_body, &new_elem);
+            if saved_tail.is_some() {
+                set_tail(&new_elem, saved_tail.as_deref());
+            }
         }
     }
 
@@ -1743,8 +1757,35 @@ pub fn _extract(tree: &NodeRef, options: &Options) -> (NodeRef, String, HashSet<
             if crate::readability::dom::parent(&e).is_none() {
                 continue;
             }
+            // M5 Stage 6a: in Python/lxml, `tail` is intrinsic to the
+            // element node — `result_body.append(el)`
+            // (main_extractor.py:608) moves the tail along with the
+            // element. mdrcel models tail as sibling Text nodes in the
+            // OLD parent, so `append_child` leaves them behind.
+            //
+            // We capture `tail(&e)` AFTER handle_textelem (which may have
+            // mutated `e` via process_node's tail-to-text swap), then
+            // re-attach the surviving tail ONLY when the returned element
+            // has the SAME local-name as `e`. The same-tag guard avoids
+            // double-emitting in the cases where handle_textelem wrapped
+            // `e`'s content into a fresh element (e.g. `<lb>`→`<p>` at
+            // line 1330 already moves the tail into the new `<p>`'s
+            // text; `<ref>`→`<p>` wrapper in handle_formatting;
+            // `<div>`→`<p>` rename in handle_other_elements). For
+            // same-tag returns (`<head>`, `<p>`) the tail is conceptually
+            // part of the element's flow position and must survive the
+            // append. The Wikipedia
+            // `<h2>History</h2>[edit]<p>...</p>` case exercises the
+            // `<head>` arm — `[edit]` is the head's tail and must follow
+            // the heading in the result.
+            let src_tag = local_name(&e);
             if let Some(new_elem) = handle_textelem(&e, &potential_tags, options) {
+                let new_tag = local_name(&new_elem);
+                let saved_tail = if src_tag == new_tag { tail(&e) } else { None };
                 append_child(&result_body, &new_elem);
+                if saved_tail.is_some() {
+                    set_tail(&new_elem, saved_tail.as_deref());
+                }
             }
         }
 

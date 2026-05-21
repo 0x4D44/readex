@@ -2547,8 +2547,29 @@ name = "mdrcel"
 # sandbox we surface it as MINOR (matching M3 Stage 9's `comments` field
 # precedent at 0.9.0 -> 0.10.0). No new dependency; no public API removal;
 # `Options` unchanged.
-version = "0.15.5"
+version = "0.15.6"
 edition = "2024"
+
+# M5 Stage 6a (2026-05-21): 0.15.5 -> 0.15.6 PATCH. Bug fix only:
+# `_extract` / `recover_wild_text` (`main_extractor.rs:1742-1761,
+# 1580-1592`) lost the outer tail of every subelem moved into
+# `result_body`. lxml stores `.tail` as an intrinsic Element attribute,
+# so `result_body.append(el)` (`main_extractor.py:608, 528`) carries it
+# along; mdrcel models tails as sibling Text nodes in the OLD parent
+# (`dom.rs:404`), so `append_child` left them behind. Fix: after the
+# handle_textelem dispatch, capture `tail(&e)` and re-attach it to the
+# new node when the returned element shares the source's local-name
+# (same-tag guard avoids double-emitting on the `<lb>`→`<p>` /
+# `<ref>`→`<p>` wrapper paths, where the tail was already folded into
+# the wrapper's text). Effect: Wikipedia `[edit]` / `[Bearbeiten]`
+# section-edit links — which sit as the heading element's tail in the
+# `<div class="mw-heading"><h2>X</h2><span class="mw-editsection">
+# [edit]</span></div>` shape — now survive the extraction pipeline,
+# matching Python byte-for-byte on the Berkshire Hathaway / Wm Morrisons
+# / de.wikipedia Rust fixtures + 3 bonus heading-tail divergences. Gate
+# movement: M5 markdown gate 26/51 -> 32/51 (content-mismatch 24 -> 18,
+# +6 fixtures green, 0 newly red). No public-API change. No new
+# dependency. PATCH bump.
 
 # M5 Stage 5b (2026-05-21): 0.15.4 -> 0.15.5 PATCH. Bug fix only:
 # `handle_table`'s `set_tail` calls on the freshly-minted `<cell>` element
