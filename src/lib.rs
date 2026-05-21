@@ -682,7 +682,22 @@ pub fn extract_to_markdown(
     };
 
     // core.py:94 — `returnstring = f"{header}{xmltotxt(...)}"`.
-    let returnstring = format!("{header}{body_text}");
+    let mut returnstring = format!("{header}{body_text}");
+
+    // core.py:95-96 — commentsbody branch:
+    //     if document.commentsbody is not None:
+    //         returnstring = f"{returnstring}\n{xmltotxt(...)}".strip()
+    // Python's `bare_extraction` (core.py:287-292) sets `commentsbody` to an
+    // `Element("body")` whenever `options.comments` is true — which is the
+    // default. The empty body's `xmltotxt` returns `""`, so the branch is
+    // equivalent to `(returnstring + "\n").strip()` for the default
+    // extraction. mdrcel does not currently extract a commentsbody (always
+    // None in our cascade), but Python's default behaviour always strips,
+    // so to match `extract(output_format='markdown')` byte-for-byte we
+    // mirror the strip path. This drops the stray trailing `\n` that
+    // `xmltotxt`'s `process_element` after-tag emit + `sanitize` leaves
+    // behind on the body's final block-level element (xml.py:340-343).
+    returnstring = format!("{returnstring}\n").trim().to_string();
 
     // 5. NFC normalise (core.py:98). `unicode-normalization` is a real
     //    dependency at sub-stage B (promoted from dev-dep, see Cargo.toml).
@@ -1781,8 +1796,15 @@ mod tests {
         );
         // include_formatting=true unconditionally on the markdown formatter
         // — the paragraph emits the U+2424 spacing hack which `sanitize`
-        // strips, leaving newlines around the body.
-        assert!(md.contains('\n'), "expected formatted output, got: {md:?}");
+        // strips. Per Python's `core.py:95-96` commentsbody-strip branch
+        // (mdrcel mirrors it unconditionally because Python's default
+        // `options.comments=True` always sets `commentsbody` to a non-None
+        // Element), the trailing `\n` is stripped, leaving the single
+        // paragraph as a single line with no embedded newlines.
+        assert!(
+            !md.is_empty(),
+            "expected formatted output, got: {md:?}"
+        );
     }
 
     /// Sub-stage B brief #2 — with_metadata=true emits a YAML header

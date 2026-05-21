@@ -2547,9 +2547,22 @@ name = "mdrcel"
 # sandbox we surface it as MINOR (matching M3 Stage 9's `comments` field
 # precedent at 0.9.0 -> 0.10.0). No new dependency; no public API removal;
 # `Options` unchanged.
-version = "0.15.3"
+version = "0.15.4"
 edition = "2024"
 
+# M5 Stage 5a (2026-05-21): 0.15.3 -> 0.15.4 PATCH. Bug fix only: the
+# markdown formatting path (`extract_to_markdown`) now mirrors Python's
+# `core.py:95-96` commentsbody-strip branch. Python's `bare_extraction`
+# (core.py:287-292) always sets `commentsbody` to an `Element("body")` when
+# `options.comments` is true (the default), so the strip branch fires
+# unconditionally for `extract(output_format='markdown')`. Without the
+# mirror, mdrcel emitted a stray trailing `\n` (the `\n\u{2424}\n` that
+# `process_element` appends after the body's last block element at
+# xml.py:340-343, reduced to `\n` by `sanitize` at utils.py:310). Surfaced
+# by M5 Stage 4's gate report: 8 fixtures in the whitespace-only bucket
+# diverged solely on this trailing `\n`. No public API change; no
+# signature change; no new dependency.
+#
 # M5 Stage 4 (2026-05-21): 0.15.2 -> 0.15.3 PATCH. Bug fix only: the
 # markdown formatting path (`extract_to_markdown`) now forces
 # `cleaning::Options.formatting = true`, mirroring Python's
