@@ -303,6 +303,24 @@ pub struct Paragraph {
     /// "short", "bad"}`.
     pub class_type: Option<String>,
 
+    /// Context-free class set by [`classify_paragraphs`] in Stage 5c.
+    /// `None` at segmentation time.
+    ///
+    /// Python source: not a class field — set as an attribute at
+    /// `justext/core.py:257-275` (`paragraph.cf_class = ...`). Read in
+    /// [`revise_paragraph_classification`] at `core.py:316,362` to (a)
+    /// seed `class_type` and (b) gate the "more good headings" rescue
+    /// pass to headings that were ORIGINALLY non-bad.
+    pub cf_class: Option<String>,
+
+    /// Heading flag set by [`classify_paragraphs`] in Stage 5c.
+    /// Equivalent to Python's `paragraph.heading = bool(not no_headings
+    /// and paragraph.is_heading)` at `justext/core.py:254` — captures
+    /// "this is a heading and `no_headings` is off". Distinct from the
+    /// segmentation-time [`is_heading`] field, which records only the
+    /// DOM-path detection (true regardless of `no_headings`).
+    pub heading: bool,
+
     /// Cached count of stopwords in [`text`]. Set by Stage 5c's
     /// classifier. `None` at Stage 5b.
     ///
@@ -339,6 +357,8 @@ impl Paragraph {
             word_count,
             is_heading,
             class_type: None,
+            cf_class: None,
+            heading: false,
             stopwords_count: None,
             is_boilerplate: None,
         }
@@ -724,6 +744,408 @@ pub fn make_paragraphs(root: &NodeRef) -> Vec<Paragraph> {
 }
 
 // ===========================================================================
+// Stage 5c — classify_paragraphs + revise_paragraph_classification
+// ===========================================================================
+//
+// Module-level constants ported verbatim from `justext/core.py:28-36`.
+// `classify_paragraphs` and `revise_paragraph_classification` consume them
+// as default thresholds (callers may override via the `*_with` variants).
+
+/// `MAX_LINK_DENSITY_DEFAULT` — `justext/core.py:28`.
+pub const MAX_LINK_DENSITY_DEFAULT: f64 = 0.2;
+
+/// `LENGTH_LOW_DEFAULT` — `justext/core.py:29`. Paragraphs shorter than
+/// this (in CHARACTERS of `text`) are classified as `short` (or `bad` if
+/// they contain any link characters).
+pub const LENGTH_LOW_DEFAULT: usize = 70;
+
+/// `LENGTH_HIGH_DEFAULT` — `justext/core.py:30`. Paragraphs at or above
+/// this character length with `stopword_density >= stopwords_high` are
+/// classified as `good` (otherwise `neargood`).
+pub const LENGTH_HIGH_DEFAULT: usize = 200;
+
+/// `STOPWORDS_LOW_DEFAULT` — `justext/core.py:31`.
+pub const STOPWORDS_LOW_DEFAULT: f64 = 0.30;
+
+/// `STOPWORDS_HIGH_DEFAULT` — `justext/core.py:32`.
+pub const STOPWORDS_HIGH_DEFAULT: f64 = 0.32;
+
+/// `NO_HEADINGS_DEFAULT` — `justext/core.py:33`.
+pub const NO_HEADINGS_DEFAULT: bool = false;
+
+/// `MAX_HEADING_DISTANCE_DEFAULT` — `justext/core.py:36`. Short / neargood
+/// headings within this many CHARACTERS before a good paragraph are
+/// promoted (unless `no_headings` is on).
+pub const MAX_HEADING_DISTANCE_DEFAULT: usize = 200;
+
+/// Class-type tag set returned by classification (Python's bare string
+/// literals at `core.py:257-275`).
+const CF_GOOD: &str = "good";
+const CF_NEARGOOD: &str = "neargood";
+const CF_SHORT: &str = "short";
+const CF_BAD: &str = "bad";
+
+/// `stopwords_count` — `justext/paragraph.py:52-53`. Count of words in
+/// the paragraph's text whose lowercase form is in `stoplist`.
+///
+/// Python uses `paragraph.text.split()` (whitespace tokenisation) and
+/// `word.lower() in stopwords`; the stoplist is itself lowercased by
+/// `define_stoplist` (`core.py:236-240`) and by Stage 5a's
+/// [`crate::trafilatura::justext_stoplists::get_stoplist`].
+fn count_stopwords(text: &str, stoplist: &[&str]) -> usize {
+    text.split_whitespace()
+        .filter(|w| {
+            let lower = w.to_lowercase();
+            stoplist.iter().any(|s| *s == lower)
+        })
+        .count()
+}
+
+/// `stopwords_density` — `justext/paragraph.py:55-59`. Returns 0 when
+/// `words_count == 0`; otherwise `stopwords_count / words_count`.
+fn stopwords_density(text: &str, word_count: usize, stoplist: &[&str]) -> (f64, usize) {
+    let stops = count_stopwords(text, stoplist);
+    if word_count == 0 {
+        (0.0, stops)
+    } else {
+        (stops as f64 / word_count as f64, stops)
+    }
+}
+
+/// `classify_paragraphs(paragraphs, stoplist)` — context-free phase-1
+/// classifier with the default thresholds from `justext/core.py:28-36`.
+///
+/// Convenience wrapper around [`classify_paragraphs_with`]. Use the `*_with`
+/// variant to override thresholds.
+///
+/// Python source: `justext/core.py:243-275` (`classify_paragraphs`).
+pub fn classify_paragraphs(paragraphs: &mut [Paragraph], stoplist: &[&str]) {
+    classify_paragraphs_with(
+        paragraphs,
+        stoplist,
+        LENGTH_LOW_DEFAULT,
+        LENGTH_HIGH_DEFAULT,
+        STOPWORDS_LOW_DEFAULT,
+        STOPWORDS_HIGH_DEFAULT,
+        MAX_LINK_DENSITY_DEFAULT,
+        NO_HEADINGS_DEFAULT,
+    );
+}
+
+/// `classify_paragraphs_with(...)` — full-parameter form. Faithful port
+/// of `justext/core.py:243-275`.
+///
+/// Mutates each `Paragraph` in-place:
+/// - sets `paragraph.heading = !no_headings && paragraph.is_heading`
+///   (`core.py:254`)
+/// - sets `paragraph.stopwords_count = Some(...)` (caches the count
+///   `paragraph.stopwords_density(...)` computed at `core.py:252`; Python
+///   recomputes on every call, we cache for downstream consumers)
+/// - sets `paragraph.cf_class = Some(...)` (one of `"good"`, `"neargood"`,
+///   `"short"`, `"bad"`) per the decision tree at `core.py:256-275`.
+///
+/// `class_type` and `is_boilerplate` are NOT set here — they're filled by
+/// [`revise_paragraph_classification`] (`core.py:316,346-347,356-358,
+/// 367-368`) and the [`classify_and_revise`] wrapper respectively.
+#[allow(clippy::too_many_arguments)]
+pub fn classify_paragraphs_with(
+    paragraphs: &mut [Paragraph],
+    stoplist: &[&str],
+    length_low: usize,
+    length_high: usize,
+    stopwords_low: f64,
+    stopwords_high: f64,
+    max_link_density: f64,
+    no_headings: bool,
+) {
+    for paragraph in paragraphs.iter_mut() {
+        // `length = len(paragraph)` at `core.py:251` — Python's
+        // `Paragraph.__len__` returns `len(self.text)`, which counts
+        // codepoints in Python 3 str. Mirror with `chars().count()`.
+        let length = paragraph.text.chars().count();
+        let (stopword_density_val, stops) =
+            stopwords_density(&paragraph.text, paragraph.word_count, stoplist);
+        let link_density_val = paragraph.link_density();
+
+        // `paragraph.heading = bool(not no_headings and paragraph.is_heading)`
+        // at `core.py:254`.
+        paragraph.heading = !no_headings && paragraph.is_heading;
+        paragraph.stopwords_count = Some(stops);
+
+        // Decision tree — `core.py:256-275`. Branch order is load-bearing
+        // (early branches short-circuit later ones).
+        let cf = if link_density_val > max_link_density {
+            // `core.py:256-257`.
+            CF_BAD
+        } else if paragraph.text.contains('\u{a9}') || paragraph.text.contains("&copy") {
+            // `core.py:258-259` — `'\xa9'` is U+00A9 (©). The literal
+            // `'&copy'` (without the trailing `;`) is matched as a raw
+            // substring; html5ever decodes the entity to `©`, so the
+            // first arm typically catches both, but the literal text path
+            // is kept faithful.
+            CF_BAD
+        } else if paragraph.dom_path.contains("select") {
+            // `core.py:260-261` — the literal substring `"select"` in
+            // dom_path catches `<select>` / `<optgroup>` / `<option>`
+            // containers. We match Python's `in` semantics (raw substring,
+            // not whole-component).
+            CF_BAD
+        } else if length < length_low {
+            // `core.py:262-266`.
+            if paragraph.chars_count_in_links > 0 {
+                CF_BAD
+            } else {
+                CF_SHORT
+            }
+        } else if stopword_density_val >= stopwords_high {
+            // `core.py:267-271`. Note: `length > length_high` (STRICT),
+            // not `>=`.
+            if length > length_high {
+                CF_GOOD
+            } else {
+                CF_NEARGOOD
+            }
+        } else if stopword_density_val >= stopwords_low {
+            // `core.py:272-273`.
+            CF_NEARGOOD
+        } else {
+            // `core.py:274-275`.
+            CF_BAD
+        };
+
+        paragraph.cf_class = Some(cf.to_string());
+    }
+}
+
+/// `_get_neighbour(i, paragraphs, ignore_neargood, inc, boundary)` —
+/// `justext/core.py:278-286`. Walks paragraphs from index `i` in
+/// direction `inc` (+1 for next, -1 for prev) until it hits `boundary` or
+/// finds a paragraph with class in {`good`, `bad`} (always returnable),
+/// or class `neargood` (returnable only when `!ignore_neargood`).
+/// Returns `"bad"` if it walks off the end without finding one.
+fn get_neighbour(
+    i: usize,
+    paragraphs: &[Paragraph],
+    ignore_neargood: bool,
+    inc: isize,
+    boundary: isize,
+) -> &'static str {
+    let mut idx = i as isize;
+    loop {
+        // `while i + inc != boundary` then `i += inc` at `core.py:279-280`
+        // — Python pre-checks the NEXT-position-vs-boundary before
+        // stepping. Match exactly.
+        if idx + inc == boundary {
+            return CF_BAD;
+        }
+        idx += inc;
+        // `class_type` is set by phase-0 of `revise_paragraph_classification`
+        // (the cf_class -> class_type copy at `core.py:316`) and updated
+        // by later phases via `new_classes`. Read whatever's there.
+        let c = paragraphs[idx as usize]
+            .class_type
+            .as_deref()
+            .unwrap_or(CF_BAD);
+        if c == CF_GOOD || c == CF_BAD {
+            return if c == CF_GOOD { CF_GOOD } else { CF_BAD };
+        }
+        if c == CF_NEARGOOD && !ignore_neargood {
+            return CF_NEARGOOD;
+        }
+    }
+}
+
+/// `get_prev_neighbour(i, paragraphs, ignore_neargood)` — `core.py:289-295`.
+fn get_prev_neighbour(i: usize, paragraphs: &[Paragraph], ignore_neargood: bool) -> &'static str {
+    get_neighbour(i, paragraphs, ignore_neargood, -1, -1)
+}
+
+/// `get_next_neighbour(i, paragraphs, ignore_neargood)` — `core.py:298-304`.
+fn get_next_neighbour(i: usize, paragraphs: &[Paragraph], ignore_neargood: bool) -> &'static str {
+    get_neighbour(
+        i,
+        paragraphs,
+        ignore_neargood,
+        1,
+        paragraphs.len() as isize,
+    )
+}
+
+/// `revise_paragraph_classification(paragraphs)` — context-sensitive
+/// phase-2 classifier with the default `max_heading_distance` from
+/// `justext/core.py:36`.
+///
+/// Convenience wrapper around [`revise_paragraph_classification_with`].
+///
+/// Python source: `justext/core.py:307-371`.
+pub fn revise_paragraph_classification(paragraphs: &mut [Paragraph]) {
+    revise_paragraph_classification_with(paragraphs, MAX_HEADING_DISTANCE_DEFAULT);
+}
+
+/// `revise_paragraph_classification_with(paragraphs, max_heading_distance)`
+/// — full-parameter form. Faithful port of `justext/core.py:307-371`.
+///
+/// Four phases, in order, each line-cited inline:
+/// 1. Copy `cf_class` -> `class_type` and run the "good headings" forward-
+///    scan: any short heading with a `good` paragraph within
+///    `max_heading_distance` characters is promoted to `neargood`.
+/// 2. "classify short": for each `short`, look at the prev/next non-short
+///    neighbour with `ignore_neargood=True`; promote / demote per the
+///    Python truth table.
+/// 3. "revise neargood": for each `neargood`, look at the prev/next
+///    neighbour with `ignore_neargood=True`; promote to `good` unless both
+///    are `bad` (then demote).
+/// 4. "more good headings": for any heading whose class flipped from
+///    non-bad to `bad`, re-run the forward scan; promote to `good` if a
+///    `good` paragraph appears within `max_heading_distance` characters.
+///
+/// On exit, every `paragraph.class_type` is set to `"good"` or `"bad"`
+/// (the four-class label has collapsed to a binary good/bad — see Python's
+/// flow at `core.py:355-358` for `neargood`, `core.py:344` for `short`,
+/// and `core.py:368-371` for the final heading rescue). [`classify_and_revise`]
+/// additionally sets `paragraph.is_boilerplate = (class_type != "good")`.
+pub fn revise_paragraph_classification_with(
+    paragraphs: &mut [Paragraph],
+    max_heading_distance: usize,
+) {
+    let n = paragraphs.len();
+
+    // Phase 1 — good headings (`core.py:314-326`).
+    //
+    // Python loop: for each paragraph, COPY cf_class -> class_type. Then,
+    // ONLY if the paragraph is a heading AND class_type=='short', forward-
+    // scan; if a 'good' paragraph appears within max_heading_distance
+    // characters, promote this heading to 'neargood'.
+    //
+    // Distance accumulator: `distance += len(paragraphs[j].text)` at
+    // `core.py:325` — character count of TEXT (Python `len(str)`).
+    for i in 0..n {
+        // `paragraph.class_type = paragraph.cf_class` at `core.py:316`.
+        paragraphs[i].class_type = paragraphs[i].cf_class.clone();
+        // `if not (paragraph.heading and paragraph.class_type == 'short')`:
+        // continue — `core.py:317-318`.
+        if !(paragraphs[i].heading && paragraphs[i].class_type.as_deref() == Some(CF_SHORT)) {
+            continue;
+        }
+        // Forward-scan with character-distance accumulator.
+        let mut j = i + 1;
+        let mut distance: usize = 0;
+        while j < n && distance <= max_heading_distance {
+            if paragraphs[j].class_type.as_deref() == Some(CF_GOOD) {
+                paragraphs[i].class_type = Some(CF_NEARGOOD.to_string());
+                break;
+            }
+            distance += paragraphs[j].text.chars().count();
+            j += 1;
+        }
+    }
+
+    // Phase 2 — classify short (`core.py:329-347`).
+    //
+    // Python collects all reclassifications into `new_classes` (a dict),
+    // THEN applies them at the end — so neighbour lookups within this
+    // phase see the PRE-phase classifications, not the in-flight ones.
+    // Faithful equivalent: build a Vec<(idx, &str)> first, then apply.
+    let mut new_classes: Vec<(usize, &'static str)> = Vec::new();
+    for i in 0..n {
+        if paragraphs[i].class_type.as_deref() != Some(CF_SHORT) {
+            continue;
+        }
+        let prev = get_prev_neighbour(i, paragraphs, true);
+        let next = get_next_neighbour(i, paragraphs, true);
+        let new_cls = if prev == CF_GOOD && next == CF_GOOD {
+            // `core.py:335-336`.
+            CF_GOOD
+        } else if prev == CF_BAD && next == CF_BAD {
+            // `core.py:337-338`.
+            CF_BAD
+        } else if (prev == CF_BAD
+            && get_prev_neighbour(i, paragraphs, false) == CF_NEARGOOD)
+            || (next == CF_BAD && get_next_neighbour(i, paragraphs, false) == CF_NEARGOOD)
+        {
+            // `core.py:340-342` — the "set(['good','bad'])" comment refers
+            // to the mixed case; the `neargood` lurking on one side
+            // promotes.
+            CF_GOOD
+        } else {
+            // `core.py:343-344`.
+            CF_BAD
+        };
+        new_classes.push((i, new_cls));
+    }
+    // `for i, c in new_classes.items(): paragraphs[i].class_type = c`
+    // at `core.py:346-347`.
+    for (idx, c) in new_classes {
+        paragraphs[idx].class_type = Some(c.to_string());
+    }
+
+    // Phase 3 — revise neargood (`core.py:350-358`).
+    //
+    // Python mutates in-place during the loop — each iteration's
+    // neighbour lookup SEES prior iterations' updates. Faithfully
+    // replicated by iterating and mutating directly.
+    for i in 0..n {
+        if paragraphs[i].class_type.as_deref() != Some(CF_NEARGOOD) {
+            continue;
+        }
+        let prev = get_prev_neighbour(i, paragraphs, true);
+        let next = get_next_neighbour(i, paragraphs, true);
+        if prev == CF_BAD && next == CF_BAD {
+            // `core.py:355-356`.
+            paragraphs[i].class_type = Some(CF_BAD.to_string());
+        } else {
+            // `core.py:357-358`.
+            paragraphs[i].class_type = Some(CF_GOOD.to_string());
+        }
+    }
+
+    // Phase 4 — more good headings (`core.py:361-371`).
+    //
+    // For each heading that ended phase-3 as `bad` BUT whose `cf_class`
+    // wasn't `bad` (i.e. it was demoted by phases 2/3), re-run the
+    // forward-scan and promote to `good` if a `good` paragraph appears
+    // within max_heading_distance characters.
+    for i in 0..n {
+        let is_heading = paragraphs[i].heading;
+        let class_is_bad = paragraphs[i].class_type.as_deref() == Some(CF_BAD);
+        let cf_is_bad = paragraphs[i].cf_class.as_deref() == Some(CF_BAD);
+        if !(is_heading && class_is_bad && !cf_is_bad) {
+            continue;
+        }
+        let mut j = i + 1;
+        let mut distance: usize = 0;
+        while j < n && distance <= max_heading_distance {
+            if paragraphs[j].class_type.as_deref() == Some(CF_GOOD) {
+                paragraphs[i].class_type = Some(CF_GOOD.to_string());
+                break;
+            }
+            distance += paragraphs[j].text.chars().count();
+            j += 1;
+        }
+    }
+}
+
+/// `classify_and_revise(paragraphs, stoplist)` — convenience wrapper that
+/// runs [`classify_paragraphs`] then [`revise_paragraph_classification`]
+/// then materializes `is_boilerplate = Some(class_type != "good")` on
+/// every paragraph.
+///
+/// Python source: `justext/core.py:389-391` (the body of `justext()`
+/// after `make_paragraphs`).
+///
+/// The `is_boilerplate` materialization mirrors `Paragraph.is_boilerplate`
+/// at `justext/paragraph.py:29-30` (which Python evaluates lazily; Rust
+/// caches it on the struct for cheap downstream filtering).
+pub fn classify_and_revise(paragraphs: &mut [Paragraph], stoplist: &[&str]) {
+    classify_paragraphs(paragraphs, stoplist);
+    revise_paragraph_classification(paragraphs);
+    for paragraph in paragraphs.iter_mut() {
+        let is_boilerplate = paragraph.class_type.as_deref() != Some(CF_GOOD);
+        paragraph.is_boilerplate = Some(is_boilerplate);
+    }
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -923,15 +1345,244 @@ mod tests {
         assert_eq!(paras[0].text, "real");
     }
 
-    /// Stage 5c placeholder verification: the three Stage-5c fields are
-    /// `None` at segmentation time.
+    /// Stage 5c placeholder verification: the four Stage-5c fields are
+    /// `None` (or `false`) at segmentation time.
     #[test]
     fn paragraph_stage_5c_placeholders_are_none() {
         let (_dom, body) = parse_body("<html><body><p>hi</p></body></html>");
         let paras = make_paragraphs(&body);
         assert_eq!(paras.len(), 1);
         assert!(paras[0].class_type.is_none());
+        assert!(paras[0].cf_class.is_none());
+        assert!(!paras[0].heading);
         assert!(paras[0].stopwords_count.is_none());
         assert!(paras[0].is_boilerplate.is_none());
+    }
+
+    // ============================================================
+    // Stage 5c — classify_paragraphs + revise_paragraph_classification
+    // ============================================================
+
+    /// Build a Paragraph directly without driving the SAX walker — used
+    /// by the Stage 5c tests to construct controlled inputs to the
+    /// classifier (long-text, link-heavy, etc.).
+    fn mk(text: &str, dom_path: &str, chars_in_links: usize, is_heading: bool) -> Paragraph {
+        // word_count tokenisation matches Python `str.split()`.
+        let word_count = text.split_whitespace().count();
+        // leaf tag is the last dot-separated component.
+        let tag = dom_path.split('.').next_back().unwrap_or("").to_string();
+        Paragraph::new(
+            text.to_string(),
+            dom_path.to_string(),
+            tag,
+            chars_in_links,
+            word_count,
+            is_heading,
+        )
+    }
+
+    /// Minimal English-ish stoplist for Stage 5c tests — enough to push
+    /// `stopword_density` above the 0.32 threshold for substantive prose.
+    fn mini_stoplist() -> Vec<&'static str> {
+        vec![
+            "the", "a", "an", "and", "or", "of", "to", "in", "is", "are", "with", "for", "on",
+            "at", "by", "as", "this", "that", "it", "be", "but", "not", "from", "have", "has",
+            "had", "was", "were", "i", "you", "he", "she", "we", "they",
+        ]
+    }
+
+    /// Brief test 1: a long substantive paragraph with high stopword
+    /// density is classified as `good`.
+    #[test]
+    fn classify_long_substantive_paragraph_marked_good() {
+        // 230 chars, ~15+ stopwords in 50ish words → density > 0.32 and
+        // length > 200 → `good`.
+        let text = "The quick brown fox jumps over the lazy dog and this is a substantive \
+                    paragraph about animals and forests with many common words like the and a \
+                    and of and to and the dog runs fast in the forest with the fox and the \
+                    cat";
+        let mut paras = vec![mk(text, "html.body.p", 0, false)];
+        let stoplist = mini_stoplist();
+        classify_paragraphs(&mut paras, &stoplist);
+        assert_eq!(paras[0].cf_class.as_deref(), Some(CF_GOOD));
+    }
+
+    /// Brief test 2: a 5-word paragraph is classified as `short`.
+    #[test]
+    fn classify_short_paragraph_marked_short() {
+        let mut paras = vec![mk("This is a short text", "html.body.p", 0, false)];
+        let stoplist = mini_stoplist();
+        classify_paragraphs(&mut paras, &stoplist);
+        assert_eq!(paras[0].cf_class.as_deref(), Some(CF_SHORT));
+    }
+
+    /// Brief test 3: a paragraph whose `link_density` exceeds the default
+    /// 0.2 threshold is classified as `bad`.
+    #[test]
+    fn classify_link_heavy_paragraph_marked_bad() {
+        // 60 chars text, 30 chars in links → density 0.5 > 0.2 → `bad`.
+        let text = "Click here for more info about this random topic now!";
+        let chars_in_links = (text.chars().count() / 2) + 5; // > 50% link density
+        let mut paras = vec![mk(text, "html.body.p", chars_in_links, false)];
+        let stoplist = mini_stoplist();
+        classify_paragraphs(&mut paras, &stoplist);
+        assert_eq!(paras[0].cf_class.as_deref(), Some(CF_BAD));
+    }
+
+    /// Brief test 4: text starting with `©` is classified as `bad`
+    /// (Python `core.py:258-259`).
+    #[test]
+    fn classify_copyright_paragraph_marked_bad() {
+        let text = "\u{a9} 2026 Example Corporation. All rights reserved worldwide.";
+        let mut paras = vec![mk(text, "html.body.p", 0, false)];
+        let stoplist = mini_stoplist();
+        classify_paragraphs(&mut paras, &stoplist);
+        assert_eq!(paras[0].cf_class.as_deref(), Some(CF_BAD));
+    }
+
+    /// Brief test 5: a heading whose `length < length_low` is classified
+    /// as `short` (not `bad`). The Python decision tree's
+    /// `length < length_low` arm sets `short` when there are no link
+    /// characters — this holds for headings AND non-headings; the
+    /// heading flag is captured separately via `paragraph.heading` and
+    /// consumed by the revise phase. (The brief's wording was slightly
+    /// loose; faithful Python behaviour is what's tested here.)
+    #[test]
+    fn classify_heading_with_few_stopwords_marked_short_not_bad() {
+        let mut paras = vec![mk("Short Heading", "html.body.h2", 0, true)];
+        let stoplist = mini_stoplist();
+        classify_paragraphs(&mut paras, &stoplist);
+        // Confirm `short`, not `bad`, and that the heading flag was set.
+        assert_eq!(paras[0].cf_class.as_deref(), Some(CF_SHORT));
+        assert!(paras[0].heading);
+    }
+
+    /// Brief test 6: `[good, short, good]` → middle promoted to `good`
+    /// via the "classify short" phase (`core.py:335-336`).
+    #[test]
+    fn revise_promotes_short_between_good_paragraphs() {
+        let mut paras = vec![
+            mk("good1", "html.body.p", 0, false),
+            mk("short", "html.body.p", 0, false),
+            mk("good3", "html.body.p", 0, false),
+        ];
+        // Seed cf_class directly to bypass classify (which needs real
+        // length/density math); we only want to test revise's neighbour
+        // logic.
+        paras[0].cf_class = Some(CF_GOOD.to_string());
+        paras[1].cf_class = Some(CF_SHORT.to_string());
+        paras[2].cf_class = Some(CF_GOOD.to_string());
+        revise_paragraph_classification(&mut paras);
+        assert_eq!(paras[1].class_type.as_deref(), Some(CF_GOOD));
+    }
+
+    /// Brief test 7: `[bad, short, bad]` → middle demoted to `bad`
+    /// (`core.py:337-338`).
+    #[test]
+    fn revise_demotes_short_between_bad_paragraphs() {
+        let mut paras = vec![
+            mk("bad1", "html.body.p", 0, false),
+            mk("short", "html.body.p", 0, false),
+            mk("bad3", "html.body.p", 0, false),
+        ];
+        paras[0].cf_class = Some(CF_BAD.to_string());
+        paras[1].cf_class = Some(CF_SHORT.to_string());
+        paras[2].cf_class = Some(CF_BAD.to_string());
+        revise_paragraph_classification(&mut paras);
+        assert_eq!(paras[1].class_type.as_deref(), Some(CF_BAD));
+    }
+
+    /// Brief test 8: a heading classified `short`, followed by a `good`
+    /// paragraph within `max_heading_distance` characters, is promoted
+    /// to `neargood` in phase 1 (`core.py:317-326`) and then to `good`
+    /// in phase 3 (`core.py:350-358`, since the next neighbour is `good`).
+    #[test]
+    fn revise_promotes_heading_before_good_content() {
+        let mut paras = vec![
+            mk("Article Heading", "html.body.h2", 0, true),
+            mk("Body paragraph", "html.body.p", 0, false),
+        ];
+        paras[0].cf_class = Some(CF_SHORT.to_string());
+        paras[0].heading = true;
+        paras[1].cf_class = Some(CF_GOOD.to_string());
+        revise_paragraph_classification(&mut paras);
+        // Heading was `short` → phase 1 promotes to `neargood` (next is
+        // `good`, within distance), then phase 3 promotes `neargood` to
+        // `good` (next neighbour with ignore_neargood=True is `good`).
+        assert_eq!(paras[0].class_type.as_deref(), Some(CF_GOOD));
+    }
+
+    /// Brief test 9: after `classify_and_revise`, `is_boilerplate` is
+    /// `Some(true)` for bad paragraphs and `Some(false)` for good ones
+    /// (Python `paragraph.py:29-30`).
+    #[test]
+    fn is_boilerplate_set_correctly_after_classify_and_revise() {
+        // Build two paragraphs with controlled class outcomes.
+        let good_text = "The quick brown fox jumps over the lazy dog and this is a substantive \
+                         paragraph about animals and forests with many common words like the \
+                         and a and of and to and the dog runs fast in the forest with the fox.";
+        let bad_text = "Click here";
+        let mut paras = vec![
+            mk(good_text, "html.body.p", 0, false),
+            mk(bad_text, "html.body.p", bad_text.chars().count(), false), // 100% link density
+        ];
+        let stoplist = mini_stoplist();
+        classify_and_revise(&mut paras, &stoplist);
+        assert_eq!(paras[0].is_boilerplate, Some(false));
+        assert_eq!(paras[1].is_boilerplate, Some(true));
+    }
+
+    /// Brief test 10: end-to-end pipeline on a minimal HTML article —
+    /// `make_paragraphs` + `classify_and_revise` yields some `good`
+    /// paragraphs (the article body) and the link-heavy nav `bad`.
+    #[test]
+    fn end_to_end_make_paragraphs_classify_revise_on_article() {
+        let html = r#"<html><body>
+            <nav>
+                <a href="/">Home</a>
+                <a href="/about">About</a>
+                <a href="/contact">Contact</a>
+            </nav>
+            <article>
+                <h1>Article Title</h1>
+                <p>The quick brown fox jumps over the lazy dog and this is a substantive
+                paragraph about animals and forests with many common words like the and a
+                and of and to and the dog runs fast in the forest with the fox and the cat.</p>
+                <p>Another substantive paragraph about the same topic — the fox and the dog
+                run through the forest at speed, with the cat watching from a tree as the
+                sun sets in the west and the moon rises in the east over the meadow.</p>
+            </article>
+        </body></html>"#;
+        let (_dom, body) = parse_body(html);
+        let mut paras = make_paragraphs(&body);
+        let stoplist = mini_stoplist();
+        classify_and_revise(&mut paras, &stoplist);
+
+        // At least one paragraph survives as `good` (the article body
+        // p's, after revise).
+        let goods = paras
+            .iter()
+            .filter(|p| p.class_type.as_deref() == Some(CF_GOOD))
+            .count();
+        assert!(
+            goods >= 1,
+            "expected ≥ 1 good paragraph, got {goods} ({:?})",
+            paras
+                .iter()
+                .map(|p| (p.text.clone(), p.class_type.clone()))
+                .collect::<Vec<_>>()
+        );
+
+        // The nav paragraph (link-heavy or short, depending on
+        // segmentation) is `bad` post-revise — confirm at least one
+        // paragraph is `bad`.
+        let bads = paras
+            .iter()
+            .filter(|p| p.class_type.as_deref() == Some(CF_BAD))
+            .count();
+        assert!(
+            bads >= 1,
+            "expected ≥ 1 bad paragraph (the nav), got {bads}"
+        );
     }
 }

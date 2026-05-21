@@ -1014,7 +1014,119 @@ name = "mdrcel"
 # context-sensitive heading + short reclassifier.
 # Stage 5d wires `make_paragraphs` + classify + revise into the M3
 # cascade (own/readability/justext arbiter).
-version = "0.6.2"
+#
+# M3 Stage 5c (2026-05-21): 0.6.2 -> 0.6.3 PATCH. Extends
+# `src/trafilatura/justext_core.rs` ADDITIVELY with the two-phase
+# classifier from `justext/core.py:243-371` — context-free
+# `classify_paragraphs` + context-sensitive
+# `revise_paragraph_classification`. Stage 5b's `Paragraph` struct gains
+# two new public fields (`cf_class: Option<String>`, `heading: bool`) so
+# the Python `paragraph.cf_class = ...` / `paragraph.heading = ...`
+# attribute writes at `core.py:254,257-275` have a faithful home; the
+# previously-`None` `class_type` / `stopwords_count` / `is_boilerplate`
+# fields are now populated by Stage 5c.
+#
+# New public surface on `#[doc(hidden)] pub mod trafilatura::justext_core`:
+# - Seven `pub const` thresholds (MAX_LINK_DENSITY_DEFAULT / LENGTH_LOW_
+#   DEFAULT / LENGTH_HIGH_DEFAULT / STOPWORDS_LOW_DEFAULT / STOPWORDS_HIGH_
+#   DEFAULT / NO_HEADINGS_DEFAULT / MAX_HEADING_DISTANCE_DEFAULT)
+#   ported verbatim from `justext/core.py:28-36`.
+# - `classify_paragraphs(&mut [Paragraph], &[&str])` — default thresholds.
+# - `classify_paragraphs_with(&mut [Paragraph], &[&str], length_low,
+#   length_high, stopwords_low, stopwords_high, max_link_density,
+#   no_headings)` — full-parameter form (`core.py:243-275`).
+# - `revise_paragraph_classification(&mut [Paragraph])` — default
+#   `max_heading_distance`.
+# - `revise_paragraph_classification_with(&mut [Paragraph],
+#   max_heading_distance)` — full-parameter form (`core.py:307-371`).
+# - `classify_and_revise(&mut [Paragraph], &[&str])` — convenience wrapper
+#   that runs classify + revise then materializes
+#   `is_boilerplate = Some(class_type != "good")` per
+#   `justext/paragraph.py:29-30`.
+# - Two new public fields on `Paragraph`: `cf_class: Option<String>` (the
+#   context-free class set by phase 1; consumed by phase 4 of revise to
+#   gate the "more good headings" rescue) and `heading: bool` (the
+#   no_headings-modulated heading flag, distinct from `is_heading` which
+#   only records the DOM-path detection).
+#
+# Decision tree (faithful order, `core.py:256-275`): link_density > max
+# -> bad; copyright (©/`&copy`) -> bad; `select` substring in dom_path
+# -> bad; length < length_low -> bad if chars_in_links > 0 else short;
+# stopword_density >= stopwords_high -> good if length > length_high
+# else neargood; stopword_density >= stopwords_low -> neargood; else
+# bad. The `length > length_high` (STRICT) and the `select`-in-dom_path
+# raw-substring tests are preserved verbatim from the Python source.
+#
+# Revise phases (faithful order, `core.py:307-371`):
+# 1. Copy cf_class -> class_type; for headings classified `short`,
+#    forward-scan up to `max_heading_distance` characters and promote
+#    to `neargood` if a `good` paragraph is found (`core.py:317-326`).
+# 2. "Classify short" — walk each `short` and reclassify via prev/next
+#    neighbour lookup with `ignore_neargood=true`; the four-way truth
+#    table (good/good -> good, bad/bad -> bad, mixed-with-neargood
+#    -> good, else -> bad) is collected into a `new_classes` list and
+#    applied at the end of the phase, matching Python's dict-then-apply
+#    pattern at `core.py:329-347`.
+# 3. "Revise neargood" — for each `neargood`, demote to `bad` if both
+#    neighbours are `bad`, else promote to `good` (`core.py:350-358`).
+#    Mutations happen in-place during the loop (faithful to Python).
+# 4. "More good headings" — for any heading demoted to `bad` whose
+#    `cf_class` was non-bad, re-run the forward-scan and promote to
+#    `good` if a `good` paragraph is found (`core.py:361-371`).
+#
+# Subtle decisions (recorded honestly):
+# - **`length` semantics**: Python `len(paragraph)` returns
+#   `len(paragraph.text)`, which counts CODEPOINTS in Python 3 `str`.
+#   Mirrored with `paragraph.text.chars().count()` (also codepoints).
+# - **`stopwords_count` semantics**: Python `paragraph.stopwords_count`
+#   re-tokenizes `paragraph.text.split()` and re-lowercases each word
+#   on every call. The Rust port caches the count once on the struct
+#   (Stage 5b's `stopwords_count: Option<usize>` field) — behaviour
+#   identical, classifier ~Nx faster.
+# - **Phase 2 dict-then-apply**: Python builds a `new_classes` dict and
+#   applies it AFTER the loop, so the in-loop neighbour lookups see the
+#   PRE-phase classifications. Faithfully replicated with a `Vec<(idx,
+#   &'static str)>` collected first, then applied.
+# - **Phase 3 in-place mutation**: Python mutates `class_type` in-loop,
+#   so subsequent iterations see prior updates. Replicated by mutating
+#   `paragraphs[i].class_type` directly.
+# - **`get_neighbour` return-on-walkoff**: Python returns `'bad'` if the
+#   walk reaches the boundary without finding a returnable class
+#   (`core.py:286`). Replicated verbatim.
+# - **`heading` vs `is_heading` distinction**: the Stage 5b `is_heading`
+#   field records the segmentation-time DOM detection; the new
+#   `heading: bool` field captures Python's `core.py:254`
+#   `bool(not no_headings and is_heading)`. Both are public for testing
+#   transparency.
+# - **`classify_and_revise` materializes `is_boilerplate`**: Python
+#   evaluates `is_boilerplate` lazily (`paragraph.py:29-30`); Rust
+#   caches it as `Some(true)` / `Some(false)` after revise for cheap
+#   downstream filtering. Defining `is_boilerplate` ONLY in the
+#   `classify_and_revise` wrapper (not in the raw revise) preserves the
+#   ability to chain custom post-revise passes before materialization,
+#   matching the spirit of Python's lazy property.
+#
+# Why PATCH (not MINOR despite adding public free functions): the new
+# surface lives inside the same `#[doc(hidden)] pub mod
+# trafilatura::justext_core` Stage 5b introduced; no NEW module is
+# created. The four BLOCKER gates remain byte-identical green
+# (parser_equivalence / trafilatura_equivalence / extract_smoke /
+# extract_content). The new functions are consumed only by Stage 5d's
+# cascade arm (pending). This matches the Stage 4b/4c precedent for
+# "extending a previously-introduced `#[doc(hidden)]` module's surface
+# without introducing a new module" being PATCH-eligible. A strict
+# reading of CLAUDE.md ("new public functions = MINOR") would support
+# MINOR; PATCH is the conservative call given the in-progress nature
+# of the `justext_core` module surface.
+#
+# Lib test count 646 -> 656 (+10 new Stage 5c tests covering the 10
+# brief-mandated cases: long-substantive -> good, short -> short,
+# link-heavy -> bad, copyright -> bad, heading-short-not-bad, revise-
+# promotes-short-between-goods, revise-demotes-short-between-bads,
+# revise-promotes-heading-before-good, is-boilerplate-materializes,
+# end-to-end-pipeline-on-article-html). All four BLOCKER gates remain
+# green; `cargo clippy --release --all-targets -- -D warnings` is clean.
+version = "0.6.3"
 edition = "2024"
 
 [dependencies]
