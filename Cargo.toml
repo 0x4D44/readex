@@ -493,7 +493,25 @@ name = "mdrcel"
 # 580) freezes the invariant on a minimal `<th>Type</th><td><list>...`
 # input. Per semver PATCH: bugfix in already-public function, no API
 # change.
-version = "0.4.16"
+#
+# M3 Stage 3-B Cluster B (2026-05-21): 0.4.16 -> 0.4.17 PATCH.
+# `handle_paragraphs` tail-preservation fix. Our `set_tail`
+# (`dom.rs:512`) stores tails as a following-Text-sibling-run, which
+# requires the element to have a PARENT — it early-returns on orphan
+# nodes. The pre-fix `handle_paragraphs` set the tail on `newsub` BEFORE
+# appending it to `processed_element`, so every inline element's tail
+# was silently dropped during paragraph processing — visible on gov.uk
+# PAYE and Fed reserve where `<lb>` carries the line-break text in its
+# tail (e.g. `Information Policy Team<lb/>The National Archives<lb/>...`
+# in Python output became `Information Policy Team<lb/><lb/>...` in
+# Rust, losing every line after the first). Python's lxml `newsub.tail
+# = ...` works on detached nodes because lxml stores tail on the
+# element itself (not as a sibling). Fix: capture the tail BEFORE the
+# graphic-swap, append, THEN set tail. New regression-pin test
+# `handle_paragraphs_preserves_lb_tail_text` (lib test 581). Stage 3-B
+# gate goes 5/10 -> 7/10 (added gov.uk PAYE + Fed reserve). Per semver
+# PATCH: bugfix in handler, no API change.
+version = "0.4.17"
 edition = "2024"
 
 [dependencies]

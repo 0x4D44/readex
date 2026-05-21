@@ -742,13 +742,18 @@ pub fn handle_paragraphs(
         // main_extractor.py:333 — newsub.text, newsub.tail = processed_child.text,
         // processed_child.tail.
         set_element_text(&newsub, element_text(&processed_child).as_deref());
-        // We need processed_child to have a parent before we can read its
-        // tail meaningfully. In the Python source `processed_child` is
-        // `child` (handle_textnode mutates and returns the same node), so
-        // its tail IS whatever was on `child`. We mirror by reading from
-        // `processed_child` directly — set_tail/tail handle the detached
-        // case as None.
-        set_tail(&newsub, tail(&processed_child).as_deref());
+        // **Stage 3-B Cluster B fix (2026-05-21):** capture the tail value
+        // BEFORE the graphic-swap below; APPLY it AFTER the append, because
+        // `set_tail` (`dom.rs:512`) silently no-ops on an orphan node —
+        // tails are stored as following-Text-sibling-run, which requires
+        // a parent. The pre-fix order set the tail on the still-orphan
+        // newsub, so every `<lb>` tail (and every other inline element's
+        // tail) was silently dropped during paragraph processing — visible
+        // on gov.uk PAYE and Fed reserve where `<lb>` carries the line-
+        // break text. Python's lxml `newsub.tail = ...` works on detached
+        // nodes because lxml stores tail on the element itself (not as a
+        // sibling).
+        let tail_value = tail(&processed_child);
 
         // main_extractor.py:335-338 — graphic dispatch (FORWARD STUB).
         if processed_child_tag == "graphic"
@@ -759,6 +764,8 @@ pub fn handle_paragraphs(
 
         // main_extractor.py:339 — append newsub to processed_element.
         append_child(&processed_element, &newsub);
+        // Tail goes AFTER the append (see Cluster B note above).
+        set_tail(&newsub, tail_value.as_deref());
         // main_extractor.py:340 — child.tag = "done". Pin alive (rcdom Drop
         // quirk).
         dones_alive.push(replace_element_tag(&child, "done"));
@@ -2890,6 +2897,50 @@ mod tests {
         // Both outer and inner texts merge into the output's .text.
         assert!(joined.contains("outer"), "outer text merged: {joined:?}");
         assert!(joined.contains("inner"), "inner text merged: {joined:?}");
+    }
+
+    #[test]
+    fn handle_paragraphs_preserves_lb_tail_text() {
+        // **Stage 3-B Cluster B regression pin (2026-05-21).**
+        //
+        // Before the fix, `handle_paragraphs` set the tail on `newsub`
+        // BEFORE appending it to `processed_element`. `set_tail` (dom.rs:512)
+        // early-returns on an orphan node (it stores tails as
+        // following-Text-sibling-run, which requires a parent), so the tail
+        // was silently dropped — visible on gov.uk PAYE and Fed reserve
+        // where `<lb>` elements carry the line-break text in their tails.
+        //
+        // Verifies that
+        //   <p>Information Policy Team<lb/>The National Archives<lb/>Kew</p>
+        // round-trips with all the lb tails intact.
+        let p = dom_create_element("p");
+        dom_append_child(&p, &create_text_node("Information Policy Team"));
+        let lb1 = dom_create_element("lb");
+        dom_append_child(&p, &lb1);
+        // Tail of lb1 — stored as a sibling Text node after lb1 in p.
+        dom_append_child(&p, &create_text_node("The National Archives"));
+        let lb2 = dom_create_element("lb");
+        dom_append_child(&p, &lb2);
+        dom_append_child(&p, &create_text_node("Kew"));
+
+        let pot = potential_tags(&["p", "lb", "hi", "ref"]);
+        let opts = Options::default();
+        let out = handle_paragraphs(&p, &pot, &opts).expect("p path → Some");
+
+        // The output should have 2 lb children with their tails as sibling
+        // Text nodes preserved.
+        let serialized = crate::readability::dom::serialize_converted_tree(&out);
+        assert!(
+            serialized.contains("The National Archives"),
+            "lb1 tail preserved: {serialized:?}"
+        );
+        assert!(
+            serialized.contains("Kew"),
+            "lb2 tail preserved: {serialized:?}"
+        );
+        // And the lbs themselves are present.
+        let lbs = get_elements_by_tag_name(&out, "lb");
+        assert_eq!(lbs.len(), 2, "both lb elements present");
     }
 
     #[test]
