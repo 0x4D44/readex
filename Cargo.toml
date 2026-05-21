@@ -2473,7 +2473,21 @@ name = "mdrcel"
 # `build_json_output(document, options.with_metadata)` — the flag is HONORED,
 # matching the same default-false semantics `extract_to_markdown` already uses.
 # No public API removal; `Options` unchanged.
-version = "0.13.1"
+#
+# M4 Stage 3 sub-stage D (2026-05-21): 0.13.1 -> 0.13.2 PATCH. Additive — adds
+# the XML formatter to the output-format surface: `extract_to_xml` (Python
+# `extract(output_format="xml")` per `core.py:62-64` + `xml.py:159-175`
+# `control_xml_output`). Ports `build_xml_output` (`xml.py:145-156`),
+# `add_xml_meta` (`xml.py:178-183`), and `control_xml_output` (`xml.py:159-175`
+# — XML branch only; TEI branch is Stage 3-E). Includes a hand-rolled
+# pretty-print serializer matching `lxml.etree.tostring(pretty_print=True)`
+# semantics (2-space indent, self-closing empty elements, mixed-content guard,
+# `remove_blank_text=True` reparse equivalence). `with_metadata=true` attaches
+# Python's `META_ATTRIBUTES` (`xml.py:42-46`) to the `<doc>` root; `false`
+# yields a bare root. Output is NFC-normalised consistent with the other
+# formatters (`core.py:98` invariant). No new dependency; no public API
+# removal; `Options` unchanged.
+version = "0.13.2"
 edition = "2024"
 
 [dependencies]

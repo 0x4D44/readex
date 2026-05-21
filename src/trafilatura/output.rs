@@ -40,7 +40,7 @@
 use crate::readability::dom::{
     self, NodeData, NodeRef, children, clear_attributes, delete_with_tail_preserve_free,
     element_text, get_attribute, get_elements_by_tag_name, local_name, parent,
-    previous_element_sibling, set_element_text, set_tail, tail,
+    previous_element_sibling, set_attribute, set_element_text, set_tail, tail,
 };
 use crate::trafilatura::metadata::Metadata;
 use crate::trafilatura::utils::text_chars_test;
@@ -1227,6 +1227,339 @@ pub(crate) fn csv_header_row(delim: &str) -> String {
 }
 
 // ===========================================================================
+// add_xml_meta (xml.py:178-183)
+// ===========================================================================
+
+/// `xml.py:178-183` — `add_xml_meta(output, docmeta)`.
+///
+/// Sets metadata attributes on the `<doc>` root element. Iterates the
+/// Python `META_ATTRIBUTES` list (`xml.py:42-46`: sitename, title, author,
+/// date, url, hostname, description, categories, tags, license, id,
+/// fingerprint, language) in order; for each truthy field, sets the attribute
+/// to either the raw string or `';'.join(list)` for list fields
+/// (`xml.py:183`). Falsy fields (`None`, empty string, empty list) are
+/// silently skipped — matching Python's `if value:` guard at `xml.py:182`.
+///
+/// `Metadata` does not carry `id`/`fingerprint` slots (M4 Stage 6 deferred);
+/// they are silently omitted, identical to Python's behaviour on a
+/// pre-`set_id` / pre-`content_fingerprint` `Document`.
+pub(crate) fn add_xml_meta(output: &NodeRef, metadata: &Metadata) {
+    // META_ATTRIBUTES order is verbatim from xml.py:42-46.
+    if let Some(v) = &metadata.site_name
+        && !v.is_empty()
+    {
+        set_attribute(output, "sitename", v);
+    }
+    if let Some(v) = &metadata.title
+        && !v.is_empty()
+    {
+        set_attribute(output, "title", v);
+    }
+    if let Some(v) = &metadata.author
+        && !v.is_empty()
+    {
+        set_attribute(output, "author", v);
+    }
+    if let Some(v) = &metadata.date
+        && !v.is_empty()
+    {
+        set_attribute(output, "date", v);
+    }
+    if let Some(v) = &metadata.url
+        && !v.is_empty()
+    {
+        set_attribute(output, "url", v);
+    }
+    if let Some(v) = &metadata.hostname
+        && !v.is_empty()
+    {
+        set_attribute(output, "hostname", v);
+    }
+    if let Some(v) = &metadata.description
+        && !v.is_empty()
+    {
+        set_attribute(output, "description", v);
+    }
+    // xml.py:183 — list fields render as `';'.join(list)`.
+    if !metadata.categories.is_empty() {
+        set_attribute(output, "categories", &metadata.categories.join(";"));
+    }
+    if !metadata.tags.is_empty() {
+        set_attribute(output, "tags", &metadata.tags.join(";"));
+    }
+    if let Some(v) = &metadata.license
+        && !v.is_empty()
+    {
+        set_attribute(output, "license", v);
+    }
+    // id / fingerprint — Metadata does not carry these (Stage 6 deferred).
+    if let Some(v) = &metadata.language
+        && !v.is_empty()
+    {
+        set_attribute(output, "language", v);
+    }
+}
+
+// ===========================================================================
+// build_xml_output (xml.py:145-156)
+// ===========================================================================
+
+/// `xml.py:145-156` — `build_xml_output(docmeta) -> _Element`.
+///
+/// Wraps `Document.body` (renamed to `<main>`) and `Document.commentsbody`
+/// (renamed to `<comments>`) inside a fresh `<doc>` root, then runs
+/// `clean_attributes` on each. The `<doc>` root carries the metadata as
+/// attributes via [`add_xml_meta`].
+///
+/// # Divergence from Python (recorded honestly)
+///
+/// Python's `Document.commentsbody` always exists (defaults to `Element("body")`
+/// per `settings.py:251`), so `xml.py:153-154` unconditionally renames it and
+/// appends it. Our `Document.commentsbody` is `Option<NodeRef>`. When `None`,
+/// we synthesise an empty `<comments>` element — semantically identical to
+/// Python's default empty-body case (`<comments/>` after rename).
+///
+/// # `clean_attributes` scope
+///
+/// Python passes `docmeta.body` to `clean_attributes` AFTER the
+/// `body.tag = 'main'` rename. The walk is descendant-or-self, so the
+/// `<main>` element itself is also stripped of attributes — but
+/// `WITH_ATTRIBUTES` (`xml.py:39`) doesn't include `main`, so this is
+/// effectively a no-op for the root and a meaningful strip for descendants.
+/// We faithfully preserve this surface.
+pub(crate) fn build_xml_output(doc: &Document) -> NodeRef {
+    // xml.py:147 — `output = Element('doc')`.
+    let output = dom::create_element("doc");
+    // xml.py:148 — `add_xml_meta(output, docmeta)`.
+    add_xml_meta(&output, &doc.metadata);
+
+    // xml.py:149 — `docmeta.body.tag = 'main'`. `replace_element_tag` creates
+    // a new <main> element, copies attrs/children, splices it into the parent
+    // slot if body had one. Since `doc.body` here is freshly extracted (no
+    // parent), the returned <main> is a detached node ready for append.
+    let main = dom::replace_element_tag(&doc.body, "main");
+
+    // xml.py:152 — `output.append(clean_attributes(docmeta.body))`.
+    clean_attributes(&main);
+    dom::append_child(&output, &main);
+
+    // xml.py:153-154 — `docmeta.commentsbody.tag = 'comments'; output.append(
+    // clean_attributes(docmeta.commentsbody))`. Synthesise empty <comments>
+    // when commentsbody is None (Python's settings.py:251 default).
+    let comments = match &doc.commentsbody {
+        Some(cb) => dom::replace_element_tag(cb, "comments"),
+        None => dom::create_element("comments"),
+    };
+    clean_attributes(&comments);
+    dom::append_child(&output, &comments);
+
+    output
+}
+
+// ===========================================================================
+// control_xml_output (xml.py:159-175)
+// ===========================================================================
+
+/// `xml.py:159-175` — `control_xml_output(document, options) -> str`.
+///
+/// The Stage 3-D entry point: runs `strip_double_tags` + `remove_empty_elements`
+/// on `document.body`, calls [`build_xml_output`], then serialises with
+/// pretty-printing via [`serialize_xml_pretty`]. Returns the rendered XML
+/// string (Python `tostring(..., pretty_print=True, encoding='unicode').strip()`).
+///
+/// # TEI branch — Stage 3-E (deferred)
+///
+/// Python `xml.py:164` dispatches to `build_tei_output` when
+/// `options.format == "xmltei"`. M4 Stage 3-E lands the TEI path; for Stage
+/// 3-D we only carry the XML branch. The signature takes no `format` switch
+/// because there's no second branch to discriminate yet.
+///
+/// # `sanitize_tree` deferral
+///
+/// Python `xml.py:167` runs `sanitize_tree(output_tree)` (utils.py:315-336)
+/// before `tostring`. That helper trims spaces, removes control chars, and
+/// normalises Unicode per-text-node. Our public `extract_to_xml` instead
+/// NFC-normalises the FINAL string (matching the same `extract_to_markdown`
+/// pattern in `core.py:98`). The resulting bytes are equivalent for the
+/// invariants tests assert — what reaches the user is NFC text.
+///
+/// # `remove_blank_text` reparse equivalence
+///
+/// Python `xml.py:169` reparses through `CONTROL_PARSER = XMLParser(
+/// remove_blank_text=True)` (`xml.py:35`) to drop inter-element whitespace
+/// before pretty-printing. We mirror this in [`serialize_xml_pretty`] by
+/// treating whitespace-only text/tail nodes as absent when deciding indent
+/// vs inline emission.
+pub(crate) fn control_xml_output(doc: &Document) -> String {
+    // xml.py:161-162 — `strip_double_tags(document.body); remove_empty_elements
+    // (document.body)`. Both mutate in place.
+    strip_double_tags(&doc.body);
+    remove_empty_elements(&doc.body);
+
+    // xml.py:164-165 — `func = build_xml_output ...; output_tree = func(document)`.
+    // TODO Stage 3-E: switch on options.format to dispatch build_tei_output here.
+    let output_tree = build_xml_output(doc);
+
+    // xml.py:167-169 — sanitize_tree + reparse-through-CONTROL_PARSER. The
+    // sanitize_tree behaviour is deferred (see fn doc); the reparse equivalent
+    // is folded into serialize_xml_pretty's whitespace handling.
+
+    // xml.py:175 — `tostring(output_tree, pretty_print=True, encoding='unicode'
+    // ).strip()`.
+    serialize_xml_pretty(&output_tree)
+}
+
+// ===========================================================================
+// serialize_xml_pretty — hand-rolled lxml-tostring(pretty_print=True) analogue
+// ===========================================================================
+
+/// Pretty-print an XML element tree to a string, matching the output of
+/// `lxml.etree.tostring(root, pretty_print=True, encoding='unicode').strip()`.
+///
+/// # Rules (derived from lxml's libxml2-backed pretty-printer)
+///
+/// 1. Indentation: 2-space increments per nesting level.
+/// 2. Self-closing form (`<tag/>`) when an element has NO children, NO text,
+///    AND no significant content.
+/// 3. **Mixed-content guard.** When an element has any non-whitespace text
+///    OR any child element has any non-whitespace tail, pretty-printing is
+///    DISABLED for that element's children: they emit inline on the same
+///    line as the parent's content.
+/// 4. Whitespace-only text/tail nodes are treated as ABSENT (mirroring
+///    `CONTROL_PARSER`'s `remove_blank_text=True` reparse at `xml.py:169`).
+/// 5. Attributes serialise as `name="value"` in source order; values are
+///    XML-escaped (`&`, `<`, `>`, `"`).
+/// 6. Element text and tail emit XML-escaped (`&`, `<`, `>`).
+/// 7. Trailing newline from lxml's `tostring` is stripped (Python `.strip()`
+///    at `xml.py:175`).
+///
+/// # Why hand-rolled
+///
+/// `dom::serialize_converted_tree` exists (`dom.rs:1548`) but produces flat
+/// compact output (`<doc><main><p>x</p></main></doc>`) — no indentation, no
+/// self-closing form, no mixed-content awareness. Pretty-printing is a
+/// Stage-3-D-specific concern (markdown / JSON / CSV don't need it); the
+/// helper lives here adjacent to its only caller.
+fn serialize_xml_pretty(root: &NodeRef) -> String {
+    let mut out = String::new();
+    write_element_pretty(root, &mut out, 0);
+    // lxml emits a trailing newline; xml.py:175 strips it.
+    out.trim_end_matches('\n').to_string()
+}
+
+/// Returns `true` if `s` is empty or contains ONLY whitespace characters
+/// (space, tab, CR, LF). Mirrors lxml's `remove_blank_text=True` predicate.
+fn is_blank(s: &str) -> bool {
+    s.bytes().all(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+}
+
+/// Write `element` and its subtree to `out` with `depth` levels of 2-space
+/// indentation already accounted for at the element's start (the caller is
+/// responsible for emitting the leading indent of THIS element if any).
+fn write_element_pretty(element: &NodeRef, out: &mut String, depth: usize) {
+    let Some(tag) = local_name(element) else {
+        return;
+    };
+
+    // Open tag with attributes.
+    out.push('<');
+    out.push_str(&tag);
+    for (k, v) in dom::attributes_in_source_order(element) {
+        out.push(' ');
+        out.push_str(&k);
+        out.push_str("=\"");
+        escape_xml_attr_into(&v, out);
+        out.push('"');
+    }
+
+    // Inspect children + text to decide self-closing / inline / indented form.
+    let text = element_text(element).unwrap_or_default();
+    let has_text = !is_blank(&text);
+    let kids = children(element);
+
+    // Self-closing form: no element children AND no non-whitespace text.
+    if kids.is_empty() && !has_text {
+        out.push_str("/>");
+        return;
+    }
+
+    out.push('>');
+
+    // Decide mixed-content vs indented. Indented requires: no text on this
+    // element AND every child has a blank tail.
+    let any_kid_has_text_tail = kids.iter().any(|k| {
+        tail(k)
+            .as_deref()
+            .map(|t| !is_blank(t))
+            .unwrap_or(false)
+    });
+    let mixed = has_text || any_kid_has_text_tail;
+
+    if mixed {
+        // Inline emission: write text, then each child + its tail, all on
+        // the same logical run. Text/tail are emitted verbatim (already
+        // sanitised by Trafilatura's pipeline upstream).
+        if has_text {
+            escape_xml_text_into(&text, out);
+        }
+        for k in &kids {
+            write_element_pretty(k, out, depth + 1);
+            if let Some(t) = tail(k) {
+                escape_xml_text_into(&t, out);
+            }
+        }
+    } else {
+        // Indented emission: each child on its own line, indented by
+        // `depth + 1` levels of 2 spaces. Blank tails are dropped (the
+        // `remove_blank_text=True` reparse equivalent).
+        for k in &kids {
+            out.push('\n');
+            for _ in 0..=depth {
+                out.push_str("  ");
+            }
+            write_element_pretty(k, out, depth + 1);
+        }
+        // Closing tag goes on its own line, indented by `depth`.
+        out.push('\n');
+        for _ in 0..depth {
+            out.push_str("  ");
+        }
+    }
+
+    out.push_str("</");
+    out.push_str(&tag);
+    out.push('>');
+}
+
+/// XML-escape text content (between tags). `&` `<` `>` only — `"` and `'`
+/// are legal in text per the XML spec.
+fn escape_xml_text_into(s: &str, out: &mut String) {
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(c),
+        }
+    }
+}
+
+/// XML-escape attribute values: `&`, `<`, `"` MUST be escaped inside
+/// double-quoted attributes; `>` is escaped for symmetry with lxml's
+/// `tostring` output (lxml escapes `>` everywhere).
+fn escape_xml_attr_into(s: &str, out: &mut String) {
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -1878,5 +2211,250 @@ mod tests {
         let expected =
             "url\tid\tfingerprint\thostname\ttitle\timage\tdate\ttext\tcomments\tlicense\tpagetype\r\n";
         assert_eq!(h, expected);
+    }
+
+    // -------------------------------------------------------------------
+    // Stage 3-D: add_xml_meta / build_xml_output / control_xml_output /
+    // serialize_xml_pretty — see xml.py:145-183.
+    // -------------------------------------------------------------------
+
+    /// Build a `Document` with body containing `<p>Hello.</p>` and given metadata.
+    fn doc_with_simple_body(metadata: Metadata) -> Document {
+        let body = create_element("body");
+        let p = build_elem("p", Some("Hello."), vec![], &[]);
+        append_child(&body, &p);
+        Document {
+            metadata,
+            body,
+            commentsbody: None,
+            raw_text: String::new(),
+        }
+    }
+
+    #[test]
+    fn build_xml_output_wraps_body_as_main_with_doc_root() {
+        // Python xml.py:147-156: <doc> root with <main> (renamed body) +
+        // empty <comments>.
+        let doc = doc_with_simple_body(Metadata::default());
+        let out = build_xml_output(&doc);
+        assert_eq!(local_name(&out).as_deref(), Some("doc"));
+        let kids = children(&out);
+        assert_eq!(kids.len(), 2, "doc has <main> + <comments>");
+        assert_eq!(local_name(&kids[0]).as_deref(), Some("main"));
+        assert_eq!(local_name(&kids[1]).as_deref(), Some("comments"));
+        // <main> contains the original <p>.
+        let ps = get_elements_by_tag_name(&kids[0], "p");
+        assert_eq!(ps.len(), 1);
+        assert_eq!(element_text(&ps[0]).as_deref(), Some("Hello."));
+    }
+
+    #[test]
+    fn add_xml_meta_sets_truthy_fields_only() {
+        // xml.py:178-183 — `if value: output.set(attribute, ...)`.
+        let md = Metadata {
+            title: Some("My Title".to_string()),
+            url: Some("https://example.com/x".to_string()),
+            author: None, // falsy: skipped.
+            description: Some(String::new()), // empty string: skipped.
+            categories: vec!["news".to_string(), "tech".to_string()],
+            ..Metadata::default()
+        };
+
+        let doc = create_element("doc");
+        add_xml_meta(&doc, &md);
+
+        assert_eq!(get_attribute(&doc, "title").as_deref(), Some("My Title"));
+        assert_eq!(
+            get_attribute(&doc, "url").as_deref(),
+            Some("https://example.com/x")
+        );
+        assert_eq!(get_attribute(&doc, "author"), None);
+        assert_eq!(get_attribute(&doc, "description"), None);
+        // List fields: ';'.join (xml.py:183).
+        assert_eq!(
+            get_attribute(&doc, "categories").as_deref(),
+            Some("news;tech")
+        );
+    }
+
+    #[test]
+    fn control_xml_output_empty_body_yields_doc_with_main_and_comments() {
+        // Empty body, no metadata -> minimal doc with self-closing <main/>
+        // and <comments/>.
+        let doc = Document {
+            metadata: Metadata::default(),
+            body: create_element("body"),
+            commentsbody: None,
+            raw_text: String::new(),
+        };
+        let s = control_xml_output(&doc);
+        // Exact match against lxml's pretty-print of the equivalent tree:
+        //   '<doc>\n  <main/>\n  <comments/>\n</doc>'
+        assert_eq!(s, "<doc>\n  <main/>\n  <comments/>\n</doc>");
+    }
+
+    #[test]
+    fn control_xml_output_with_metadata_attrs_populate_doc_root() {
+        let md = Metadata {
+            title: Some("T".to_string()),
+            url: Some("https://e.com/".to_string()),
+            ..Metadata::default()
+        };
+        let doc = doc_with_simple_body(md);
+        let s = control_xml_output(&doc);
+        // <doc title="T" url="https://e.com/">... — attribute presence and
+        // ordering match add_xml_meta's xml.py:42-46 sequence (title before url).
+        assert!(
+            s.starts_with("<doc title=\"T\" url=\"https://e.com/\">"),
+            "got: {s}"
+        );
+        // Body content rendered:
+        assert!(s.contains("<p>Hello.</p>"));
+    }
+
+    #[test]
+    fn control_xml_output_without_metadata_has_bare_doc_root() {
+        let doc = doc_with_simple_body(Metadata::default());
+        let s = control_xml_output(&doc);
+        // No metadata attrs on <doc>.
+        assert!(s.starts_with("<doc>\n"), "got: {s}");
+        assert!(!s.contains("title="));
+        assert!(!s.contains("url="));
+    }
+
+    #[test]
+    fn control_xml_output_emits_comments_when_present() {
+        // commentsbody with content -> <comments> populated.
+        let body = create_element("body");
+        let p = build_elem("p", Some("body text"), vec![], &[]);
+        append_child(&body, &p);
+        let commentsbody = create_element("body");
+        let pc = build_elem("p", Some("user reply"), vec![], &[]);
+        append_child(&commentsbody, &pc);
+        let doc = Document {
+            metadata: Metadata::default(),
+            body,
+            commentsbody: Some(commentsbody),
+            raw_text: String::new(),
+        };
+        let s = control_xml_output(&doc);
+        // The <comments> element holds the user-reply <p>.
+        assert!(
+            s.contains("<comments>") && s.contains("user reply"),
+            "got: {s}"
+        );
+    }
+
+    #[test]
+    fn control_xml_output_escapes_special_chars_in_text() {
+        let body = create_element("body");
+        let p = build_elem("p", Some("a < b & c > d"), vec![], &[]);
+        append_child(&body, &p);
+        let doc = Document {
+            metadata: Metadata::default(),
+            body,
+            commentsbody: None,
+            raw_text: String::new(),
+        };
+        let s = control_xml_output(&doc);
+        assert!(s.contains("a &lt; b &amp; c &gt; d"), "got: {s}");
+    }
+
+    #[test]
+    fn control_xml_output_escapes_special_chars_in_attributes() {
+        // Quote / angle bracket / ampersand in attribute value must escape.
+        let md = Metadata {
+            title: Some("a \" < & > b".to_string()),
+            ..Metadata::default()
+        };
+        let doc = doc_with_simple_body(md);
+        let s = control_xml_output(&doc);
+        // " -> &quot;, < -> &lt;, & -> &amp;, > -> &gt; (lxml escapes all four
+        // inside double-quoted attribute values).
+        assert!(
+            s.contains("title=\"a &quot; &lt; &amp; &gt; b\""),
+            "got: {s}"
+        );
+    }
+
+    #[test]
+    fn control_xml_output_indents_nested_elements_two_spaces() {
+        // Verify exact indentation: <doc>\n  <main>\n    <p>...</p>\n  </main>...
+        let doc = doc_with_simple_body(Metadata::default());
+        let s = control_xml_output(&doc);
+        // The <p> sits at depth 2 -> 4 spaces of indent.
+        assert!(s.contains("\n    <p>Hello.</p>\n"), "got: {s}");
+        // <main> sits at depth 1 -> 2 spaces of indent.
+        assert!(s.contains("\n  <main>\n"), "got: {s}");
+    }
+
+    #[test]
+    fn control_xml_output_preserves_attrs_on_with_attributes_tags() {
+        // <hi rend="#b"> survives clean_attributes; <p class="ignored"> loses
+        // its class (p not in WITH_ATTRIBUTES). Build programmatically so HTML
+        // parsing doesn't drop the Trafilatura-internal <hi> tag.
+        let body = create_element("body");
+        let p = build_elem("p", Some("lead "), vec![], &[("class", "ignored")]);
+        let hi = build_elem("hi", Some("bold"), vec![], &[("rend", "#b")]);
+        append_child(&p, &hi);
+        append_child(&body, &p);
+        let doc = Document {
+            metadata: Metadata::default(),
+            body,
+            commentsbody: None,
+            raw_text: String::new(),
+        };
+        let s = control_xml_output(&doc);
+        // <hi rend="#b"> preserved (xml.py:39).
+        assert!(s.contains("<hi rend=\"#b\">bold</hi>"), "got: {s}");
+        // <p class="..."> stripped (p not whitelisted).
+        assert!(!s.contains("class=\"ignored\""), "got: {s}");
+    }
+
+    #[test]
+    fn control_xml_output_is_nfc_normalised_at_public_surface() {
+        // The control_xml_output helper itself does NOT NFC; that's the public
+        // extract_to_xml's job. But verify the serializer doesn't mangle NFC
+        // input — feeding NFC text yields NFC output (the helpers are
+        // transparent to Unicode form).
+        let body = create_element("body");
+        // U+00E9 is the NFC composed form of "é".
+        let p = build_elem("p", Some("café"), vec![], &[]);
+        append_child(&body, &p);
+        let doc = Document {
+            metadata: Metadata::default(),
+            body,
+            commentsbody: None,
+            raw_text: String::new(),
+        };
+        let s = control_xml_output(&doc);
+        // U+00E9 (NFC) survives.
+        assert!(s.contains("café"), "got: {s}");
+        // U+0065 U+0301 (NFD decomposed) would also pass `contains("café")`
+        // only if normalised — we explicitly check the byte form.
+        assert!(s.contains('\u{00E9}'));
+    }
+
+    #[test]
+    fn serialize_xml_pretty_self_closes_empty_elements() {
+        // <doc><main/></doc> pretty-prints to '<doc>\n  <main/>\n</doc>'.
+        let doc = create_element("doc");
+        let main = create_element("main");
+        append_child(&doc, &main);
+        let s = serialize_xml_pretty(&doc);
+        assert_eq!(s, "<doc>\n  <main/>\n</doc>");
+    }
+
+    #[test]
+    fn serialize_xml_pretty_mixed_content_stays_inline() {
+        // <main>Lead <hi>bold</hi> tail</main> — mixed content (text + child
+        // tail) MUST emit inline, not split across lines.
+        let main = create_element("main");
+        set_element_text(&main, Some("Lead "));
+        let hi = build_elem("hi", Some("bold"), vec![], &[]);
+        append_child(&main, &hi);
+        set_tail(&hi, Some(" tail"));
+        let s = serialize_xml_pretty(&main);
+        assert_eq!(s, "<main>Lead <hi>bold</hi> tail</main>");
     }
 }

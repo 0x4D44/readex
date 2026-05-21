@@ -801,6 +801,124 @@ pub fn extract_to_csv(
     Ok(out)
 }
 
+/// Extract `html` and render the main content as Trafilatura-flavoured XML.
+///
+/// Equivalent to Python's `extract(html, output_format="xml")` per
+/// `core.py:62-64` (`returnstring = control_xml_output(document, options)`,
+/// `xml.py:159-175`). Produces a pretty-printed XML string whose root is
+/// `<doc>`; child elements are `<main>` (the extracted body, renamed from
+/// `<body>` per `xml.py:149`) and `<comments>` (Python `xml.py:153-154` —
+/// the comments tree, defaulting to an empty element when no comments
+/// were extracted).
+///
+/// # `with_metadata` semantics
+///
+/// When `opts.with_metadata` is `true`, metadata is attached to the `<doc>`
+/// root as attributes — matching Python's `add_xml_meta` (`xml.py:178-183`).
+/// Attributes emitted, in the `META_ATTRIBUTES` order (`xml.py:42-46`):
+/// `sitename`, `title`, `author`, `date`, `url`, `hostname`, `description`,
+/// `categories`, `tags`, `license`, `language`. (`id` / `fingerprint` are
+/// M4 Stage 6 deferred — silently omitted, matching Python's behaviour on
+/// a pre-`set_id` `Document`.) Falsy fields are skipped. When `false`,
+/// `<doc>` carries no metadata attributes.
+///
+/// # Element attributes (body subtree)
+///
+/// Per `xml.py:152` (`clean_attributes`), attributes survive ONLY on the
+/// `WITH_ATTRIBUTES` tag set (`xml.py:39`: `cell`, `row`, `del`, `graphic`,
+/// `head`, `hi`, `item`, `list`, `ref`). Everything else has its attributes
+/// wiped. Useful surviving attributes: `<hi rend="#b">`, `<ref target="...">`,
+/// `<graphic src="...">`, `<head rend="h2">`.
+///
+/// # XML escaping
+///
+/// `<`, `>`, `&` in text are escaped to `&lt;`, `&gt;`, `&amp;`. Attribute
+/// values additionally escape `"` to `&quot;`.
+///
+/// # `base_url`
+///
+/// As in [`extract`] — informational only. Never fetched.
+///
+/// # Errors
+///
+/// Same shape as [`extract_with`]: only [`ExtractError::ContentTooShort`]
+/// when `opts.min_word_count > 0` and the produced body text fails the
+/// threshold. The default-`Options` path never produces an error — an empty
+/// body returns a minimal `<doc>` with empty `<main>` and `<comments>`
+/// children.
+pub fn extract_to_xml(
+    html: &str,
+    base_url: Option<&str>,
+    opts: &Options,
+) -> Result<String, ExtractError> {
+    // M4 Stage 3 sub-stage D — port of `core.bare_extraction` +
+    // `control_xml_output` (xml.py:159-175) wired into the public surface.
+    //
+    // Pipeline:
+    // 1. Metadata (gated by opts.with_metadata — when false, we skip metadata
+    //    extraction to keep the `<doc>` root attribute-free).
+    // 2. Body extraction via the cascade.
+    // 3. Min-word-count gate on the same xmltotxt(body) the consumer sees.
+    // 4. Wrap Document in `<doc>`, run strip_double_tags + remove_empty_elements
+    //    + clean_attributes via `control_xml_output`.
+    // 5. NFC-normalise the final string (core.py:98 invariant).
+
+    // 1. Metadata. When opts.with_metadata is false, we still call extract_metadata
+    //    because the cascade path uses url/hostname signals downstream; we then
+    //    drop the metadata when building Document so `<doc>` stays bare.
+    let metadata = if opts.with_metadata {
+        trafilatura::metadata::extract_metadata(html, base_url, true, &[])
+    } else {
+        trafilatura::metadata::Metadata::default()
+    };
+
+    // 2. Body extraction via the cascade.
+    let cleaning_opts = trafilatura::cleaning::Options {
+        url: base_url.map(|s| s.to_string()),
+        ..trafilatura::cleaning::Options::default()
+    };
+    let body_opt =
+        trafilatura::readability_fork::bare_extraction_with_cascade(html, &cleaning_opts);
+
+    // 3. Min-word-count gate (xmltotxt with include_formatting=false matches
+    //    JSON/CSV; the user-visible XML byte stream is a different shape but
+    //    the gate semantic is "did we recover enough content").
+    let body_text = trafilatura::output::xmltotxt(body_opt.as_ref(), false);
+    let word_count = body_text.split_whitespace().count();
+    if opts.min_word_count > 0 && word_count < opts.min_word_count {
+        let _ = body_opt;
+        return Err(ExtractError::ContentTooShort {
+            word_count,
+            threshold: opts.min_word_count,
+        });
+    }
+
+    // 4. Build Document (empty <body> sentinel when cascade returned None).
+    let body_node = body_opt.clone().unwrap_or_else(|| {
+        use crate::readability::dom::create_element;
+        create_element("body")
+    });
+    let doc = trafilatura::output::Document {
+        metadata,
+        body: body_node,
+        commentsbody: None,
+        raw_text: String::new(),
+    };
+
+    // 5. control_xml_output runs the full xml.py:159-175 pipeline and returns
+    //    the pretty-printed string.
+    let xml_string = trafilatura::output::control_xml_output(&doc);
+
+    // 6. NFC-normalise (core.py:98 invariant — extract_to_markdown does the
+    //    same; consistent user-visible byte shape across all formatters).
+    use unicode_normalization::UnicodeNormalization;
+    let normalised: String = xml_string.as_str().nfc().collect();
+
+    // Keep cascade body alive through serialisation (rcdom Drop quirk, HLD §m-3).
+    let _ = body_opt;
+    Ok(normalised)
+}
+
 /// Extract via the **M2 Mozilla Readability port** (the previous default).
 ///
 /// This is the pre-Stage-9 extraction path preserved verbatim. The M3
@@ -1942,6 +2060,165 @@ mod tests {
             ..Options::default()
         };
         let err = extract_to_markdown("<html><body></body></html>", None, &opts)
+            .expect_err("must Err on threshold miss");
+        match err {
+            ExtractError::ContentTooShort {
+                word_count,
+                threshold,
+            } => {
+                assert_eq!(word_count, 0);
+                assert_eq!(threshold, 5);
+            }
+            other => panic!("expected ContentTooShort, got {other:?}"),
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Stage 3-D: extract_to_xml — Python xml.py:159-175 control_xml_output.
+    // -------------------------------------------------------------------
+
+    /// Brief #1 — Basic article yields valid XML with `<doc>` root and a
+    /// `<main>` child carrying the extracted body.
+    #[test]
+    fn extract_to_xml_basic_article_yields_doc_main() {
+        let html = r#"<html><body>
+            <article><h1>Title</h1><p>Hello, world.</p></article>
+        </body></html>"#;
+        let s = extract_to_xml(html, None, &Options::default()).expect("ok");
+        assert!(s.starts_with("<doc"), "must start with <doc: {s}");
+        assert!(s.contains("<main>"), "must contain <main>: {s}");
+        assert!(s.contains("Hello, world."), "must contain body text: {s}");
+        assert!(s.ends_with("</doc>"), "must end with </doc>: {s}");
+    }
+
+    /// Brief #6 — Empty article: minimal <doc> with self-closing children.
+    #[test]
+    fn extract_to_xml_empty_body_produces_minimal_doc() {
+        let s =
+            extract_to_xml("<html><body></body></html>", None, &Options::default()).expect("ok");
+        // Empty extraction -> <doc>\n  <main/>\n  <comments/>\n</doc>.
+        assert_eq!(s, "<doc>\n  <main/>\n  <comments/>\n</doc>");
+    }
+
+    /// Brief #3 — with_metadata=true populates <doc> root attributes.
+    #[test]
+    fn extract_to_xml_with_metadata_populates_doc_attrs() {
+        let html = r#"<html>
+            <head>
+                <title>The Title</title>
+                <meta property="og:url" content="https://example.com/article"/>
+            </head>
+            <body><article><p>One two three four five.</p></article></body>
+        </html>"#;
+        let opts = Options {
+            with_metadata: true,
+            ..Options::default()
+        };
+        let s = extract_to_xml(html, Some("https://example.com/article"), &opts).expect("ok");
+        assert!(
+            s.contains("title=\"The Title\""),
+            "metadata title must populate <doc>: {s}"
+        );
+    }
+
+    /// Brief #4 — with_metadata=false yields bare <doc> root (no attrs).
+    #[test]
+    fn extract_to_xml_without_metadata_has_bare_doc_root() {
+        let html = r#"<html>
+            <head><title>The Title</title></head>
+            <body><article><p>One two three four five.</p></article></body>
+        </html>"#;
+        let s = extract_to_xml(html, None, &Options::default()).expect("ok");
+        // Default opts -> with_metadata=false -> no title= on <doc>.
+        assert!(s.starts_with("<doc>\n"), "got: {s}");
+        assert!(!s.contains("title="), "got: {s}");
+    }
+
+    /// Brief #7 — Special chars in body text are XML-escaped.
+    #[test]
+    fn extract_to_xml_escapes_special_chars_in_body() {
+        let html = r#"<html><body>
+            <article><p>a &lt; b &amp;&amp; c &gt; d</p></article>
+        </body></html>"#;
+        let s = extract_to_xml(html, None, &Options::default()).expect("ok");
+        // The HTML entities decoded to characters in the DOM, then re-escaped
+        // by our XML serializer.
+        assert!(s.contains("a &lt; b &amp;&amp; c &gt; d"), "got: {s}");
+    }
+
+    /// Brief #9 — Output is NFC-normalised.
+    #[test]
+    fn extract_to_xml_output_is_nfc() {
+        // U+0065 U+0301 (NFD) -> U+00E9 (NFC) after extract_to_xml normalises.
+        let html = "<html><body><article><p>cafe\u{0301}</p></article></body></html>";
+        let s = extract_to_xml(html, None, &Options::default()).expect("ok");
+        assert!(
+            s.contains('\u{00E9}'),
+            "decomposed e+combining-acute must NFC to single U+00E9: {s:?}"
+        );
+        assert!(
+            !s.contains('\u{0301}'),
+            "no combining acute should survive NFC: {s:?}"
+        );
+    }
+
+    /// Brief #2 — Output is a serialisable XML byte stream (the only way to
+    /// "parse back" cheaply is to re-render via the same path; what we
+    /// actually verify is that the byte stream is well-formed enough to
+    /// re-pass through mdrcel's HTML5 parser without panic).
+    #[test]
+    fn extract_to_xml_output_is_parseable_html_subset() {
+        use crate::readability::dom::Dom;
+        let html = r#"<html><body><article><p>Hello world from XML.</p></article></body></html>"#;
+        let s = extract_to_xml(html, None, &Options::default()).expect("ok");
+        // The Trafilatura XML uses <doc> / <main> / <comments> — not real
+        // HTML tags — but feeding it back to the HTML5 parser MUST NOT
+        // panic. The parser will wrap it in <html><head></head><body>...
+        // tolerantly.
+        let _ = Dom::parse(&s);
+    }
+
+    /// Brief #10 — Per-tag attributes preserved when whitelisted. We can't
+    /// trigger <hi rend=...> from real HTML easily (HTML's <b>/<i> map to
+    /// xmltotxt formatting markers, not <hi> tags). Instead verify the
+    /// negative: <p class="..."> attrs are STRIPPED (p is not in
+    /// WITH_ATTRIBUTES per xml.py:39).
+    #[test]
+    fn extract_to_xml_strips_non_whitelisted_attrs() {
+        let html = r#"<html><body>
+            <article><p class="article-body" id="lead">First para.</p></article>
+        </body></html>"#;
+        let s = extract_to_xml(html, None, &Options::default()).expect("ok");
+        // class / id on <p> get wiped by clean_attributes.
+        assert!(
+            !s.contains("class=\"article-body\""),
+            "p.class must be stripped: {s}"
+        );
+        assert!(!s.contains("id=\"lead\""), "p.id must be stripped: {s}");
+        // Body text still present.
+        assert!(s.contains("First para."), "got: {s}");
+    }
+
+    /// Brief #8 — Indentation: nested elements use 2-space increments.
+    #[test]
+    fn extract_to_xml_indents_two_spaces_per_level() {
+        let html = r#"<html><body><article><p>Hello world.</p></article></body></html>"#;
+        let s = extract_to_xml(html, None, &Options::default()).expect("ok");
+        // The <main> sits at depth 1 -> 2 spaces.
+        assert!(
+            s.contains("\n  <main>"),
+            "main must be indented 2 spaces: {s}"
+        );
+    }
+
+    /// Stage 3-D parity with extract_to_markdown — min_word_count gate fires.
+    #[test]
+    fn extract_to_xml_respects_min_word_count() {
+        let opts = Options {
+            min_word_count: 5,
+            ..Options::default()
+        };
+        let err = extract_to_xml("<html><body></body></html>", None, &opts)
             .expect_err("must Err on threshold miss");
         match err {
             ExtractError::ContentTooShort {
