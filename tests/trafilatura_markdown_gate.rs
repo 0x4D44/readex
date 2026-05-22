@@ -105,6 +105,26 @@ const PYTHON_UNDER_EXTRACT_ALLOWLIST: &[&str] = &[
     // every `<pre>` (destructive). 7-byte diff at byte 1106 of a
     // 20,602-char fixture. ADR: wrk_docs/m5-allowlist/39ca4af9.md.
     "39ca4af9befa0524.html",
+    // Apple FR — French Wikipedia Apple Inc. article (M6 Stage 1 pivot,
+    // 2026-05-22). The M5 deferred ADR claimed Python's `xmltotxt` has a
+    // `<sup class="reference">` paragraph-break branch and mdrcel should
+    // mirror it. M6 Stage 1 verified Python source and found NO such
+    // branch: `htmlprocessing.convert_tags` clears the `class` attribute
+    // and renames `<sup>` → `<hi rend="#sup">` BEFORE `xmltotxt` sees
+    // the tree (`htmlprocessing.py:402-407`); `xml.py:process_element`
+    // (`xml.py:253-351`) has no `<sup>`-class branch at all. The
+    // paragraph break is a side-effect of `handle_paragraphs`/
+    // `handle_formatting` (`main_extractor.py:108-115, 272-351`) running
+    // on inline `<hi rend="#sup">` when `formatting=True` — identical
+    // pattern to the already-allowlisted 86df4d2e fracture. Smoking gun:
+    // `trafilatura.extract(output_format='txt')` on the same fixture
+    // produces inline references matching mdrcel exactly; only the
+    // markdown path diverges. Mirroring Python's markdown bug would be
+    // anti-inversion-violating. ~145 bytes of structural divergence over
+    // ~30 reference markers, net ~1 byte in a 122,740-char fixture.
+    // ADR: wrk_docs/m5-allowlist/507b9cdb.md (supersedes
+    // wrk_docs/m5-deferred/507b9cdb.md).
+    "507b9cdbe036bf58.html",
 ];
 
 /// Fixtures where **mdrcel** is the buggy side — divergence is a known
@@ -147,17 +167,6 @@ const DEFERRED_KNOWN_DEFECT: &[&str] = &[
     // by gate definition. ADR: wrk_docs/m5-deferred/e1106c5e.md.
     // Suggested milestone: M6.
     "e1106c5e26712078.html",
-    // Apple FR (Wikipedia French Apple Inc. article). Inline `<sup
-    // class="reference">[19]</sup>` reference markers: Python's
-    // `xmltotxt` emits each one as its own paragraph break
-    // (`...\n\n[19]\n\n...`); Rust keeps them inline (`...[19] ...`).
-    // 145 bytes of structural divergence inside a 122,740-char fixture
-    // but the local diffs cancel out at the char-count level (net
-    // diff: 1 byte), so the harness's coarse classification under-
-    // states the work. Real fix is in xmltotxt's `<sup
-    // class="reference">` rendering path. ADR:
-    // wrk_docs/m5-deferred/507b9cdb.md. Suggested milestone: M6.
-    "507b9cdbe036bf58.html",
 ];
 
 /// All 51 corpus snapshots — enumerated literally from
