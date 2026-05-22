@@ -157,16 +157,18 @@ const DEFERRED_KNOWN_DEFECT: &[&str] = &[
     // mdrcel defect (not anti-inversion). ADR:
     // wrk_docs/m5-deferred/e339ce76.md. Suggested milestone: M6.
     "e339ce76eb1cba73.html",
-    // PBS news article — BODY_XPATH selection divergence. Python's
-    // body selector lands on the "Latest Stories" sidebar list which
-    // becomes the substantive output; Rust skips the sidebar and lands
-    // on the article body. Inverse of the Stage 6g Verge byline
-    // tightening (where Rust over-included a sidebar div); this time
-    // PYTHON over-includes a sidebar and mdrcel does not. Anti-
-    // inversion doctrine says Python wins, so mdrcel is the buggy side
-    // by gate definition. ADR: wrk_docs/m5-deferred/e1106c5e.md.
-    // Suggested milestone: M6.
-    "e1106c5e26712078.html",
+    // PBS (CNN-lite) news article (`e1106c5e26712078.html`) — FORMERLY
+    // deferred under the misdiagnosed `BODY_XPATH selection divergence`
+    // hypothesis. M6 Stage 2 anti-inversion verification: BOTH engines
+    // select the same `<ul>` of stories; the divergence was in mdrcel's
+    // readability_fork `Document::summary` retry loop, which re-parsed
+    // `self.html` on every attempt (an M2 Mozilla flag-sieve pattern,
+    // HLD §m-3) instead of mutating `self.doc` in place across attempts
+    // like Python's `readability_lxml.Document.summary`. Fix landed in
+    // `src/trafilatura/readability_fork.rs::Document::summary` + body-
+    // fallback detachment into a fresh wrapper to survive the rcdom
+    // Drop quirk. Fixture is now byte-equivalent to Python and counted
+    // as substantive. (No allowlist entry — mdrcel was the buggy side.)
 ];
 
 /// All 51 corpus snapshots — enumerated literally from

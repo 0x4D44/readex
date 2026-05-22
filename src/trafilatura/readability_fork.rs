@@ -500,13 +500,16 @@ pub fn link_density(elem: &NodeRef) -> f64 {
 /// The Python defaults `min_text_length=25` / `retry_length=250` are
 /// preserved verbatim.
 pub struct Document {
-    /// Raw HTML source — kept verbatim so each retry attempt re-parses
-    /// (avoiding stale `drop_tree` side effects from a prior attempt). The
-    /// Python `Document` instead holds a single parsed tree and mutates
-    /// it; we trade that for the M2 flag-sieve precedent (HLD §m-3).
+    /// Raw HTML source — retained for debugging / introspection. M6 Stage 2
+    /// removed the re-parse-per-attempt pattern (HLD §m-3 was M2 Mozilla
+    /// semantics; Trafilatura's `readability_lxml` mutates in place across
+    /// attempts) so the field is no longer consulted by `summary()`.
+    #[allow(dead_code)]
     html: String,
-    /// Live working DOM for the current attempt. Re-parsed at the top of
-    /// each retry iteration in [`Document::summary`].
+    /// Live working DOM. Parsed once by [`Document::new`] /
+    /// [`Document::with_options`] and mutated in place across retry
+    /// attempts in [`Document::summary`] (faithful to Python's
+    /// `readability_lxml.Document` semantics, M6 Stage 2 fix).
     dom: Dom,
     /// Lower bound on a paragraph's trimmed text length for it to
     /// contribute to scoring. Default `25` (Python source).
@@ -560,14 +563,38 @@ impl Document {
     /// root (e.g. empty input). For a normal "empty body but parseable
     /// document" input, returns `Some(body)` per the Python fallback.
     ///
-    /// # Faithful retry semantics
+    /// # Faithful retry semantics (M6 Stage 2 fix)
     ///
-    /// Each retry RE-PARSES `self.html` from scratch (the lxml `drop_tree`
-    /// mutations from the prior attempt are not idempotent across modes
-    /// — a node dropped ruthlessly should re-appear in a lenient attempt).
-    /// This mirrors M2 `grab_article`'s flag-sieve retry (HLD §m-3 / Stage
-    /// 1c Cargo entry).
+    /// Earlier versions of mdrcel's readability_fork re-parsed `self.html`
+    /// from scratch at the top of every retry iteration, applying M2 Mozilla
+    /// Readability's flag-sieve pattern (HLD §m-3) to Trafilatura's
+    /// `readability_lxml`. That was an anti-inversion violation: Python's
+    /// `Document.summary` (readability_lxml.py:125-166) does NOT re-parse.
+    /// It runs `for elem in self.doc.iter("script", "style"): elem.drop_tree()`
+    /// ONCE outside the `while True` loop, then mutates `self.doc` in place
+    /// across attempts. The lenient retry therefore operates on the
+    /// already-depleted DOM from the ruthless attempt — when the ruthless
+    /// pass stripped most candidates and the lenient pass still finds none,
+    /// the fall-through `body = self.doc.find("body")` returns the
+    /// **post-strip** body, which on pages like CNN-lite (sidebar-only news
+    /// listing, 0 candidates either way) is exactly the substantive content
+    /// the user wants.
+    ///
+    /// With re-parse-per-attempt, mdrcel's lenient attempt found 2 candidates
+    /// (best score 4.73 on a footer div) and returned a 343-char article that
+    /// `sanitize` then crushed to 11 chars — bypassing Python's `<body>`
+    /// rescue path. The PBS fixture (`e1106c5e26712078.html`) exposed this:
+    /// Python emits 20,834-byte "Latest Stories" sidebar; mdrcel emitted
+    /// nothing and the cascade fell through to lower-quality fallbacks.
     pub fn summary(&mut self) -> Option<NodeRef> {
+        // readability_lxml.py:131-132 — drop every script/style subtree
+        // ONCE up front, outside the retry loop. The mutation persists
+        // across ruthless/lenient attempts (Python semantics).
+        let doc = self.dom.document();
+        for elem in get_all_nodes_with_tag(&doc, &["script", "style"]) {
+            delete_with_tail_preserve_free(&elem);
+        }
+
         let mut ruthless = true;
         // Bound the loop at 3 iterations (ruthless attempt, lenient
         // attempt, lenient-with-short-article attempt = the third path
@@ -578,18 +605,8 @@ impl Document {
         // than 3 in practice, but a panic-free upper bound beats a
         // theoretical infinite loop on adversarial input.
         for _attempt in 0..5 {
-            // Re-parse: drop the previous attempt's mutated DOM and start
-            // from the original HTML (HLD §m-3 re-parse-on-retry pattern).
-            self.dom = Dom::parse(&self.html);
-
-            // readability_lxml.py:131-132 — drop every script/style
-            // subtree before any other processing.
-            let doc = self.dom.document();
-            for elem in get_all_nodes_with_tag(&doc, &["script", "style"]) {
-                delete_with_tail_preserve_free(&elem);
-            }
-
-            // readability_lxml.py:137 — ruthless strip pass.
+            // readability_lxml.py:137 — ruthless strip pass. NO re-parse;
+            // mutations persist across attempts (see method docstring).
             if ruthless {
                 self.remove_unlikely_candidates();
             }
@@ -613,8 +630,45 @@ impl Document {
                         continue;
                     }
                     // readability_lxml.py:154-158 — return body or doc root.
+                    // Note: this is the POST-MUTATION body — `remove_unlikely`
+                    // and `transform_misused_divs` from the ruthless attempt
+                    // have already shaped it.
+                    //
+                    // **Detach into a fresh wrapper.** The body NodeRef is
+                    // owned by `self.dom`; when the caller's `Document`
+                    // drops, the rcdom Drop pass drains the body's children
+                    // and the returned NodeRef goes empty. Mirroring the
+                    // `get_article` pattern (`output = create_element("div")
+                    // ; output.append(sibling)` — which reparents siblings
+                    // into a freshly-created Rc-owned graph that survives
+                    // Dom drop), we move the post-mutation body's children
+                    // into a fresh `<body>` wrapper. The returned graph is
+                    // then independent of `self.dom`.
                     match self.dom.body() {
-                        Some(b) => b,
+                        Some(b) => {
+                            let fresh = create_element("body");
+                            // Copy class+id attributes so downstream
+                            // class-based heuristics (e.g. Trafilatura's
+                            // `sanitize_tree`) see the same attribute
+                            // surface as the original body.
+                            for name in ["class", "id"] {
+                                if let Some(v) = get_attribute(&b, name) {
+                                    crate::readability::dom::set_attribute(
+                                        &fresh, name, &v,
+                                    );
+                                }
+                            }
+                            // Reparent all children into `fresh` in order.
+                            // `append_child` detaches each child from `b`
+                            // (mirroring lxml `output.append(child)`); the
+                            // new graph is owned by `fresh`'s Rc tree and
+                            // survives `self.dom` drop.
+                            let body_kids: Vec<NodeRef> = b.children.borrow().clone();
+                            for k in body_kids {
+                                append_child(&fresh, &k);
+                            }
+                            fresh
+                        }
                         None => self.dom.document(),
                     }
                 }
@@ -2377,40 +2431,105 @@ mod tests {
     /// would strip the article entirely. The article div carries an
     /// `extra` class that matches `unlikelyCandidatesRe` — the ruthless
     /// pass strips it, leaving no scoreable paragraphs. The lenient
-    /// retry keeps the div in the tree and produces an article
-    /// (readability_lxml.py:146-152).
+    /// Lenient retry pins the IN-PLACE mutation semantics of Python's
+    /// `readability_lxml.Document.summary` (readability_lxml.py:124-166).
+    /// The ruthless attempt mutates `self.doc` (drops the unlikely-class
+    /// subtree); the lenient retry sees the ALREADY-MUTATED DOM. This
+    /// matches Python — the lenient retry does NOT re-parse and therefore
+    /// CANNOT recover content that ruthless threw away.
     ///
-    /// # `extra` vs `sidebar` — Stage 4c note
+    /// To exercise the lenient retry's "no best candidate → fall through to
+    /// `body`" path WITHOUT depending on ruthless-stripped content, build
+    /// a fixture whose only paragraphs sit inside a `<div class="comment">`
+    /// (matched by `unlikelyCandidatesRe`, no override). After ruthless
+    /// strip the body is empty → lenient retry → still no candidates →
+    /// fall through returns the (now-empty-but-existent) `<body>`.
     ///
-    /// Originally written at Stage 4b against `class="sidebar"`. Stage 4c
-    /// replaced the sanitize stub with the real port — `sidebar` matches
-    /// BOTH `unlikelyCandidatesRe` AND `negativeRe`, so even after the
-    /// lenient retry keeps the sidebar div in the tree, the real
-    /// `sanitize`'s `weight + score < 0` arm drops it (class_weight =
-    /// -25 from `negativeRe`, easily overwhelming the paragraph score).
-    /// `extra` matches `unlikelyCandidatesRe` only (not `negativeRe`),
-    /// exercising the SAME lenient-retry path without the secondary
-    /// sanitize-drop — which is the actual invariant this test is meant
-    /// to pin (the retry shape, not the sanitize numeric weight).
+    /// # History (M6 Stage 2)
+    ///
+    /// This test was originally written at M3 Stage 4b under the
+    /// non-faithful re-parse-per-attempt assumption — it expected the
+    /// lenient retry to RECOVER ruthless-dropped content. That's M2
+    /// Mozilla Readability semantics (HLD §m-3), NOT Trafilatura's
+    /// `readability_lxml` semantics. M6 Stage 2 removed the re-parse to
+    /// fix the PBS (`e1106c5e26712078.html`) fixture, and this test was
+    /// rewritten to pin the correct Python-faithful in-place-mutation
+    /// behaviour. Differential proof: Python's
+    /// `readability_lxml.Document.summary` on the original `<div
+    /// class="extra">...</div>` body returns the empty body
+    /// `<body>\n    \n</body>` (19 bytes) — the substantive content does
+    /// NOT survive ruthless.
     #[test]
-    fn document_summary_falls_back_to_lenient_when_ruthless_fails() {
+    fn document_summary_falls_back_to_body_when_no_candidates_either_attempt() {
         // The ONLY content sits inside a div whose class matches
-        // `unlikelyCandidatesRe` (extra) but NOT `okMaybeItsACandidateRe`
-        // and NOT `negativeRe`. Ruthless drops it; lenient keeps it; the
-        // sanitize pass does not have grounds to drop it again.
+        // `unlikelyCandidatesRe` (comment). Ruthless drops the div;
+        // lenient sees the (now-empty) body and falls through to
+        // `body = self.doc.find("body"); article = body`.
         let html = r#"<html><body>
-            <div class="extra">
+            <div class="comment">
                 <p>This paragraph holds the only article-shaped content on the page, with commas, length, and structure to score above the minimum length threshold.</p>
                 <p>A second paragraph adds more text, more commas, and enough length to push the parent score well into the candidate-selection range.</p>
-                <p>A third paragraph cements the candidate, with explicit reflective analysis, careful word choice, and a satisfying conclusion to the thought.</p>
             </div>
         </body></html>"#;
         let mut doc = Document::new(html);
-        let article = doc.summary().expect("lenient retry should yield an article");
+        let article = doc
+            .summary()
+            .expect("body-fallback path always yields Some(body)");
+        // Faithful to Python: the fall-through returns `<body>`, not a
+        // wrapped `<div>`. Earlier (re-parse) implementations returned a
+        // `<div>` holding the recovered `<p>` from lenient retry; the
+        // Python-faithful behaviour returns the post-strip body.
+        assert_eq!(
+            local_name(&article).as_deref(),
+            Some("body"),
+            "lenient fall-through returns <body> (Python `self.doc.find(\"body\")`)"
+        );
         let text = crate::readability::dom::text_content(&article);
+        let trimmed = text.trim();
         assert!(
-            text.contains("article-shaped content"),
-            "lenient retry should preserve the extra-class paragraph, got: {text:.200}…"
+            trimmed.is_empty(),
+            "ruthless-dropped content does NOT survive lenient retry under \
+             Python-faithful in-place-mutation semantics, got: {trimmed:.200}"
+        );
+    }
+
+    /// M6 Stage 2 — pin in-place-mutation semantics across the
+    /// ruthless→lenient retry boundary. Python's
+    /// `readability_lxml.Document.summary` mutates `self.doc` in place;
+    /// the lenient retry MUST see the post-ruthless DOM. The previous
+    /// re-parse-per-attempt implementation produced different candidates
+    /// on retry, causing the PBS (CNN-lite, `e1106c5e26712078.html`)
+    /// fixture to surface a tiny footer instead of falling through to
+    /// the `<body>` rescue.
+    ///
+    /// This test pins the mutation persistence: call `summary`, observe
+    /// that the doc HAS been mutated (e.g. `remove_unlikely_candidates`
+    /// dropped a `class="comment"` div on the first ruthless attempt and
+    /// that drop persists, observable via the dom).
+    #[test]
+    fn document_summary_mutates_dom_in_place_across_attempts() {
+        // Two divs: one matches `unlikelyCandidatesRe` (comment, dropped
+        // ruthlessly), one is a candidate `<div>` holding scorable `<p>`s.
+        let html = r#"<html><body>
+            <div class="comment">noise to be stripped</div>
+            <div class="article">
+                <p>This paragraph holds the only article-shaped content on the page, with commas, length, and structure to score above the minimum length threshold.</p>
+                <p>A second paragraph adds more text, more commas, and enough length to push the parent score well into the candidate-selection range.</p>
+            </div>
+        </body></html>"#;
+        let mut doc = Document::new(html);
+        let _article = doc.summary().expect("article expected");
+        // After summary, the `comment` div MUST be gone from doc — proving
+        // mutations persist (would survive only if re-parse-per-attempt
+        // was in effect; in the fixed faithful build the body has only
+        // the `article` div left after ruthless).
+        let body = doc.dom.body().expect("body exists");
+        let kids = children(&body);
+        let classes: Vec<String> = kids.iter().map(class_name).collect();
+        assert!(
+            !classes.iter().any(|c| c == "comment"),
+            "`comment` div must have been stripped and the strip must \
+             persist — got body kids classes: {classes:?}"
         );
     }
 

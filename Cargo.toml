@@ -2687,7 +2687,27 @@ name = "mdrcel"
 # remain green (`parser_equivalence`, `trafilatura_equivalence`,
 # `trafilatura_extract_content`, `trafilatura_extract_smoke`,
 # `htmldate_parity`); lib tests 1155 pass. No new dependency.
-version = "0.16.0"
+#
+# M6 Stage 2 (2026-05-22): 0.16.0 -> 0.16.1 PATCH. Bug fix in
+# `src/trafilatura/readability_fork.rs::Document::summary` — the retry
+# loop was re-parsing `self.html` from scratch on every attempt (an M2
+# Mozilla Readability flag-sieve pattern, HLD §m-3) instead of mutating
+# `self.doc` in place across attempts like Python's
+# `readability_lxml.Document.summary` (readability_lxml.py:124-166).
+# Anti-inversion verification on the PBS CNN-lite fixture
+# (`e1106c5e26712078.html`) traced the divergence to the lenient retry
+# pass re-discovering different candidates than Python (which sees the
+# already-depleted post-ruthless DOM). The fix moves the script/style
+# strip outside the loop (Python places it OUTSIDE `while True`) and
+# removes the per-attempt re-parse; the body-fallback path also detaches
+# into a fresh wrapper to survive the rcdom Drop quirk on
+# `self.dom.body()`. Markdown corpus gate: 41 -> 42 substantive
+# byte-equivalent (51-fixture corpus); deferred shrank 2 -> 1. Per
+# semver PATCH — bug fix only, no public API change, no new dependency.
+# Lib tests 1155 -> 1156 (one new in-place-mutation pin test, one
+# pre-existing test rewritten to match Python-faithful semantics — the
+# previous test pinned the wrong M2 re-parse behaviour).
+version = "0.16.1"
 edition = "2024"
 
 # M5 Stage 6e-b (2026-05-21): 0.15.10 -> 0.15.11 PATCH. No source change —
