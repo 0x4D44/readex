@@ -37,31 +37,34 @@
 //! calls `extract_to_tei` with **default `Options`** (matching the other
 //! gates) and relies on the lib-side forcing.
 //!
-//! # `<teiHeader>` metadata neutralisation (the surgical mask, csv/xml pattern)
+//! # `<teiHeader>` parity + the fingerprint-only mask (M8)
 //!
 //! Because TEI forces `with_metadata=True` (above), the `<teiHeader>` is fully
-//! populated from the metadata-extraction subsystem — the FIRST and ONLY M7
+//! populated from the metadata-extraction subsystem — the FIRST and ONLY format
 //! gate to exercise it (txt/json/csv use `with_metadata=False`; xml emits only
-//! the fingerprint). mdrcel's metadata extraction diverges from Python on
-//! several axes that are NOT TEI-format concerns: `filedate` (Python = today;
-//! mdrcel has no slot — M4 Stage 6 deferred), the blake2b `fingerprint`,
-//! date truncation/value, `www.`-hostname stripping, and author/sitename
-//! extraction quality. mdrcel is the weaker side on each, so they are DEFERRED,
-//! not allowlisted. After two minimal `check_tei` tail-semantics fixes (see
-//! ADR), the TEI **`<text>` subtree is byte-identical on all 39
-//! non-allowlist/non-deferred fixtures** — 100% of the residual divergence is
-//! in the header.
+//! the fingerprint). At M7 close this gate masked the ENTIRE `<teiHeader>`
+//! because mdrcel's metadata was the weaker side on date / hostname / sitename /
+//! author / filedate.
 //!
-//! Following the established csv/xml masking pattern (mask the one diverging
-//! field, byte-compare the rest), this gate NEUTRALISES the `<teiHeader>`
-//! region — collapsing both sides' header to a canonical empty shell — and
-//! byte-compares the `<text>` subtree (everything the TEI serialiser /
-//! `check_tei` / pretty-printer actually produces) on every fixture. Deferring
-//! all 39 instead would make the gate vacuous. The fingerprint note carries an
-//! EXTRA explicit shape-check (well-formed lowercase-hex, 1–16 chars) before
-//! the header is blanked, so the simhash divergence stays accounted for.
-//! Documented in `wrk_docs/m7-deferred/tei-header-metadata.md` and the shared
-//! `wrk_docs/m7-deferred/fingerprint-blake2b.md`.
+//! **M8 drove the metadata subsystem to byte-parity and UNMASKED the header.**
+//! The fixes (all faithful ports verified against vendored trafilatura/courlan/
+//! htmldate source): a `filedate` slot (= today); unconditional htmldate via
+//! `original_date=True` + `max_date=today` + `%Y-%m-%d` output (truncation +
+//! discovery); `extract_domain` registered-domain extraction; sitename
+//! normalisation + `META_URL` URL fallback; the full `normalize_authors`;
+//! `AUTHOR_DISCARD_XPATHS` prune; `extract_metainfo` itertext-join; greedy
+//! `HTMLTITLE_REGEX` split; and courlan `normalize_url` path %-encoding. The
+//! `<teiHeader>` (title / author / publisher / hostname / date / url / sigle /
+//! filedate / categories / tags) is now byte-identical on every
+//! non-allowlist/non-deferred fixture.
+//!
+//! The gate therefore masks ONLY the one principled field — the blake2b
+//! `<note type="fingerprint">` — and byte-compares the ENTIRE document (header
+//! AND body). mdrcel uses an FNV-1a substitute (no crypto dep) that can never
+//! byte-match Python's blake2b simhash; that is an Arthur-level dependency
+//! decision (`wrk_docs/m7-deferred/fingerprint-blake2b.md`). The note still
+//! carries an explicit shape-check (well-formed lowercase-hex, 1–16 chars)
+//! before it is blanked, so the simhash divergence stays accounted for.
 //!
 //! # Comparison shape
 //!
@@ -74,8 +77,8 @@
 //!
 //! GREEN when every fixture lands in exactly one of: `pass`,
 //! `allowlist_python_bug` (ADR under `wrk_docs/m7-allowlist/`), or
-//! `deferred_known_defect` (ADR under `wrk_docs/m7-deferred/`). Any untriaged
-//! bucket count > 0 fails the gate.
+//! `deferred_known_defect` (ADR under `wrk_docs/m7-deferred/` or
+//! `wrk_docs/m8-deferred/`). Any untriaged bucket count > 0 fails the gate.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -150,6 +153,15 @@ const DEFERRED_KNOWN_DEFECT: &[&str] = &[
     // note). NOTE: the fingerprint note is still neutralised for this fixture
     // before the U+2063 body divergence is observed — the two are independent.
     "507b9cdbe036bf58.html",
+    // SEC press release — mdrcel's htmldate port over-extracts an XBRL schema
+    // date (`numeric-2009-12-16.xsd`, in a <script> JSON blob) in its extensive
+    // last-resort scan, where Python's htmldate finds the article's text date
+    // (`Jan. 3, 2024`) in an earlier extensive element-walk and returns first.
+    // Header `<date>`/`<bibl>` diverge (`2009-12-16` vs `2024-01-03`); body is
+    // byte-identical. mdrcel is the wrong side; the fix is a deep htmldate-port
+    // change gated only by the original_date=False htmldate parity gate. ADR:
+    // wrk_docs/m8-deferred/8d5cc524-htmldate-extensive.md.
+    "8d5cc5247b273722.html",
 ];
 
 /// All 51 corpus snapshots — copied verbatim from the txt / json / csv / xml
@@ -388,57 +400,57 @@ fn workspace_path(rel: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(rel)
 }
 
-/// The canonical empty form the `<teiHeader>` is collapsed to on both sides.
-const EMPTY_TEI_HEADER: &str = "<teiHeader/>";
+/// The canonical empty form the fingerprint note is collapsed to on both sides.
+const EMPTY_FINGERPRINT_NOTE: &str = "<note type=\"fingerprint\"/>";
 
-/// Neutralise the metadata-bearing `<teiHeader>` so the byte-comparison pins
-/// the TEI `<text>` subtree (the serialiser's actual product).
+/// Neutralise the ONE principled mask: the blake2b `<note type="fingerprint">`.
 ///
-/// Background (ADRs `wrk_docs/m7-deferred/tei-header-metadata.md` +
-/// `fingerprint-blake2b.md`): TEI forces `with_metadata=True`
-/// (settings.py:144-149), so the header is fully populated from the
-/// metadata-extraction subsystem, which mdrcel diverges from on filedate /
-/// fingerprint / date / hostname / author. These are mdrcel-weaker deferred
-/// gaps, not TEI-format defects. The `<text>` subtree is byte-identical on
-/// every non-allowlist/non-deferred fixture.
+/// M8 narrowed this from the whole-`<teiHeader>` collapse (M7) to just the
+/// fingerprint note. Every other header field (title / author / publisher /
+/// hostname / date / url / filedate / sigle) is now driven to byte-parity in
+/// the metadata subsystem and byte-compared in full. The fingerprint stays
+/// masked because mdrcel uses an FNV-1a substitute (no crypto dep) that can
+/// never byte-match Python's blake2b simhash — an Arthur-level dependency
+/// decision (`wrk_docs/m7-deferred/fingerprint-blake2b.md`). The U+2063 body
+/// leak (`507b9cdb`) and one htmldate date-discovery edge (`8d5cc524`) remain
+/// in `DEFERRED_KNOWN_DEFECT`.
 ///
 /// Steps:
 /// 1. SHAPE-CHECK Python's `<note type="fingerprint">` text where present: it
 ///    MUST be a well-formed lowercase-hex simhash (1–16 chars). A malformed
 ///    value PANICS — keeps the blake2b divergence explicitly accounted for and
 ///    proves the header still carries a real fingerprint before it is blanked.
-/// 2. Collapse the `<teiHeader>…</teiHeader>` element to `<teiHeader/>` on BOTH
-///    sides. When a side has no header (e.g. Python under-extracted to an empty
-///    string) the collapse is a no-op for that side, so the caller's divergence
-///    triage still routes the fixture to the allowlist / deferred lists.
+/// 2. Collapse the populated `<note type="fingerprint">…</note>` to
+///    `<note type="fingerprint"/>` on BOTH sides (mdrcel already emits the
+///    self-closing empty form; this blanks Python's value to match). Every other
+///    byte of the document — header AND body — is compared verbatim.
 fn neutralise_header(rust: &str, python: &str, fixture_rel: &str) -> (String, String) {
     if let Some(fp) = note_fingerprint_value(python) {
         assert!(
             is_well_formed_fingerprint(&fp),
-            "M7 tei gate: python <note type=\"fingerprint\"> text on {fixture_rel} \
+            "M8 tei gate: python <note type=\"fingerprint\"> text on {fixture_rel} \
              is not a well-formed lowercase-hex simhash (1-16 chars): {fp:?} — the \
              neutralisation must not paper over a structurally-malformed fingerprint",
         );
     }
-    (collapse_tei_header(rust), collapse_tei_header(python))
+    (mask_fingerprint_note(rust), mask_fingerprint_note(python))
 }
 
-/// Collapse a populated `<teiHeader>…</teiHeader>` (which may be self-closing
-/// already) to the canonical `<teiHeader/>`. Idempotent; a no-op when the
-/// header is absent (e.g. Python under-extracted to an empty string).
-fn collapse_tei_header(s: &str) -> String {
-    let open = "<teiHeader>";
+/// Collapse a populated `<note type="fingerprint">…</note>` to the canonical
+/// self-closing `<note type="fingerprint"/>`. Idempotent; a no-op when the note
+/// is absent or already self-closing.
+fn mask_fingerprint_note(s: &str) -> String {
+    let open = "<note type=\"fingerprint\">";
     let Some(open_pos) = s.find(open) else {
-        // Already self-closing or absent.
         return s.to_string();
     };
     let after_open = open_pos + open.len();
-    let close = "</teiHeader>";
+    let close = "</note>";
     let Some(rel_close) = s[after_open..].find(close) else {
         return s.to_string();
     };
     let close_end = after_open + rel_close + close.len();
-    format!("{}{}{}", &s[..open_pos], EMPTY_TEI_HEADER, &s[close_end..])
+    format!("{}{}{}", &s[..open_pos], EMPTY_FINGERPRINT_NOTE, &s[close_end..])
 }
 
 /// Extract the text of the first `<note type="fingerprint">…</note>` element,
@@ -617,28 +629,45 @@ fn note_fingerprint_value_reads_text() {
     assert_eq!(note_fingerprint_value("no note here"), None);
 }
 
-/// Collapsing the `<teiHeader>` canonicalises a populated header to
-/// `<teiHeader/>`, preserves the surrounding `<text>` subtree, and is idempotent.
+/// Masking the fingerprint note canonicalises a populated note to the
+/// self-closing form, preserves the rest of the document, and is idempotent.
 #[test]
-fn collapse_tei_header_canonicalises() {
-    let py = "<TEI>\n  <teiHeader>\n    <fileDesc/>\n  </teiHeader>\n  <text><body/></text>\n</TEI>";
-    let want = "<TEI>\n  <teiHeader/>\n  <text><body/></text>\n</TEI>";
-    assert_eq!(collapse_tei_header(py), want);
-    // Idempotent: already-collapsed header unchanged.
-    assert_eq!(collapse_tei_header(want), want);
-    // Absent header: no-op.
-    assert_eq!(collapse_tei_header("no header"), "no header");
+fn mask_fingerprint_note_canonicalises() {
+    let py = "<teiHeader>\n  <note type=\"fingerprint\">faaf02cb89b18b2b</note>\n</teiHeader>";
+    let want = "<teiHeader>\n  <note type=\"fingerprint\"/>\n</teiHeader>";
+    assert_eq!(mask_fingerprint_note(py), want);
+    // Idempotent: already-self-closing note unchanged.
+    assert_eq!(mask_fingerprint_note(want), want);
+    // Absent note: no-op.
+    assert_eq!(mask_fingerprint_note("no note"), "no note");
+    // The rest of the header (title/author/date/publisher) is untouched.
+    let full = "<title type=\"main\">T</title><note type=\"fingerprint\">3f6</note><date>2024-01-01</date>";
+    assert_eq!(
+        mask_fingerprint_note(full),
+        "<title type=\"main\">T</title><note type=\"fingerprint\"/><date>2024-01-01</date>"
+    );
 }
 
-/// End-to-end: a Python populated header and mdrcel's differing header with an
-/// otherwise identical `<text>` subtree compare equal AFTER neutralisation, and
-/// the fingerprint shape-check accepts Python's value.
+/// End-to-end: a Python populated header and mdrcel's empty-fingerprint header
+/// with an otherwise identical body+header compare equal AFTER neutralisation
+/// (only the fingerprint is masked), and the shape-check accepts Python's value.
 #[test]
 fn neutralise_header_blanks_header_and_compares_text() {
-    let rust = "<TEI><teiHeader><note type=\"fingerprint\"/></teiHeader><text><body>x</body></text></TEI>";
-    let python = "<TEI><teiHeader><note type=\"fingerprint\">fbe8c3db32b3b7c2</note></teiHeader><text><body>x</body></text></TEI>";
+    let rust = "<TEI><teiHeader><title type=\"main\">T</title><note type=\"fingerprint\"/></teiHeader><text><body>x</body></text></TEI>";
+    let python = "<TEI><teiHeader><title type=\"main\">T</title><note type=\"fingerprint\">fbe8c3db32b3b7c2</note></teiHeader><text><body>x</body></text></TEI>";
     let (r, p) = neutralise_header(rust, python, "synthetic");
-    assert_eq!(r, p, "documents must match once the header is neutralised");
+    assert_eq!(r, p, "documents must match once only the fingerprint is masked");
+}
+
+/// The narrowed mask is load-bearing: a header that differs in a NON-fingerprint
+/// field (here the title) must NOT compare equal — proving M8 byte-compares the
+/// rest of the header, not just the body.
+#[test]
+fn neutralise_header_detects_non_fingerprint_header_divergence() {
+    let rust = "<teiHeader><title type=\"main\">A</title><note type=\"fingerprint\"/></teiHeader>";
+    let python = "<teiHeader><title type=\"main\">B</title><note type=\"fingerprint\">3f6</note></teiHeader>";
+    let (r, p) = neutralise_header(rust, python, "synthetic");
+    assert_ne!(r, p, "a title divergence must survive the fingerprint-only mask");
 }
 
 /// The fingerprint shape-check is load-bearing: a malformed Python fingerprint
