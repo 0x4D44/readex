@@ -301,13 +301,19 @@ pub fn custom_parse(
     // ----------------------------------------------------------------------
     // 1. extractors.py:292-318 — `string[:4].isdigit()` shortcut
     // ----------------------------------------------------------------------
-    if string.len() >= 4 && string[..4].chars().all(|c| c.is_ascii_digit()) {
+    // Python's `string[:4]` slices by CODE POINT; mirror that with a char
+    // prefix so a non-ASCII date-ish string (e.g. a CJK prefix like "来源：未")
+    // falls through here — matching Python's `False` `.isdigit()` — instead of
+    // panicking on a byte-slice that lands mid-char (M9 Stage-0 finding). For
+    // ASCII input this is byte-identical to the prior `string[..4]` form.
+    let prefix: Vec<char> = string.chars().take(8).collect();
+    if prefix.len() >= 4 && prefix[..4].iter().all(char::is_ascii_digit) {
         // a. extractors.py:295-302 — 8-digit YYYYMMDD form.
         let candidate: Option<DateTime> =
-            if string.len() >= 8 && string[4..8].chars().all(|c| c.is_ascii_digit()) {
-                let y: i32 = string[..4].parse().ok()?;
-                let m: u32 = string[4..6].parse().ok()?;
-                let d: u32 = string[6..8].parse().ok()?;
+            if prefix.len() >= 8 && prefix[4..8].iter().all(char::is_ascii_digit) {
+                let y: i32 = prefix[0..4].iter().collect::<String>().parse().ok()?;
+                let m: u32 = prefix[4..6].iter().collect::<String>().parse().ok()?;
+                let d: u32 = prefix[6..8].iter().collect::<String>().parse().ok()?;
                 make_datetime(y, m, d)
             } else {
                 // b. extractors.py:305-312 — fromisoformat, then dateutil
@@ -962,6 +968,27 @@ mod tests {
         // 2050 is above the max — fails is_valid_date.
         let r = custom_parse("2050-06-15", "%Y-%m-%d", &min, &max);
         assert_eq!(r, None);
+    }
+
+    /// Regression (M9 Stage-0): a non-ASCII date-ish prefix must NOT panic on
+    /// the `string[:4]` shortcut (Python slices by code point, not byte). The
+    /// embedded `2020-08-22` is then found via the YMD scan, mirroring Python.
+    #[test]
+    fn custom_parse_non_ascii_prefix_does_not_panic() {
+        let min = dt(1995, 1, 1);
+        let max = dt(2030, 12, 31);
+        // 4th byte lands inside '源' (bytes 3..6) — the byte-slice form panicked.
+        let r = custom_parse("来源：未知 发布时间：2020-08-22", "%Y-%m-%d", &min, &max);
+        assert_eq!(r.as_deref(), Some("2020-08-22"));
+    }
+
+    /// Regression (M9 Stage-0): a short non-ASCII string (fewer than 4 code
+    /// points, multi-byte) must fall through without panicking.
+    #[test]
+    fn custom_parse_short_non_ascii_does_not_panic() {
+        let min = dt(1995, 1, 1);
+        let max = dt(2030, 12, 31);
+        assert_eq!(custom_parse("电话", "%Y-%m-%d", &min, &max), None);
     }
 
     /// Ports extractors.py:286-383 — fallback through YMD_PATTERN finds a
