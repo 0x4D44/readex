@@ -2756,7 +2756,27 @@ name = "mdrcel"
 # U+2063 control-char leak, which flows through the identical `xmltotxt(body)`
 # text field). PATCH per semver — test-only + an ADR cross-reference note, no
 # public API, no new dependency.
-version = "0.17.1"
+#
+# M7 Stage 3 (2026-05-22): 0.17.1 -> 0.17.2 PATCH. Adds the corpus-wide CSV
+# differential gate `tests/trafilatura_csv_gate.rs` (mdrcel `extract_to_csv` vs
+# Python `extract(output_format="csv")`, byte-exact over 51 fixtures). GREEN:
+# 45 substantive + 5 allowlisted + 1 deferred = 51. Two reconciliations:
+# (1) `extract_to_csv` now honours `opts.with_metadata` — `xmltocsv` gained a
+# `with_metadata` flag so the 9 metadata columns render `null` when metadata is
+# OFF, mirroring Python's empty-`Document()` path (core.py:269-270) the oracle
+# exercises; this is a faithful behaviour fix behind the unchanged public
+# `extract_to_csv` signature (the only touched signature is the `pub(crate)`
+# `xmltocsv`), and one lib test that built docs with empty metadata was updated
+# to pass the new flag (no behaviour assertion changed). (2) The fingerprint
+# column (FNV-1a simhash vs Python's blake2b — a deliberate, documented
+# divergence) is MASKED + shape-checked test-side in the gate rather than
+# deferring 51 fixtures; ADR wrk_docs/m7-deferred/fingerprint-blake2b.md (the
+# blake2b-dependency decision is batched for Arthur at M7 close). The 5
+# allowlist + 1 U+2063 deferred fixtures re-use existing ADRs (format-
+# independent causes shared with the txt/json gates). PATCH per semver — no new
+# public API/type, no new dependency; an internal behaviour refinement +
+# test-only masking.
+version = "0.17.2"
 edition = "2024"
 
 # M7 Stage 1 (2026-05-22): 0.16.2 -> 0.17.0 MINOR. New public function

@@ -942,6 +942,17 @@ pub fn extract_to_json(
 /// is the literal string `null` (`xml.py:366`), emitted for empty / `None`
 /// fields per Python's `d if d else null` rule.
 ///
+/// # `with_metadata` semantics
+///
+/// Python's `core.py:269-270` builds an *empty* `Document()` when
+/// `options.with_metadata` is `false` (the [`Options::default`]), so every
+/// metadata-derived column (`url`, `id`, `fingerprint`, `hostname`, `title`,
+/// `image`, `date`, `license`, `pagetype`) renders `null` — only the
+/// body-derived `text` / `comments` columns carry content. We mirror this by
+/// passing `opts.with_metadata` into `xmltocsv`: when `false`, the metadata
+/// columns are forced to `null` regardless of what was extracted. When
+/// `true`, the real extracted metadata populates those columns.
+///
 /// # `base_url`
 ///
 /// As in [`extract`] — informational only. Never fetched.
@@ -995,7 +1006,13 @@ pub fn extract_to_csv(
     //    `outputwriter.writerow([...])` (xml.py:377-389). Defaults match
     //    Python's `delim="\t"`, `null="null"`.
     let mut out = trafilatura::output::csv_header_row("\t");
-    out.push_str(&trafilatura::output::xmltocsv(&doc, false, "\t", "null"));
+    out.push_str(&trafilatura::output::xmltocsv(
+        &doc,
+        false,
+        "\t",
+        "null",
+        opts.with_metadata,
+    ));
 
     let _ = body_opt;
     Ok(out)
@@ -2358,7 +2375,7 @@ mod tests {
             commentsbody: None,
             raw_text: String::new(),
         };
-        let row = xmltocsv(&doc, false, "\t", "null");
+        let row = xmltocsv(&doc, false, "\t", "null", false);
         // The text column must be quoted (contains both \t and \n).
         // Easiest check: the row contains a `"`.
         assert!(

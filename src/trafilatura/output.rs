@@ -1313,6 +1313,24 @@ fn json_str(s: &str) -> String {
 /// Python writes `d if d else null` for every field (`xml.py:377`) — empty
 /// strings, `None`, and missing values render as the `null` parameter.
 ///
+/// # `with_metadata` gating (parity with `build_json_output`)
+///
+/// Python's `core.py:269-270` builds a *fresh empty* `Document()` when
+/// `options.with_metadata` is `false`, so every metadata-derived CSV column
+/// (`url`, `id`, `fingerprint`, `hostname`, `title`, `image`, `date`,
+/// `license`, `pagetype`) renders as the `null` token — only the body-derived
+/// `text` / `comments` columns carry content. mdrcel has no separate
+/// "empty Document" carrier, so we mirror the same observable behaviour with
+/// a `with_metadata` flag: when `false`, the metadata columns are forced to
+/// `null` regardless of what `doc.metadata` holds. This matches how
+/// [`build_json_output`] honours the same flag.
+///
+/// The `fingerprint` column is *always* `null` here (mdrcel deliberately does
+/// not compute Python's blake2b `content_fingerprint`; see the CSV gate's
+/// `wrk_docs/m7-deferred/fingerprint-blake2b.md` ADR). Python emits a real
+/// 16-char hex fingerprint even with `with_metadata=false`, so the csv gate
+/// masks + shape-checks that single column.
+///
 /// # CSV quoting (xml.py:374)
 ///
 /// Python uses `csv.QUOTE_MINIMAL`: quote a field only when it contains the
@@ -1324,6 +1342,7 @@ pub(crate) fn xmltocsv(
     include_formatting: bool,
     delim: &str,
     null: &str,
+    with_metadata: bool,
 ) -> String {
     // xml.py:369-370 — body / comments text via xmltotxt, falling back to
     // the `null` token when empty.
@@ -1336,20 +1355,30 @@ pub(crate) fn xmltocsv(
         comments_text
     };
 
+    // When metadata is gated OFF, Python's empty `Document()` makes every
+    // metadata column `None` → `null`. `with_metadata=false` reproduces that
+    // by reading the real metadata only when the flag is set.
     let md = &doc.metadata;
+    fn meta(v: Option<&str>, with_metadata: bool) -> Option<&str> {
+        if with_metadata {
+            v
+        } else {
+            None
+        }
+    }
     // xml.py:378-388 — column order, with `d if d else null` for each.
     let columns: [String; 11] = [
-        csv_or_null(md.url.as_deref(), null),       // 1. url
-        csv_or_null(None, null),                    // 2. id (Metadata lacks)
-        csv_or_null(None, null),                    // 3. fingerprint (lacks)
-        csv_or_null(md.hostname.as_deref(), null),  // 4. hostname
-        csv_or_null(md.title.as_deref(), null),     // 5. title
-        csv_or_null(md.image.as_deref(), null),     // 6. image
-        csv_or_null(md.date.as_deref(), null),      // 7. date
-        posttext,                                   // 8. text
-        commentstext,                               // 9. comments
-        csv_or_null(md.license.as_deref(), null),   // 10. license
-        csv_or_null(md.pagetype.as_deref(), null),  // 11. pagetype
+        csv_or_null(meta(md.url.as_deref(), with_metadata), null), // 1. url
+        csv_or_null(None, null),                                   // 2. id (Metadata lacks)
+        csv_or_null(None, null),                                   // 3. fingerprint (lacks)
+        csv_or_null(meta(md.hostname.as_deref(), with_metadata), null), // 4. hostname
+        csv_or_null(meta(md.title.as_deref(), with_metadata), null), // 5. title
+        csv_or_null(meta(md.image.as_deref(), with_metadata), null), // 6. image
+        csv_or_null(meta(md.date.as_deref(), with_metadata), null), // 7. date
+        posttext,                                                  // 8. text
+        commentstext,                                              // 9. comments
+        csv_or_null(meta(md.license.as_deref(), with_metadata), null), // 10. license
+        csv_or_null(meta(md.pagetype.as_deref(), with_metadata), null), // 11. pagetype
     ];
 
     let mut row = String::new();
@@ -3187,7 +3216,7 @@ mod tests {
             commentsbody: None,
             raw_text: String::new(),
         };
-        let row = xmltocsv(&doc, false, "\t", "null");
+        let row = xmltocsv(&doc, false, "\t", "null", true);
         let cols: Vec<&str> = row.trim_end_matches("\r\n").split('\t').collect();
         // Column 8 (index 7) is text; column 9 (index 8) is comments.
         assert_eq!(cols[7], "null", "text col must be null");
@@ -3202,7 +3231,7 @@ mod tests {
             commentsbody: None,
             raw_text: String::new(),
         };
-        let row = xmltocsv(&doc, false, ",", "N/A");
+        let row = xmltocsv(&doc, false, ",", "N/A", true);
         // 11 columns, all "N/A", comma-delimited.
         assert!(row.starts_with("N/A,N/A,N/A"), "got: {row:?}");
         assert!(row.contains("N/A,N/A\r\n"), "ends with N/A row");
