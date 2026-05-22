@@ -2611,7 +2611,22 @@ name = "mdrcel"
 # in a way that's anti-inversion territory; replicating it requires
 # wider tree-disassembly logic. No public-API change. No new dependency.
 # PATCH bump.
-version = "0.15.17"
+#
+# M5 Stage 6j-a (2026-05-22): 0.15.17 -> 0.15.18 PATCH. Audit follow-up
+# to Stage 6i: the same orphan-tail leak fixed in `_extract`
+# (`main_extractor.rs:~1893`) also exists in `recover_wild_text`
+# (`main_extractor.rs:~1665`). Both sites move an element from its old
+# parent into `result_body` via `append_child`; lxml's `tail` is
+# intrinsic to the element and travels with it, but rcdom models tail
+# as a following-sibling Text node owned by the OLD parent, so
+# `append_child` leaves it orphaned. The subsequent
+# `strip_tags(result_body, 'div')` in `extract_content` then lifts the
+# orphan tail into an unrelated ancestor still in `result_body`. Mirror
+# the Stage 6i fix here: clear the OLD-tail before the move. Stage 6i's
+# doctrinal note flagged this as a likely 0-2 fixture flip — recorded
+# as a hygiene fix regardless. No public-API change. No new dependency.
+# PATCH bump.
+version = "0.15.18"
 edition = "2024"
 
 # M5 Stage 6e-b (2026-05-21): 0.15.10 -> 0.15.11 PATCH. No source change —

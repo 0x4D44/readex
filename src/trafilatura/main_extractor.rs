@@ -1662,11 +1662,21 @@ pub fn recover_wild_text(
     // behind. Re-attach when the returned element shares the source's
     // tag (same-tag heuristic — see _extract's comment for the wrapped-
     // tag rejection list).
+    //
+    // **M5 Stage 6j-a (2026-05-22):** mirror the Stage 6i fix from
+    // `_extract` here too — clear the OLD tail BEFORE the move so the
+    // later `strip_tags(result_body, 'div')` in `extract_content` can't
+    // fold an orphan tail-text into an unrelated ancestor. Same orphan-
+    // tail-leak shape as the `_extract` site (audit follow-up from
+    // Stage 6i's doctrinal note).
     for e in subelems {
         let src_tag = local_name(&e);
         if let Some(new_elem) = handle_textelem(&e, &pot, options) {
             let new_tag = local_name(&new_elem);
             let saved_tail = if src_tag == new_tag { tail(&e) } else { None };
+            if saved_tail.is_some() {
+                set_tail(&e, None);
+            }
             append_child(result_body, &new_elem);
             if saved_tail.is_some() {
                 set_tail(&new_elem, saved_tail.as_deref());
