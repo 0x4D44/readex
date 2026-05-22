@@ -2744,7 +2744,19 @@ name = "mdrcel"
 # retired). 5 prior BLOCKER gates remain green. Lib tests 1156
 # (unchanged). PATCH bump per semver — no public API change, no new
 # dependency.
-version = "0.17.0"
+#
+# M7 Stage 2 (2026-05-22): 0.17.0 -> 0.17.1 PATCH. Adds the corpus-wide JSON
+# differential gate `tests/trafilatura_json_gate.rs` (mdrcel `extract_to_json`
+# vs Python `extract(output_format="json")`, byte-exact over 51 fixtures).
+# GREEN first run: 45 substantive + 5 allowlisted + 1 deferred = 51. No Rust
+# source change — mdrcel's body-only `build_json_output` already matched
+# Python's `json.dumps(.., ensure_ascii=False)` default separators byte-for-
+# byte. The 5 allowlist + 1 deferred fixtures re-use the existing txt-gate
+# ADRs (format-independent selection/parser/decoding causes + the shared
+# U+2063 control-char leak, which flows through the identical `xmltotxt(body)`
+# text field). PATCH per semver — test-only + an ADR cross-reference note, no
+# public API, no new dependency.
+version = "0.17.1"
 edition = "2024"
 
 # M7 Stage 1 (2026-05-22): 0.16.2 -> 0.17.0 MINOR. New public function
