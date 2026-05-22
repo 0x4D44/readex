@@ -1874,6 +1874,25 @@ pub fn _extract(tree: &NodeRef, options: &Options) -> (NodeRef, String, HashSet<
             if let Some(new_elem) = handle_textelem(&e, &potential_tags, options) {
                 let new_tag = local_name(&new_elem);
                 let saved_tail = if src_tag == new_tag { tail(&e) } else { None };
+                // **M5 Stage 6i fix (2026-05-22):** lxml's `tail` is intrinsic
+                // to the element, so moving the element moves the tail.
+                // rcdom stores tail as following-sibling Text nodes in the
+                // OLD parent — `append_child` (via `remove`) only detaches
+                // the element itself, leaving the orphan tail-text behind.
+                // The later `strip_tags(result_body, 'div')` (in
+                // `extract_content`) then flattens that orphan text up into
+                // whichever ancestor is also in result_body, fusing
+                // unrelated content. Clear the OLD tail BEFORE the move so
+                // it cannot bubble up via div-stripping. Guardian Spotlight
+                // (3d00ac8e) exercises this: `<a>Learn more...</a>` inside
+                // `<details>` becomes a Text tail of the inner `<p>`; the
+                // outer `<div class="dcr-w58v3c">` renames to `<p>` and
+                // brings the entire nested div chain along — without this
+                // clear, `Learn more...` ends up folded into the outer
+                // `<p>Paid content</p>`.
+                if saved_tail.is_some() {
+                    set_tail(&e, None);
+                }
                 append_child(&result_body, &new_elem);
                 if saved_tail.is_some() {
                     set_tail(&new_elem, saved_tail.as_deref());
