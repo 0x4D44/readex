@@ -2641,7 +2641,26 @@ name = "mdrcel"
 # `tests/trafilatura_markdown_gate.rs`. Gate movement:
 # 41/51 + 5 -> 41/51 + 6 substantive (content-mismatch 5 -> 4, allowlist
 # 5 -> 6). No public-API change. No new dependency. PATCH bump.
-version = "0.15.19"
+#
+# M5 Stage 6j-c (2026-05-22): 0.15.19 -> 0.15.20 PATCH. Allowlist-only —
+# `39ca4af9befa0524.html` (Rust blog post). html5ever follows HTML5
+# §13.2.5.51 (in-body start-tag dispatch for `<pre>`): "If the next
+# token is a U+000A LINE FEED (LF) character token, then ignore that
+# token..." lxml's HTMLParser does NOT implement that spec rule and
+# preserves the leading `\n` as `<pre>.text`. Downstream, `xmltotxt`'s
+# `<code>` formatting branch emits an empty ```\n``` fence pair from
+# the preserved `\n` — a 7-byte content-free artefact. mdrcel parses
+# per spec, so no empty fence is emitted. Replicating Python's artefact
+# would require either patching html5ever (invasive) or injecting
+# leading `\n` into every `<pre>` (destructive). Parser-level
+# divergence; not the port's job to undo html5ever's spec compliance.
+# 7-byte diff at byte 1106 of a 20,602-char fixture. ADR:
+# `wrk_docs/m5-allowlist/39ca4af9.md`. Added to
+# `PYTHON_UNDER_EXTRACT_ALLOWLIST` in
+# `tests/trafilatura_markdown_gate.rs`. Gate movement:
+# 41/51 + 6 -> 41/51 + 7 substantive (content-mismatch 4 -> 3, allowlist
+# 6 -> 7). No public-API change. No new dependency. PATCH bump.
+version = "0.15.20"
 edition = "2024"
 
 # M5 Stage 6e-b (2026-05-21): 0.15.10 -> 0.15.11 PATCH. No source change —

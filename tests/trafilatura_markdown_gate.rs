@@ -92,6 +92,19 @@ const PYTHON_UNDER_EXTRACT_ALLOWLIST: &[&str] = &[
     // diff at byte 30291 in a 65,906-char fixture. ADR:
     // wrk_docs/m5-allowlist/86df4d2e.md.
     "86df4d2e654952e4.html",
+    // Rust blog post (M5 Stage 6j-c, 2026-05-22). html5ever follows
+    // HTML5 §13.2.5.51 (in-body start-tag dispatch for `<pre>`):
+    // "If the next token is a U+000A LINE FEED (LF) character token,
+    // then ignore that token..." lxml's HTMLParser does NOT implement
+    // this spec rule and preserves the leading `\n` as `<pre>.text`.
+    // Downstream, `xmltotxt`'s `<code>` formatting branch emits an
+    // empty ```` ```\n``` ```` fence pair from the preserved `\n` —
+    // a 7-byte content-free artefact. mdrcel parses per spec, so no
+    // empty fence is emitted. Replicating the artefact would require
+    // patching html5ever (invasive) or injecting leading `\n` into
+    // every `<pre>` (destructive). 7-byte diff at byte 1106 of a
+    // 20,602-char fixture. ADR: wrk_docs/m5-allowlist/39ca4af9.md.
+    "39ca4af9befa0524.html",
 ];
 
 /// All 51 corpus snapshots — enumerated literally from
