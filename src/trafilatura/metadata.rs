@@ -662,26 +662,28 @@ fn examine_meta(doc: &Dom, document: &mut Metadata) {
 /// separator-character set when surrounded by whitespace; return the two
 /// halves. The character class is the same set as the Python regex
 /// (`-`, `–`, `•`, `·`, `—`, `|`, `⁄`, `*`, `⋆`, `~`, `‹`, `«`, `<`, `›`,
-/// `»`, `>`, `:`). When multiple separators occur, the regex's leftmost
-/// match wins (greedy `(.+)?\s+SEP\s+(.+)`), which we replicate by
-/// preferring the FIRST separator (Python re `match` is leftmost-first).
+/// `»`, `>`, `:`). When multiple separators occur, group 1 `(.+)?` is
+/// **greedy**, so it maximises the LEFT half — i.e. the regex splits on the
+/// LAST separator (rightmost), leaving the smallest non-empty right half.
+/// (Verified: `"A - B - C"` → `("A - B", "C")`, not `("A", "B - C")`.)
 fn split_html_title(title: &str) -> Option<(String, String)> {
     const SEPS: &[char] = &[
         '–', '•', '·', '—', '|', '⁄', '*', '⋆', '~', '‹', '«', '<', '›', '»', '>', ':', '-',
     ];
     let chars: Vec<char> = title.chars().collect();
-    // Find the first index `i` such that chars[i-1] is whitespace, chars[i]
-    // is in SEPS, chars[i+1] is whitespace, and there is at least one
-    // non-whitespace char on each side.
-    for i in 1..chars.len().saturating_sub(1) {
+    if chars.len() < 3 {
+        return None;
+    }
+    // Greedy group 1 → scan from the RIGHT for the last index `i` such that
+    // chars[i-1] is whitespace, chars[i] is in SEPS, chars[i+1] is whitespace,
+    // and both trimmed halves are non-empty.
+    for i in (1..chars.len() - 1).rev() {
         if !SEPS.contains(&chars[i]) {
             continue;
         }
         if !chars[i - 1].is_whitespace() || !chars[i + 1].is_whitespace() {
             continue;
         }
-        // Left half: chars[0..i-1], must contain a non-whitespace char
-        // (`.+` requires >= 1 char).
         let left: String = chars[..i - 1].iter().collect();
         let right: String = chars[i + 2..].iter().collect();
         if left.trim().is_empty() || right.trim().is_empty() {
