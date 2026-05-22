@@ -43,7 +43,7 @@
 //! - `normalize_authors`: Python's `json_metadata.py:226-268` runs a full
 //!   regex-driven name-splitter / emoji-stripper / Twitter-handle-stripper /
 //!   nickname-stripper / title-case heuristic. Stage 7a ships a **lite**
-//!   variant ([`normalize_authors_lite`]) that strips HTML tags, decodes
+//!   variant ([`normalize_authors`]) that strips HTML tags, decodes
 //!   entities, trims, and applies the AUTHOR_EMAIL / URL-prefix rejection
 //!   gate from the Python source. The full normaliser arrives when 7b /
 //!   downstream JSON-LD wiring needs it (currently no test in our corpus
@@ -64,6 +64,8 @@ use crate::readability::dom::{
 use crate::trafilatura::utils::trim;
 use crate::trafilatura::xpath_engine;
 use crate::trafilatura::xpaths_constants::{AUTHOR_XPATHS, TITLE_XPATHS};
+use regex::Regex;
+use std::sync::OnceLock;
 
 // ===========================================================================
 // Metadata struct (metadata.py:Document analogue, settings.py:Document)
@@ -262,57 +264,143 @@ fn assign_og_property(metadata: &mut Metadata, property_name: &str, content: &st
 // Helpers
 // ===========================================================================
 
-/// `normalize_authors` (`json_metadata.py:226-268`) — **lite** variant.
+/// `normalize_authors(current_authors, author_string)` (`json_metadata.py:226-268`).
 ///
-/// Stage 7a needs author normalisation only for the simple `<meta>`-tag
-/// path (`metadata.py:268` `metadata.author = normalize_authors(...)`). The
-/// full Python normaliser runs a large regex-driven pipeline; the lite
-/// variant here implements the two load-bearing gates that the simple
-/// corpus tests exercise:
-///
-/// 1. **URL/email reject** (`json_metadata.py:229-230`): if the input
-///    starts with `http`/`https` or contains an `@` (rough
-///    AUTHOR_EMAIL test), return `current_authors` unchanged.
-/// 2. **Trim + HTML strip**: drop leading/trailing whitespace and any
-///    `<...>` HTML tags via the simple regex `HTML_STRIP_TAGS`
-///    (`utils.py:HTML_STRIP_TAGS` — `<[^<>]*>`).
-///
-/// Stage 7b / a future commit will fold in the full splitter / dedup /
-/// title-case heuristics when the corpus demands them.
-fn normalize_authors_lite(current: Option<&str>, candidate: &str) -> Option<String> {
-    let lowered = candidate.to_ascii_lowercase();
-    if lowered.starts_with("http") {
-        return current.map(|s| s.to_string());
+/// Full port (M8 — was a "lite" partial). Splits the candidate on
+/// `AUTHOR_SPLIT`, runs each piece through the regex-cleaning pipeline (emoji /
+/// `@handle` / `._+`→space / nickname-parenthetical / special chars / "by"
+/// prefix / digits-to-end / trailing preposition), applies the empty/too-long
+/// skip, title-cases ALL-CAPS or no-cap names, then dedup-merges into the
+/// existing `; `-joined author list and returns `'; '.join(...).strip('; ')`.
+fn normalize_authors(current: Option<&str>, author_string: &str) -> Option<String> {
+    // `if author_string.lower().startswith('http') or AUTHOR_EMAIL.match(...)`.
+    if author_string.to_ascii_lowercase().starts_with("http")
+        || author_email_re()
+            .find(author_string)
+            .is_some_and(|m| m.start() == 0)
+    {
+        return current.map(str::to_string);
     }
-    if candidate.contains('@') {
-        // Rough AUTHOR_EMAIL gate (`json_metadata.py:229`). A real email regex
-        // would tighten this; the gate is "looks like an address, skip it".
-        return current.map(|s| s.to_string());
-    }
-    // Strip simple HTML tags `<...>` via a one-pass scan (no regex
-    // dependency added for one pattern). This is faithful to
-    // `utils.py:HTML_STRIP_TAGS = re.compile(r"<[^<>]*>")`.
-    let stripped = strip_simple_html_tags(candidate);
-    let trimmed = trim(&stripped);
-    if trimmed.is_empty() {
-        return current.map(|s| s.to_string());
-    }
-    // Merge with any existing authors (`current` may already hold one).
-    // The Python source builds `new_authors = current.split("; ")` and
-    // appends; for the lite variant we simply concatenate with "; "
-    // when the candidate is new. Dedup is a string-equality match.
-    match current {
-        Some(c) if !c.is_empty() => {
-            // Skip exact duplicates.
-            let already: Vec<&str> = c.split("; ").collect();
-            if already.iter().any(|a| *a == trimmed) {
-                Some(c.to_string())
-            } else {
-                Some(format!("{c}; {trimmed}"))
-            }
+
+    // `new_authors = current_authors.split('; ')` (else []).
+    let mut new_authors: Vec<String> = match current {
+        Some(c) => c.split("; ").map(str::to_string).collect(),
+        None => Vec::new(),
+    };
+
+    // NOTE: the `'\\u' in author_string` unicode-escape branch (json_metadata.py:234)
+    // is not ported — no corpus author carries a literal backslash-u; would need
+    // Python `unicode_escape` decoding. Documented gap.
+    // `if '&#' in s or '&amp;' in s: s = unescape(s)` (json_metadata.py:237-238).
+    let unescaped = if author_string.contains("&#") || author_string.contains("&amp;") {
+        crate::readability::metadata::unescape_html_entities(author_string)
+    } else {
+        author_string.to_string()
+    };
+    // `author_string = HTML_STRIP_TAGS.sub('', author_string)`.
+    let stripped = html_strip_tags_re().replace_all(&unescaped, "").into_owned();
+
+    for piece in author_split_re().split(&stripped) {
+        let mut author = trim(piece);
+        author = author_emoji_re().replace_all(&author, "").into_owned();
+        author = author_twitter_re().replace_all(&author, "").into_owned();
+        author = trim(&author_replace_join_re().replace_all(&author, " "));
+        author = author_nickname_re().replace_all(&author, "").into_owned();
+        author = author_special_re().replace_all(&author, "").into_owned();
+        author = author_prefix_re().replace_all(&author, "").into_owned();
+        author = author_numbers_re().replace_all(&author, "").into_owned();
+        author = author_preposition_re().replace_all(&author, "").into_owned();
+
+        // `if not author or (len(author) >= 50 and ' ' not in author and '-' not in author): continue`.
+        let len = author.chars().count();
+        if author.is_empty()
+            || (len >= 50 && !author.contains(' ') && !author.contains('-'))
+        {
+            continue;
         }
-        _ => Some(trimmed),
+
+        // `if not author[0].isupper() or sum(c.isupper()) < 1: author = author.title()`.
+        let first_upper = author.chars().next().is_some_and(char::is_uppercase);
+        let any_upper = author.chars().any(char::is_uppercase);
+        if !first_upper || !any_upper {
+            author = python_title_case(&author);
+        }
+
+        // `if author not in new_authors and (len==0 or all(na not in author))`.
+        if !new_authors.iter().any(|na| na == &author)
+            && (new_authors.is_empty() || new_authors.iter().all(|na| !author.contains(na.as_str())))
+        {
+            new_authors.push(author);
+        }
     }
+
+    if new_authors.is_empty() {
+        return current.map(str::to_string);
+    }
+    // `'; '.join(new_authors).strip('; ')`.
+    Some(
+        new_authors
+            .join("; ")
+            .trim_matches(|c| c == ';' || c == ' ')
+            .to_string(),
+    )
+}
+
+// ---- AUTHOR_* regexes (json_metadata.py:21-54, utils.py:66) ----------------
+
+fn author_email_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b").unwrap())
+}
+fn html_strip_tags_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"(?s)(<!--.*?-->|<[^>]*>)").unwrap())
+}
+fn author_split_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"(?i)/|;|,|\||&|(?:^|\W)[u|a]nd(?:$|\W)").unwrap())
+}
+fn author_emoji_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| {
+        Regex::new(
+            "[\u{2700}-\u{27BE}\u{1F600}-\u{1F64F}\u{2600}-\u{26FF}\u{1F300}-\u{1F5FF}\
+             \u{1F900}-\u{1F9FF}\u{1FA70}-\u{1FAFF}\u{1F680}-\u{1F6FF}]+",
+        )
+        .unwrap()
+    })
+}
+fn author_twitter_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"@\w+").unwrap())
+}
+fn author_replace_join_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"[._+]").unwrap())
+}
+fn author_nickname_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r#"["‘({\[’'][^"]+?[‘’"')\]}]"#).unwrap())
+}
+fn author_special_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"[^\w]+$|[:()?*$#!%/<>{}~¿]").unwrap())
+}
+fn author_prefix_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| {
+        Regex::new(r"(?i)^([a-zäöüß]+(ed|t))? ?(written by|words by|words|by|von|from) ").unwrap()
+    })
+}
+fn author_numbers_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"\d.+?$").unwrap())
+}
+fn author_preposition_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| {
+        Regex::new(r"(?i)\b\s+(am|on|for|at|in|to|from|of|via|with|—|-|–)\s+(.*)").unwrap()
+    })
 }
 
 /// One-pass strip of `<...>` HTML tag patterns (`utils.py:HTML_STRIP_TAGS =
@@ -436,7 +524,7 @@ fn examine_opengraph(head: &NodeRef, metadata: &mut Metadata) {
         assign_og_property(metadata, &property_lower, &content);
         // og:author / og:article:author (`metadata.py:213-214`).
         if OG_AUTHOR.contains(&property_lower.as_str()) {
-            metadata.author = normalize_authors_lite(metadata.author.as_deref(), &content);
+            metadata.author = normalize_authors(metadata.author.as_deref(), &content);
         }
         // og:url -> `Metadata.url` (Stage 7a stub: we DO accept the og:url
         // value here even though full URL canonicalization is Stage 7d.
@@ -492,7 +580,7 @@ fn examine_meta(doc: &Dom, document: &mut Metadata) {
                     tags.push(normalized);
                 }
             } else if PROPERTY_AUTHOR.contains(&property_attr.as_str()) {
-                document.author = normalize_authors_lite(document.author.as_deref(), &content);
+                document.author = normalize_authors(document.author.as_deref(), &content);
             } else if property_attr == "article:publisher" && document.site_name.is_none() {
                 document.site_name = Some(content);
             } else if METANAME_IMAGE.contains(&property_attr.as_str())
@@ -507,7 +595,7 @@ fn examine_meta(doc: &Dom, document: &mut Metadata) {
         if let Some(name_raw) = get_attribute(&elem, "name") {
             let name_attr = name_raw.to_ascii_lowercase();
             if METANAME_AUTHOR.contains(&name_attr.as_str()) {
-                document.author = normalize_authors_lite(document.author.as_deref(), &content);
+                document.author = normalize_authors(document.author.as_deref(), &content);
             } else if METANAME_TITLE.contains(&name_attr.as_str()) {
                 if document.title.is_none() {
                     document.title = Some(content);
@@ -541,7 +629,7 @@ fn examine_meta(doc: &Dom, document: &mut Metadata) {
         if let Some(itemprop_raw) = get_attribute(&elem, "itemprop") {
             let itemprop_attr = itemprop_raw.to_ascii_lowercase();
             if itemprop_attr == "author" {
-                document.author = normalize_authors_lite(document.author.as_deref(), &content);
+                document.author = normalize_authors(document.author.as_deref(), &content);
             } else if itemprop_attr == "description" {
                 if document.description.is_none() {
                     document.description = Some(content);
@@ -731,7 +819,7 @@ fn extract_title(doc: &Dom) -> Option<String> {
 fn extract_author(doc: &Dom, blacklist: &[String]) -> Option<String> {
     let body = doc.body()?;
     let raw = extract_metainfo(&body, AUTHOR_XPATHS, 120)?;
-    let normalized = normalize_authors_lite(None, &raw)?;
+    let normalized = normalize_authors(None, &raw)?;
     if !blacklist.is_empty() {
         check_authors(&normalized, blacklist)
     } else {
@@ -1169,32 +1257,32 @@ mod tests {
     }
 
     #[test]
-    fn normalize_authors_lite_rejects_urls() {
-        let out = normalize_authors_lite(None, "https://example.com/by/jane");
+    fn normalize_authors_rejects_urls() {
+        let out = normalize_authors(None, "https://example.com/by/jane");
         assert_eq!(out, None);
     }
 
     #[test]
-    fn normalize_authors_lite_rejects_emails() {
-        let out = normalize_authors_lite(None, "jane@example.com");
+    fn normalize_authors_rejects_emails() {
+        let out = normalize_authors(None, "jane@example.com");
         assert_eq!(out, None);
     }
 
     #[test]
-    fn normalize_authors_lite_strips_html_tags() {
-        let out = normalize_authors_lite(None, "<span>Jane Doe</span>");
+    fn normalize_authors_strips_html_tags() {
+        let out = normalize_authors(None, "<span>Jane Doe</span>");
         assert_eq!(out.as_deref(), Some("Jane Doe"));
     }
 
     #[test]
-    fn normalize_authors_lite_joins_multiple_with_semicolon() {
-        let out = normalize_authors_lite(Some("Jane Doe"), "John Smith");
+    fn normalize_authors_joins_multiple_with_semicolon() {
+        let out = normalize_authors(Some("Jane Doe"), "John Smith");
         assert_eq!(out.as_deref(), Some("Jane Doe; John Smith"));
     }
 
     #[test]
-    fn normalize_authors_lite_dedupes_exact_match() {
-        let out = normalize_authors_lite(Some("Jane Doe"), "Jane Doe");
+    fn normalize_authors_dedupes_exact_match() {
+        let out = normalize_authors(Some("Jane Doe"), "Jane Doe");
         assert_eq!(out.as_deref(), Some("Jane Doe"));
     }
 
