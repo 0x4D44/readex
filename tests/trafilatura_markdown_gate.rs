@@ -145,18 +145,30 @@ const PYTHON_UNDER_EXTRACT_ALLOWLIST: &[&str] = &[
 /// rail — but the per-fixture ADRs cite each other when the choice was
 /// non-obvious.
 const DEFERRED_KNOWN_DEFECT: &[&str] = &[
-    // FRED (St. Louis Fed) economic-data page. mdrcel's jusText port
-    // classifies fewer paragraphs as "good" than Python's
-    // `justext.core.classify_paragraphs` does on the same body
-    // (487 chars vs 2907 chars on the substantive content). The
-    // jusText-override gate (`len_text > 4 * jt_len`) then evaluates
-    // TRUE in Rust (5128 > 1948) but FALSE in Python (5128 < 11628),
-    // so Python's cascade REPLACES the readability winner with the
-    // jusText result while Rust's does NOT — leaving the `<noscript>`
-    // "Please enable JavaScript" stub as Rust's emitted body. Genuine
-    // mdrcel defect (not anti-inversion). ADR:
-    // wrk_docs/m5-deferred/e339ce76.md. Suggested milestone: M6.
-    "e339ce76eb1cba73.html",
+    // FRED (St. Louis Fed) economic-data page (`e339ce76eb1cba73.html`)
+    // — FORMERLY deferred under the misdiagnosed "jusText classifier
+    // returns 487 chars" hypothesis. M6 Stage 3 anti-inversion
+    // verification: the classifier itself is structurally faithful, but
+    // TWO independent surface bugs combined to truncate FRED's
+    // markdown output to a 5187-char noscript stub:
+    //   (1) Threshold mismatch — `try_justext` was calling
+    //       `classify_and_revise` with jusText's library defaults
+    //       (length_low=70, stopwords_high=0.32, no_headings=False) when
+    //       trafilatura's `custom_justext` (external.py:121-126)
+    //       overrides them to (50, 150, 0.1, 0.2, 0.25, no_headings=True).
+    //       The wider net is what classifies English narrative paragraphs
+    //       at 0.10-0.30 stopword density as `good` instead of `bad`.
+    //   (2) `cleaned_tree_backup` missing — Python (core.py:281,297)
+    //       deep-copies the post-`tree_cleaning` body BEFORE
+    //       `convert_tags`/`extract_content` mutate it, then hands the
+    //       copy to `compare_extraction` so `justext_rescue` sees the
+    //       full un-extracted tree. mdrcel passed the same `body`
+    //       NodeRef that `extract_content` had stripped down to ~10% of
+    //       its element content, so jusText saw a truncated tree.
+    // Fix landed in `justext_core::custom_justext` (new helper) plus
+    // `bare_extraction_with_cascade::cleaned_body_backup` (deep_clone
+    // before convert_tags). Fixture now byte-equivalent to Python.
+    // (No allowlist entry — mdrcel was the buggy side on both surfaces.)
     // PBS (CNN-lite) news article (`e1106c5e26712078.html`) — FORMERLY
     // deferred under the misdiagnosed `BODY_XPATH selection divergence`
     // hypothesis. M6 Stage 2 anti-inversion verification: BOTH engines

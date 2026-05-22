@@ -2707,7 +2707,44 @@ name = "mdrcel"
 # Lib tests 1155 -> 1156 (one new in-place-mutation pin test, one
 # pre-existing test rewritten to match Python-faithful semantics — the
 # previous test pinned the wrong M2 re-parse behaviour).
-version = "0.16.1"
+#
+# M6 Stage 3 (2026-05-22): 0.16.1 -> 0.16.2 PATCH. Two-surface bug fix on
+# the jusText cascade arm (`src/trafilatura/justext_core.rs` +
+# `src/trafilatura/readability_fork.rs`) closing the last M5 deferred
+# fixture (`e339ce76eb1cba73.html` — FRED St. Louis Fed economic-data
+# page). The M5 deferred ADR diagnosed "jusText classifier returns 487
+# vs 2907 chars" as a classifier-internal defect; M6 Stage 3 anti-
+# inversion verification revealed two independent surface bugs upstream
+# of the classifier:
+#   (1) `try_justext` invoked `classify_and_revise` with jusText's
+#       library defaults (length_low=70, stopwords_high=0.32,
+#       no_headings=False) instead of trafilatura's `custom_justext`
+#       overrides (50, 150, 0.1, 0.2, 0.25, no_headings=True) from
+#       `external.py:121-126`. The overrides are DRAMATICALLY more
+#       permissive on stopword density and matter on English-narrative
+#       fixtures where many paragraphs sit in the 0.10-0.30 band that
+#       the defaults classify as bad. Fix: new private `custom_justext`
+#       helper that calls `classify_paragraphs_with`/
+#       `revise_paragraph_classification_with` with the override
+#       thresholds verbatim.
+#   (2) `bare_extraction_with_cascade` passed the same `body` NodeRef to
+#       both `extract_content` AND `compare_extraction`. `extract_content`
+#       mutates the body in place (strips elements, marks done, etc.),
+#       so by the time `justext_rescue(tree, ...)` ran inside
+#       `compare_extraction`, jusText saw a body already pruned to ~10%
+#       of its element content. Python (`core.py:281,297`) deep-copies
+#       `cleaned_tree_backup` BEFORE the mutation chain and hands the
+#       copy to `compare_extraction`; mdrcel did not. Fix: deep_clone
+#       the body to `cleaned_body_backup` before `convert_tags`/
+#       `extract_content` and pass the backup to `compare_extraction`.
+# Both fixes are required — fix (1) alone gives 1299 chars (partial,
+# wrong content selection); fix (2) alone preserves the wrong jusText
+# thresholds. Together they produce byte-equivalent output to Python.
+# Markdown corpus gate: 42 -> 43 substantive; deferred 1 -> 0 (bucket
+# retired). 5 prior BLOCKER gates remain green. Lib tests 1156
+# (unchanged). PATCH bump per semver — no public API change, no new
+# dependency.
+version = "0.16.2"
 edition = "2024"
 
 # M5 Stage 6e-b (2026-05-21): 0.15.10 -> 0.15.11 PATCH. No source change —

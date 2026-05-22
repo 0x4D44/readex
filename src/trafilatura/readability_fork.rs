@@ -2107,6 +2107,25 @@ pub fn bare_extraction_with_cascade(
     let dom = Dom::parse(html);
     let html_root = dom.root_element()?;
     crate::trafilatura::cleaning::tree_cleaning(&html_root, opts);
+
+    // core.py:281 — `cleaned_tree_backup = copy(cleaned_tree)`. Python
+    // deep-copies the post-`tree_cleaning` tree BEFORE `convert_tags` /
+    // `extract_content` mutate it, then hands the copy to
+    // `compare_extraction` as its `tree` arg so that `justext_rescue` sees
+    // the un-extracted tree. Without this, `_extract` strips the body
+    // down to ~10% of its original element content before jusText runs,
+    // which on table-heavy / `<noscript>`-tainted fixtures (FRED,
+    // M5 deferred `e339ce76`) causes the jusText arm to return a
+    // truncated body and the cascade arbiter to keep the noscript stub
+    // as the "winner". Doctrinal note: this is the canonical `rcdom`
+    // shared-ownership trap the M5 journal flagged as systemic — the
+    // same body NodeRef is mutated in place by extract_content unless we
+    // hand jusText a fresh subtree.
+    let cleaned_body_backup = {
+        let body = dom.body()?;
+        crate::readability::dom::deep_clone(&body)
+    };
+
     crate::trafilatura::cleaning::convert_tags(&html_root, opts);
     let body = dom.body()?;
     let (own_body, own_text, own_len) =
@@ -2115,13 +2134,12 @@ pub fn bare_extraction_with_cascade(
     // external.py:45-108 — full 7-branch arbiter + jusText override +
     // sanitize_tree post-pass. Stage 6 replaces the simplified
     // `cascade_prefers_readability` length-only fold with the faithful
-    // Python `compare_extraction`. We pass the cleaned `body` as Python's
-    // `tree` arg (Python's `tree` is the pre-cleaning DOM at the
-    // `trafilatura_sequence` callsite; in the Rust cascade we already ran
-    // tree_cleaning above, so `body` here is the structurally-equivalent
-    // input — see Faithful divergence #1 in `compare_extraction`'s docs).
+    // Python `compare_extraction`. Pass the pre-extract_content
+    // `cleaned_body_backup` as `tree` so jusText sees the full
+    // tree-cleaned body — mirroring Python's `cleaned_tree_backup`
+    // (core.py:281,297; external.py:97).
     let (winning_body, winning_text, winning_len) =
-        compare_extraction(&body, html, &own_body, own_text, own_len, opts);
+        compare_extraction(&cleaned_body_backup, html, &own_body, own_text, own_len, opts);
 
     // core.py:123-125 — baseline rescue.
     //

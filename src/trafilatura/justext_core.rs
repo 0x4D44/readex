@@ -1276,18 +1276,82 @@ fn resolve_stoplist(target_language: Option<&str>) -> &'static [String] {
 ///   union the Python `JT_STOPLIST` fallback represents).
 pub fn try_justext(tree: &NodeRef, _url: Option<&str>, target_language: Option<&str>) -> Vec<Paragraph> {
     let stoplist = resolve_stoplist(target_language);
-    // Stage 5a's get_stoplist returns Vec<String>; classify_and_revise
+    // Stage 5a's get_stoplist returns Vec<String>; classify_paragraphs_with
     // wants &[&str] — collect references in a temporary owned slice.
     let stoplist_refs: Vec<&str> = stoplist.iter().map(|s| s.as_str()).collect();
 
-    let mut paragraphs = make_paragraphs(tree);
-    classify_and_revise(&mut paragraphs, &stoplist_refs);
+    let mut paragraphs = custom_justext(tree, &stoplist_refs);
 
     // external.py:144-149 — filter to non-boilerplate paragraphs.
     paragraphs
-        .into_iter()
+        .drain(..)
         .filter(|p| !p.is_boilerplate.unwrap_or(true))
         .collect()
+}
+
+/// `custom_justext(tree, stoplist)` — `trafilatura/external.py:121-126`.
+///
+/// Trafilatura's *customised* jusText runner: it deliberately overrides
+/// every default threshold from `justext/core.py:28-36` to widen the net
+/// for content-vs-boilerplate classification. Faithful port of:
+///
+/// ```python
+/// def custom_justext(tree, stoplist):
+///     paragraphs = ParagraphMaker.make_paragraphs(tree)
+///     classify_paragraphs(paragraphs, stoplist, 50, 150, 0.1, 0.2, 0.25, True)
+///     revise_paragraph_classification(paragraphs, 150)
+///     return paragraphs
+/// ```
+///
+/// The argument layout matches `classify_paragraphs(paragraphs, stoplist,
+/// length_low, length_high, stopwords_low, stopwords_high,
+/// max_link_density, no_headings)` from `justext/core.py:243-246`:
+/// - `length_low=50` (vs default 70) — short-paragraph threshold lowered
+/// - `length_high=150` (vs default 200) — high-density cutoff lowered
+/// - `stopwords_low=0.1` (vs default 0.30) — DRAMATICALLY more permissive
+/// - `stopwords_high=0.2` (vs default 0.32) — DRAMATICALLY more permissive
+/// - `max_link_density=0.25` (vs default 0.2) — slightly more tolerant
+/// - `no_headings=True` (vs default False) — disables heading-as-good promo
+///
+/// And `revise_paragraph_classification(paragraphs, 150)` lowers
+/// `max_heading_distance` from 200 to 150 (matters only when
+/// `no_headings=False`, which trafilatura sets to `True`; kept for
+/// line-cite parity with `external.py:125`).
+///
+/// Without these overrides, paragraphs with stopword density in the
+/// 0.10–0.30 range — typical for English news / data narrative — are
+/// classified as `bad` by `classify_paragraphs`, which causes the
+/// jusText-override gate in `compare_extraction` (`core.py:255`) to keep
+/// the readability-arm winner even when it is contaminated with
+/// `<noscript>` chrome. The FRED fixture is the canonical case (see
+/// `wrk_docs/m5-deferred/e339ce76.md`).
+///
+/// This also matches `is_boilerplate` materialization done by
+/// [`classify_and_revise`] but is inlined to keep the threshold-override
+/// path self-contained.
+fn custom_justext(tree: &NodeRef, stoplist: &[&str]) -> Vec<Paragraph> {
+    let mut paragraphs = make_paragraphs(tree);
+    // `classify_paragraphs(paragraphs, stoplist, 50, 150, 0.1, 0.2, 0.25, True)`
+    classify_paragraphs_with(
+        &mut paragraphs,
+        stoplist,
+        50,    // length_low
+        150,   // length_high
+        0.1,   // stopwords_low
+        0.2,   // stopwords_high
+        0.25,  // max_link_density
+        true,  // no_headings
+    );
+    // `revise_paragraph_classification(paragraphs, 150)`
+    revise_paragraph_classification_with(&mut paragraphs, 150);
+    // Materialize is_boilerplate = (class_type != "good"), matching what
+    // `classify_and_revise` does (and what Python's lazy
+    // `Paragraph.is_boilerplate` evaluates to at `paragraph.py:29-30`).
+    for paragraph in paragraphs.iter_mut() {
+        let is_boilerplate = paragraph.class_type.as_deref() != Some(CF_GOOD);
+        paragraph.is_boilerplate = Some(is_boilerplate);
+    }
+    paragraphs
 }
 
 /// `justext_rescue(tree, options)` — `external.py:153-160`.
