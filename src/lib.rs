@@ -1206,15 +1206,16 @@ pub fn extract_to_tei(
     // surface. Mirrors `extract_to_xml`'s pipeline shape; the only difference
     // is the `OutputFormat::Tei` discriminator passed to `control_xml_output`.
 
-    // 1. Metadata — always extract (the TEI header consumes everything; even
-    //    `with_metadata=false` produces a structurally valid header with empty
-    //    fields). `with_metadata` gates whether populated metadata reaches the
-    //    header (false = blank header fields).
-    let metadata = if opts.with_metadata {
-        trafilatura::metadata::extract_metadata(html, base_url, true, &[])
-    } else {
-        trafilatura::metadata::Metadata::default()
-    };
+    // 1. Metadata — ALWAYS extract, regardless of `opts.with_metadata`.
+    //    Faithful port of `Extractor.__init__` (settings.py:144-149): the
+    //    effective `with_metadata` is forced `True` whenever
+    //    `output_format == "xmltei"`, so the TEI header is always populated
+    //    from extracted metadata (unlike the plain `xml` path, where
+    //    `with_metadata=False` yields a bare `<doc fingerprint=…>` root). The
+    //    teiHeader is structurally mandatory and consumes the full metadata
+    //    set (title/author/publisher/date/url), so TEI cannot honour a
+    //    `with_metadata=False` request the way txt/json/xml do.
+    let metadata = trafilatura::metadata::extract_metadata(html, base_url, true, &[]);
 
     // 2. Body extraction via the cascade.
     let cleaning_opts = trafilatura::cleaning::Options {
@@ -2665,18 +2666,21 @@ mod tests {
     /// Brief #3 — with_metadata=false: header still emitted (TEI requires it)
     /// but with blank fields.
     #[test]
-    fn extract_to_tei_without_metadata_still_emits_minimal_header() {
+    fn extract_to_tei_always_extracts_metadata_for_header() {
         let html = r#"<html>
-            <head><title>Should Not Appear</title></head>
+            <head><title>Should Appear In Header</title></head>
             <body><article><p>The body content here.</p></article></body>
         </html>"#;
+        // TEI forces with_metadata=True regardless of opts (faithful port of
+        // settings.py:144-149 `output_format == "xmltei"`), so the populated
+        // header appears even with the default Options (with_metadata=false).
         let s = extract_to_tei(html, None, &Options::default()).expect("ok");
         // teiHeader is always present (TEI conformance).
         assert!(s.contains("<teiHeader>"), "{s}");
-        // But the title from metadata should NOT appear (with_metadata=false).
+        // The extracted title DOES reach the header — TEI always populates it.
         assert!(
-            !s.contains("Should Not Appear"),
-            "title must NOT leak when with_metadata=false: {s}"
+            s.contains("Should Appear In Header"),
+            "TEI header must carry extracted metadata title: {s}"
         );
     }
 

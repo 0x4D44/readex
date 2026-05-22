@@ -1854,6 +1854,17 @@ fn _handle_unwanted_tails(element: &NodeRef) {
         return;
     };
 
+    // xml.py:529 — `element.tail = None`. In lxml the tail is an attribute of
+    // the element; clearing it is a pure metadata edit that does not move
+    // siblings. In our rcdom the tail is the run of Text-node siblings AFTER
+    // `element`, so we must drop it FIRST: otherwise the new `<p>` sibling
+    // inserted at `idx + 1` below would land BETWEEN `element` and its tail
+    // text node, leaving that text node orphaned as the new `<p>`'s OWN tail
+    // (and re-introducing mixed content under the parent `<div>`). We have
+    // already captured the value in `trimmed`, so removing the node now is
+    // safe for both branches.
+    set_tail(element, None);
+
     let tag = local_name(element).unwrap_or_default();
     if tag == "p" {
         // xml.py:521-522 — `element.text = " ".join(filter(None, [element.text, element.tail]))`.
@@ -1875,8 +1886,6 @@ fn _handle_unwanted_tails(element: &NodeRef) {
             insert_child_at(&p, &new_sibling, idx + 1);
         }
     }
-    // xml.py:529 — `element.tail = None`.
-    set_tail(element, None);
 }
 
 /// `xml.py:532-550` — `_tei_handle_complex_head(element)`.
@@ -1928,9 +1937,18 @@ fn _tei_handle_complex_head(element: &NodeRef) -> NodeRef {
                 set_element_text(&new_element, Some(&child_text));
             }
         } else {
-            // xml.py:545-546 — append other children verbatim.
+            // xml.py:545-546 — `new_element.append(child)`. In lxml the child's
+            // tail travels WITH the element (tail is an element attribute). In
+            // our rcdom the tail is a separate following Text-node sibling that
+            // `dom::remove` + `dom::append_child` would leave behind, silently
+            // dropping it (e.g. `<head ...><code>if</code> expressions</head>`
+            // would lose " expressions"). Capture and re-apply it.
+            let child_tail = tail(&child);
             dom::remove(&child);
             dom::append_child(&new_element, &child);
+            if let Some(t) = child_tail {
+                set_tail(&child, Some(&t));
+            }
         }
     }
 

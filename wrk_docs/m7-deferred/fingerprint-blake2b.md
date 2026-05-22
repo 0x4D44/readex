@@ -26,6 +26,23 @@ deferred triage still routes those fixtures correctly.
 The single fingerprint column is **masked + shape-checked** in the gate; the
 blake2b-dependency question is **batched for Arthur at M7 close**.
 
+## Also affects xmltei (Stage 5)
+
+On the TEI path the same `core.py:481-485` unconditional fingerprint runs, but
+the value surfaces as the TEXT of `<note type="fingerprint">…</note>` inside the
+`<teiHeader>`'s `notesStmt` (`write_fullheader`, xml.py:447) rather than a `<doc>`
+attribute. Python emits `<note type="fingerprint">fbe8c3db32b3b7c2</note>`;
+mdrcel (no fingerprint slot, M4 Stage 6 deferred) emits an empty
+`<note type="fingerprint"/>`. `tests/trafilatura_tei_gate.rs` reconciles this the
+same way: it SHAPE-CHECKS Python's note text (well-formed lowercase-hex, 1–16
+chars) where present, then COLLAPSES the `<note type="fingerprint">…</note>`
+element to the canonical empty `<note type="fingerprint"/>` on BOTH sides before
+byte-comparing. This is independent of (and applied alongside) the broader
+teiHeader metadata neutralisation documented in
+`wrk_docs/m7-deferred/tei-header-metadata.md` — the fingerprint note is one
+field inside the header region that gate also neutralises, but it has its own
+shape-check so the simhash divergence stays explicitly accounted for.
+
 ## The divergence
 
 Python's `core.py:481-485` populates `document.fingerprint` for every

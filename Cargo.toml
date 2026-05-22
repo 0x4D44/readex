@@ -2793,7 +2793,25 @@ name = "mdrcel"
 # divergences (XBRL/1991-site/pre-code-newline/empty-cell — ADRs under
 # wrk_docs/m7-allowlist/), 1 deferred U+2063 (507b9cdb.md). No new public
 # API/type, no new dependency.
-version = "0.17.3"
+#
+# M7 Stage 5 (2026-05-22): 0.17.3 -> 0.17.4 PATCH. xmltei (TEI) differential
+# gate (tests/trafilatura_tei_gate.rs) lands GREEN at 51/51 = 39 substantive +
+# 11 allowlisted + 1 deferred. Two genuine internal TEI-serialiser fixes in
+# output.rs's check_tei helpers (no API change): (1) _handle_unwanted_tails now
+# clears an <ab>'s tail BEFORE inserting the new <p> sibling (rcdom stores tails
+# as sibling Text-nodes, so the old post-insert clear orphaned the tail onto the
+# new <p>, re-introducing mixed content and suppressing <div type="entry">
+# pretty-print); (2) _tei_handle_complex_head now carries a non-<p> child's tail
+# when re-parenting it (dom::remove+append_child dropped the sibling Text-node,
+# e.g. losing " expressions" after <code>if</code>). lib.rs extract_to_tei now
+# ALWAYS extracts metadata, mirroring Python's settings.py:144-149 forcing of
+# with_metadata=True for output_format=="xmltei" (behaviour change, frozen
+# signature). The metadata-bearing <teiHeader> is neutralised test-side (ADR
+# tei-header-metadata.md) — the TEI <text> subtree is byte-identical on all 39
+# substantive fixtures; residual header divergence (filedate/fingerprint/date/
+# hostname/author) is the metadata subsystem, deferred. No new public API/type,
+# no new dependency.
+version = "0.17.4"
 edition = "2024"
 
 # M7 Stage 1 (2026-05-22): 0.16.2 -> 0.17.0 MINOR. New public function
