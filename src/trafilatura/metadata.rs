@@ -63,7 +63,7 @@ use crate::readability::dom::{
 };
 use crate::trafilatura::utils::trim;
 use crate::trafilatura::xpath_engine;
-use crate::trafilatura::xpaths_constants::{AUTHOR_XPATHS, TITLE_XPATHS};
+use crate::trafilatura::xpaths_constants::{AUTHOR_DISCARD_XPATHS, AUTHOR_XPATHS, TITLE_XPATHS};
 use regex::Regex;
 use std::sync::OnceLock;
 
@@ -811,14 +811,19 @@ fn extract_title(doc: &Dom) -> Option<String> {
 
 /// `extract_author(tree)` (`metadata.py:379-386`).
 ///
-/// Stage 7a does NOT yet apply `AUTHOR_DISCARD_XPATHS` pruning — the
-/// Python source `deepcopy(tree)`s and runs `prune_unwanted_nodes` first.
-/// The discard XPaths target comment lists / hidden blocks / time/figure
-/// elements which the corpus tests do not exercise; if a future test
-/// fails due to this gap, the prune is a one-shot add.
+/// Python: `subtree = prune_unwanted_nodes(deepcopy(tree), AUTHOR_DISCARD_XPATHS);
+/// author = extract_metainfo(subtree, AUTHOR_XPATHS, len_limit=120)`. M8 wires
+/// the discard-prune (was skipped): it removes comment/sidebar/title/date/
+/// `//time`/`//figure` blocks before AUTHOR_XPATHS runs, so spurious matches
+/// (a headline or nav text mistaken for a byline) are pruned — Python returns
+/// no author there, and mdrcel now matches (5f27add4, eceb9608). We `deep_clone`
+/// the body so the shared metadata `Dom` (reused for categories/tags/license)
+/// is not mutated.
 fn extract_author(doc: &Dom, blacklist: &[String]) -> Option<String> {
     let body = doc.body()?;
-    let raw = extract_metainfo(&body, AUTHOR_XPATHS, 120)?;
+    let subtree = crate::readability::dom::deep_clone(&body);
+    crate::trafilatura::cleaning::prune_unwanted_nodes(&subtree, AUTHOR_DISCARD_XPATHS, false);
+    let raw = extract_metainfo(&subtree, AUTHOR_XPATHS, 120)?;
     let normalized = normalize_authors(None, &raw)?;
     if !blacklist.is_empty() {
         check_authors(&normalized, blacklist)
