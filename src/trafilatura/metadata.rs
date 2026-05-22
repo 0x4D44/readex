@@ -122,6 +122,12 @@ pub struct Metadata {
     pub pagetype: Option<String>,
     /// `Document.license` — empty at Stage 7a (future fold-in).
     pub license: Option<String>,
+    /// `Document.filedate` — the download/extraction date. Python sets this
+    /// to `date_config["max_date"]` = `datetime.now().strftime("%Y-%m-%d")`
+    /// (`metadata.py:586` + `settings.py:202`), i.e. *today*. M8 added this
+    /// slot (M4 Stage 6 had deferred it). Rendered as `<date type="download">`
+    /// in the TEI header.
+    pub filedate: Option<String>,
 }
 
 // ===========================================================================
@@ -746,6 +752,58 @@ fn extract_description(_doc: &Dom) -> Option<String> {
 }
 
 // ===========================================================================
+// "today" source (metadata.py:586 / settings.py:202)
+// ===========================================================================
+
+/// Today's date as `(year, month, day)` in UTC.
+///
+/// Python's `set_date_params` (`settings.py:202`) computes
+/// `datetime.now().strftime("%Y-%m-%d")` — *local* civil date — and uses it
+/// for BOTH `filedate` (`metadata.py:586`) and htmldate's `max_date` upper
+/// bound (`metadata.py:546`). mdrcel is otherwise fully deterministic, but
+/// reproducing Python's "today" is the ONLY way to byte-match the
+/// `<date type="download">` filedate and to reject post-today garbage dates in
+/// htmldate. We compute the UTC civil date from the system clock via Howard
+/// Hinnant's `civil_from_days` algorithm (no new dependency).
+///
+/// Caveat (documented in the M8 journal): we use UTC, Python uses local. On
+/// this UTC+1 host the two civil dates agree except in the ~1h window around
+/// local midnight (UTC 23:00–00:00), where mdrcel would be one day behind. The
+/// live TEI gate runs both sides within milliseconds, so this only flakes if a
+/// run straddles that window — an accepted residual versus adding a timezone
+/// dependency.
+fn today_utc() -> (i32, u32, u32) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let days = secs.div_euclid(86_400);
+    civil_from_days(days)
+}
+
+/// Howard Hinnant's `civil_from_days`: convert a count of days since the Unix
+/// epoch (1970-01-01) to a `(year, month, day)` Gregorian civil date.
+fn civil_from_days(days: i64) -> (i32, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32; // [1, 12]
+    let year = (y + i64::from(m <= 2)) as i32;
+    (year, m, d)
+}
+
+/// Format a `(year, month, day)` tuple as Python's `%Y-%m-%d`.
+fn ymd_to_iso((y, m, d): (i32, u32, u32)) -> String {
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+// ===========================================================================
 // extract_metadata orchestrator (metadata.py:482-589)
 // ===========================================================================
 
@@ -771,6 +829,12 @@ pub fn extract_metadata(
 
     let dom = Dom::parse(html);
     let mut metadata = Metadata::default();
+
+    // Python's `set_date_params` (settings.py:197-203) computes
+    // `max_date = datetime.now().strftime("%Y-%m-%d")` ONCE and uses it for
+    // both htmldate's upper bound (metadata.py:546) and `filedate`
+    // (metadata.py:586). We mirror that: compute today once and share it.
+    let today = today_utc();
 
     // <html lang="..."> (`metadata.py:Document.language` — populated by
     // json_metadata typically; Stage 7a takes it from the html element
@@ -842,11 +906,33 @@ pub fn extract_metadata(
         metadata.description = extract_description(&dom);
     }
 
-    // 8. Sitename: `<title>` separator-split fallback (`metadata.py:550-572`).
+    // 8. URL fallback (`metadata.py:538-539`). Only fires when earlier passes
+    //    (og:url / twitter:url / JSON-LD) didn't already populate `metadata.url`.
+    if metadata.url.is_none() {
+        metadata.url = crate::trafilatura::metadata_url::extract_url(&dom, default_url);
+    }
+
+    // 9. Hostname from URL (`metadata.py:542-543`). Always fires when a URL is
+    //    present (Python overwrites unconditionally). `extract_domain` returns
+    //    the registered domain (leading subdomain / `www.` stripped).
+    if let Some(ref url) = metadata.url {
+        metadata.hostname = crate::trafilatura::metadata_url::extract_domain(url);
+    }
+
+    // 10. Date (`metadata.py:546-547`). Python assigns `metadata.date =
+    //     find_date(tree, **date_config)` UNCONDITIONALLY — overwriting any
+    //     JSON-LD `datePublished` set by `extract_meta_json` — so the final
+    //     date is always htmldate's output (`%Y-%m-%d`, date-only, bounded at
+    //     today). M8 fix: match that (was a `if date.is_none()` gate that let
+    //     the raw JSON-LD timestamp win, e.g. `2002-06-06T01:53:27Z`).
+    metadata.date = crate::trafilatura::metadata_url::extract_date(&dom, today);
+
+    // 11. Sitename (`metadata.py:549-572`). If still empty, try the `<title>`
+    //     separator-split (`extract_sitename`, metadata.py:550). Then normalise
+    //     a present sitename (strip a leading `@`; title-case a dot-less,
+    //     lower-initial name); ELSE derive it from the URL host via `META_URL`.
     if metadata.site_name.is_none() {
         let (_raw, first, second) = examine_title_element(&dom);
-        // Prefer the half containing a "." (interpreted as the site domain
-        // hint, `metadata.py:419` `extract_sitename`).
         for half in [first.as_deref(), second.as_deref()].into_iter().flatten() {
             if half.contains('.') {
                 metadata.site_name = Some(half.to_string());
@@ -854,25 +940,24 @@ pub fn extract_metadata(
             }
         }
     }
-
-    // 9. URL fallback (Stage 7d, `metadata.py:538-539`). Only fires when
-    //    earlier passes (og:url / twitter:url / JSON-LD) didn't already
-    //    populate `metadata.url`.
-    if metadata.url.is_none() {
-        metadata.url = crate::trafilatura::metadata_url::extract_url(&dom, default_url);
-    }
-
-    // 10. Hostname from URL (Stage 7d, `metadata.py:542-543`). Always fires
-    //     when a URL is present (Python overwrites unconditionally).
-    if let Some(ref url) = metadata.url {
-        metadata.hostname = crate::trafilatura::metadata_url::extract_domain(url);
-    }
-
-    // 11. Date fallback (Stage 7d, `metadata.py:546-547`). Stage 7d is an
-    //     additive STUB — only fires when JSON-LD (Stage 7b) didn't already
-    //     populate `metadata.date`.
-    if metadata.date.is_none() {
-        metadata.date = crate::trafilatura::metadata_url::extract_date(&dom);
+    if let Some(sn) = metadata.site_name.take() {
+        // `metadata.sitename.lstrip("@")` (metadata.py:560).
+        let sn = sn.trim_start_matches('@').to_string();
+        // `if "." not in sitename and not sitename[0].isupper(): .title()`
+        // (metadata.py:562-567).
+        let sn = if !sn.is_empty()
+            && !sn.contains('.')
+            && !sn.chars().next().is_some_and(|c| c.is_uppercase())
+        {
+            python_title_case(&sn)
+        } else {
+            sn
+        };
+        metadata.site_name = Some(sn);
+    } else if let Some(url) = metadata.url.as_deref() {
+        // `mymatch = META_URL.match(url); sitename = mymatch[1]`
+        // (metadata.py:569-572).
+        metadata.site_name = crate::trafilatura::metadata_url::meta_url_sitename(url);
     }
 
     // 12. Categories fallback (Stage 7d, `metadata.py:575-576`).
@@ -891,7 +976,35 @@ pub fn extract_metadata(
     //     anywhere else.
     metadata.license = crate::trafilatura::metadata_url::extract_license(&dom);
 
+    // 15. filedate (`metadata.py:586`): `metadata.filedate =
+    //     date_config["max_date"]` = today (`%Y-%m-%d`). M8 added the slot.
+    metadata.filedate = Some(ymd_to_iso(today));
+
     metadata
+}
+
+/// Python `str.title()` for ASCII-ish sitenames (`metadata.py:567`).
+///
+/// Uppercases the first cased character of each run of cased characters and
+/// lowercases the rest; non-cased characters (digits, `-`, `.`, spaces) act as
+/// word boundaries. E.g. `"rustlang"` → `"Rustlang"`, `"rust-lang"` →
+/// `"Rust-Lang"`. Faithful enough for the sitename normalisation, which only
+/// reaches this for dot-less, lower-initial names.
+fn python_title_case(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_cased = false;
+    for ch in s.chars() {
+        let is_cased = ch.is_alphabetic();
+        if is_cased && !prev_cased {
+            out.extend(ch.to_uppercase());
+        } else if is_cased {
+            out.extend(ch.to_lowercase());
+        } else {
+            out.push(ch);
+        }
+        prev_cased = is_cased;
+    }
+    out
 }
 
 // ===========================================================================

@@ -236,31 +236,38 @@ fn repair_relative_url(dom: &Dom, rel: &str) -> Option<String> {
 /// **full domain including subdomain**, port-stripped, after the optional
 /// `user@` userinfo. We replicate that minimal scope here.
 ///
-/// **Documented Python behaviour** (verified against the Python source):
-/// `extract_domain("https://www.example.com/foo")` returns
-/// `"www.example.com"`, NOT `"example.com"` — the `www.` prefix is part of
-/// the returned `full_domain`. Python's `urlutils.py:46` applies
-/// `CLEAN_FLD_REGEX = re.compile(r"^www[0-9]*\.")` only on the **slow path**
-/// (via the `tld` library); the `fast=True` regex path returns
-/// `www.example.com` verbatim.
+/// **Documented Python behaviour** (verified against the live oracle):
+/// `extract_domain("https://www.example.com/foo")` returns `"example.com"`
+/// (NOT `"www.example.com"`), `"https://en.wikipedia.org/x"` → `"wikipedia.org"`,
+/// `"https://www.gov.uk/"` → `"gov.uk"`. The leading subdomain is stripped.
 ///
-/// Stage 7d uses the fast path uniformly (matching `metadata.py:543`'s
-/// `extract_domain(metadata.url, fast=True)` call).
+/// Implementation replicates `DOMAIN_REGEX` (`urlutils.py:14-21`)'s match
+/// semantics for the fast path, plus a `www.`-stripping approximation of the
+/// `get_tld` PSL fallback:
+///
+/// 1. **Fast path** (`DOMAIN_REGEX` group 1): the optional subdomain prefix
+///    `(?:[^/?#]{,63}\.)?` is greedy, so it strips as many leading labels as
+///    possible while leaving `([^/?#.]{4,63}\.[^/?#]{2,63})` — a label of
+///    length 4–63 followed by `.` and a 2–63-char remainder (which may contain
+///    dots). Equivalently: the domain begins at the RIGHTMOST non-final label
+///    whose length is 4–63 (`news.bbc.co.uk` → `news.bbc.co.uk`;
+///    `blog.example.co.uk` → `example.co.uk`). The IPv4/IPv6 alternatives need
+///    no special-casing — a dotted-quad has no ≥4-char non-final label, so it
+///    falls through to the fallback and is returned verbatim.
+/// 2. **PSL fallback** when no non-final label qualifies (all <4 chars, e.g.
+///    `www.gov.uk`, `www.sec.gov`): Python calls `get_tld(...).fld` (public
+///    suffix list) then `CLEAN_FLD_REGEX = ^www[0-9]*\.`. The `tld` PSL is NOT
+///    vendored (a data dependency); we approximate with the `www`-strip alone,
+///    which reproduces every corpus fallback case (`gov.uk`, `sec.gov`,
+///    `bbc.com`, `w3.org`). A host that genuinely needs the PSL (e.g.
+///    `m.bbc.com`) would diverge — a documented gap, not in the corpus.
+///
+/// Matches `metadata.py:543`'s `extract_domain(metadata.url, fast=True)`.
 pub fn extract_domain(url: &str) -> Option<String> {
     if url.is_empty() {
         return None;
     }
-    // DOMAIN_REGEX shape (`urlutils.py:14-21`):
-    //   (?:(?:f|ht)tp)s?:// + (?:[^/?#]{,63}\.)? + (
-    //     [^/?#.]{4,63}\.[^/?#]{2,63} | IPv4 | IPv6
-    //   ) + (?:/|$)
-    //
-    // We implement this structurally rather than pull in a regex compile
-    // for one pattern: parse the scheme + `://` prefix, capture everything
-    // up to the next `/`, `?`, or `#` as the authority, strip optional
-    // userinfo + port.
-
-    // Scheme gate.
+    // Scheme gate (DOMAIN_REGEX requires a protocol).
     let after_scheme = strip_scheme(url)?;
     // Authority = everything up to `/`, `?`, `#` (or end).
     let authority_end = after_scheme
@@ -270,15 +277,79 @@ pub fn extract_domain(url: &str) -> Option<String> {
     if authority.is_empty() {
         return None;
     }
-    // Strip optional `user@` userinfo.
+    // Strip optional `user@` userinfo (Python `.split("@")[-1]`).
     let host_and_port = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
-    // Strip optional `:port` (only when port digits follow a non-digit —
-    // matches Python `STRIP_PORT_REGEX = r"(?<=\D):\d+"`).
-    let host = strip_port(host_and_port);
+    // Strip optional `:port` (Python `STRIP_PORT_REGEX = r"(?<=\D):\d+"`).
+    let host = strip_port(host_and_port).to_ascii_lowercase();
     if host.is_empty() {
         return None;
     }
-    Some(host.to_ascii_lowercase())
+
+    // Fast path: DOMAIN_REGEX group 1 = from the rightmost non-final label of
+    // length 4..=63 to the end, with the remainder 2..=63 chars.
+    let labels: Vec<&str> = host.split('.').collect();
+    if labels.len() >= 2 {
+        let last_non_final = labels.len() - 2;
+        for i in (0..=last_non_final).rev() {
+            let label_len = labels[i].len();
+            if (4..=63).contains(&label_len) {
+                let candidate = labels[i..].join(".");
+                let rest_len = candidate.len() - label_len - 1; // strip "label."
+                if (2..=63).contains(&rest_len) {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+
+    // PSL fallback approximation: strip a leading `www[0-9]*.` prefix.
+    Some(strip_www_prefix(&host).to_string())
+}
+
+/// `CLEAN_FLD_REGEX = re.compile(r"^www[0-9]*\.")` (`urlutils.py:23`) — strip a
+/// leading `www`/`wwwN` label and its dot.
+fn strip_www_prefix(host: &str) -> &str {
+    let Some(rest) = host.strip_prefix("www") else {
+        return host;
+    };
+    let digits_end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    if let Some(stripped) = rest[digits_end..].strip_prefix('.') {
+        stripped
+    } else {
+        host
+    }
+}
+
+/// `META_URL = re.compile(r"https?://(?:www\.|w[0-9]+\.)?([^/]+)")`
+/// (`metadata.py:46`) — the sitename URL fallback (`metadata.py:569-572`).
+///
+/// Anchored at the start; returns group 1 = the host (optional `www.`/`wN.`
+/// prefix stripped), up to the first `/`. `None` when the URL does not begin
+/// with an `http(s)://` authority.
+pub(crate) fn meta_url_sitename(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    // Optional `www.` or `wN.` prefix (`w[0-9]+\.` requires ≥1 digit).
+    let rest = if let Some(r) = rest.strip_prefix("www.") {
+        r
+    } else if let Some(r) = rest.strip_prefix('w') {
+        let digits_end = r.find(|c: char| !c.is_ascii_digit()).unwrap_or(r.len());
+        if digits_end > 0 && r[digits_end..].starts_with('.') {
+            &r[digits_end + 1..]
+        } else {
+            rest
+        }
+    } else {
+        rest
+    };
+    let host_end = rest.find('/').unwrap_or(rest.len());
+    let host = &rest[..host_end];
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
 }
 
 /// Strip the `http://` / `https://` (or `ftp[s]://`) prefix; return `None` if
@@ -606,21 +677,26 @@ fn normalize_url(url: &str) -> String {
 /// Stage 7b's JSON-LD `datePublished`/`dateModified` path still runs first
 /// in `extract_metadata` and keeps precedence — `extract_date` only fires
 /// when JSON-LD didn't supply a date.
-pub fn extract_date(dom: &Dom) -> Option<String> {
+pub fn extract_date(dom: &Dom, max_date: (i32, u32, u32)) -> Option<String> {
     let tree = dom.root_element()?;
     let options = crate::htmldate::utils::Extractor::new(
-        // Python `extensive_search=True` default (core.py:810).
+        // Python `extensive_search=True` (set_date_params, settings.py:201).
         true,
-        // Python `get_max_date(None)` returns `datetime.now()`; the Rust
-        // port pins to a "very future" sentinel for test determinism (see
-        // validators.rs::get_max_date). The (9999, 12, 31) tuple gives the
-        // same "no upper bound" effect.
-        (9999, 12, 31),
+        // Python `max_date = datetime.now()` (settings.py:202). The metadata
+        // path bounds at *today* (rejecting post-today garbage dates), unlike
+        // the htmldate-parity gate which uses the (9999,12,31) no-bound
+        // sentinel for determinism. Passed in by the caller (`extract_metadata`
+        // computes today once and shares it with `filedate`).
+        max_date,
         // Python `get_min_date(None)` returns `MIN_DATE = (1995, 1, 1)`.
         crate::htmldate::settings::MIN_DATE,
-        // Python `original_date=False` default (core.py:811).
-        false,
-        // Python `outputformat="%Y-%m-%d"` default (core.py:812).
+        // Python `original_date=True` (set_date_params, settings.py:200) — the
+        // metadata path prefers the ORIGINAL publication date over the latest
+        // modification date. (The htmldate-parity gate uses `False`, htmldate's
+        // own `find_date` default; trafilatura's metadata path overrides it.)
+        true,
+        // Python `outputformat="%Y-%m-%d"` default (htmldate/core.py:812) — so
+        // the metadata date is always date-only (no time/zone suffix).
         "%Y-%m-%d".to_string(),
     );
     crate::htmldate::core::find_date(&tree, &options)
@@ -1003,14 +1079,45 @@ mod tests {
 
     #[test]
     fn extract_domain_simple() {
-        // Python's `extract_domain("https://www.example.com/foo", fast=True)`
-        // returns "www.example.com" — the `www.` prefix is part of the
-        // fast-path output; only the slow path (via `tld`) strips it via
-        // CLEAN_FLD_REGEX. We faithfully match the fast path here.
+        // Verified against the live courlan oracle (M8): `extract_domain(url,
+        // fast=True)` strips the leading subdomain via DOMAIN_REGEX group 1.
         assert_eq!(
             extract_domain("https://www.example.com/foo").as_deref(),
-            Some("www.example.com")
+            Some("example.com")
         );
+    }
+
+    #[test]
+    fn extract_domain_strips_subdomain_keeps_registered() {
+        // Rightmost non-final label of length >=4 begins the domain.
+        assert_eq!(
+            extract_domain("https://en.wikipedia.org/wiki/X").as_deref(),
+            Some("wikipedia.org")
+        );
+        assert_eq!(
+            extract_domain("http://a.b.c.example.com/").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(
+            extract_domain("https://blog.example.co.uk/p").as_deref(),
+            Some("example.co.uk")
+        );
+        // No non-final label >=4 chars: no label can begin group 1, so
+        // `news.bbc.co.uk` is kept whole (matches the live oracle).
+        assert_eq!(
+            extract_domain("https://news.bbc.co.uk/").as_deref(),
+            Some("news.bbc.co.uk")
+        );
+    }
+
+    #[test]
+    fn extract_domain_psl_fallback_strips_www() {
+        // Fast regex fails (gov/sec/bbc/w3 are <4 chars); the www-strip
+        // fallback reproduces courlan's PSL `get_tld` result on the corpus.
+        assert_eq!(extract_domain("https://www.gov.uk/").as_deref(), Some("gov.uk"));
+        assert_eq!(extract_domain("https://www.sec.gov/").as_deref(), Some("sec.gov"));
+        assert_eq!(extract_domain("https://www.bbc.com/").as_deref(), Some("bbc.com"));
+        assert_eq!(extract_domain("https://www.w3.org/x").as_deref(), Some("w3.org"));
     }
 
     #[test]
@@ -1048,7 +1155,7 @@ mod tests {
                 <meta property="article:published_time" content="2024-01-15">
                 </head><body></body></html>"#,
         );
-        assert_eq!(extract_date(&dom).as_deref(), Some("2024-01-15"));
+        assert_eq!(extract_date(&dom, (9999, 12, 31)).as_deref(), Some("2024-01-15"));
     }
 
     #[test]
@@ -1058,7 +1165,7 @@ mod tests {
                 <article><time datetime="2024-01-15">Jan 15</time></article>
                 </body></html>"#,
         );
-        assert_eq!(extract_date(&dom).as_deref(), Some("2024-01-15"));
+        assert_eq!(extract_date(&dom, (9999, 12, 31)).as_deref(), Some("2024-01-15"));
     }
 
     #[test]
@@ -1068,7 +1175,7 @@ mod tests {
                 <meta name="date" content="2024-02-20">
                 </head><body></body></html>"#,
         );
-        assert_eq!(extract_date(&dom).as_deref(), Some("2024-02-20"));
+        assert_eq!(extract_date(&dom, (9999, 12, 31)).as_deref(), Some("2024-02-20"));
     }
 
     #[test]
@@ -1083,7 +1190,7 @@ mod tests {
                 <p>Posted: January 15, 2024</p>
                 </body></html>"#,
         );
-        assert_eq!(extract_date(&dom).as_deref(), Some("2024-01-15"));
+        assert_eq!(extract_date(&dom, (9999, 12, 31)).as_deref(), Some("2024-01-15"));
     }
 
     // ---- extract_catstags -------------------------------------------------

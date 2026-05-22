@@ -2260,10 +2260,13 @@ fn write_fullheader(teidoc: &NodeRef, metadata: &Metadata) -> NodeRef {
 
     let creation = dom::create_element("creation");
     dom::append_child(&profiledesc, &creation);
-    // Python uses `docmeta.filedate` which Metadata doesn't yet carry (M4 Stage 6
-    // deferred). Emit an empty <date type="download"/> for shape parity.
+    // xml.py:483 — <date type="download">docmeta.filedate</date>. M8 wired the
+    // `filedate` slot (today, `%Y-%m-%d`); see metadata.rs.
     let creation_date = dom::create_element("date");
     set_attribute(&creation_date, "type", "download");
+    if let Some(fd) = metadata.filedate.as_deref().filter(|s| !s.is_empty()) {
+        set_element_text(&creation_date, Some(fd));
+    }
     dom::append_child(&creation, &creation_date);
 
     // xml.py:485-489 — encodingDesc / appInfo / application / label / ptr.
