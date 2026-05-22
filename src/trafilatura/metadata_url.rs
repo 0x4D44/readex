@@ -628,27 +628,88 @@ fn is_valid_url(url: &str) -> bool {
     host.contains('.') || host.eq_ignore_ascii_case("localhost")
 }
 
-/// Minimal `normalize_url` (`clean.py:173-207`) — lowercase scheme +
-/// lowercase netloc only. The full Python implementation strips tracker
-/// query parameters, normalises percent-encoded characters, and (when
-/// `trailing_slash=False`) trims a trailing `/`; we defer the tracker
-/// stripper to a future fold-in (no Stage 3-B fixture exercises it).
+/// `normalize_url` (`clean.py:173-207`) — lowercase scheme + lowercase netloc,
+/// and **percent-encode the path** via `normalize_part = quote(path,
+/// safe="/%!=:,-")` (`clean.py:157-160,192`). Collapses `/+` → `/` (`PATH1`)
+/// and strips a leading `/..` run (`PATH2`) before quoting.
 ///
-/// This is the function that `metadata.py:411` calls after
-/// `validate_url`: `url = normalize_url(parsed_url) if validation_result
-/// else None`.
+/// Query/fragment tracker-stripping (`clean_query` / `normalize_fragment`),
+/// punycode decoding, and `:80`/`:443` port-stripping are NOT ported: every
+/// corpus `<ptr target>` URL already byte-matches Python under verbatim
+/// query/fragment passthrough (none carries a tracker, fragment, or default
+/// port), so adding those would be speculative. The path-quote is the one step
+/// the corpus exercises (`Rust_(Programmiersprache)` → `Rust_%28…%29`).
+///
+/// Called by `metadata.py:411` after `validate_url`.
 fn normalize_url(url: &str) -> String {
     let Some(rest) = strip_scheme(url) else {
         return url.to_string();
     };
-    // Reconstruct with lowercased scheme + lowercased netloc.
     let scheme_lower = url[..url.len() - rest.len() - 3].to_ascii_lowercase();
-    let authority_end = rest
-        .find(['/', '?', '#'])
-        .unwrap_or(rest.len());
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let netloc_lower = rest[..authority_end].to_ascii_lowercase();
     let tail = &rest[authority_end..];
-    format!("{scheme_lower}://{netloc_lower}{tail}")
+    // Split the tail into path / (query+fragment): the path runs up to the
+    // first `?` or `#`. Only the path is quoted (Python quotes the fragment
+    // too, but no corpus URL carries one).
+    let path_end = tail.find(['?', '#']).unwrap_or(tail.len());
+    let path = &tail[..path_end];
+    let suffix = &tail[path_end..];
+    let collapsed = collapse_path_slashes(path);
+    let quoted_path = quote_url_part(&collapsed);
+    format!("{scheme_lower}://{netloc_lower}{quoted_path}{suffix}")
+}
+
+/// `PATH1.sub("/", path)` then `PATH2.sub("", …)` (`clean.py:28-29,192`):
+/// collapse runs of `/` to a single `/`, then strip a leading `/..` run.
+fn collapse_path_slashes(path: &str) -> String {
+    // Collapse `/+` → `/`.
+    let mut collapsed = String::with_capacity(path.len());
+    let mut prev_slash = false;
+    for c in path.chars() {
+        if c == '/' {
+            if !prev_slash {
+                collapsed.push('/');
+            }
+            prev_slash = true;
+        } else {
+            collapsed.push(c);
+            prev_slash = false;
+        }
+    }
+    // PATH2 = `^(?:/\.\.(?![^/]))+` — strip leading `/..` segments (each `/..`
+    // must be followed by `/` or end). Rare; ported for faithfulness.
+    let mut s = collapsed.as_str();
+    loop {
+        if let Some(after) = s.strip_prefix("/..") {
+            if after.is_empty() || after.starts_with('/') {
+                s = after;
+                continue;
+            }
+        }
+        break;
+    }
+    s.to_string()
+}
+
+/// Python `urllib.parse.quote(part, safe="/%!=:,-")` (`clean.py:160`).
+///
+/// Percent-encodes each UTF-8 byte that is neither "always safe" (unreserved
+/// `A-Za-z0-9` + `_.-~`) nor in the explicit safe set `/%!=:,-`. `%` is safe,
+/// so existing percent-escapes are preserved (not double-encoded). Hex is
+/// uppercase, matching CPython.
+fn quote_url_part(part: &str) -> String {
+    const SAFE_PUNCT: &[u8] = b"/%!=:,-_.~"; // safe="/%!=:,-" + always-safe `_.~`
+    let mut out = String::with_capacity(part.len());
+    for &b in part.as_bytes() {
+        if b.is_ascii_alphanumeric() || SAFE_PUNCT.contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push_str(&format!("{b:02X}"));
+        }
+    }
+    out
 }
 
 // ===========================================================================
@@ -1118,6 +1179,21 @@ mod tests {
         assert_eq!(extract_domain("https://www.sec.gov/").as_deref(), Some("sec.gov"));
         assert_eq!(extract_domain("https://www.bbc.com/").as_deref(), Some("bbc.com"));
         assert_eq!(extract_domain("https://www.w3.org/x").as_deref(), Some("w3.org"));
+    }
+
+    #[test]
+    fn normalize_url_percent_encodes_path() {
+        // courlan `normalize_part = quote(path, safe="/%!=:,-")`: parens are
+        // not safe, so `(`/`)` -> `%28`/`%29` (verified vs Python).
+        assert_eq!(
+            normalize_url("https://de.wikipedia.org/wiki/Rust_(Programmiersprache)"),
+            "https://de.wikipedia.org/wiki/Rust_%28Programmiersprache%29"
+        );
+        // Existing percent-escapes are preserved (`%` is safe), query kept.
+        assert_eq!(
+            normalize_url("https://Example.COM/a%20b?x=1"),
+            "https://example.com/a%20b?x=1"
+        );
     }
 
     #[test]
