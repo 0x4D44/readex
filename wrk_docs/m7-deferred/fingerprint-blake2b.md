@@ -1,8 +1,26 @@
 # M7 Deferred ADR — fingerprint column (FNV-1a vs blake2b): masked + shape-checked, not deferred per-fixture
 
-**Affects:** `tests/trafilatura_csv_gate.rs` now (M7 Stage 3); will affect
-`tests/trafilatura_xml_gate.rs` (Stage 4) and `tests/trafilatura_xmltei_gate.rs`
-(Stage 5), which also serialise `Document.fingerprint`.
+**Affects:** `tests/trafilatura_csv_gate.rs` (M7 Stage 3) and
+`tests/trafilatura_xml_gate.rs` (Stage 4, landed); will affect
+`tests/trafilatura_xmltei_gate.rs` (Stage 5), which also serialises
+`Document.fingerprint`.
+
+## Also affects xml (Stage 4)
+
+On the XML path the same `core.py:480-485` unconditional fingerprint runs, but
+the value surfaces as an ATTRIBUTE on the `<doc>` root rather than a CSV column:
+`add_xml_meta` (xml.py:178-183) emits every truthy `META_ATTRIBUTES` value as a
+`<doc>` attribute, and with `with_metadata=False` the fingerprint is the ONLY
+one present (`record_id` defaults to `None`, so no `id=`). Python therefore
+always emits `<doc fingerprint="…">`; mdrcel emits a bare `<doc>`.
+
+`tests/trafilatura_xml_gate.rs` reconciles this the same way the csv gate masks
+column 2: it SHAPE-CHECKS Python's `fingerprint` attribute (well-formed
+lowercase-hex, 1–16 chars) where present, then STRIPS the `fingerprint="…"`
+attribute (and its leading space) from the `<doc …>` start tag on BOTH sides
+before byte-comparing the rest of the document. The strip is a no-op when a side
+has no `<doc>` root (e.g. Python under-extracted), so the gate's allowlist /
+deferred triage still routes those fixtures correctly.
 **Scope:** ONE column out of 11 on the csv path. Not a whole-fixture defect.
 **Verdict:** deliberate, documented divergence in mdrcel's simhash token hash.
 The single fingerprint column is **masked + shape-checked** in the gate; the

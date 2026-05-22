@@ -2776,7 +2776,24 @@ name = "mdrcel"
 # independent causes shared with the txt/json gates). PATCH per semver — no new
 # public API/type, no new dependency; an internal behaviour refinement +
 # test-only masking.
-version = "0.17.2"
+#
+# M7 Stage 4 (2026-05-22): 0.17.2 -> 0.17.3 PATCH. xml differential gate
+# (tests/trafilatura_xml_gate.rs) pins extract_to_xml byte-for-byte against
+# Python `output_format="xml"`: 39 substantive + 11 allowlisted + 1 deferred /
+# 51. Three internal output.rs serialization fixes, all behind unchanged public
+# signatures: (1) serialize_xml_pretty now threads a sticky `formatting` flag so
+# a mixed-content ancestor flattens its WHOLE subtree (libxml2 semantics);
+# (2) sanitize_tree (utils.py:315-336) is now run on the XML path — collapses
+# raw source whitespace in element text/tail honouring SPACING/FORMATTING_-
+# PROTECTED (line_processing/sanitize gained the preserve_space/trailing_space
+# knobs); (3) prune_childless_textless (core.py:48-59) added as the missing
+# first empty-element pass so remove_empty_elements can cascade. The <doc>
+# fingerprint attribute is neutralised test-side (ADR fingerprint-blake2b.md,
+# "Also affects xml"); 6 new allowlist fixtures are html5ever-vs-lxml tree-shape
+# divergences (XBRL/1991-site/pre-code-newline/empty-cell — ADRs under
+# wrk_docs/m7-allowlist/), 1 deferred U+2063 (507b9cdb.md). No new public
+# API/type, no new dependency.
+version = "0.17.3"
 edition = "2024"
 
 # M7 Stage 1 (2026-05-22): 0.16.2 -> 0.17.0 MINOR. New public function

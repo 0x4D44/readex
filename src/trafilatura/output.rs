@@ -364,6 +364,53 @@ pub(crate) fn remove_empty_elements(tree: &NodeRef) {
 }
 
 // ===========================================================================
+// prune_childless_textless (core.py:47-59 XML "last cleaning")
+// ===========================================================================
+
+/// Port of `core.py:48-59` (the `"xml" in options.format` last-cleaning loop):
+/// `for element in document.body.iter("*"): if element.tag != "graphic" and
+/// len(element) == 0 and not element.text and not element.tail: parent =
+/// element.getparent(); if parent is not None and parent.tag != "code":
+/// parent.remove(element)`.
+///
+/// Note the FALSY-string semantics (`not element.text`): an element whose text
+/// is `None` or `""` qualifies, but one whose text is whitespace-only (a
+/// truthy string) does NOT — this is deliberately LESS aggressive than
+/// [`remove_empty_elements`]'s `text_chars_test`. The point of this pass is to
+/// strip genuinely-empty inner leaves so that [`remove_empty_elements`] (run
+/// next) can cascade-remove the now-childless parents in its own document-order
+/// sweep.
+fn prune_childless_textless(tree: &NodeRef) {
+    for element in get_elements_by_tag_name(tree, "*") {
+        // len(element) == 0 — no ELEMENT children.
+        let has_element_children = element
+            .children
+            .borrow()
+            .iter()
+            .any(|c| matches!(c.data, NodeData::Element { .. }));
+        if has_element_children {
+            continue;
+        }
+        // not element.text and not element.tail — falsy (None / "") on BOTH.
+        let text_falsy = element_text(&element).map(|t| t.is_empty()).unwrap_or(true);
+        let tail_falsy = tail(&element).map(|t| t.is_empty()).unwrap_or(true);
+        if !text_falsy || !tail_falsy {
+            continue;
+        }
+        // tag != "graphic".
+        if local_name(&element).as_deref() == Some("graphic") {
+            continue;
+        }
+        // parent is not None and parent.tag != "code".
+        let Some(p) = parent(&element) else { continue };
+        if local_name(&p).as_deref() == Some("code") {
+            continue;
+        }
+        dom::remove(&element);
+    }
+}
+
+// ===========================================================================
 // strip_double_tags (xml.py:106-112)
 // ===========================================================================
 
@@ -755,23 +802,104 @@ pub(crate) fn xmltotxt(xmloutput: Option<&NodeRef>, include_formatting: bool) ->
     unescape_html(&sanitized)
 }
 
+/// Port of `utils.py:315-336` (`sanitize_tree`): walk every element, run
+/// `sanitize` over its `.text` and `.tail`, computing the `preserve_space` /
+/// `trailing_space` knobs from the `SPACING_PROTECTED` / `FORMATTING_PROTECTED`
+/// tag sets (utils.py:79-80, 323-324). Python runs this at `xml.py:167`
+/// between `build_xml_output` and the pretty-printing reparse; mdrcel had
+/// deferred it (the `serialize_xml_pretty` doc noted "the sanitize_tree
+/// behaviour is deferred"), which left raw source whitespace (newlines, runs of
+/// spaces) inside element text on the XML path. This restores it.
+///
+/// We deliberately do NOT port the `attrib` namespace-pruning at
+/// utils.py:327-330: the rcdom tree carries no namespaced attributes by this
+/// stage (`clean_attributes` already ran), so the loop is a no-op here.
+pub(crate) fn sanitize_tree(root: &NodeRef) {
+    for elem in descendants_and_self(root) {
+        let Some(tag) = local_name(&elem) else {
+            continue;
+        };
+        let parent_tag = parent(&elem)
+            .as_ref()
+            .and_then(local_name)
+            .unwrap_or_default();
+
+        // utils.py:323-324.
+        let preserve_space = crate::trafilatura::utils::spacing_protected(&tag)
+            || crate::trafilatura::utils::spacing_protected(&parent_tag);
+        let trailing_space = preserve_space
+            || crate::trafilatura::utils::formatting_protected(&tag)
+            || crate::trafilatura::utils::formatting_protected(&parent_tag);
+
+        // utils.py:332-335 — sanitize text + tail in place. Python only
+        // touches a slot when it is truthy (`if elem.text:`), so an empty /
+        // absent slot is left exactly as-is.
+        if let Some(text) = element_text(&elem).filter(|t| !t.is_empty()) {
+            let cleaned = sanitize(&text, preserve_space, trailing_space);
+            set_element_text(&elem, cleaned.as_deref());
+        }
+        if let Some(t) = tail(&elem).filter(|t| !t.is_empty()) {
+            let cleaned = sanitize(&t, preserve_space, trailing_space);
+            set_tail(&elem, cleaned.as_deref());
+        }
+    }
+}
+
+/// All elements in document order including `root` itself. `sanitize_tree`
+/// must touch the root's own text/tail too (Python `tree.iter()` yields the
+/// root first), so we cannot reuse the children-only walk.
+fn descendants_and_self(root: &NodeRef) -> Vec<NodeRef> {
+    let mut out = Vec::new();
+    fn rec(n: &NodeRef, out: &mut Vec<NodeRef>) {
+        out.push(n.clone());
+        for c in children(n) {
+            rec(&c, out);
+        }
+    }
+    rec(root, &mut out);
+    out
+}
+
 /// Faithful subset of `utils.py:303-312` (`sanitize`) — line-by-line cleanup
 /// with `\u{2424}` removed (xml.py:343's spacing hack) and HTML space
 /// entities decoded. Empty lines (whitespace-only after `line_processing`)
 /// are pruned; non-empty lines are `\n`-joined.
 fn sanitize_text(text: &str) -> String {
-    // utils.py:310 — `'\n'.join(filter(None, (line_processing(l, ...) for l
-    // in text.splitlines()))).replace('␤', '')`.
+    // The `xmltotxt` callsite (xml.py:363) uses `sanitize` with default knobs
+    // (preserve_space=False, trailing_space=False). `sanitize` returns `None`
+    // for all-blank input; xml.py:363's `or ""` collapses that to "".
+    sanitize(text, false, false).unwrap_or_default()
+}
+
+/// Port of `utils.py:303-312` (`sanitize`) with the full `preserve_space` /
+/// `trailing_space` knobs (needed by [`sanitize_tree`]; the `xmltotxt`
+/// callsite passes the defaults via [`sanitize_text`]).
+///
+/// - `trailing_space=true`: treat the whole input as ONE line
+///   (utils.py:306-307 — `line_processing(text, preserve_space, True)`).
+/// - otherwise: process line-by-line, drop `None` lines, `\n`-join, then
+///   strip every `\u{2424}` (utils.py:308-310). lxml splitlines semantics are
+///   approximated by `split('\n')` (the spacing hack `\u{2424}` is the only
+///   non-`\n` line break the pipeline injects, and it is stripped anyway).
+///
+/// Returns `None` when the result would be empty/all-blank (Python returns
+/// `None`; the callsites either `or ""` it or skip the slot).
+fn sanitize(text: &str, preserve_space: bool, trailing_space: bool) -> Option<String> {
+    if trailing_space {
+        return line_processing(text, preserve_space, true);
+    }
     let mut out_lines: Vec<String> = Vec::new();
     for line in text.split('\n') {
-        let processed = line_processing(line);
-        // utils.py:310 — `filter(None, ...)` drops `None`-returning lines.
-        if let Some(p) = processed {
+        if let Some(p) = line_processing(line, preserve_space, false) {
             out_lines.push(p);
         }
     }
-    // utils.py:310 — `.replace('␤', '')` — apply AFTER the join.
-    out_lines.join("\n").replace('\u{2424}', "")
+    let joined = out_lines.join("\n").replace('\u{2424}', "");
+    if joined.is_empty() {
+        None
+    } else {
+        Some(joined)
+    }
 }
 
 /// Faithful subset of `utils.py:282-300` (`line_processing`):
@@ -784,20 +912,45 @@ fn sanitize_text(text: &str) -> String {
 /// defaults). `remove_control_characters` is omitted — the upstream
 /// parser already drops C0 controls except whitespace; if a future test
 /// surfaces a control-character leak the helper grows here.
-fn line_processing(line: &str) -> Option<String> {
+fn line_processing(line: &str, preserve_space: bool, trailing_space: bool) -> Option<String> {
     // utils.py:288 — `remove_control_characters(line.replace('&#13;',
     // '\r').replace('&#10;', '\n').replace('&nbsp;', ' '))`.
     let decoded = line
         .replace("&#13;", "\r")
         .replace("&#10;", "\n")
         .replace("&nbsp;", "\u{00A0}");
+
+    // utils.py:289 — `if not preserve_space:` guards the whole trim block.
+    // When preserve_space is set, the (control-char-cleaned) line is returned
+    // verbatim: no whitespace collapse, no None-pruning.
+    if preserve_space {
+        return Some(decoded);
+    }
+
     // utils.py:292 — `trim(LINES_TRIMMING.sub(r" ", new_line))`. Our `trim`
     // (utils.rs:97) already collapses Unicode whitespace + strips, which
     // subsumes LINES_TRIMMING's behaviour on the realistic inputs.
     let trimmed = crate::trafilatura::utils::trim(&decoded);
     // utils.py:294-295 — `if all(map(str.isspace, new_line)): new_line = None`.
-    if trimmed.chars().all(char::is_whitespace) {
-        None
+    // (`trim` already collapsed to "" for all-blank input, so test emptiness.)
+    if trimmed.is_empty() {
+        return None;
+    }
+    // utils.py:296-299 — `elif trailing_space:` re-attach a single leading /
+    // trailing space based on the ORIGINAL (pre-trim) line's first/last char.
+    if trailing_space {
+        let chars: Vec<char> = line.chars().collect();
+        let before = if chars.first().is_some_and(|c| c.is_whitespace()) {
+            " "
+        } else {
+            ""
+        };
+        let after = if chars.last().is_some_and(|c| c.is_whitespace()) {
+            " "
+        } else {
+            ""
+        };
+        Some(format!("{before}{trimmed}{after}"))
     } else {
         Some(trimmed)
     }
@@ -2414,6 +2567,18 @@ pub(crate) enum OutputFormat {
 /// treating whitespace-only text/tail nodes as absent when deciding indent
 /// vs inline emission.
 pub(crate) fn control_xml_output(doc: &Document, format: OutputFormat) -> String {
+    // core.py:47-59 — the XML branch of `determine_returnstring` runs a
+    // "last cleaning" pass over `document.body` BEFORE `control_xml_output`:
+    // drop every element that is childless AND has falsy text AND falsy tail
+    // (except `<graphic>` and direct children of `<code>`). This guards
+    // `"xml" in options.format`, i.e. both xml and xmltei, so it lives here.
+    // It is a SEPARATE earlier pass than `remove_empty_elements` below: it
+    // removes inner empty leaves (e.g. an empty `<p>` inside a `<cell>`), and
+    // the now-childless parent is then caught by `remove_empty_elements`. A
+    // single document-order pass cannot cascade parent-after-child, so the
+    // two-pass structure is load-bearing for byte-equivalence.
+    prune_childless_textless(&doc.body);
+
     // xml.py:161-162 — `strip_double_tags(document.body); remove_empty_elements
     // (document.body)`. Both mutate in place.
     strip_double_tags(&doc.body);
@@ -2426,9 +2591,12 @@ pub(crate) fn control_xml_output(doc: &Document, format: OutputFormat) -> String
         OutputFormat::Tei => build_tei_output(doc),
     };
 
-    // xml.py:167-169 — sanitize_tree + reparse-through-CONTROL_PARSER. The
-    // sanitize_tree behaviour is deferred (see fn doc); the reparse equivalent
-    // is folded into serialize_xml_pretty's whitespace handling.
+    // xml.py:167 — `output_tree = sanitize_tree(output_tree)`: collapse raw
+    // source whitespace inside element text/tail (honouring the
+    // SPACING_PROTECTED / FORMATTING_PROTECTED knobs). xml.py:169's
+    // reparse-through-CONTROL_PARSER (remove_blank_text=True) is folded into
+    // serialize_xml_pretty's whitespace handling.
+    sanitize_tree(&output_tree);
 
     // xml.py:175 — `tostring(output_tree, pretty_print=True, encoding='unicode'
     // ).strip()`.
@@ -2453,10 +2621,16 @@ pub(crate) fn control_xml_output(doc: &Document, format: OutputFormat) -> String
 /// 1. Indentation: 2-space increments per nesting level.
 /// 2. Self-closing form (`<tag/>`) when an element has NO children, NO text,
 ///    AND no significant content.
-/// 3. **Mixed-content guard.** When an element has any non-whitespace text
-///    OR any child element has any non-whitespace tail, pretty-printing is
-///    DISABLED for that element's children: they emit inline on the same
-///    line as the parent's content.
+/// 3. **Mixed-content guard (sticky, subtree-wide).** When an element has any
+///    non-whitespace text OR any child element has any non-whitespace tail,
+///    pretty-printing is DISABLED for that element's children — they emit
+///    inline on the same line. Crucially, libxml2 propagates the disabled
+///    state down the ENTIRE descendant subtree: once an ancestor is mixed,
+///    every descendant is emitted flat (inline), even descendants that are
+///    themselves "clean" element-only containers. We thread a `formatting`
+///    flag through the recursion to reproduce this: a `<main>` whose child
+///    `<head>` carries an `[edit]` tail goes flat, and its `<table>` /
+///    `<row>` / `<cell>` descendants stay flat too (verified against lxml).
 /// 4. Whitespace-only text/tail nodes are treated as ABSENT (mirroring
 ///    `CONTROL_PARSER`'s `remove_blank_text=True` reparse at `xml.py:169`).
 /// 5. Attributes serialise as `name="value"` in source order; values are
@@ -2474,7 +2648,9 @@ pub(crate) fn control_xml_output(doc: &Document, format: OutputFormat) -> String
 /// helper lives here adjacent to its only caller.
 fn serialize_xml_pretty(root: &NodeRef) -> String {
     let mut out = String::new();
-    write_element_pretty(root, &mut out, 0);
+    // The root starts with formatting ENABLED (libxml2's `format=1`); it is
+    // turned off (and stays off) as soon as a mixed-content ancestor is hit.
+    write_element_pretty(root, &mut out, 0, true);
     // lxml emits a trailing newline; xml.py:175 strips it.
     out.trim_end_matches('\n').to_string()
 }
@@ -2488,7 +2664,13 @@ fn is_blank(s: &str) -> bool {
 /// Write `element` and its subtree to `out` with `depth` levels of 2-space
 /// indentation already accounted for at the element's start (the caller is
 /// responsible for emitting the leading indent of THIS element if any).
-fn write_element_pretty(element: &NodeRef, out: &mut String, depth: usize) {
+///
+/// `formatting` mirrors libxml2's `format` flag: when `true`, element-only
+/// children are indented onto their own lines; when `false`, the whole subtree
+/// is emitted flat (inline). Once an ancestor is found to be mixed-content the
+/// flag is turned off for the entire descendant subtree (see rule 3 in
+/// [`serialize_xml_pretty`]'s doc) — libxml2 never re-enables it deeper down.
+fn write_element_pretty(element: &NodeRef, out: &mut String, depth: usize, formatting: bool) {
     let Some(tag) = local_name(element) else {
         return;
     };
@@ -2517,8 +2699,11 @@ fn write_element_pretty(element: &NodeRef, out: &mut String, depth: usize) {
 
     out.push('>');
 
-    // Decide mixed-content vs indented. Indented requires: no text on this
-    // element AND every child has a blank tail.
+    // Decide mixed-content vs indented. Indented requires: formatting is still
+    // enabled by an ancestor AND this element has no text AND every child has a
+    // blank tail. If formatting was already disabled upstream, this element is
+    // emitted flat regardless of its own (clean) content — matching libxml2's
+    // sticky `format=0` propagation down the subtree.
     let any_kid_has_text_tail = kids.iter().any(|k| {
         tail(k)
             .as_deref()
@@ -2526,16 +2711,18 @@ fn write_element_pretty(element: &NodeRef, out: &mut String, depth: usize) {
             .unwrap_or(false)
     });
     let mixed = has_text || any_kid_has_text_tail;
+    let indent = formatting && !mixed;
 
-    if mixed {
-        // Inline emission: write text, then each child + its tail, all on
-        // the same logical run. Text/tail are emitted verbatim (already
-        // sanitised by Trafilatura's pipeline upstream).
+    if !indent {
+        // Inline emission: write text, then each child + its tail, all on the
+        // same logical run. Once inline, formatting stays OFF for descendants
+        // (sticky), so the recursive call passes `false`. Text/tail are emitted
+        // verbatim (already sanitised by Trafilatura's pipeline upstream).
         if has_text {
             escape_xml_text_into(&text, out);
         }
         for k in &kids {
-            write_element_pretty(k, out, depth + 1);
+            write_element_pretty(k, out, depth + 1, false);
             if let Some(t) = tail(k) {
                 escape_xml_text_into(&t, out);
             }
@@ -2543,13 +2730,13 @@ fn write_element_pretty(element: &NodeRef, out: &mut String, depth: usize) {
     } else {
         // Indented emission: each child on its own line, indented by
         // `depth + 1` levels of 2 spaces. Blank tails are dropped (the
-        // `remove_blank_text=True` reparse equivalent).
+        // `remove_blank_text=True` reparse equivalent). Formatting stays ON.
         for k in &kids {
             out.push('\n');
             for _ in 0..=depth {
                 out.push_str("  ");
             }
-            write_element_pretty(k, out, depth + 1);
+            write_element_pretty(k, out, depth + 1, true);
         }
         // Closing tag goes on its own line, indented by `depth`.
         out.push('\n');
