@@ -681,11 +681,11 @@ fn collapse_path_slashes(path: &str) -> String {
     // must be followed by `/` or end). Rare; ported for faithfulness.
     let mut s = collapsed.as_str();
     loop {
-        if let Some(after) = s.strip_prefix("/..") {
-            if after.is_empty() || after.starts_with('/') {
-                s = after;
-                continue;
-            }
+        if let Some(after) = s.strip_prefix("/..")
+            && (after.is_empty() || after.starts_with('/'))
+        {
+            s = after;
+            continue;
         }
         break;
     }

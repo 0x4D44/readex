@@ -2828,7 +2828,28 @@ name = "mdrcel"
 # detached-node `set_tail` was a silent no-op). No corpus fixture currently
 # triggered these latent paths, so all gates stay green; the two TEI unit tests
 # now exercise non-whitespace tails as differential guards.
-version = "0.17.5"
+#
+# M8 (2026-05-22): 0.17.5 -> 0.18.0 MINOR. Metadata-subsystem parity drive that
+# UNMASKS the TEI <teiHeader> (the metadata oracle: output_format=="xmltei"
+# forces with_metadata=True). Additive public field `Metadata.filedate`
+# (mdrcel::trafilatura::metadata::Metadata, a pub struct in the pub trafilatura
+# module) = today (%Y-%m-%d, metadata.py:586 + settings.py:202) via a SystemTime
+# civil-date helper (no new dependency). Per the M3/M4 precedent (Extracted
+# gained fields = MINOR), an additive field on a non-#[non_exhaustive] pub
+# struct is MINOR pre-1.0. Other changes are internal behaviour refinements
+# behind frozen signatures: date extraction now calls htmldate find_date
+# UNCONDITIONALLY with original_date=True + max_date=today + "%Y-%m-%d"
+# (metadata.py:546-547); extract_domain returns the registered domain
+# (DOMAIN_REGEX group-1, courlan urlutils.py:14-62); sitename @-strip +
+# title-case + META_URL fallback (metadata.py:559-572); full normalize_authors
+# (json_metadata.py:226-268); extract_author AUTHOR_DISCARD_XPATHS prune
+# (metadata.py:381); extract_metainfo itertext-join (metadata.py:327); greedy
+# split_html_title (metadata.py:50-52); normalize_url path %-encoding
+# (courlan clean.py:157-207). The TEI gate mask narrows from the whole
+# <teiHeader> to <note type="fingerprint"> only; header+body byte-compared.
+# GREEN 51 = 38 substantive + 11 allowlisted + 2 deferred. No new dependency
+# (regex/unicode-normalization already pinned). All 11 BLOCKER gates green.
+version = "0.18.0"
 edition = "2024"
 
 # M7 Stage 1 (2026-05-22): 0.16.2 -> 0.17.0 MINOR. New public function
