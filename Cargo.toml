@@ -2744,8 +2744,34 @@ name = "mdrcel"
 # retired). 5 prior BLOCKER gates remain green. Lib tests 1156
 # (unchanged). PATCH bump per semver — no public API change, no new
 # dependency.
-version = "0.16.2"
+version = "0.17.0"
 edition = "2024"
+
+# M7 Stage 1 (2026-05-22): 0.16.2 -> 0.17.0 MINOR. New public function
+# `extract_to_txt(html, base_url, opts)` — the plain-TXT sibling of
+# `extract_to_markdown`, equivalent to Python's `extract(output_format=
+# "txt")` (core.py:71-98). TXT is the formatting-OFF variant: same pipeline
+# shape (metadata → cascade body → xmltotxt → optional YAML header →
+# commentsbody strip → NFC) but with `formatting=false`, so it routes the
+# body through `xmltotxt(body, false)` rather than the markdown-path
+# `..true`. A dedicated function is required because `extract_with(..).text`
+# derives text via `text_content + trim` (a flat itertext join), which is
+# NOT byte-equivalent to Python's `xmltotxt(body, False)` (the latter
+# preserves table `|` separators, list items, paragraph breaks). This is a
+# backward-compatible public-API ADDITION (no signature/type change; old
+# callers unaffected) → MINOR per CLAUDE.md version management. (The stage
+# brief anticipated a PATCH on the assumption the gate added no public Rust
+# API; that assumption did not hold because TXT needs its own entry point.)
+# Also adds five `--txt/--json/--csv/--xml/--xmltei` oracle modes to
+# benchmark/oracles/trafilatura/run.py (scaffolding for M7 Stages 1-5;
+# Stage 1 GATEs only --txt) and the new BLOCKER gate
+# tests/trafilatura_txt_gate.rs. Gate verdict: 45/51 substantive + 5
+# allowlisted (wrk_docs/m7-allowlist/: 41d2afac, 0f63a2a5, 683d5643,
+# 9c64e8e3, dc8ba3c0 — all share their markdown-gate root cause,
+# format-independent) + 1 deferred (wrk_docs/m7-deferred/507b9cdb.md —
+# mdrcel leaks non-printable U+2063 that Python strips via
+# remove_control_characters; faithful fix needs a Unicode general-category
+# facility, deferred). No new crate dependency.
 
 # M5 Stage 6e-b (2026-05-21): 0.15.10 -> 0.15.11 PATCH. No source change —
 # allowlist-only: `9c64e8e3fcd844d4.html` (blog.rust-lang.org index) is

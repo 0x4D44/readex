@@ -19,6 +19,18 @@ gates:
   --extract-content     M3 Stage 3-B — `extract_content` result body as XML.
   --markdown            M5 Stage 2  — `extract(output_format="markdown")`
                                        as raw UTF-8 (None → "").
+  --txt                 M7 Stage 1  — `extract(output_format="txt")`.
+  --json                M7 Stage 2  — `extract(output_format="json")`.
+  --csv                 M7 Stage 3  — `extract(output_format="csv")`.
+  --xml                 M7 Stage 4  — `extract(output_format="xml")`.
+  --xmltei              M7 Stage 5  — `extract(output_format="xmltei")`.
+
+The five M7 modes mirror --markdown EXACTLY, changing only the
+`output_format=` string. Each emits the returned string (None → "") as raw
+UTF-8 bytes on stdout (no JSON envelope). The format strings are validated
+against trafilatura's `bare_extraction` accepted set (core.py:168 /
+`{"csv", "html", "json", "markdown", "txt", "xml", "xmltei"}`); TEI is the
+literal string `"xmltei"`.
 
 Self-correcting interpreter (HLD section 4, B2 spike resolution): the harness
 invokes BARE `python` from PATH and activates no venv. `requirements.txt` only
@@ -183,7 +195,14 @@ def _parse_args(argv):
     No argparse: a fixed CLI; argparse would print to stdout on error.
 
     Returns (path, base_url, convert_tags_only, extract_content_only,
-             markdown_only, err).
+             markdown_only, extra_format, err).
+
+    `extra_format` is `None` unless exactly one of the M7 output-format
+    flags (--txt / --json / --csv / --xml / --xmltei) is set, in which case
+    it carries the matching `output_format=` string. These mirror
+    --markdown's full-`extract` shape, differing only in the format string,
+    and are mutually exclusive with each other AND with --convert-tags-only
+    / --extract-content / --markdown.
 
     `--convert-tags-only` (M3 Stage 1b additive — HLD §6.2 / Trafilatura-
     equivalence BLOCKER gate): when set, run.py SKIPS the full
@@ -215,17 +234,28 @@ def _parse_args(argv):
     oracle. Mutually exclusive with --convert-tags-only and
     --extract-content.
     """
+    # The M7 output-format flags map 1:1 onto trafilatura's accepted
+    # `output_format=` strings (core.py:168). --xmltei maps to the literal
+    # "xmltei" (the string trafilatura validates against for TEI).
+    _EXTRA_FORMAT_FLAGS = {
+        "--txt": "txt",
+        "--json": "json",
+        "--csv": "csv",
+        "--xml": "xml",
+        "--xmltei": "xmltei",
+    }
     path = None
     base_url = None
     convert_tags_only = False
     extract_content_only = False
     markdown_only = False
+    extra_format = None
     i = 0
     while i < len(argv):
         a = argv[i]
         if a == "--base-url":
             if i + 1 >= len(argv):
-                return None, None, False, False, False, (
+                return None, None, False, False, False, None, (
                     "--base-url requires a URL argument"
                 )
             base_url = argv[i + 1]
@@ -243,22 +273,48 @@ def _parse_args(argv):
             markdown_only = True
             i += 1
             continue
+        if a in _EXTRA_FORMAT_FLAGS:
+            if extra_format is not None:
+                return None, None, False, False, False, None, (
+                    "--txt / --json / --csv / --xml / --xmltei are "
+                    "mutually exclusive"
+                )
+            extra_format = _EXTRA_FORMAT_FLAGS[a]
+            i += 1
+            continue
         if path is None:
             path = a
             i += 1
             continue
-        return None, None, False, False, False, f"unexpected extra argument: {a!r}"
+        return None, None, False, False, False, None, (
+            f"unexpected extra argument: {a!r}"
+        )
     if path is None:
-        return None, None, False, False, False, "missing required <abs.html> argument"
+        return None, None, False, False, False, None, (
+            "missing required <abs.html> argument"
+        )
     exclusive_count = sum(
-        (convert_tags_only, extract_content_only, markdown_only)
+        (
+            convert_tags_only,
+            extract_content_only,
+            markdown_only,
+            extra_format is not None,
+        )
     )
     if exclusive_count > 1:
-        return None, None, False, False, False, (
-            "--convert-tags-only, --extract-content, and --markdown are "
-            "mutually exclusive"
+        return None, None, False, False, False, None, (
+            "--convert-tags-only, --extract-content, --markdown, --txt, "
+            "--json, --csv, --xml, and --xmltei are mutually exclusive"
         )
-    return path, base_url, convert_tags_only, extract_content_only, markdown_only, None
+    return (
+        path,
+        base_url,
+        convert_tags_only,
+        extract_content_only,
+        markdown_only,
+        extra_format,
+        None,
+    )
 
 
 def main():
@@ -277,6 +333,7 @@ def main():
             convert_tags_only,
             extract_content_only,
             markdown_only,
+            extra_format,
             arg_err,
         ) = _parse_args(sys.argv[1:])
         if arg_err is not None:
@@ -459,6 +516,43 @@ def main():
             sys.stdout.buffer.flush()
             sys.exit(0)
         # --- end --markdown branch ----------------------------------------
+
+        # --- M7 Stage 1+: --txt/--json/--csv/--xml/--xmltei modes ---------
+        # Identical in shape to --markdown above: run the FULL
+        # `trafilatura.extract(raw, output_format=<fmt>)` pipeline and emit
+        # the returned string (UTF-8 bytes, no JSON envelope), collapsing a
+        # `None` result to `""` so the Rust gate can strict byte-compare
+        # unconditionally. Only the `output_format=` string differs across
+        # the five modes — the same committed `trafilatura.cfg` and the same
+        # with_metadata/deduplicate/include_comments posture as --markdown.
+        # Front-loaded here so M7 Stages 2-5 share this single oracle surface
+        # without re-touching run.py. (M7 Stage 1 only GATEs --txt; the
+        # other four are scaffolding consumed by later stages.)
+        if extra_format is not None:
+            from trafilatura import extract as trafi_extract
+            from trafilatura.settings import use_config
+
+            cfg = use_config(
+                os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    "trafilatura.cfg",
+                )
+            )
+            payload = trafi_extract(
+                raw,
+                url=base_url,
+                output_format=extra_format,
+                with_metadata=False,
+                deduplicate=False,
+                include_comments=False,
+                config=cfg,
+            )
+            if payload is None:
+                payload = ""
+            sys.stdout.buffer.write(payload.encode("utf-8"))
+            sys.stdout.buffer.flush()
+            sys.exit(0)
+        # --- end M7 output-format branch ----------------------------------
 
         # Explicit committed config, never ambient (HLD section 4).
         # EXTRACTION_TIMEOUT=0 disables the signal-based timeout: SIGALRM is

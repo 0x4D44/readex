@@ -727,6 +727,106 @@ pub fn extract_to_markdown(
     Ok(normalised)
 }
 
+/// Extract `html` and render the main content as plain TXT.
+///
+/// Equivalent to Python's `extract(html, output_format="txt")`
+/// (`core.py:71-98`, the "Markdown and TXT" branch). TXT is the
+/// **formatting-off** sibling of [`extract_to_markdown`]: the SAME pipeline
+/// shape (metadata → cascade body → `xmltotxt` → optional YAML header →
+/// commentsbody strip → NFC) but with `formatting` **false** throughout.
+///
+/// # Why a separate function (not `extract_with(...).text`)
+///
+/// `extract_with(...)?.text` derives its text via `text_content(body)` +
+/// `trim` — a flat space-join of `itertext()`. Python's `output_format=
+/// "txt"` path instead routes the body through `xmltotxt(body, False)`
+/// (`core.py:94`), which preserves block structure: table rows rendered with
+/// `|` separators, list items, paragraph breaks, etc. The two are NOT
+/// byte-equivalent, so TXT needs its own formatter call.
+///
+/// # The formatting flag, two places
+///
+/// Python's `settings.py:133` sets `self.formatting = formatting or
+/// self.format == "markdown"`. For `"txt"` neither is true, so `formatting`
+/// stays `False`. That single flag governs BOTH:
+///
+/// 1. `cleaning::convert_tags` — with `formatting=false`, `<b>/<i>/<u>/…` are
+///    stripped to their text rather than rewritten to `<hi rend=…>` (so no
+///    `**bold**`/`*italic*` markers survive); and
+/// 2. `xmltotxt(body, false)` — the formatter's `<hi>`/code/quote branches
+///    emit plain text without the markdown decorations.
+///
+/// This function therefore sets `cleaning_opts.formatting = false` (vs
+/// markdown's `true`) and calls `xmltotxt(.., false)` (vs markdown's `true`).
+///
+/// # `with_metadata`, `base_url`, NFC, and errors
+///
+/// Identical to [`extract_to_markdown`]: optional YAML header when
+/// `opts.with_metadata`, `base_url` is informational only, the final string
+/// is NFC-normalised (`core.py:98`), and the only error is
+/// [`ExtractError::ContentTooShort`] when `opts.min_word_count > 0` and the
+/// produced text is below threshold.
+pub fn extract_to_txt(
+    html: &str,
+    base_url: Option<&str>,
+    opts: &Options,
+) -> Result<String, ExtractError> {
+    // Mirror of `extract_to_markdown`, with `formatting` forced OFF (the
+    // ONLY behavioural difference between Python's "txt" and "markdown"
+    // output_format branches — see core.py:71-98 + settings.py:133).
+
+    // 1. Metadata.
+    let metadata = trafilatura::metadata::extract_metadata(html, base_url, true, &[]);
+
+    // 2. Body extraction via the cascade. Unlike markdown, `formatting` is
+    //    left at its default (false): the "txt" output_format does NOT
+    //    auto-enable it (settings.py:133), so `convert_tags` strips inline
+    //    `<b>/<i>/<u>/<tt>` rather than rewriting them to `<hi rend=…>`.
+    let cleaning_opts = trafilatura::cleaning::Options {
+        url: base_url.map(|s| s.to_string()),
+        ..trafilatura::cleaning::Options::default()
+    };
+    let body_opt =
+        trafilatura::readability_fork::bare_extraction_with_cascade(html, &cleaning_opts);
+
+    // 3. Format body via `xmltotxt(body, include_formatting=false)` — the
+    //    plain-TXT branch (core.py:94 passes `options.formatting`, which is
+    //    false here).
+    let body_text = trafilatura::output::xmltotxt(body_opt.as_ref(), false);
+
+    // 4. Optional YAML header (core.py:73-91) — identical to markdown.
+    let header = if opts.with_metadata {
+        trafilatura::output::build_yaml_header(&metadata)
+    } else {
+        String::new()
+    };
+
+    // core.py:94 — `returnstring = f"{header}{xmltotxt(...)}"`.
+    let mut returnstring = format!("{header}{body_text}");
+
+    // core.py:95-96 — commentsbody strip path (see extract_to_markdown for
+    // the full rationale; mdrcel's cascade never sets commentsbody, but the
+    // default Python path always strips, so we mirror it for byte parity).
+    returnstring = format!("{returnstring}\n").trim().to_string();
+
+    // 5. NFC normalise (core.py:98).
+    use unicode_normalization::UnicodeNormalization;
+    let normalised: String = returnstring.as_str().nfc().collect();
+
+    let word_count = normalised.split_whitespace().count();
+    if opts.min_word_count > 0 && word_count < opts.min_word_count {
+        let _ = body_opt;
+        return Err(ExtractError::ContentTooShort {
+            word_count,
+            threshold: opts.min_word_count,
+        });
+    }
+
+    // Keep `body_opt` alive across the format pass (rcdom Drop quirk).
+    let _ = body_opt;
+    Ok(normalised)
+}
+
 /// Extract `html` and render the main content as a JSON object.
 ///
 /// Equivalent to Python's `extract(html, output_format="json")` per
