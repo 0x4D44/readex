@@ -768,6 +768,67 @@ pub fn replace_child(parent: &NodeRef, new_node: &NodeRef, old_node: &NodeRef) {
     old_node.parent.set(None);
 }
 
+/// lxml `new_parent.append(child)` — **move `child` (with its tail) to become
+/// `new_parent`'s last child**.
+///
+/// # Why this primitive exists (the rcdom reparent-tail bug class)
+///
+/// In lxml, `.tail` is an intrinsic attribute of the element node, so
+/// `parent.append(el)` / `parent.insert(i, el)` / `parent.extend([...])`
+/// move the element **together with its tail**. mdrcel models a tail as a
+/// *separate* run of following `Text` siblings ([`tail`] / [`set_tail`]), so
+/// the naive port `remove(child); append_child(new_parent, child)` MOVES the
+/// element but LEAVES its tail Text-node(s) orphaned in the old parent —
+/// silently dropping text. The same defect recurs at every hand-rolled
+/// "reparent a node" site (a 6-time-recurring bug class found by audit; e.g.
+/// `output.rs` `_wrap_unwanted_siblings_of_div` / `_move_element_one_level_up`).
+///
+/// This primitive captures the tail before the move and re-applies it at the
+/// destination, matching lxml `append` exactly: the moved node ends up as
+/// `new_parent`'s last child WITH its tail, and the source parent keeps
+/// nothing behind.
+///
+/// No-op if `child` has no tail beyond the plain move.
+pub fn reparent_with_tail(new_parent: &NodeRef, child: &NodeRef) {
+    let captured = tail(child);
+    // Drain the source tail run BEFORE the move, otherwise the tail Text
+    // node(s) stay orphaned in the old parent (the very defect this guards).
+    if captured.is_some() {
+        set_tail(child, None);
+    }
+    append_child(new_parent, child);
+    if let Some(t) = captured {
+        set_tail(child, Some(&t));
+    }
+}
+
+/// lxml `new_parent.insert(idx, child)` — **move `child` (with its tail) to
+/// position `idx` under `new_parent`**.
+///
+/// Index variant of [`reparent_with_tail`]; see that function for the
+/// rationale (the rcdom reparent-tail bug class). Captures `child`'s tail
+/// before the move and re-applies it at the destination so the tail travels
+/// with the node, matching lxml `insert`. `idx` is clamped to the destination
+/// child count. No-op tail handling if `child` has no tail.
+pub fn insert_with_tail(new_parent: &NodeRef, child: &NodeRef, idx: usize) {
+    let captured = tail(child);
+    // Drain the source tail run BEFORE detaching, otherwise the tail Text
+    // node(s) stay orphaned in the old parent (the very defect this guards).
+    if captured.is_some() {
+        set_tail(child, None);
+    }
+    remove(child);
+    {
+        let mut kids = new_parent.children.borrow_mut();
+        let clamped = idx.min(kids.len());
+        child.parent.set(Some(Rc::downgrade(new_parent)));
+        kids.insert(clamped, child.clone());
+    }
+    if let Some(t) = captured {
+        set_tail(child, Some(&t));
+    }
+}
+
 /// `getElementsByTagName(tag)` over `node`'s subtree (descendants only,
 /// document order). `"*"` matches every element. Returns an **owned snapshot
 /// `Vec`** (HLD §5 / risk #3): a later tree mutation does **not** retroactively
@@ -2487,6 +2548,86 @@ mod tests {
             _ => panic!("expected merged Text first, got {:?}", kids[0].data),
         }
         assert_eq!(tag_name(&kids[1]).as_deref(), Some("SPAN"));
+    }
+
+    // ---- reparent_with_tail / insert_with_tail (rcdom reparent-tail class) ----
+
+    #[test]
+    fn reparent_with_tail_carries_tail_to_destination() {
+        // Source: <div><p>x</p>TAILTEXT<span/></div>  (so <p>.tail = "TAILTEXT").
+        // Destination: a fresh detached <wrap>. After reparent, <p> is the
+        // last child of <wrap> and STILL has tail "TAILTEXT"; the source <div>
+        // must NOT retain the tail Text node.
+        let dom = Dom::parse("<div><p>x</p>TAILTEXT<span></span></div>");
+        let div = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let p = get_elements_by_tag_name(&div, "p")[0].clone();
+        assert_eq!(tail(&p).as_deref(), Some("TAILTEXT"));
+        let wrap = create_element("wrap");
+
+        reparent_with_tail(&wrap, &p);
+
+        // <p> moved under <wrap>.
+        assert!(parent(&p).map(|x| Rc::ptr_eq(&x, &wrap)).unwrap_or(false));
+        // Tail travelled with it.
+        assert_eq!(tail(&p).as_deref(), Some("TAILTEXT"));
+        // Source parent kept nothing behind: only <span> remains, no orphan
+        // Text("TAILTEXT").
+        let div_kids = child_nodes(&div);
+        assert_eq!(div_kids.len(), 1);
+        assert_eq!(tag_name(&div_kids[0]).as_deref(), Some("SPAN"));
+        assert!(
+            !div_kids
+                .iter()
+                .any(|n| matches!(&n.data, NodeData::Text { .. })),
+            "tail Text node must NOT be orphaned in the source parent"
+        );
+    }
+
+    #[test]
+    fn insert_with_tail_carries_tail_to_indexed_position() {
+        // Source: <div><p>x</p>TAILTEXT<span/></div>.
+        // Destination: <wrap><a/><b/></wrap>; insert <p> at index 1.
+        // Result children: [<a>, <p>, <b>] with <p>.tail = "TAILTEXT".
+        let dom = Dom::parse("<div><p>x</p>TAILTEXT<span></span></div>");
+        let div = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let p = get_elements_by_tag_name(&div, "p")[0].clone();
+        let wrap = create_element("wrap");
+        let a = create_element("a");
+        let b = create_element("b");
+        append_child(&wrap, &a);
+        append_child(&wrap, &b);
+
+        insert_with_tail(&wrap, &p, 1);
+
+        let kids = children(&wrap);
+        assert_eq!(kids.len(), 3);
+        assert_eq!(tag_name(&kids[0]).as_deref(), Some("A"));
+        assert_eq!(tag_name(&kids[1]).as_deref(), Some("P"));
+        assert_eq!(tag_name(&kids[2]).as_deref(), Some("B"));
+        // Tail travelled: it sits between <p> and <b>.
+        assert_eq!(tail(&p).as_deref(), Some("TAILTEXT"));
+        // Source parent kept nothing behind.
+        let div_kids = child_nodes(&div);
+        assert_eq!(div_kids.len(), 1);
+        assert_eq!(tag_name(&div_kids[0]).as_deref(), Some("SPAN"));
+    }
+
+    #[test]
+    fn reparent_with_tail_no_tail_is_plain_move() {
+        // <p>'s next sibling is an element, so tail() is None. The move still
+        // happens; no spurious Text node is created at the destination.
+        let dom = Dom::parse("<div><p>x</p><span></span></div>");
+        let div = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let p = get_elements_by_tag_name(&div, "p")[0].clone();
+        let wrap = create_element("wrap");
+
+        reparent_with_tail(&wrap, &p);
+
+        let kids = children(&wrap);
+        assert_eq!(kids.len(), 1);
+        assert_eq!(tail(&p), None);
+        // Destination has no trailing Text node.
+        assert_eq!(child_nodes(&wrap).len(), 1);
     }
 
     // ---- M3 Stage 0a: document_order_triplets (HLD §5.1 / §6.0) ----

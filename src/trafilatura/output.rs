@@ -1953,6 +1953,14 @@ fn _tei_handle_complex_head(element: &NodeRef) -> NodeRef {
     }
 
     // xml.py:547-549 — preserve trailing tail (trimmed).
+    //
+    // NOTE: `new_element` is still DETACHED here (it is only spliced into the
+    // tree by the caller via `parent.replace(elem, new_elem)`). `set_tail`
+    // on a detached node is a no-op (a tail is a *following sibling* run, which
+    // a parentless node cannot have). The caller is therefore responsible for
+    // re-applying this trimmed tail AFTER it attaches `new_element` — see
+    // `check_tei` (xml.py:207). Capturing it here for the no-children path
+    // would silently drop the head's tail otherwise (rcdom reparent-tail class).
     let trimmed_tail = tail(element).map(|t| t.trim().to_string());
     if let Some(t) = trimmed_tail.filter(|t| !t.is_empty()) {
         set_tail(&new_element, Some(&t));
@@ -1986,9 +1994,11 @@ fn _wrap_unwanted_siblings_of_div(div_element: &NodeRef) {
             if new_sibling_index.is_none() {
                 new_sibling_index = position_of(&p, &sibling);
             }
-            // Detach and append to the new wrapper.
-            dom::remove(&sibling);
-            dom::append_child(&new_sibling, &sibling);
+            // xml.py:566 `new_sibling.append(sibling)` — lxml moves the
+            // sibling's tail INTO the wrapper with it. Use the tail-carrying
+            // reparent primitive (a naive remove+append_child orphans the
+            // tail in the old parent — the rcdom reparent-tail bug class).
+            dom::reparent_with_tail(&new_sibling, &sibling);
         } else {
             // xml.py:569-573 — non-TEI_DIV_SIBLING separator (e.g. <lb/>).
             // Flush the current wrapper if it has any collected children, then
@@ -1996,6 +2006,9 @@ fn _wrap_unwanted_siblings_of_div(div_element: &NodeRef) {
             if let Some(idx) = new_sibling_index
                 && !children(&new_sibling).is_empty()
             {
+                // `new_sibling` is a freshly-built, detached wrapper with no
+                // tail of its own (xml.py:571), so plain `insert_child_at` is
+                // intentionally tail-less here.
                 insert_child_at(&p, &new_sibling, idx);
                 new_sibling = dom::create_element("div");
                 new_sibling_index = None;
@@ -2003,7 +2016,8 @@ fn _wrap_unwanted_siblings_of_div(div_element: &NodeRef) {
         }
     }
 
-    // xml.py:574-575 — flush any remaining wrapper.
+    // xml.py:574-575 — flush any remaining wrapper. Freshly-built, detached
+    // wrapper with no tail — intentionally tail-less insert.
     if let Some(idx) = new_sibling_index
         && !children(&new_sibling).is_empty()
     {
@@ -2025,18 +2039,25 @@ fn _move_element_one_level_up(element: &NodeRef) {
     let new_elem = dom::create_element("p");
     let following: Vec<NodeRef> = following_element_siblings(element);
     for sib in &following {
-        dom::remove(sib);
-        dom::append_child(&new_elem, sib);
+        // xml.py:589 `new_elem.extend(list(element.itersiblings()))` — lxml
+        // moves each following sibling WITH its tail. Use the tail-carrying
+        // reparent primitive (rcdom reparent-tail bug class: a naive
+        // remove+append_child would orphan each sibling's tail).
+        dom::reparent_with_tail(&new_elem, sib);
     }
 
     // xml.py:591 — `grand_parent.insert(grand_parent.index(parent) + 1, element)`.
-    // First detach `element` from `p`, then insert into `gp` after `p`.
-    dom::remove(element);
+    // lxml `insert` moves `element` WITH its tail, and the very next step
+    // (xml.py:593-596) reads `element.tail` to seed `new_elem.text`. A naive
+    // remove+insert would orphan element's tail in `p`, leaving `tail(element)`
+    // empty below (rcdom reparent-tail bug class). Carry the tail through.
     let gp_idx_of_p = position_of(&gp, &p);
     let insert_at = gp_idx_of_p.map(|i| i + 1).unwrap_or_else(|| {
-        children(&gp).len() // fall back to end
+        // fall back to end. `element` is still under `p` at this point, so
+        // gp's child count is the correct "append" index.
+        children(&gp).len()
     });
-    insert_child_at(&gp, element, insert_at);
+    dom::insert_with_tail(&gp, element, insert_at);
 
     // xml.py:593-596 — tail of `element` becomes `new_elem.text`.
     let elem_tail = tail(element).map(|t| t.trim().to_string());
@@ -2046,20 +2067,31 @@ fn _move_element_one_level_up(element: &NodeRef) {
     }
 
     // xml.py:598-601 — tail of `parent` becomes `new_elem.tail`.
-    let p_tail = tail(&p).map(|t| t.trim().to_string());
-    if let Some(t) = p_tail.filter(|t| !t.is_empty()) {
-        set_tail(&new_elem, Some(&t));
+    //
+    // `new_elem` is still DETACHED here, so we cannot apply its tail yet
+    // (`set_tail` on a parentless node is a no-op — a tail is a following
+    // sibling run). Capture the trimmed value and apply it AFTER `new_elem`
+    // is spliced into `gp` below; otherwise the tail (the old `<p>` tail) is
+    // silently dropped (rcdom reparent-tail bug class).
+    let new_elem_tail = tail(&p)
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+    if new_elem_tail.is_some() {
         set_tail(&p, None);
     }
 
     // xml.py:603-604 — insert new_elem one slot after element if non-empty.
     let has_kids = !children(&new_elem).is_empty();
     let has_text = element_text(&new_elem).is_some_and(|s| !s.is_empty());
-    let has_tail = tail(&new_elem).is_some_and(|s| !s.is_empty());
+    let has_tail = new_elem_tail.is_some();
     if has_kids || has_text || has_tail {
         // grand_parent.index(element) + 1.
         if let Some(idx) = position_of(&gp, element) {
             insert_child_at(&gp, &new_elem, idx + 1);
+            // Now attached: apply the captured tail (xml.py:600 `new_elem.tail`).
+            if let Some(t) = new_elem_tail {
+                set_tail(&new_elem, Some(&t));
+            }
         }
     }
 
@@ -2317,11 +2349,23 @@ fn check_tei(xmldoc: &NodeRef) -> &NodeRef {
 
         // xml.py:205-208 — non-leaf head: complex-head conversion.
         let cur = if !children(&ab).is_empty() {
+            // xml.py:206-208 — `new_elem = _tei_handle_complex_head(elem);
+            // parent.replace(elem, new_elem)`. lxml's `replace` keeps the new
+            // node's OWN tail; here that tail is the original head's trimmed
+            // tail (xml.py:547-549). `_tei_handle_complex_head` cannot set it
+            // (it returns a DETACHED node, where `set_tail` is a no-op), so we
+            // capture the head's trimmed tail here and re-apply it once
+            // `new_elem` is attached — otherwise the tail is silently dropped
+            // (rcdom reparent-tail bug class).
+            let head_tail = tail(&ab).map(|t| t.trim().to_string());
             let new_elem = _tei_handle_complex_head(&ab);
             // parent.replace(elem, new_elem) — find ab in parent, swap.
             if let Some(idx) = position_of(&p, &ab) {
                 dom::remove(&ab);
                 insert_child_at(&p, &new_elem, idx);
+                if let Some(t) = head_tail.filter(|t| !t.is_empty()) {
+                    set_tail(&new_elem, Some(&t));
+                }
             }
             new_elem
         } else {
@@ -3811,6 +3855,11 @@ mod tests {
     }
 
     /// `_wrap_unwanted_siblings_of_div`: TEI_DIV_SIBLINGS wrapped in fresh <div>.
+    ///
+    /// Regression guard for the rcdom reparent-tail bug class: the moved `<p>`
+    /// carries a NON-whitespace tail (`xml.py:566` `new_sibling.append(sibling)`
+    /// moves the tail with the element). A naive remove+append_child orphaned
+    /// that tail in `<body>`; here we assert it travels into the wrapper.
     #[test]
     fn tei_wrap_unwanted_siblings_of_div_wraps_p_siblings() {
         let body = create_element("body");
@@ -3819,6 +3868,8 @@ mod tests {
         let div2 = build_elem("div", None, vec![], &[]);
         append_child(&body, &div1);
         append_child(&body, &p_loose);
+        // Non-whitespace tail on the sibling that will be moved.
+        set_tail(&p_loose, Some("PTAIL"));
         append_child(&body, &div2);
         _wrap_unwanted_siblings_of_div(&div1);
         // After: body has [div, div(wrapper containing p), div].
@@ -3830,22 +3881,54 @@ mod tests {
         let middle_kids = children(middle);
         assert_eq!(middle_kids.len(), 1);
         assert_eq!(local_name(&middle_kids[0]).as_deref(), Some("p"));
+        // The moved <p>'s tail must travel WITH it into the wrapper, not stay
+        // orphaned under <body>.
+        assert_eq!(
+            tail(&middle_kids[0]).as_deref(),
+            Some("PTAIL"),
+            "moved sibling's tail must travel into the wrapper div"
+        );
+        // And it must NOT remain in the source parent (no orphan Text in body).
+        let body_has_orphan_text = dom::child_nodes(&body).iter().any(dom::is_text);
+        assert!(
+            !body_has_orphan_text,
+            "tail must not be orphaned under <body>"
+        );
     }
 
     /// `_move_element_one_level_up`: `<ab>` nested under `<p>` moves up.
+    ///
+    /// Regression guard for the rcdom reparent-tail bug class: a following
+    /// sibling of `<ab>` carries a NON-whitespace tail. `xml.py:589`
+    /// `new_elem.extend(list(element.itersiblings()))` moves each following
+    /// sibling WITH its tail into the new `<p>`; a naive remove+append_child
+    /// dropped those tails. Here we assert the moved sibling's tail survives
+    /// on the destination `<p>` (new_elem).
     #[test]
     fn tei_move_element_one_level_up_lifts_ab_from_p() {
-        // <body><p><ab>head</ab>tail</p></body>
+        // <body><p><ab>head</ab><hi>x</hi>SIBTAIL</p></body>
+        // <ab> has one following sibling <hi> whose tail is "SIBTAIL".
         let body = create_element("body");
         let p = build_elem("p", None, vec![], &[]);
         let ab = build_elem("ab", Some("head"), vec![], &[]);
+        let hi = build_elem("hi", Some("x"), vec![], &[]);
         append_child(&p, &ab);
+        append_child(&p, &hi);
+        set_tail(&hi, Some("SIBTAIL"));
         append_child(&body, &p);
         _move_element_one_level_up(&ab);
         // After: <ab> is now a direct child of body (sibling of p).
         let kids = children(&body);
-        // ab moved up to be after p; new_elem may not be inserted because empty.
         assert!(kids.iter().any(|k| local_name(k).as_deref() == Some("ab")));
+        // The new <p> (new_elem) holds the moved <hi>, and <hi>'s tail must
+        // have travelled with it (rather than being orphaned in the old <p>).
+        let hi_after = get_elements_by_tag_name(&body, "hi");
+        assert_eq!(hi_after.len(), 1, "the moved <hi> must survive exactly once");
+        assert_eq!(
+            tail(&hi_after[0]).as_deref(),
+            Some("SIBTAIL"),
+            "moved sibling's tail must travel into new_elem"
+        );
     }
 
     /// `check_tei`: non-whitelisted descendant is merged with parent.

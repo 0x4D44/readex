@@ -2811,7 +2811,24 @@ name = "mdrcel"
 # substantive fixtures; residual header divergence (filedate/fingerprint/date/
 # hostname/author) is the metadata subsystem, deferred. No new public API/type,
 # no new dependency.
-version = "0.17.4"
+#
+# Reserve work (2026-05-22): 0.17.4 -> 0.17.5 PATCH. Internal bug-fix +
+# internal primitive; no public API change. Adds `dom::reparent_with_tail` and
+# `dom::insert_with_tail` (src/readability/dom.rs) — safe "move a node WITH its
+# tail to a new parent" primitives that close the rcdom reparent-tail bug class:
+# lxml `parent.append/insert/extend` carry an element's `.tail`, but mdrcel
+# models a tail as a separate following Text-node run, so hand-rolled
+# `dom::remove + append_child/insert_child_at` reparent sites silently orphaned
+# the moved node's tail in the old parent. Routes four offending output.rs
+# check_tei sites through the new primitives / deferred-apply pattern:
+# _wrap_unwanted_siblings_of_div (xml.py:566), _move_element_one_level_up's
+# following-sibling extend (xml.py:589) and element insert (xml.py:591) and
+# new_elem tail (xml.py:600), plus the complex-head replace path (xml.py:207)
+# which re-applies the head's trimmed tail AFTER attachment (the prior
+# detached-node `set_tail` was a silent no-op). No corpus fixture currently
+# triggered these latent paths, so all gates stay green; the two TEI unit tests
+# now exercise non-whitespace tails as differential guards.
+version = "0.17.5"
 edition = "2024"
 
 # M7 Stage 1 (2026-05-22): 0.16.2 -> 0.17.0 MINOR. New public function
