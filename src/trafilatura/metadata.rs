@@ -728,9 +728,11 @@ fn examine_title_element(doc: &Dom) -> (String, Option<String>, Option<String>) 
 
 /// `extract_metainfo(tree, expressions, len_limit)` (`metadata.py:318-334`).
 ///
-/// Walk the XPath expressions; for each result, take its trimmed
-/// `text_content`; return the FIRST result whose length is strictly between
-/// 2 and `len_limit`.
+/// Walk the XPath expressions; for each result, take `trim(" ".join(
+/// elem.itertext()))` (metadata.py:327) — itertext joined on a SPACE, NOT a
+/// bare `text_content` concat: a `<div>X<a>Y</a><a>Z</a>` element yields
+/// `"X Y Z"`, not `"XYZ"`. Return the FIRST result whose length is strictly
+/// between 2 and `len_limit`.
 fn extract_metainfo(
     tree: &NodeRef,
     expressions: &[&str],
@@ -741,11 +743,11 @@ fn extract_metainfo(
             continue;
         };
         for elem in &results {
-            let raw = text_content(elem);
-            // Join split-whitespace via `trim` (`utils.py:340-346` —
-            // " ".join(s.split())).
+            let raw = crate::trafilatura::baseline::itertext(elem).join(" ");
+            // `trim` = `" ".join(s.split())` (utils.py:340-346) collapses the
+            // join's whitespace runs to single spaces.
             let content = trim(&raw);
-            if content.len() > 2 && content.len() < len_limit {
+            if content.chars().count() > 2 && content.chars().count() < len_limit {
                 return Some(content);
             }
         }

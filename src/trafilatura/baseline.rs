@@ -543,7 +543,7 @@ fn html2txt_from_tree(tree_root: &NodeRef, clean: bool) -> String {
 /// outside `elem`). We achieve this by walking `elem`'s `children` only,
 /// recursing into every element child, and emitting Text-node `data` as we
 /// hit it.
-fn itertext(elem: &NodeRef) -> Vec<String> {
+pub(crate) fn itertext(elem: &NodeRef) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     collect_itertext(elem, &mut out);
     out
