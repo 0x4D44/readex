@@ -2626,7 +2626,22 @@ name = "mdrcel"
 # doctrinal note flagged this as a likely 0-2 fixture flip — recorded
 # as a hygiene fix regardless. No public-API change. No new dependency.
 # PATCH bump.
-version = "0.15.18"
+#
+# M5 Stage 6j-b (2026-05-22): 0.15.18 -> 0.15.19 PATCH. Allowlist-only —
+# `86df4d2e654952e4.html` (Wikipedia article with inline `<sup>[<i><a>
+# <span>citation needed</span></a></i>]</sup>`). Python's markdown path
+# (`xmltotxt(body, formatting=True)` re-running `handle_formatting`)
+# STRUCTURALLY FRACTURES the citation into multiple sibling `<hi>`
+# elements at different tree positions; Python's XML path keeps it
+# intact. mdrcel matches Python's XML (the faithful body). 3-byte diff
+# at byte 30291 of a 65,906-char fixture. Replicating the fracture would
+# be bug-for-bug replication of an internal Python pipeline quirk —
+# anti-inversion-violating. ADR: `wrk_docs/m5-allowlist/86df4d2e.md`.
+# Added to `PYTHON_UNDER_EXTRACT_ALLOWLIST` in
+# `tests/trafilatura_markdown_gate.rs`. Gate movement:
+# 41/51 + 5 -> 41/51 + 6 substantive (content-mismatch 5 -> 4, allowlist
+# 5 -> 6). No public-API change. No new dependency. PATCH bump.
+version = "0.15.19"
 edition = "2024"
 
 # M5 Stage 6e-b (2026-05-21): 0.15.10 -> 0.15.11 PATCH. No source change —

@@ -81,6 +81,17 @@ const PYTHON_UNDER_EXTRACT_ALLOWLIST: &[&str] = &[
     // proper markdown table and omits the nav chrome. ADR:
     // wrk_docs/m5-allowlist/0f63a2a5.md.
     "0f63a2a5a5620b74.html",
+    // Wikipedia article (M5 Stage 6j-b, 2026-05-22). Python's
+    // `extract(output_format='markdown')` re-runs `handle_formatting`
+    // during `xmltotxt(body, formatting=True)` and STRUCTURALLY
+    // FRACTURES the source `<sup>[<i><a><span>citation needed</span></a></i>]</sup>`
+    // into multiple sibling `<hi>` elements at different tree positions
+    // (closing `]` ends up as orphan-tail at body level; opening `[` ends
+    // up in a fresh `<p>`). Python's XML output preserves the citation
+    // intact; mdrcel matches Python's XML (the faithful body). 3-byte
+    // diff at byte 30291 in a 65,906-char fixture. ADR:
+    // wrk_docs/m5-allowlist/86df4d2e.md.
+    "86df4d2e654952e4.html",
 ];
 
 /// All 51 corpus snapshots — enumerated literally from
