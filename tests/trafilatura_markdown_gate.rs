@@ -33,11 +33,12 @@
 //! The end-of-report tally totals each bucket so Stage 3 can pick the
 //! highest-value fix target.
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
-
 use mdrcel::{extract_to_markdown, Options};
-use unicode_normalization::UnicodeNormalization;
+
+mod common;
+use common::{
+    classify, escape, first_diff_index, nfc, run_oracle, window_around, workspace_path, Bucket,
+};
 
 /// Fixtures where Python's `trafilatura.extract` is the under-extractor
 /// (or its output is anti-inversion-violating in a corpus-specific way).
@@ -240,32 +241,6 @@ const FIXTURES: &[&str] = &[
     "benchmark/corpus/snapshots/f76ec833b4b5e57d.html",
 ];
 
-/// Bucket classification of a divergence — coarse-grained on purpose so
-/// Stage 3 can decide the highest-value fix target at a glance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Bucket {
-    /// One side empty, the other not. The most severe class — typically a
-    /// pipeline silently producing nothing.
-    EmptyVsNon,
-    /// Both sides non-empty AND identical after collapsing all ASCII
-    /// whitespace runs to a single space. Often a low-stakes formatting
-    /// drift (extra blank lines, paragraph spacing).
-    WhitespaceOnly,
-    /// Both sides non-empty, differ even after whitespace collapse. The
-    /// "real" content divergence — Stage 3's main focus.
-    ContentMismatch,
-}
-
-impl Bucket {
-    fn label(self) -> &'static str {
-        match self {
-            Bucket::EmptyVsNon => "empty-vs-non",
-            Bucket::WhitespaceOnly => "whitespace-only",
-            Bucket::ContentMismatch => "content-mismatch",
-        }
-    }
-}
-
 #[test]
 fn trafilatura_markdown_gate() {
     let mut pass = 0usize;
@@ -312,7 +287,7 @@ fn trafilatura_markdown_gate() {
             }
         };
         // 2. Python markdown output (subprocess oracle).
-        let python_md_raw = match python_markdown(&path) {
+        let python_md_raw = match run_oracle("--markdown", &path) {
             Ok(s) => s,
             Err(e) => panic!(
                 "M5 STAGE 2 GATE: Python oracle failure on {} — {e}",
@@ -322,8 +297,8 @@ fn trafilatura_markdown_gate() {
 
         // 3. NFC-normalise both (belt-and-braces — both pipelines already
         //    NFC-normalise; this makes the contract explicit at gate level).
-        let rust_md: String = rust_md_raw.as_str().nfc().collect();
-        let python_md: String = python_md_raw.as_str().nfc().collect();
+        let rust_md: String = nfc(&rust_md_raw);
+        let python_md: String = nfc(&python_md_raw);
 
         if rust_md == python_md {
             pass += 1;
@@ -438,134 +413,3 @@ fn trafilatura_markdown_gate() {
     }
 }
 
-fn workspace_path(rel: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(rel)
-}
-
-/// Python oracle path: spawn `run.py --markdown` and read its stdout as the
-/// markdown payload. Bypasses the venv re-exec by setting
-/// `MDRCEL_TRAFILATURA_REEXECED=1` (same trick as the Stage 1b / 3-B gates).
-fn python_markdown(snapshot_path: &Path) -> Result<String, String> {
-    let run_py = workspace_path("benchmark/oracles/trafilatura/run.py");
-    let output = Command::new("python")
-        .arg(&run_py)
-        .arg("--markdown")
-        .arg(snapshot_path)
-        .env("MDRCEL_TRAFILATURA_REEXECED", "1")
-        .output()
-        .map_err(|e| format!("failed to spawn python: {e}"))?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "python adapter exited non-zero ({:?}):\nstdout: {}\nstderr: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        ));
-    }
-    String::from_utf8(output.stdout).map_err(|e| format!("python stdout not utf-8: {e}"))
-}
-
-/// Bucket-classify a divergence. Coarse on purpose — Stage 3 sub-buckets as
-/// needed from the per-fixture window listing.
-fn classify(rust: &str, python: &str) -> Bucket {
-    if rust.is_empty() != python.is_empty() {
-        return Bucket::EmptyVsNon;
-    }
-    if collapse_ws(rust) == collapse_ws(python) {
-        return Bucket::WhitespaceOnly;
-    }
-    Bucket::ContentMismatch
-}
-
-/// Collapse every run of ASCII whitespace to a single space, strip leading
-/// and trailing whitespace. Cheap proxy for the "did only formatting
-/// differ?" question; if the answer is yes, the bucket is downgraded.
-fn collapse_ws(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// First byte index where two byte slices differ; min(len) if one is a
-/// prefix of the other.
-fn first_diff_index(a: &[u8], b: &[u8]) -> usize {
-    let n = a.len().min(b.len());
-    for i in 0..n {
-        if a[i] != b[i] {
-            return i;
-        }
-    }
-    n
-}
-
-/// Return up to `n` chars of context centred on `byte_idx`, snapped to UTF-8
-/// boundaries. Empty when the string is empty.
-fn window_around(s: &str, byte_idx: usize, n: usize) -> String {
-    if s.is_empty() {
-        return String::new();
-    }
-    let half = n / 2;
-    let mut lo = byte_idx.saturating_sub(half);
-    let mut hi = (byte_idx + half).min(s.len());
-    while lo > 0 && !s.is_char_boundary(lo) {
-        lo -= 1;
-    }
-    while hi < s.len() && !s.is_char_boundary(hi) {
-        hi += 1;
-    }
-    s[lo..hi].to_string()
-}
-
-/// Escape control chars + newlines so the per-fixture report is a single
-/// readable line. Keeps tabs/spaces visible as `\t` / regular space.
-fn escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        match ch {
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\x{:02x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
-// ===========================================================================
-// Self-tests for the harness helpers — exercised at compile time of this
-// integration-test binary so the harness machinery itself doesn't drift.
-// ===========================================================================
-
-#[test]
-fn bucket_empty_vs_non() {
-    assert_eq!(classify("", "x"), Bucket::EmptyVsNon);
-    assert_eq!(classify("x", ""), Bucket::EmptyVsNon);
-}
-
-#[test]
-fn bucket_whitespace_only() {
-    assert_eq!(classify("a b", "a  b"), Bucket::WhitespaceOnly);
-    assert_eq!(classify("a\nb", "a b"), Bucket::WhitespaceOnly);
-}
-
-#[test]
-fn bucket_content_mismatch() {
-    assert_eq!(classify("hello", "world"), Bucket::ContentMismatch);
-}
-
-#[test]
-fn first_diff_index_basic() {
-    assert_eq!(first_diff_index(b"abc", b"abd"), 2);
-    assert_eq!(first_diff_index(b"abc", b"abc"), 3);
-    assert_eq!(first_diff_index(b"abc", b"abcdef"), 3);
-}
-
-#[test]
-fn window_around_snaps_to_boundary() {
-    // A 3-byte UTF-8 char ("é" is 2 bytes; "—" is 3) at start of string.
-    let s = "—abc—def";
-    let w = window_around(s, 4, 10);
-    // Must be valid UTF-8 and contain at least one of the surrounding chars.
-    assert!(!w.is_empty());
-    assert!(s.contains(&w));
-}

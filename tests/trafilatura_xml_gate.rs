@@ -53,11 +53,12 @@
 //! pinned to a future milestone; ADR under `wrk_docs/m7-deferred/`). Any
 //! untriaged bucket count > 0 fails the gate.
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
-
 use mdrcel::{extract_to_xml, Options};
-use unicode_normalization::UnicodeNormalization;
+
+mod common;
+use common::{
+    classify, escape, first_diff_index, nfc, run_oracle, window_around, workspace_path, Bucket,
+};
 
 /// Fixtures where Python's `trafilatura.extract(output_format="xml")` is the
 /// under-extractor or otherwise anti-inversion-violating in a corpus-specific
@@ -198,27 +199,6 @@ const FIXTURES: &[&str] = &[
     "benchmark/corpus/snapshots/f76ec833b4b5e57d.html",
 ];
 
-/// Bucket classification of a divergence — coarse-grained on purpose.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Bucket {
-    /// One side empty, the other not. The most severe class.
-    EmptyVsNon,
-    /// Both non-empty AND identical after collapsing ASCII whitespace runs.
-    WhitespaceOnly,
-    /// Both non-empty, differ even after whitespace collapse.
-    ContentMismatch,
-}
-
-impl Bucket {
-    fn label(self) -> &'static str {
-        match self {
-            Bucket::EmptyVsNon => "empty-vs-non",
-            Bucket::WhitespaceOnly => "whitespace-only",
-            Bucket::ContentMismatch => "content-mismatch",
-        }
-    }
-}
-
 #[test]
 fn trafilatura_xml_gate() {
     let mut pass = 0usize;
@@ -256,7 +236,7 @@ fn trafilatura_xml_gate() {
             }
         };
         // 2. Python xml output (subprocess oracle).
-        let python_xml_raw = match python_xml(&path) {
+        let python_xml_raw = match run_oracle("--xml", &path) {
             Ok(s) => s,
             Err(e) => panic!(
                 "M7 STAGE 4 GATE: Python oracle failure on {} — {e}",
@@ -265,8 +245,8 @@ fn trafilatura_xml_gate() {
         };
 
         // 3. NFC-normalise both (belt-and-braces).
-        let rust_nfc: String = rust_xml_raw.as_str().nfc().collect();
-        let python_nfc: String = python_xml_raw.as_str().nfc().collect();
+        let rust_nfc: String = nfc(&rust_xml_raw);
+        let python_nfc: String = nfc(&python_xml_raw);
 
         // 4. Neutralise the deliberate blake2b-vs-(absent) fingerprint
         //    attribute on the `<doc>` root (ADR
@@ -373,10 +353,6 @@ fn trafilatura_xml_gate() {
     }
 }
 
-fn workspace_path(rel: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(rel)
-}
-
 /// Strip the deliberate blake2b-vs-(absent) `fingerprint` attribute from the
 /// `<doc …>` root start tag on BOTH sides so the rest of the document compares
 /// byte-for-byte.
@@ -475,127 +451,6 @@ fn is_well_formed_fingerprint(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 16
         && s.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
-}
-
-/// Python oracle path: spawn `run.py --xml` and read its stdout as the XML
-/// payload. Bypasses the venv re-exec via `MDRCEL_TRAFILATURA_REEXECED=1`
-/// (same trick as the txt / json / csv / markdown gates).
-fn python_xml(snapshot_path: &Path) -> Result<String, String> {
-    let run_py = workspace_path("benchmark/oracles/trafilatura/run.py");
-    let output = Command::new("python")
-        .arg(&run_py)
-        .arg("--xml")
-        .arg(snapshot_path)
-        .env("MDRCEL_TRAFILATURA_REEXECED", "1")
-        .output()
-        .map_err(|e| format!("failed to spawn python: {e}"))?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "python adapter exited non-zero ({:?}):\nstdout: {}\nstderr: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        ));
-    }
-    String::from_utf8(output.stdout).map_err(|e| format!("python stdout not utf-8: {e}"))
-}
-
-/// Bucket-classify a divergence.
-fn classify(rust: &str, python: &str) -> Bucket {
-    if rust.is_empty() != python.is_empty() {
-        return Bucket::EmptyVsNon;
-    }
-    if collapse_ws(rust) == collapse_ws(python) {
-        return Bucket::WhitespaceOnly;
-    }
-    Bucket::ContentMismatch
-}
-
-/// Collapse every run of ASCII whitespace to a single space; strip ends.
-fn collapse_ws(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// First byte index where two byte slices differ; min(len) if one is a
-/// prefix of the other.
-fn first_diff_index(a: &[u8], b: &[u8]) -> usize {
-    let n = a.len().min(b.len());
-    for i in 0..n {
-        if a[i] != b[i] {
-            return i;
-        }
-    }
-    n
-}
-
-/// Return up to `n` chars of context centred on `byte_idx`, snapped to UTF-8
-/// boundaries. Empty when the string is empty.
-fn window_around(s: &str, byte_idx: usize, n: usize) -> String {
-    if s.is_empty() {
-        return String::new();
-    }
-    let half = n / 2;
-    let mut lo = byte_idx.saturating_sub(half);
-    let mut hi = (byte_idx + half).min(s.len());
-    while lo > 0 && !s.is_char_boundary(lo) {
-        lo -= 1;
-    }
-    while hi < s.len() && !s.is_char_boundary(hi) {
-        hi += 1;
-    }
-    s[lo..hi].to_string()
-}
-
-/// Escape control chars + newlines so the per-fixture report is one line.
-fn escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        match ch {
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\x{:02x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
-// ===========================================================================
-// Self-tests for the harness helpers.
-// ===========================================================================
-
-#[test]
-fn bucket_empty_vs_non() {
-    assert_eq!(classify("", "x"), Bucket::EmptyVsNon);
-    assert_eq!(classify("x", ""), Bucket::EmptyVsNon);
-}
-
-#[test]
-fn bucket_whitespace_only() {
-    assert_eq!(classify("a b", "a  b"), Bucket::WhitespaceOnly);
-    assert_eq!(classify("a\nb", "a b"), Bucket::WhitespaceOnly);
-}
-
-#[test]
-fn bucket_content_mismatch() {
-    assert_eq!(classify("hello", "world"), Bucket::ContentMismatch);
-}
-
-#[test]
-fn first_diff_index_basic() {
-    assert_eq!(first_diff_index(b"abc", b"abd"), 2);
-    assert_eq!(first_diff_index(b"abc", b"abc"), 3);
-    assert_eq!(first_diff_index(b"abc", b"abcdef"), 3);
-}
-
-#[test]
-fn window_around_snaps_to_boundary() {
-    let s = "—abc—def";
-    let w = window_around(s, 4, 10);
-    assert!(!w.is_empty());
-    assert!(s.contains(&w));
 }
 
 #[test]
