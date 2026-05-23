@@ -2849,7 +2849,7 @@ name = "mdrcel"
 # <teiHeader> to <note type="fingerprint"> only; header+body byte-compared.
 # GREEN 51 = 38 substantive + 11 allowlisted + 2 deferred. No new dependency
 # (regex/unicode-normalization already pinned). All 11 BLOCKER gates green.
-version = "0.18.1"
+version = "0.18.2"
 edition = "2024"
 
 # M7 Stage 1 (2026-05-22): 0.16.2 -> 0.17.0 MINOR. New public function

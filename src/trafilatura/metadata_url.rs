@@ -55,6 +55,7 @@
 use crate::readability::dom::{
     Dom, NodeRef, element_text, get_attribute, get_elements_by_tag_name, local_name, text_content,
 };
+use crate::trafilatura::output::strip_control_chars;
 use crate::trafilatura::utils::trim;
 use crate::trafilatura::xpath_engine;
 use crate::trafilatura::xpaths_constants::{CATEGORIES_XPATHS, TAGS_XPATHS};
@@ -868,17 +869,19 @@ fn href_matches_metatype(href: &str, metatype: &str) -> bool {
 }
 
 /// `line_processing(line)` (`utils.py:283-300`) — minimal port: replace
-/// `&#13;`/`&#10;`/`&nbsp;` then trim. The full Python helper additionally
-/// strips control characters via `remove_control_characters` and applies a
-/// `LINES_TRIMMING` regex; we apply the obvious entity replacements + trim
-/// (which collapses internal whitespace) — sufficient for the category/tag
-/// link-text path where the input is typically clean.
+/// `&#13;`/`&#10;`/`&nbsp;` then `strip_control_chars` (M10 Phase 1,
+/// HLD §5) then trim. The `LINES_TRIMMING` regex portion is still
+/// covered by `trim`, which collapses internal whitespace.
 fn line_processing(line: &str) -> String {
     let replaced = line
         .replace("&#13;", "\r")
         .replace("&#10;", "\n")
         .replace("&nbsp;", "\u{00A0}");
-    trim(&replaced)
+    // M10 Phase 1 (utils.py:288) — same `remove_control_characters` strip
+    // the output.rs mirror runs; see HLD §5 and ADR
+    // wrk_docs/m7-deferred/507b9cdb.md.
+    let stripped = strip_control_chars(&replaced);
+    trim(&stripped)
 }
 
 // ===========================================================================

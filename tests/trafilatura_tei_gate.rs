@@ -142,18 +142,13 @@ const PYTHON_UNDER_EXTRACT_ALLOWLIST: &[&str] = &[
 /// corresponding ADR in `wrk_docs/m7-deferred/`. A fixture MUST NOT appear in
 /// both lists.
 const DEFERRED_KNOWN_DEFECT: &[&str] = &[
-    // Apple FR (French Wikipedia) — mdrcel leaks U+2063 INVISIBLE SEPARATOR
-    // (Unicode category Cf) that the source HTML literally contains; Python's
-    // body text is run through `remove_control_characters` (utils.py:272-300),
-    // mdrcel's `output::line_processing` omits that step. The same body text
-    // flows into the TEI `<div type="entry">` element text, so the leak
-    // re-appears exactly as on the txt/json/csv/xml paths. mdrcel is the buggy
-    // side; a faithful fix needs a Unicode general-category facility (new
-    // dependency / vendored table = supervisor-sign-off). ADR:
-    // wrk_docs/m7-deferred/507b9cdb.md (shared; has an "also affects xmltei"
-    // note). NOTE: the fingerprint note is still neutralised for this fixture
-    // before the U+2063 body divergence is observed — the two are independent.
-    "507b9cdbe036bf58.html",
+    // (M10 Phase 1, 2026-05-23) The 507b9cdb (Apple FR / U+2063) deferral
+    // was resolved by porting Python's `remove_control_characters`
+    // (utils.py:266-274) into `output::line_processing` and the metadata
+    // slot path. ADR `wrk_docs/m7-deferred/507b9cdb.md` carries a closure
+    // note. The fixture now passes byte-equality on this gate
+    // substantively. Fingerprint-note neutralisation is independent and
+    // remains in force.
     // SEC press release — mdrcel's htmldate port over-extracts an XBRL schema
     // date (`numeric-2009-12-16.xsd`, in a <script> JSON blob) in its extensive
     // last-resort scan, where Python's htmldate finds the article's text date

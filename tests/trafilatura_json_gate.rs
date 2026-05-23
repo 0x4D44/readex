@@ -81,19 +81,12 @@ const PYTHON_UNDER_EXTRACT_ALLOWLIST: &[&str] = &[
 /// entry MUST have a corresponding ADR in `wrk_docs/m7-deferred/`. A fixture
 /// MUST NOT appear in both lists.
 const DEFERRED_KNOWN_DEFECT: &[&str] = &[
-    // Apple FR (French Wikipedia) — mdrcel leaks U+2063 INVISIBLE SEPARATOR
-    // (Unicode category Cf) that the source HTML literally contains around
-    // link text. Python's xmltotxt body text is run through
-    // `remove_control_characters` (utils.py:272-300; `char.isprintable() or
-    // char.isspace()`); mdrcel's `output::line_processing` deliberately
-    // omitted that step pending a real control-character-leak test. The same
-    // `xmltotxt(body)` string flows into json's `text` field, so the leak
-    // re-appears here exactly as on the txt path. mdrcel is the buggy side; a
-    // faithful fix needs a Unicode general-category facility (new dependency /
-    // vendored table = supervisor-sign-off work), so it is deferred. ADR:
-    // wrk_docs/m7-deferred/507b9cdb.md (shared with the txt gate; that ADR has
-    // an "also affects json" note).
-    "507b9cdbe036bf58.html",
+    // (M10 Phase 1, 2026-05-23) The 507b9cdb (Apple FR / U+2063) deferral
+    // was resolved by porting Python's `remove_control_characters`
+    // (utils.py:266-274) into `output::line_processing` and the metadata
+    // slot path. ADR `wrk_docs/m7-deferred/507b9cdb.md` carries a closure
+    // note. The fixture now passes byte-equality on this gate
+    // substantively.
 ];
 
 /// All 51 corpus snapshots — copied verbatim from the txt / markdown gate.

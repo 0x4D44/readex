@@ -76,19 +76,12 @@ const PYTHON_UNDER_EXTRACT_ALLOWLIST: &[&str] = &[
 /// entry MUST have a corresponding ADR in `wrk_docs/m7-deferred/`. A fixture
 /// MUST NOT appear in both lists.
 const DEFERRED_KNOWN_DEFECT: &[&str] = &[
-    // Apple FR (French Wikipedia) — mdrcel leaks U+2063 INVISIBLE SEPARATOR
-    // (Unicode category Cf) that the source HTML literally contains around
-    // link text. Python's txt path strips it via `remove_control_characters`
-    // (utils.py:272-300; `char.isprintable() or char.isspace()`); mdrcel's
-    // `output::line_processing` (output.rs:787) deliberately omitted that step
-    // pending a real control-character-leak test — THIS is that test. mdrcel
-    // is the buggy side. A faithful fix needs a Unicode general-category
-    // facility (new dependency / vendored table = supervisor-sign-off work),
-    // so it is deferred to a future milestone. Net ~73-char delta in a
-    // 121,769-char fixture. ADR: wrk_docs/m7-deferred/507b9cdb.md. (Distinct
-    // from the markdown gate's 507b9cdb allowlist entry, which is the separate
-    // `<sup>`-fracture under formatting=True.)
-    "507b9cdbe036bf58.html",
+    // (M10 Phase 1, 2026-05-23) The 507b9cdb (Apple FR / U+2063) deferral
+    // was resolved by porting Python's `remove_control_characters`
+    // (utils.py:266-274) into `output::line_processing` and the metadata
+    // slot path. ADR `wrk_docs/m7-deferred/507b9cdb.md` carries a closure
+    // note. The fixture now passes byte-equality on this gate
+    // substantively.
 ];
 
 /// All 51 corpus snapshots — copied verbatim from the markdown gate

@@ -44,6 +44,8 @@ use crate::readability::dom::{
 };
 use crate::trafilatura::metadata::Metadata;
 use crate::trafilatura::utils::text_chars_test;
+use regex::Regex;
+use std::sync::OnceLock;
 
 // ===========================================================================
 // Module constants (xml.py:37-50)
@@ -912,16 +914,46 @@ fn sanitize(text: &str, preserve_space: bool, trailing_space: bool) -> Option<St
     }
 }
 
+/// Faithful port of Python's `remove_control_characters`
+/// (`utils.py:266-274`).
+///
+/// One `Regex::replace_all` over the input. The character class covers
+/// every codepoint Python's `isprintable() or isspace()` predicate
+/// rejects:
+///
+///   - `\p{Cf}` — Format (all stripped; e.g. ZWSP U+200B, INVISIBLE
+///     SEPARATOR U+2063, BOM U+FEFF, SOFT HYPHEN U+00AD).
+///   - `\p{Co}` — Private Use Area (all stripped).
+///   - `\p{Cn}` — Unassigned (all stripped).
+///   - `\x00-\x08`, `\x0E-\x1B`, `\x7F-\x84`, `\x86-\x9F` — the Cc
+///     codepoints Python rejects (i.e. `\p{Cc}` minus the ten
+///     `isspace()` Cc kept-set: 0x09-0x0D, 0x1C-0x1F, 0x85 NEL).
+///   - Cs (surrogates) is structurally unreachable in `&str` and is
+///     omitted from the class.
+///
+/// Full-Unicode equivalence with Python verified by an offline sweep
+/// (`notes/m10-strip-probe/`) — zero disagreements across all
+/// 1,112,064 non-surrogate codepoints.
+pub(crate) fn strip_control_chars(s: &str) -> String {
+    static STRIP_RE: OnceLock<Regex> = OnceLock::new();
+    let re = STRIP_RE.get_or_init(|| {
+        Regex::new(r"[\p{Cf}\p{Co}\p{Cn}\x00-\x08\x0E-\x1B\x7F-\x84\x86-\x9F]")
+            .expect("static regex")
+    });
+    re.replace_all(s, "").into_owned()
+}
+
 /// Faithful subset of `utils.py:282-300` (`line_processing`):
 /// - replace `&#13;` -> '\r', `&#10;` -> '\n', `&nbsp;` -> '\u{00A0}'
+/// - `strip_control_chars` (utils.py:288, M10 Phase 1)
 /// - trim (`utils.py:340-346`: collapse whitespace + strip)
 /// - return `None` for all-whitespace lines
 ///
 /// Stage 3-B does NOT port the `preserve_space` / `trailing_space` knobs
 /// (the `sanitize`-`process_element` callsite at `xml.py:363` uses
-/// defaults). `remove_control_characters` is omitted — the upstream
-/// parser already drops C0 controls except whitespace; if a future test
-/// surfaces a control-character leak the helper grows here.
+/// defaults). M10 Phase 1 lands the `strip_control_chars` call between
+/// the entity-substitute and trim blocks per HLD §4 and ADR
+/// `wrk_docs/m7-deferred/507b9cdb.md`.
 fn line_processing(line: &str, preserve_space: bool, trailing_space: bool) -> Option<String> {
     // utils.py:288 — `remove_control_characters(line.replace('&#13;',
     // '\r').replace('&#10;', '\n').replace('&nbsp;', ' '))`.
@@ -929,6 +961,10 @@ fn line_processing(line: &str, preserve_space: bool, trailing_space: bool) -> Op
         .replace("&#13;", "\r")
         .replace("&#10;", "\n")
         .replace("&nbsp;", "\u{00A0}");
+
+    // M10 Phase 1 (utils.py:288) — `remove_control_characters(...)` strip,
+    // ported per HLD §4 and ADR `wrk_docs/m7-deferred/507b9cdb.md`.
+    let decoded = strip_control_chars(&decoded);
 
     // utils.py:289 — `if not preserve_space:` guards the whole trim block.
     // When preserve_space is set, the (control-char-cleaned) line is returned
@@ -4054,5 +4090,145 @@ mod tests {
         assert!(s.contains("xmlns=\"http://www.tei-c.org/ns/1.0\""), "{s}");
         assert!(s.contains("<teiHeader>"), "{s}");
         assert!(s.ends_with("</TEI>"), "must end with </TEI>: {s}");
+    }
+
+    // -------------------------------------------------------------------
+    // strip_control_chars (utils.py:266-274) — 17 tests
+    // M10 Phase 1 (HLD §6a). Each case is one-line input + one-line
+    // expected; coverage spans Cc-kept, Cc-stripped, Cf, Co, Cn, and
+    // representative Unicode whitespace categories (Zs/Zl/Zp).
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn strip_control_chars_passes_ascii_through_verbatim() {
+        let s = "hello world";
+        assert_eq!(strip_control_chars(s), "hello world");
+    }
+
+    #[test]
+    fn strip_control_chars_keeps_preserved_cc_whitespace() {
+        // TAB / LF / CR / VT / FF — all Cc but Python isspace() = True.
+        let s = "a\tb\nc\rd\u{000B}e\u{000C}f";
+        assert_eq!(strip_control_chars(s), s);
+    }
+
+    #[test]
+    fn strip_control_chars_keeps_information_separators() {
+        // FS/GS/RS/US (U+001C..U+001F) — surprise Cc-kept (Python isspace).
+        let s = "a\u{001C}b\u{001D}c\u{001E}d\u{001F}e";
+        assert_eq!(strip_control_chars(s), s);
+    }
+
+    #[test]
+    fn strip_control_chars_keeps_nel() {
+        // U+0085 NEL — C1 control but Python isspace() = True.
+        let s = "a\u{0085}b";
+        assert_eq!(strip_control_chars(s), s);
+    }
+
+    #[test]
+    fn strip_control_chars_strips_nul_and_bel() {
+        let s = "a\u{0000}b\u{0007}c";
+        assert_eq!(strip_control_chars(s), "abc");
+    }
+
+    #[test]
+    fn strip_control_chars_strips_del() {
+        // U+007F DEL — Cc, not Python isspace().
+        let s = "a\u{007F}b";
+        assert_eq!(strip_control_chars(s), "ab");
+    }
+
+    #[test]
+    fn strip_control_chars_strips_c1_controls_except_nel() {
+        // C1 range (0x80-0x9F) minus 0x85 NEL — all stripped.
+        let s = "a\u{0086}b\u{0099}c\u{009F}d";
+        assert_eq!(strip_control_chars(s), "abcd");
+    }
+
+    #[test]
+    fn strip_control_chars_strips_soft_hyphen() {
+        // U+00AD SOFT HYPHEN — Cf, known M7 leak class.
+        let s = "hyphen\u{00AD}ate";
+        assert_eq!(strip_control_chars(s), "hyphenate");
+    }
+
+    #[test]
+    fn strip_control_chars_strips_invisible_separator_u2063() {
+        // The exact pattern from the 507b9cdb (Apple FR) fixture.
+        let s = "iPadOS 15\u{2063}\u{2063}, il";
+        assert_eq!(strip_control_chars(s), "iPadOS 15, il");
+    }
+
+    #[test]
+    fn strip_control_chars_strips_bom() {
+        // U+FEFF BYTE ORDER MARK — Cf.
+        let s = "\u{FEFF}hello";
+        assert_eq!(strip_control_chars(s), "hello");
+    }
+
+    #[test]
+    fn strip_control_chars_strips_zero_width_joiner_set() {
+        // ZWSP / ZWNJ / ZWJ / LRM / RLM — all Cf.
+        let s = "a\u{200B}b\u{200C}c\u{200D}d\u{200E}e\u{200F}f";
+        assert_eq!(strip_control_chars(s), "abcdef");
+    }
+
+    #[test]
+    fn strip_control_chars_keeps_unicode_whitespace() {
+        // NBSP (Zs) / LINE SEP (Zl) / PARA SEP (Zp) / EM SPACE (Zs).
+        let s = "a\u{00A0}b\u{2028}c\u{2029}d\u{2003}e";
+        assert_eq!(strip_control_chars(s), s);
+    }
+
+    #[test]
+    fn strip_control_chars_strips_pua() {
+        // Private Use Area — Co category.
+        let s = "a\u{E000}b\u{F8FF}c";
+        assert_eq!(strip_control_chars(s), "abc");
+    }
+
+    #[test]
+    fn strip_control_chars_preserves_letters_marks_numbers() {
+        // Sanity: nothing kept is being lost. Includes combining mark.
+        let s = "café 123 \u{0301}";
+        assert_eq!(strip_control_chars(s), s);
+    }
+
+    #[test]
+    fn strip_control_chars_empty_returns_empty() {
+        assert_eq!(strip_control_chars(""), "");
+    }
+
+    #[test]
+    fn strip_control_chars_idempotent() {
+        // f(f(x)) == f(x). Mix of stripped + kept inputs.
+        let inputs = [
+            "iPadOS 15\u{2063}\u{2063}, il",
+            "hyphen\u{00AD}ate",
+            "\u{FEFF}hello",
+            "a\tb\nc",
+            "café 123",
+            "",
+        ];
+        for x in inputs {
+            let once = strip_control_chars(x);
+            let twice = strip_control_chars(&once);
+            assert_eq!(once, twice, "not idempotent on input: {x:?}");
+        }
+    }
+
+    #[test]
+    fn strip_control_chars_passes_long_unicode_text_unchanged() {
+        // ~5KB string with letters, marks, numbers, NBSP, and various
+        // scripts (Latin/CJK/Cyrillic + combining diacritic). Validates
+        // the fast path: regex finds no match, no allocation churn.
+        let chunk = "Café résumé Привет 你好 123 \u{00A0}\u{0301}";
+        let mut input = String::with_capacity(5200);
+        while input.len() < 5000 {
+            input.push_str(chunk);
+            input.push(' ');
+        }
+        assert_eq!(strip_control_chars(&input), input);
     }
 }

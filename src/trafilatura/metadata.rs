@@ -61,6 +61,7 @@ use crate::readability::dom::{
     Dom, NodeRef, children, element_text, get_attribute, get_elements_by_tag_name, local_name,
     text_content,
 };
+use crate::trafilatura::output::strip_control_chars;
 use crate::trafilatura::utils::trim;
 use crate::trafilatura::xpath_engine;
 use crate::trafilatura::xpaths_constants::{AUTHOR_DISCARD_XPATHS, AUTHOR_XPATHS, TITLE_XPATHS};
@@ -1077,7 +1078,45 @@ pub fn extract_metadata(
     //     date_config["max_date"]` = today (`%Y-%m-%d`). M8 added the slot.
     metadata.filedate = Some(ymd_to_iso(today));
 
+    // 16. M10 Phase 1: control-char strip across every metadata slot.
+    //     Mirrors Python's `metadata.clean_and_trim()` (metadata.py:587 →
+    //     settings.py:288-298) — the strip portion only, per HLD §5.
+    //     The 10,000-char length cap and `html.unescape` portions of
+    //     Python's `clean_and_trim` are deferred.
+    clean_and_trim_metadata(&mut metadata);
+
     metadata
+}
+
+/// Phase-1 port of Python's `metadata.clean_and_trim()`
+/// (`metadata.py:587` → `settings.py:288-298`). Strips control
+/// characters from every str-typed metadata slot. The length cap and
+/// `html.unescape` portions of Python's `clean_and_trim` are deferred
+/// (see HLD §5 "Phase 1 scope clarification").
+fn clean_and_trim_metadata(m: &mut Metadata) {
+    fn strip_in_place(slot: &mut Option<String>) {
+        if let Some(v) = slot.take() {
+            *slot = Some(strip_control_chars(&v));
+        }
+    }
+    strip_in_place(&mut m.title);
+    strip_in_place(&mut m.author);
+    strip_in_place(&mut m.url);
+    strip_in_place(&mut m.hostname);
+    strip_in_place(&mut m.description);
+    strip_in_place(&mut m.site_name);
+    strip_in_place(&mut m.date);
+    strip_in_place(&mut m.language);
+    strip_in_place(&mut m.image);
+    strip_in_place(&mut m.pagetype);
+    strip_in_place(&mut m.license);
+    strip_in_place(&mut m.filedate);
+    for c in m.categories.iter_mut() {
+        *c = strip_control_chars(c);
+    }
+    for t in m.tags.iter_mut() {
+        *t = strip_control_chars(t);
+    }
 }
 
 /// Python `str.title()` for ASCII-ish sitenames (`metadata.py:567`).
@@ -1378,5 +1417,87 @@ mod tests {
         assert!(m.image.is_none());
         assert!(m.pagetype.is_none());
         assert!(m.license.is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // clean_and_trim_metadata (M10 Phase 1, HLD §6a-bis) — 5 tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn clean_and_trim_metadata_strips_cf_from_title() {
+        let mut m = Metadata {
+            title: Some("Hello\u{200B}World".into()),
+            ..Default::default()
+        };
+        clean_and_trim_metadata(&mut m);
+        assert_eq!(m.title.as_deref(), Some("HelloWorld"));
+    }
+
+    #[test]
+    fn clean_and_trim_metadata_strips_invisible_separator_from_description() {
+        // The 507b9cdb fixture's exact pattern, applied to a description slot.
+        let mut m = Metadata {
+            description: Some("iPadOS 15\u{2063}\u{2063}, il".into()),
+            ..Default::default()
+        };
+        clean_and_trim_metadata(&mut m);
+        assert_eq!(m.description.as_deref(), Some("iPadOS 15, il"));
+    }
+
+    #[test]
+    fn clean_and_trim_metadata_strips_per_category_and_tag_entry() {
+        // Belt-and-braces over JSON-LD-sourced categories that bypass
+        // extract_catstags's line_processing.
+        let mut m = Metadata {
+            categories: vec!["news".into(), "sport\u{00AD}s".into()],
+            tags: vec!["foo\u{2063}".into(), "bar".into()],
+            ..Default::default()
+        };
+        clean_and_trim_metadata(&mut m);
+        assert_eq!(m.categories, vec!["news".to_string(), "sports".to_string()]);
+        assert_eq!(m.tags, vec!["foo".to_string(), "bar".to_string()]);
+    }
+
+    #[test]
+    fn clean_and_trim_metadata_leaves_none_slots_none() {
+        let mut m = Metadata::default();
+        clean_and_trim_metadata(&mut m);
+        assert!(m.title.is_none());
+        assert!(m.author.is_none());
+        assert!(m.url.is_none());
+        assert!(m.hostname.is_none());
+        assert!(m.description.is_none());
+        assert!(m.site_name.is_none());
+        assert!(m.date.is_none());
+        assert!(m.language.is_none());
+        assert!(m.image.is_none());
+        assert!(m.pagetype.is_none());
+        assert!(m.license.is_none());
+        assert!(m.filedate.is_none());
+        assert!(m.categories.is_empty());
+        assert!(m.tags.is_empty());
+    }
+
+    #[test]
+    fn clean_and_trim_metadata_preserves_clean_slots_byte_equal() {
+        let mut m = Metadata {
+            title: Some("My Article".into()),
+            author: Some("Jane Doe".into()),
+            url: Some("https://example.com/post".into()),
+            hostname: Some("example.com".into()),
+            description: Some("A short summary.".into()),
+            site_name: Some("Example Site".into()),
+            date: Some("2026-05-23".into()),
+            language: Some("en".into()),
+            image: Some("https://example.com/cover.jpg".into()),
+            pagetype: Some("article".into()),
+            license: Some("CC-BY-4.0".into()),
+            filedate: Some("2026-05-23".into()),
+            categories: vec!["news".into()],
+            tags: vec!["rust".into(), "café".into()],
+        };
+        let before = m.clone();
+        clean_and_trim_metadata(&mut m);
+        assert_eq!(m, before);
     }
 }
