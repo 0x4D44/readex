@@ -71,9 +71,9 @@ use regex::Regex;
 
 use crate::readability::dom::{
     Dom, NodeRef, append_child, children, class_name, create_element, delete_with_tail_preserve_free,
-    element_text, get_all_nodes_with_tag, get_attribute, get_elements_by_tag_name, id, local_name,
-    next_element_sibling, parent, previous_element_sibling, replace_element_tag,
-    serialize_converted_tree, set_element_text, text_content,
+    element_text, get_all_nodes_with_tag, get_attribute, get_elements_by_tag_name, id,
+    insert_with_tail, local_name, next_element_sibling, parent, previous_element_sibling,
+    replace_element_tag, serialize_converted_tree, set_element_text, set_tail, tail, text_content,
 };
 use crate::trafilatura::utils::trim;
 
@@ -769,38 +769,49 @@ impl Document {
     ///
     /// Two passes over `<div>` descendants:
     ///
-    /// 1. **Retag pass:** any `<div>` whose serialized child markup does
-    ///    NOT contain another block-level tag (`<a>`/`<blockquote>`/
-    ///    `<dl>`/`<div>`/`<img>`/`<ol>`/`<p>`/`<pre>`/`<table>`/`<ul>`)
-    ///    is retagged to `<p>`. The Python serializes each child via
-    ///    `_tostring` (XML mode) and runs `divToPElementsRe` over the
-    ///    joined string; we serialize via `serialize_converted_tree` (the
-    ///    XML-shape serializer the rest of this crate uses) and apply
-    ///    the same regex.
+    /// 1. **Retag pass** (readability_lxml.py:298-310): any `<div>` whose
+    ///    serialized child markup does NOT contain another block-level
+    ///    tag (`<a>`/`<blockquote>`/`<dl>`/`<div>`/`<img>`/`<ol>`/`<p>`/
+    ///    `<pre>`/`<table>`/`<ul>`) is retagged to `<p>`. The Python
+    ///    serializes each child via `_tostring` (XML mode) and runs
+    ///    `divToPElementsRe` over the joined string; we serialize via
+    ///    `serialize_converted_tree` (the XML-shape serializer the rest
+    ///    of this crate uses) and apply the same regex.
     ///
-    /// 2. **Br/text-rescue pass:** for each remaining `<div>`, hoist its
-    ///    leading text into a fresh `<p>` child, and any post-child tail
-    ///    text into a fresh `<p>` sibling; drop `<br>` children entirely.
-    ///    Stage 4b currently implements **only the retag pass** —
-    ///    the rescue pass is a pure structural cleanup that does not
-    ///    affect the scoring decisions the rest of `summary()` consumes
-    ///    (paragraph scoring already concatenates descendant text via
-    ///    `text_content`). Stage 4c may revisit this if a corpus
-    ///    divergence demands it; until then, the retag pass alone is the
-    ///    load-bearing half.
+    /// 2. **Br/text-rescue pass** (readability_lxml.py:312-324): for each
+    ///    `<div>` that survived retag, hoist non-whitespace leading text
+    ///    into a fresh `<p>` first-child, hoist each non-whitespace child
+    ///    tail into a fresh `<p>` next-sibling (reverse-iterated so
+    ///    insertions do not shift yet-to-be-processed indices), and
+    ///    `drop_tree` every `<br>` child (lxml's `drop_tree` re-anchors
+    ///    the tail onto the previous sibling / parent text — mdrcel's
+    ///    `delete_with_tail_preserve_free` mirrors that semantic).
+    ///    Ported in M10 Phase 2C per `2026.05.23 - HLD - M10 Phase 2C
+    ///    rescue pass.md`. The rescue pass IS load-bearing for scoring:
+    ///    `score_paragraphs` (readability_lxml.py:228) iterates `<p>` /
+    ///    `<pre>` / `<td>` descendants, so every rescue-pass-created
+    ///    `<p>` becomes a scoring contributor that raises its parent
+    ///    `<div>`'s candidacy score (see HLD §2d for the worked example).
     ///
     /// # Return value (rcdom Drop quirk pin)
     ///
-    /// Returns the `Vec<NodeRef>` of post-retag handles. Each retag goes
-    /// through [`replace_element_tag`] which detaches the old `<div>` and
-    /// returns a fresh `<p>` handle — Drop-ing the temporary returned
-    /// value would iteratively drain every descendant's children Vec
-    /// (M3 Stage 3-B follow-on, commit `a10dfa5`). Caller must keep the
-    /// `Vec` alive for the remainder of the function. Mirror of the
-    /// `dones_alive` pattern in `main_extractor.rs` (HLD §m-3.5).
-    fn transform_misused_divs_into_paragraphs(&mut self) -> Vec<NodeRef> {
+    /// Returns the `Vec<NodeRef>` of pinned handles. The retag pass
+    /// contributes the post-retag `<p>` handles (each retag goes through
+    /// [`replace_element_tag`] which detaches the old `<div>` and
+    /// returns a fresh `<p>` handle); the rescue pass additionally
+    /// contributes every freshly-`create_element("p")`-built wrapper and
+    /// every detached `<br>` (pushed BEFORE the
+    /// `delete_with_tail_preserve_free` call so its Rc count is held
+    /// during removal). Drop-ing any of these temporaries would
+    /// iteratively drain every descendant's children Vec (M3 Stage 3-B
+    /// follow-on, commit `a10dfa5`). Caller must keep the `Vec` alive
+    /// for the remainder of the function. Mirror of the `dones_alive`
+    /// pattern in `main_extractor.rs` (HLD §m-3.5).
+    pub(crate) fn transform_misused_divs_into_paragraphs(&mut self) -> Vec<NodeRef> {
         let mut pinned: Vec<NodeRef> = Vec::new();
         let doc = self.dom.document();
+
+        // === Pass 1 — retag (readability_lxml.py:298-310) ===
         for div in get_elements_by_tag_name(&doc, "div") {
             // readability_lxml.py:307-310 — serialize each element child
             // and run `divToPElementsRe` on the joined string. If no
@@ -815,6 +826,99 @@ impl Document {
                 pinned.push(replace_element_tag(&div, "p"));
             }
         }
+
+        // === Pass 2 — rescue (readability_lxml.py:312-324) ===
+        //
+        // A fresh descendant-only `<div>` snapshot picks up the post-retag
+        // survivors (the retagged ones are `<p>` now and won't match).
+        // Every new `<p>` and every detached `<br>` is pushed onto
+        // `pinned` (HLD §O1, defensive — matches M3 Stage 3-B precedent).
+        for div in get_elements_by_tag_name(&doc, "div") {
+            // 2a. Leading-text rescue (readability_lxml.py:313-316).
+            //
+            // `if elem.text and elem.text.strip(): …` — only fires for
+            // NON-whitespace leading text. Whitespace-only `.text` is
+            // skipped (Python falsiness on `"   ".strip()`).
+            let leading = element_text(&div);
+            if let Some(s) = leading.as_deref()
+                && !s.trim().is_empty()
+            {
+                // Capture the leading run BEFORE draining (own the
+                // string so we can hand it to the new <p>).
+                let leading_owned = s.to_string();
+                let p = create_element("p");
+                set_element_text(&p, Some(&leading_owned)); // p.text = leading
+                set_element_text(&div, None); // div.text = None
+                // div.insert(0, p) — element-index 0. Since we just
+                // drained the leading Text-run, all-children index 0 is
+                // the first slot, which is exactly where Python inserts.
+                insert_with_tail(&div, &p, 0);
+                pinned.push(p);
+            }
+
+            // 2b. Per-child tail/br rescue (readability_lxml.py:318-324).
+            //
+            // Snapshot ELEMENT children only (matches Python's
+            // enumerate(elem) over lxml's element iterator). REVERSE
+            // order — `elem.insert(pos+1, p)` at a later index does
+            // not shift earlier indices we have yet to process.
+            //
+            // We hold each `child` as an owned `NodeRef`; identity is
+            // stable across in-between mutations (Rc::ptr_eq is the
+            // membership test against `div.children` below).
+            let child_elems: Vec<NodeRef> = children(&div);
+            for child in child_elems.iter().rev() {
+                // 2b-i. Tail rescue (readability_lxml.py:319-322).
+                //
+                // Drain the tail BEFORE computing the all-children
+                // index, because once `set_tail(child, None)` runs
+                // the Text-run formerly after `child` is gone, so the
+                // slot at `child_idx + 1` IS the insertion point
+                // Python's `elem.insert(pos + 1, p_elem)` targets.
+                let t = tail(child);
+                if let Some(s) = t.as_deref()
+                    && !s.trim().is_empty()
+                {
+                    let tail_owned = s.to_string();
+                    let p = create_element("p");
+                    set_element_text(&p, Some(&tail_owned));
+                    set_tail(child, None);
+                    // Convert element-index (pos+1) to all-children
+                    // index: after draining `child`'s tail Text-run,
+                    // the slot at `child_idx + 1` is the next element
+                    // (or end-of-list) — exactly where lxml's
+                    // `elem.insert(pos+1, p)` places the new `<p>`.
+                    let child_idx_in_div = div
+                        .children
+                        .borrow()
+                        .iter()
+                        .position(|c| Rc::ptr_eq(c, child))
+                        .expect("child is still a member of div after set_tail");
+                    insert_with_tail(&div, &p, child_idx_in_div + 1);
+                    pinned.push(p);
+                }
+
+                // 2b-ii. <br> drop (readability_lxml.py:323-324).
+                //
+                // lxml `drop_tree()` removes the element and
+                // re-anchors its tail onto the previous sibling /
+                // parent text. At this point any non-whitespace tail
+                // was already drained by 2b-i; whitespace-only tails
+                // (which fall through the `.strip()` guard) survive
+                // here and are merged by
+                // `delete_with_tail_preserve_free` — exact match.
+                //
+                // Push the detached <br> onto `pinned` BEFORE removing
+                // it, so its Rc count stays > 0 across the remove
+                // (HLD §4b — defends against the rcdom iterative-drain
+                // quirk on Drop).
+                if local_name(child).as_deref() == Some("br") {
+                    pinned.push(child.clone());
+                    delete_with_tail_preserve_free(child);
+                }
+            }
+        }
+
         pinned
     }
 
@@ -3772,6 +3876,239 @@ mod tests {
         assert!(
             winning_len > 4,
             "Branch arbiter must override the tiny own arm via the readability/jusText path; got len={winning_len} text={winning_text:.200?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // transform_misused_divs_into_paragraphs — rescue pass
+    // (readability_lxml.py:312-324; M10 Phase 2C port)
+    // -----------------------------------------------------------------------
+    //
+    // The tests below pin the rescue-pass shape after retag-pass + rescue-pass
+    // BOTH run. Because the retag pass goes first (no block-tag opener in
+    // serialized children -> retag to <p>), the input fixtures here are chosen
+    // so the retag pass either (a) leaves the target <div> intact (it has a
+    // block-tag descendant like <a>, so retag does NOT fire) or (b) retags
+    // it to <p> in a way the assertion accepts. For shapes where retag DOES
+    // fire, the rescue pass never sees the element (it's a <p> by then),
+    // which is also faithful to Python (readability_lxml.py:312 re-scans
+    // ".//div" and only sees survivors).
+    //
+    // Empirical anchors: each expected shape was verified by running the
+    // Python rescue-pass algorithm under the vendored interpreter on the
+    // same input (HLD §9b). Outputs match byte-for-byte.
+
+    /// Helper: render `body`'s child-element tag list and the leading-text
+    /// run of each into a compact assertion string. We use this rather than
+    /// raw serialization because the rcdom serializer adds attribute quotes
+    /// and self-closing markers that complicate equality assertions, and
+    /// the rescue-pass invariant we care about is the children-shape +
+    /// `.text` slots, not the wire format.
+    fn dump_div_shape(div: &NodeRef) -> String {
+        use crate::readability::dom::child_nodes;
+        let mut out = String::new();
+        for c in child_nodes(div).iter() {
+            match &c.data {
+                crate::readability::dom::NodeData::Element { name, .. } => {
+                    let t = element_text(c).unwrap_or_default();
+                    out.push('<');
+                    out.push_str(&name.local);
+                    out.push('>');
+                    if !t.is_empty() {
+                        out.push('"');
+                        out.push_str(&t);
+                        out.push('"');
+                    }
+                    out.push_str(&format!("</{}>", name.local));
+                }
+                crate::readability::dom::NodeData::Text { contents } => {
+                    out.push('#');
+                    out.push_str(&contents.borrow());
+                    out.push('#');
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Helper: run the full `transform_misused_divs_into_paragraphs` over a
+    /// document and return the live DOM + pinned Vec so the caller can
+    /// assert on post-state shape without the pinned Vec being dropped.
+    fn run_transform(html: &str) -> (Document, Vec<NodeRef>) {
+        let mut doc = Document::new(html);
+        let pinned = doc.transform_misused_divs_into_paragraphs();
+        (doc, pinned)
+    }
+
+    /// `<div>X<a/></div>` — leading text "X" must be hoisted into a fresh
+    /// `<p>X</p>` first-child, and `<div>.text` drained to None.
+    /// (HLD §6a fixture 1; readability_lxml.py:313-316.)
+    #[test]
+    fn transform_misused_divs_leading_text_rescue() {
+        let html = "<html><body><div>X<a></a></div></body></html>";
+        let (doc, _pinned) = run_transform(html);
+        let body = doc.dom.body().expect("body");
+        // The outer <div> contains an <a>, so divToPElementsRe matches and
+        // the retag pass does NOT fire. The rescue pass should hoist "X".
+        let divs = get_elements_by_tag_name(&body, "div");
+        assert_eq!(divs.len(), 1, "outer <div> must survive retag");
+        let div = &divs[0];
+        assert_eq!(
+            element_text(div),
+            None,
+            "div.text must be drained after rescue"
+        );
+        assert_eq!(
+            dump_div_shape(div),
+            r#"<p>"X"</p><a></a>"#,
+            "leading text X must be hoisted into a fresh <p>X</p> first-child"
+        );
+    }
+
+    /// `<div><a/>Y</div>` — child tail "Y" must be hoisted into a fresh
+    /// `<p>Y</p>` next-sibling of `<a/>`, and `<a/>.tail` drained to None.
+    /// (HLD §6a fixture 2; readability_lxml.py:319-322.)
+    #[test]
+    fn transform_misused_divs_tail_rescue() {
+        let html = "<html><body><div><a></a>Y</div></body></html>";
+        let (doc, _pinned) = run_transform(html);
+        let body = doc.dom.body().expect("body");
+        let divs = get_elements_by_tag_name(&body, "div");
+        assert_eq!(divs.len(), 1, "outer <div> must survive retag");
+        let div = &divs[0];
+        // <a>'s tail must be None after rescue.
+        let a = &get_elements_by_tag_name(div, "a")[0];
+        assert_eq!(tail(a), None, "a.tail must be drained after rescue");
+        assert_eq!(
+            dump_div_shape(div),
+            r#"<a></a><p>"Y"</p>"#,
+            "tail Y must be hoisted into a fresh <p>Y</p> sibling of <a>"
+        );
+    }
+
+    /// `<div><br/></div>` — the lone `<br>` must be dropped by the rescue
+    /// pass. The outer `<div>` first retags to `<p>` (serialized children =
+    /// "<br/>" which has no block-tag opener), and the rescue pass then
+    /// never visits it (it's a `<p>` now, not a `<div>`). So the post-
+    /// transform body shape is `<p><br/></p>` — `<br>` is NOT dropped here
+    /// because the retag pass beat the rescue pass to this element.
+    ///
+    /// To pin the actual `<br>`-drop behaviour of the rescue pass, we use
+    /// a `<div>` that survives retag (contains a block-level child).
+    /// (HLD §6a fixture 4 + a guard variant covering retag-then-rescue
+    /// ordering.)
+    #[test]
+    fn transform_misused_divs_br_drop() {
+        // Variant A: `<div><br/></div>` — retag fires first (the inner
+        // markup is just "<br/>"); rescue pass never visits the resulting
+        // `<p>`. Post-transform shape: `<p><br/></p>`.
+        let html_a = "<html><body><div><br></div></body></html>";
+        let (doc_a, _pinned_a) = run_transform(html_a);
+        let body_a = doc_a.dom.body().expect("body");
+        let divs_a = get_elements_by_tag_name(&body_a, "div");
+        assert!(
+            divs_a.is_empty(),
+            "<div><br/></div> must retag to <p> in pass 1"
+        );
+        let ps_a = get_elements_by_tag_name(&body_a, "p");
+        assert_eq!(ps_a.len(), 1, "exactly one <p> after retag of <div>");
+        assert_eq!(
+            dump_div_shape(&ps_a[0]),
+            "<br></br>",
+            "<br/> child must survive (rescue pass does not visit retagged <p>)"
+        );
+
+        // Variant B: `<div><a/><br/></div>` — `<a>` keeps retag from
+        // firing on the outer `<div>` (block-tag opener present), so the
+        // rescue pass DOES visit it and drops the `<br/>`.
+        let html_b = "<html><body><div><a></a><br></div></body></html>";
+        let (doc_b, _pinned_b) = run_transform(html_b);
+        let body_b = doc_b.dom.body().expect("body");
+        let divs_b = get_elements_by_tag_name(&body_b, "div");
+        assert_eq!(divs_b.len(), 1, "outer <div> must survive retag");
+        let div_b = &divs_b[0];
+        assert_eq!(
+            dump_div_shape(div_b),
+            "<a></a>",
+            "<br/> must be dropped by rescue pass when outer <div> survives retag"
+        );
+        assert!(
+            get_elements_by_tag_name(div_b, "br").is_empty(),
+            "no <br> may remain after rescue pass on a surviving <div>"
+        );
+    }
+
+    /// `<div>L<a/>M<a/>T</div>` — three rescue insertions in one div.
+    /// Pins the reverse-iteration invariant: an off-by-one would
+    /// misplace at least one of the three new `<p>`s.
+    /// (HLD §6a fixture 3; readability_lxml.py:313-322.)
+    #[test]
+    fn transform_misused_divs_combined_leading_and_tails() {
+        let html = "<html><body><div>L<a></a>M<a></a>T</div></body></html>";
+        let (doc, _pinned) = run_transform(html);
+        let body = doc.dom.body().expect("body");
+        let divs = get_elements_by_tag_name(&body, "div");
+        assert_eq!(divs.len(), 1, "outer <div> must survive retag");
+        let div = &divs[0];
+        assert_eq!(
+            dump_div_shape(div),
+            r#"<p>"L"</p><a></a><p>"M"</p><a></a><p>"T"</p>"#,
+            "three rescued <p>s must interleave with the two original <a>s in order"
+        );
+    }
+
+    /// `<div>   <a/></div>` — whitespace-only leading text must NOT be
+    /// hoisted (Python's `if elem.text and elem.text.strip():` guard).
+    #[test]
+    fn transform_misused_divs_skips_whitespace_leading() {
+        let html = "<html><body><div>   <a></a></div></body></html>";
+        let (doc, _pinned) = run_transform(html);
+        let body = doc.dom.body().expect("body");
+        let divs = get_elements_by_tag_name(&body, "div");
+        assert_eq!(divs.len(), 1, "outer <div> must survive retag");
+        let div = &divs[0];
+        // Leading text must still be the whitespace run (NOT hoisted).
+        assert_eq!(
+            element_text(div).as_deref(),
+            Some("   "),
+            "whitespace-only leading text must survive rescue pass unchanged"
+        );
+        // No new <p> may have been created.
+        assert!(
+            get_elements_by_tag_name(div, "p").is_empty(),
+            "no <p> may be created when leading text is whitespace-only"
+        );
+    }
+
+    /// `<div><br/><span/>Z</div>` — `<br>` dropped; `<span>`'s tail "Z"
+    /// hoisted to a fresh `<p>Z</p>` sibling. Tests the interaction of
+    /// `<br>` drop + tail rescue on the same div.
+    #[test]
+    fn transform_misused_divs_br_then_elem_then_tail() {
+        let html = "<html><body><div><br><span></span>Z</div></body></html>";
+        let (doc, _pinned) = run_transform(html);
+        let body = doc.dom.body().expect("body");
+        // Both the inner markup is "<br/><span/>" which the regex matches
+        // (no block-tag opener? actually <span> isn't in DIV_TO_P_ELEMS,
+        // and <br> isn't either, so the regex MISSES and retag fires).
+        // Variant: add an <a> so retag does not fire and rescue runs.
+        let _ = (body, doc);
+
+        let html2 = "<html><body><div><a></a><br><span></span>Z</div></body></html>";
+        let (doc2, _pinned2) = run_transform(html2);
+        let body2 = doc2.dom.body().expect("body");
+        let divs = get_elements_by_tag_name(&body2, "div");
+        assert_eq!(divs.len(), 1, "outer <div> must survive retag");
+        let div = &divs[0];
+        assert!(
+            get_elements_by_tag_name(div, "br").is_empty(),
+            "<br/> must be dropped by rescue pass"
+        );
+        assert_eq!(
+            dump_div_shape(div),
+            r#"<a></a><span></span><p>"Z"</p>"#,
+            "br dropped; span's tail Z hoisted to fresh <p>Z</p> after span"
         );
     }
 }

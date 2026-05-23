@@ -2849,7 +2849,20 @@ name = "mdrcel"
 # <teiHeader> to <note type="fingerprint"> only; header+body byte-compared.
 # GREEN 51 = 38 substantive + 11 allowlisted + 2 deferred. No new dependency
 # (regex/unicode-normalization already pinned). All 11 BLOCKER gates green.
-version = "0.18.2"
+#
+# M10 Phase 2C (2026-05-23): 0.18.2 -> 0.18.3 PATCH. Bug fix only: port the
+# missing second pass of `transform_misused_divs_into_paragraphs`
+# (readability_lxml.py:312-324) into mdrcel — `readability_fork.rs:801-…`.
+# The first pass (retag <div>→<p> when no block-level child elements) was
+# ported in M3; the second pass (hoist non-whitespace `.text` / child `.tail`
+# into fresh `<p>` siblings + drop `<br>` children) was deferred behind a
+# verifiably-wrong omission comment that claimed rescue did not influence
+# scoring. It does: `score_paragraphs` iterates `<p>` descendants, so the
+# rescue-pass-created `<p>`s contribute to their parent `<div>`'s candidacy.
+# Internal-only function signature bump (`fn` -> `pub(crate) fn`) for direct
+# unit-test access; no public API surface change, no new dependency. Patch
+# per HLD §6c-ratified KPI predictions + Cargo semver "internal bug fix".
+version = "0.18.3"
 edition = "2024"
 
 # M7 Stage 1 (2026-05-22): 0.16.2 -> 0.17.0 MINOR. New public function
