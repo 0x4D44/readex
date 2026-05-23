@@ -18,3 +18,10 @@ notes/
 # Gold-curation scratch area — untracked working dir, not a deliverable
 # (kept out so it cannot be swept into a commit).
 wrk_gold/
+
+# M9 fuzz harness: the HTML corpus and per-run scratch (HLD §9).
+# The corpus is reproducible from benchmark/fuzz/manifest.jsonl (committed)
+# plus the WARC offsets recorded therein, so we never store it in git.
+benchmark/fuzz_corpus/
+benchmark/fuzz/oracle_cache.jsonl
+benchmark/fuzz/divergences.jsonl
