@@ -1271,12 +1271,25 @@ pub fn handle_table(
                         define_newelem(Some(p), &new_child_elem);
                         // Stage 6d tail recovery (see comment above).
                         // Stage 6h-a extension: keep whitespace-only tails when
-                        // `child` is the LAST direct element-child of the cell
-                        // (so they survive as Python's `last.tail` and render
-                        // as a newline before the cell's closing ` | `).
+                        // `child` is the LAST direct element-child of the cell —
+                        // but only for tags whose Python handler routes through
+                        // `deepcopy` (lxml preserves tail intrinsically;
+                        // rcdom's `deep_clone` drops it). That is the
+                        // `CODES_QUOTES` set: `<code>` / `<quote>` via
+                        // `handle_quotes` → `handle_code_blocks`. For other
+                        // tags (`head`, `p`, `hi`, `ref`, `span`), Python's
+                        // handler routes through `process_node` (or builds a
+                        // fresh element), which TRIMS the tail — a whitespace-
+                        // only tail becomes `None` and must NOT be revived,
+                        // otherwise `<head>`-in-cell ends up with a newline
+                        // between the head text and the cell's closing ` | `
+                        // (M9 Stage 5 Round 2 regression).
                         if let Some(t) = saved_child_tail.as_deref() {
                             let trimmed = crate::trafilatura::utils::trim(t);
-                            let keep = !trimmed.is_empty() || is_last_direct_child;
+                            let deepcopy_routed =
+                                matches!(child_local_name.as_str(), "code" | "quote");
+                            let keep = !trimmed.is_empty()
+                                || (is_last_direct_child && deepcopy_routed);
                             if keep {
                                 let kids = element_children(&new_child_elem);
                                 if let Some(last) = kids.last() {
