@@ -30,7 +30,23 @@ The five M7 modes mirror --markdown EXACTLY, changing only the
 UTF-8 bytes on stdout (no JSON envelope). The format strings are validated
 against trafilatura's `bare_extraction` accepted set (core.py:168 /
 `{"csv", "html", "json", "markdown", "txt", "xml", "xmltei"}`); TEI is the
-literal string `"xmltei"`.
+literal string `"xmltei"`. All six format modes share a single
+`run_oracle(...)` (the M9 Stage 2 config-lock invariant — one place builds
+the `extract` kwargs, every call path goes through it).
+
+M9 Stage 2 also adds an additive batch mode:
+
+  --batch <corpus_dir> <manifest_path>
+                        Loop over a JSONL manifest, read each
+                        `<corpus_dir>/<sha>.html`, call `run_oracle` for
+                        each of {"txt", "markdown", "xml"}, and emit one
+                        JSONL line per doc to stdout. The first stdout
+                        line is a `{"_header": {...}}` cache-integrity
+                        header (`traf_version`, `cfg_sha`, `run_py_sha`,
+                        `manifest_sha`) so the Rust diff harness can
+                        refuse a stale cache. One Python process / one
+                        trafilatura import / many docs (the per-fixture
+                        spawn cost is the harvester's bottleneck).
 
 Self-correcting interpreter (HLD section 4, B2 spike resolution): the harness
 invokes BARE `python` from PATH and activates no venv. `requirements.txt` only
@@ -45,6 +61,7 @@ spaced --base-url). Re-exec happens AT MOST ONCE, enforced by one tightly
 scoped internal env sentinel (the sole, justified exception to 'no env vars').
 """
 
+import hashlib
 import json
 import os
 import sys
@@ -188,6 +205,211 @@ def _word_count(text):
     return len(text.split())
 
 
+# --- M9 Stage 2: single config-locked oracle surface -----------------------
+# Every extract-mode branch (--markdown / --txt / --json / --csv / --xml /
+# --xmltei) AND the --batch mode go through `run_oracle`. There is EXACTLY
+# ONE place in this file that constructs the extract() kwargs (the
+# `_LOCKED_EXTRACT_KWARGS` dict below) — that is the anti-drift invariant the
+# M9 HLD §5.3 demands. The five M7 per-mode branches used to inline their own
+# near-identical extract() call; today they all funnel through here.
+#
+# The locked posture matches what the per-mode branches had before refactor:
+#   with_metadata=False, deduplicate=False, include_comments=False
+# `--xmltei` does NOT need a special with_metadata=True override here:
+# Trafilatura's Extractor.__init__ (settings.py:144-149) already promotes
+# with_metadata to True whenever output_format == "xmltei", so passing
+# with_metadata=False is harmless and identical to today's behavior.
+
+def _trafilatura_cfg_path():
+    """Absolute path to the committed `trafilatura.cfg` next to this file.
+
+    Single source of truth for both `run_oracle` and the `cfg_sha` header
+    hash.
+    """
+    return os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "trafilatura.cfg"
+    )
+
+
+def _locked_kwargs_descriptor():
+    """Stable dict describing the locked extract() posture for hashing.
+
+    The kwargs we pin to `trafi_extract` are not all JSON-serializable
+    (`config` is a `configparser.ConfigParser` instance). So for the
+    `cfg_sha` header we encode the SHAPE of the posture: the literal
+    keyword booleans we pass, PLUS the SHA-256 of the trafilatura.cfg file
+    bytes (since that file's contents are part of the posture — change it
+    and the oracle's behavior changes, and the Rust diff harness should
+    refuse a stale cache).
+    """
+    with open(_trafilatura_cfg_path(), "rb") as fh:
+        cfg_bytes = fh.read()
+    return {
+        "with_metadata": False,
+        "deduplicate": False,
+        "include_comments": False,
+        "config_file_sha256": hashlib.sha256(cfg_bytes).hexdigest(),
+    }
+
+
+def _cfg_sha():
+    """SHA-256 (hex) of the locked-kwargs descriptor.
+
+    Stable JSON encoding: sort_keys=True, separators=(",", ":") — no
+    whitespace, deterministic key order, ASCII-only escaping (the
+    descriptor is ASCII anyway). Documented here so a future maintainer
+    sees why the encoding is what it is.
+    """
+    payload = json.dumps(
+        _locked_kwargs_descriptor(),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _file_sha256(path):
+    """SHA-256 (hex) of a file's bytes. Used for run_py_sha / manifest_sha."""
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def run_oracle(raw, base_url, output_format):
+    """THE single config-locked entry point. Every extract-mode call goes here.
+
+    Returns the trafilatura.extract() string (None → "") for the given
+    output_format. Imports trafilatura lazily so the cost is paid once per
+    Python process; `use_config` is also called once per call (cheap; it just
+    re-reads the committed cfg file). For --batch we'd ideally cache the
+    `cfg` object across calls, but `use_config` is fast enough on a 51-doc
+    corpus that the simpler "one cfg per call" shape is the right call —
+    keeps the surface tiny and avoids a module-global mutable.
+
+    `base_url` may be None (the Python `extract()` signature accepts that;
+    it disables URL-derived metadata).
+    """
+    from trafilatura import extract as trafi_extract
+    from trafilatura.settings import use_config
+
+    cfg = use_config(_trafilatura_cfg_path())
+    payload = trafi_extract(
+        raw,
+        url=base_url,
+        output_format=output_format,
+        with_metadata=False,
+        deduplicate=False,
+        include_comments=False,
+        config=cfg,
+    )
+    return "" if payload is None else payload
+
+
+# Output formats the --batch mode emits per doc. Stage 0 showed signal in
+# all three; xmltei/json/csv are scaffolding consumed only by per-doc gates
+# (and the noisier xmltei carries the documented BST/local-time residual).
+_BATCH_OUTPUT_FORMATS = ("txt", "markdown", "xml")
+
+
+def _emit_batch_line(obj):
+    """Single-line JSONL writer for --batch.
+
+    Same UTF-8 byte-discipline as `_emit_json` (raw `sys.stdout.buffer`
+    write so non-Latin-1 code points survive a cp1252 console), but
+    appends a `\\n` so the result is one valid JSONL record. We flush
+    after every record so a partial run is salvageable mid-pipe.
+    `ensure_ascii=False` so the payload's UTF-8 round-trips bit-for-bit
+    (HLD section 3.3 / M9 HLD §5.2 cache-integrity contract).
+    """
+    line = json.dumps(obj, ensure_ascii=False)
+    sys.stdout.buffer.write(line.encode("utf-8"))
+    sys.stdout.buffer.write(b"\n")
+    sys.stdout.buffer.flush()
+
+
+def _run_batch(corpus_dir, manifest_path):
+    """--batch mode entry point. See module docstring for the contract.
+
+    Reads the manifest line-by-line (skipping blank lines), for each entry
+    reads `<corpus_dir>/<sha>.html` as bytes, calls `run_oracle` for each
+    output format in `_BATCH_OUTPUT_FORMATS`, and emits one JSONL line per
+    doc. The FIRST stdout line is the cache-integrity header so the Rust
+    diff harness can refuse a stale cache before reading any per-doc data.
+    """
+    if not os.path.isdir(corpus_dir):
+        _emit_failure(
+            f"--batch corpus_dir not found or not a directory: {corpus_dir!r}"
+        )
+    if not os.path.isfile(manifest_path):
+        _emit_failure(
+            f"--batch manifest_path not found or not a regular file: "
+            f"{manifest_path!r}"
+        )
+
+    # trafilatura version for the header (best-effort; None if unreadable).
+    import importlib.metadata
+
+    try:
+        traf_version = importlib.metadata.version("trafilatura")
+    except Exception:  # noqa: BLE001
+        traf_version = None
+
+    header = {
+        "_header": {
+            "traf_version": traf_version,
+            "cfg_sha": _cfg_sha(),
+            "run_py_sha": _file_sha256(os.path.abspath(__file__)),
+            "manifest_sha": _file_sha256(manifest_path),
+        }
+    }
+    _emit_batch_line(header)
+
+    # Stream the manifest line-by-line. Blank lines are tolerated (harvest
+    # tooling may emit a trailing newline). Each non-blank line must parse
+    # as a JSON object with a `sha` key; `source_url` is optional (missing
+    # / empty / null → pass base_url=None to run_oracle).
+    with open(manifest_path, "r", encoding="utf-8") as mfh:
+        for line_no, raw_line in enumerate(mfh, start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError as exc:
+                _emit_failure(
+                    f"--batch manifest line {line_no} is not valid JSON: "
+                    f"{exc}"
+                )
+            sha = entry.get("sha")
+            if not isinstance(sha, str) or not sha:
+                _emit_failure(
+                    f"--batch manifest line {line_no} missing/invalid 'sha'"
+                )
+            source_url = entry.get("source_url")
+            if not isinstance(source_url, str) or not source_url:
+                source_url = None
+
+            html_path = os.path.join(corpus_dir, f"{sha}.html")
+            if not os.path.isfile(html_path):
+                _emit_failure(
+                    f"--batch corpus file missing for sha {sha!r}: "
+                    f"{html_path!r}"
+                )
+            with open(html_path, "rb") as fh:
+                raw = fh.read()
+
+            outputs = {}
+            for fmt in _BATCH_OUTPUT_FORMATS:
+                outputs[fmt] = run_oracle(raw, source_url, fmt)
+
+            _emit_batch_line(
+                {"sha": sha, "source_url": source_url, "outputs": outputs}
+            )
+
+
 def _parse_args(argv):
     """Positional <abs.html> plus optional --base-url <URL> plus optional
     --convert-tags-only / --extract-content / --markdown (mutually exclusive).
@@ -195,7 +417,13 @@ def _parse_args(argv):
     No argparse: a fixed CLI; argparse would print to stdout on error.
 
     Returns (path, base_url, convert_tags_only, extract_content_only,
-             markdown_only, extra_format, err).
+             markdown_only, extra_format, batch, err).
+
+    `batch` is `None` unless `--batch <corpus_dir> <manifest_path>` is set,
+    in which case it is the tuple `(corpus_dir, manifest_path)` and the
+    `path` positional is unused (the manifest supplies per-doc shas). The
+    --batch mode is mutually exclusive with every other mode flag and with
+    --base-url (per-doc source_urls come from the manifest).
 
     `extra_format` is `None` unless exactly one of the M7 output-format
     flags (--txt / --json / --csv / --xml / --xmltei) is set, in which case
@@ -250,16 +478,25 @@ def _parse_args(argv):
     extract_content_only = False
     markdown_only = False
     extra_format = None
+    batch = None
     i = 0
     while i < len(argv):
         a = argv[i]
         if a == "--base-url":
             if i + 1 >= len(argv):
-                return None, None, False, False, False, None, (
+                return None, None, False, False, False, None, None, (
                     "--base-url requires a URL argument"
                 )
             base_url = argv[i + 1]
             i += 2
+            continue
+        if a == "--batch":
+            if i + 2 >= len(argv):
+                return None, None, False, False, False, None, None, (
+                    "--batch requires <corpus_dir> <manifest_path>"
+                )
+            batch = (argv[i + 1], argv[i + 2])
+            i += 3
             continue
         if a == "--convert-tags-only":
             convert_tags_only = True
@@ -275,7 +512,7 @@ def _parse_args(argv):
             continue
         if a in _EXTRA_FORMAT_FLAGS:
             if extra_format is not None:
-                return None, None, False, False, False, None, (
+                return None, None, False, False, False, None, None, (
                     "--txt / --json / --csv / --xml / --xmltei are "
                     "mutually exclusive"
                 )
@@ -286,11 +523,39 @@ def _parse_args(argv):
             path = a
             i += 1
             continue
-        return None, None, False, False, False, None, (
+        return None, None, False, False, False, None, None, (
             f"unexpected extra argument: {a!r}"
         )
+    # --batch is mutually exclusive with EVERY other mode flag, with
+    # --base-url (per-doc source_urls come from the manifest), and with the
+    # <abs.html> positional (the manifest supplies the per-doc shas).
+    if batch is not None:
+        if (
+            convert_tags_only
+            or extract_content_only
+            or markdown_only
+            or extra_format is not None
+            or base_url is not None
+            or path is not None
+        ):
+            return None, None, False, False, False, None, None, (
+                "--batch is mutually exclusive with --base-url, "
+                "--convert-tags-only, --extract-content, --markdown, "
+                "--txt, --json, --csv, --xml, --xmltei, and the "
+                "<abs.html> positional"
+            )
+        return (
+            None,
+            None,
+            False,
+            False,
+            False,
+            None,
+            batch,
+            None,
+        )
     if path is None:
-        return None, None, False, False, False, None, (
+        return None, None, False, False, False, None, None, (
             "missing required <abs.html> argument"
         )
     exclusive_count = sum(
@@ -302,7 +567,7 @@ def _parse_args(argv):
         )
     )
     if exclusive_count > 1:
-        return None, None, False, False, False, None, (
+        return None, None, False, False, False, None, None, (
             "--convert-tags-only, --extract-content, --markdown, --txt, "
             "--json, --csv, --xml, and --xmltei are mutually exclusive"
         )
@@ -313,6 +578,7 @@ def _parse_args(argv):
         extract_content_only,
         markdown_only,
         extra_format,
+        None,
         None,
     )
 
@@ -334,6 +600,7 @@ def main():
             extract_content_only,
             markdown_only,
             extra_format,
+            batch,
             arg_err,
         ) = _parse_args(sys.argv[1:])
         if arg_err is not None:
@@ -349,6 +616,20 @@ def main():
             oracle_version = importlib.metadata.version("trafilatura")
         except Exception:  # noqa: BLE001 — null on any unreadable version.
             oracle_version = None
+
+        # --- M9 Stage 2: --batch <corpus_dir> <manifest_path> -------------
+        # One Python process, one trafilatura import, loops over the
+        # manifest JSONL. Emits a single `{"_header": {...}}` line first
+        # (cache-integrity contract — see _cfg_sha / _file_sha256 / the
+        # M9 HLD §5.3); then one JSONL line per doc:
+        #   {"sha": ..., "source_url": ..., "outputs": {"txt": ..., ...}}
+        # By invariant, each `outputs[<fmt>]` is byte-identical to running
+        # `python run.py <abs> --<fmt>` on the same doc — both go through
+        # `run_oracle`.
+        if batch is not None:
+            _run_batch(batch[0], batch[1])
+            sys.exit(0)
+        # --- end --batch branch -------------------------------------------
 
         if not os.path.isfile(snapshot_path):
             _emit_failure(
@@ -480,79 +761,27 @@ def main():
             sys.exit(0)
         # --- end --extract-content branch ---------------------------------
 
-        # --- M5 Stage 2: --markdown mode (corpus markdown diff gate) ------
-        # Run the FULL `trafilatura.extract(raw, output_format="markdown")`
-        # pipeline and emit the returned string (UTF-8 bytes, no JSON
-        # envelope). `trafilatura.extract` returns either a `str` or `None`
-        # — the latter when nothing extractable was found (Bug-E2 valid
-        # empty result). We collapse `None` → `""` so the Rust gate can
-        # strict byte-compare unconditionally. The Python pipeline already
-        # NFC-normalises (core.py:98); the Rust harness re-NFC-normalises
-        # on its side belt-and-braces. Uses the same committed config
-        # (`trafilatura.cfg`) the bare_extraction path uses below, so the
-        # algorithm and timeout/dedup posture match.
-        if markdown_only:
-            from trafilatura import extract as trafi_extract
-            from trafilatura.settings import use_config
-
-            cfg = use_config(
-                os.path.join(
-                    os.path.dirname(os.path.abspath(__file__)),
-                    "trafilatura.cfg",
-                )
-            )
-            md = trafi_extract(
-                raw,
-                url=base_url,
-                output_format="markdown",
-                with_metadata=False,
-                deduplicate=False,
-                include_comments=False,
-                config=cfg,
-            )
-            if md is None:
-                md = ""
-            sys.stdout.buffer.write(md.encode("utf-8"))
-            sys.stdout.buffer.flush()
-            sys.exit(0)
-        # --- end --markdown branch ----------------------------------------
-
-        # --- M7 Stage 1+: --txt/--json/--csv/--xml/--xmltei modes ---------
-        # Identical in shape to --markdown above: run the FULL
-        # `trafilatura.extract(raw, output_format=<fmt>)` pipeline and emit
-        # the returned string (UTF-8 bytes, no JSON envelope), collapsing a
-        # `None` result to `""` so the Rust gate can strict byte-compare
-        # unconditionally. Only the `output_format=` string differs across
-        # the five modes — the same committed `trafilatura.cfg` and the same
-        # with_metadata/deduplicate/include_comments posture as --markdown.
-        # Front-loaded here so M7 Stages 2-5 share this single oracle surface
-        # without re-touching run.py. (M7 Stage 1 only GATEs --txt; the
-        # other four are scaffolding consumed by later stages.)
-        if extra_format is not None:
-            from trafilatura import extract as trafi_extract
-            from trafilatura.settings import use_config
-
-            cfg = use_config(
-                os.path.join(
-                    os.path.dirname(os.path.abspath(__file__)),
-                    "trafilatura.cfg",
-                )
-            )
-            payload = trafi_extract(
-                raw,
-                url=base_url,
-                output_format=extra_format,
-                with_metadata=False,
-                deduplicate=False,
-                include_comments=False,
-                config=cfg,
-            )
-            if payload is None:
-                payload = ""
+        # --- M5 Stage 2 + M7 Stages 1-5: shared per-doc extract-mode branch
+        # All six extract modes (--markdown / --txt / --json / --csv /
+        # --xml / --xmltei) share the SINGLE config-locked surface
+        # `run_oracle(raw, base_url, output_format)`. The per-mode branches
+        # used to inline near-duplicate `trafilatura.extract(...)` calls;
+        # M9 Stage 2 collapsed them into one. The returned string (None →
+        # "") is emitted as raw UTF-8 bytes on stdout — no JSON envelope —
+        # so the Rust gates can strict byte-compare unconditionally.
+        #
+        # `--xmltei` does NOT need a special with_metadata=True override
+        # here: Trafilatura's `Extractor.__init__` (settings.py:144-149)
+        # already promotes with_metadata to True whenever output_format ==
+        # "xmltei", so the locked posture (`with_metadata=False`) is
+        # behavior-identical to the pre-refactor inline call.
+        _mode_format = "markdown" if markdown_only else extra_format
+        if _mode_format is not None:
+            payload = run_oracle(raw, base_url, _mode_format)
             sys.stdout.buffer.write(payload.encode("utf-8"))
             sys.stdout.buffer.flush()
             sys.exit(0)
-        # --- end M7 output-format branch ----------------------------------
+        # --- end extract-mode branch --------------------------------------
 
         # Explicit committed config, never ambient (HLD section 4).
         # EXTRACTION_TIMEOUT=0 disables the signal-based timeout: SIGALRM is
