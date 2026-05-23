@@ -2862,7 +2862,25 @@ name = "mdrcel"
 # Internal-only function signature bump (`fn` -> `pub(crate) fn`) for direct
 # unit-test access; no public API surface change, no new dependency. Patch
 # per HLD §6c-ratified KPI predictions + Cargo semver "internal bug fix".
-version = "0.18.3"
+#
+# M10 Phase 2E (2026-05-23): 0.18.3 -> 0.18.4 PATCH. Closes the Phase 1
+# deferral: the `clean_and_trim_metadata` helper now performs the FULL
+# Python `metadata.clean_and_trim()` semantics (settings.py:289-299) — the
+# 10,000-char length cap with U+2026 ellipsis truncation, then faithful
+# `html.unescape` (full HTML5 entity table via the new direct dep
+# `web_atoms`, 2231 named entities + Windows-1252 `_invalid_charrefs` table
+# + `_invalid_codepoints` empty-string substitutions + surrogate / overflow
+# guards + longest-prefix legacy-entity fallback), then the existing Phase 1
+# `strip_control_chars`. Order is cap -> unescape -> strip exactly per the
+# Python source. Two new file-private helpers (`cap_at_python_length`,
+# `invalid_charref_replacement`, `is_invalid_codepoint`) and one
+# `pub(crate)` helper (`python_html_unescape`, visibility per HLD Q2 to
+# allow future consolidation of mdrcel's three unescape helpers).
+# Internal-only change; no public API surface modified. One new direct dep
+# (`web_atoms = "=0.2.4"`) is a promotion of an existing transitive dep
+# (zero new crates in the build graph). Patch per CLAUDE.md "Patch (0.0.X)
+# — bug fixes ... with no API changes".
+version = "0.18.4"
 edition = "2024"
 
 # M7 Stage 1 (2026-05-22): 0.16.2 -> 0.17.0 MINOR. New public function
@@ -3158,11 +3176,29 @@ edition = "2024"
 # `Handle` clones and never holds a borrow across a mutation.
 #
 # VERSION-BUMP FENCE (HLD §3.1): any bump of html5ever / markup5ever_rcdom /
-# tendril MUST re-run the §6.1 parser-equivalence BLOCKER gate before merge,
-# and the bump commit MUST state the gate was re-run green.
+# tendril / web_atoms MUST re-run the §6.1 parser-equivalence BLOCKER gate
+# before merge, and the bump commit MUST state the gate was re-run green.
+# M10 Phase 2E (2026-05-23): `web_atoms` joins the fence because its
+# `NAMED_ENTITIES` PHF table is now an algorithm-correctness dependency for
+# the Python `html.unescape` port at `metadata.rs::python_html_unescape` —
+# a semver-minor bump that changes the entity-table contents (e.g. an HTML LS
+# update adding new entities) could silently shift byte output of every
+# metadata slot. Treat any `web_atoms` bump as identical to an html5ever bump.
 html5ever = "=0.39.0"
 markup5ever_rcdom = "=0.39.0"
 tendril = "=0.5.0"
+
+# M10 Phase 2E (2026-05-23): the `html.unescape` port at metadata.rs's
+# `clean_and_trim_metadata` needs Python `html.entities.html5`'s 2231-row
+# named-entity table to reach byte parity (HLD §2.3 / §4.1). `web_atoms 0.2.4`
+# already lives in our Cargo.lock as a transitive dep via
+# html5ever -> markup5ever -> web_atoms; promoting it to a DIRECT dep adds
+# ZERO new transitive crates. The exported `pub static NAMED_ENTITIES:
+# phf::Map<&'static str, (u32, u32)>` has exactly 2231 entries — verified to
+# match Python's `html.entities.html5` cardinality. Pure-algorithm (a PHF
+# table lookup), no I/O. Pinned EXACTLY per project new-dependency
+# discipline; also under the version-bump fence above.
+web_atoms = "=0.2.4"
 
 # M2 Stage 1a (2026-05-18): the Readability port reaches the point DEC-3
 # anticipated for `regex` ("deferred until the extraction algorithm needs

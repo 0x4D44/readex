@@ -282,7 +282,7 @@ dependencies = [
 
 [[package]]
 name = "mdrcel"
-version = "0.18.3"
+version = "0.18.4"
 dependencies = [
  "html5ever",
  "markup5ever_rcdom",
@@ -291,6 +291,7 @@ dependencies = [
  "sha2",
  "tendril",
  "unicode-normalization",
+ "web_atoms",
 ]
 
 [[package]]

@@ -66,6 +66,7 @@ use crate::trafilatura::utils::trim;
 use crate::trafilatura::xpath_engine;
 use crate::trafilatura::xpaths_constants::{AUTHOR_DISCARD_XPATHS, AUTHOR_XPATHS, TITLE_XPATHS};
 use regex::Regex;
+use std::borrow::Cow;
 use std::sync::OnceLock;
 
 // ===========================================================================
@@ -1078,45 +1079,420 @@ pub fn extract_metadata(
     //     date_config["max_date"]` = today (`%Y-%m-%d`). M8 added the slot.
     metadata.filedate = Some(ymd_to_iso(today));
 
-    // 16. M10 Phase 1: control-char strip across every metadata slot.
-    //     Mirrors Python's `metadata.clean_and_trim()` (metadata.py:587 →
-    //     settings.py:288-298) — the strip portion only, per HLD §5.
-    //     The 10,000-char length cap and `html.unescape` portions of
-    //     Python's `clean_and_trim` are deferred.
+    // 16. M10 Phase 1 + Phase 2E: faithful port of Python's
+    //     `metadata.clean_and_trim()` (`metadata.py:587` →
+    //     `settings.py:289-299`). Applies 10,000-char length cap →
+    //     `html.unescape` → control-char strip to every str-typed metadata
+    //     slot in Python's exact order. Phase 1 ported the strip; Phase 2E
+    //     closed out the cap + unescape (HLD §1.2 / §3 / §4).
     clean_and_trim_metadata(&mut metadata);
 
     metadata
 }
 
-/// Phase-1 port of Python's `metadata.clean_and_trim()`
-/// (`metadata.py:587` → `settings.py:288-298`). Strips control
-/// characters from every str-typed metadata slot. The length cap and
-/// `html.unescape` portions of Python's `clean_and_trim` are deferred
-/// (see HLD §5 "Phase 1 scope clarification").
+/// Faithful port of Python's `metadata.clean_and_trim()`
+/// (`metadata.py:587` → `settings.py:289-299`). Applies the 10,000-char
+/// length cap with U+2026 ellipsis truncation, `html.unescape` (full
+/// HTML5 entity table via `web_atoms::NAMED_ENTITIES`), and
+/// `strip_control_chars` to every str-typed metadata slot in Python's
+/// exact order (cap → unescape → strip). Phase 1 ported the strip;
+/// Phase 2E (HLD §1.2 / §3 / §4) closed out the cap + unescape.
 fn clean_and_trim_metadata(m: &mut Metadata) {
-    fn strip_in_place(slot: &mut Option<String>) {
+    fn process_slot(slot: &mut Option<String>) {
         if let Some(v) = slot.take() {
-            *slot = Some(strip_control_chars(&v));
+            // Step 1 — settings.py:295-296 — 10_000-char cap.
+            let capped = cap_at_python_length(&v);
+            // Step 2 — settings.py:298 — html.unescape.
+            let unescaped = python_html_unescape(&capped);
+            // Step 3 — line_processing's strip half (Phase 1).
+            *slot = Some(strip_control_chars(&unescaped));
         }
     }
-    strip_in_place(&mut m.title);
-    strip_in_place(&mut m.author);
-    strip_in_place(&mut m.url);
-    strip_in_place(&mut m.hostname);
-    strip_in_place(&mut m.description);
-    strip_in_place(&mut m.site_name);
-    strip_in_place(&mut m.date);
-    strip_in_place(&mut m.language);
-    strip_in_place(&mut m.image);
-    strip_in_place(&mut m.pagetype);
-    strip_in_place(&mut m.license);
-    strip_in_place(&mut m.filedate);
+    process_slot(&mut m.title);
+    process_slot(&mut m.author);
+    process_slot(&mut m.url);
+    process_slot(&mut m.hostname);
+    process_slot(&mut m.description);
+    process_slot(&mut m.site_name);
+    process_slot(&mut m.date);
+    process_slot(&mut m.language);
+    process_slot(&mut m.image);
+    process_slot(&mut m.pagetype);
+    process_slot(&mut m.license);
+    process_slot(&mut m.filedate);
     for c in m.categories.iter_mut() {
-        *c = strip_control_chars(c);
+        let capped = cap_at_python_length(c);
+        let unescaped = python_html_unescape(&capped);
+        *c = strip_control_chars(&unescaped);
     }
     for t in m.tags.iter_mut() {
-        *t = strip_control_chars(t);
+        let capped = cap_at_python_length(t);
+        let unescaped = python_html_unescape(&capped);
+        *t = strip_control_chars(&unescaped);
     }
+}
+
+// ===========================================================================
+// M10 Phase 2E — html.unescape + 10,000-char cap helpers
+// ===========================================================================
+
+/// Python `value[:9999] + "…"` cap (`settings.py:295-296`).
+///
+/// Char count, NOT byte count: Python `len(str)` returns the number of
+/// codepoints, so a 5_000-`'中'` string (15_000 bytes / 5_000 chars) does
+/// NOT trigger truncation. The threshold is strict `>` — exactly 10_000
+/// chars passes through unchanged.
+///
+/// When truncation fires: takes the first 9_999 chars, appends a single
+/// `'\u{2026}'` (HORIZONTAL ELLIPSIS — NOT three ASCII dots), yielding a
+/// string of exactly 10_000 chars.
+fn cap_at_python_length(v: &str) -> Cow<'_, str> {
+    if v.chars().count() <= 10_000 {
+        return Cow::Borrowed(v);
+    }
+    let mut out: String = v.chars().take(9999).collect();
+    out.push('\u{2026}');
+    Cow::Owned(out)
+}
+
+/// Faithful port of CPython `html.unescape` (`html/__init__.py:91-132`).
+///
+/// Implements the regex `&(#[0-9]+;?|#[xX][0-9a-fA-F]+;?|[^\t\n\f <&#;]{1,32};?)`
+/// (`html/__init__.py:118-120`) as a hand-written scanner state machine for
+/// `Cow`-friendly fast-path support. Each match is processed by an inline
+/// equivalent of `_replace_charref` (`html/__init__.py:91-115`):
+///
+/// - **Numeric** (decimal `&#NN;` or hex `&#xHH;`): parse the integer, then
+///   apply, in order, `_invalid_charrefs` (35-entry Windows-1252 substitution
+///   table; e.g. `0x80` → `U+20AC` €), surrogate / overflow guard
+///   (`0xD800..=0xDFFF` or `> 0x10FFFF` → `U+FFFD`), `_invalid_codepoints`
+///   (~80-entry empty-string substitution set; e.g. `0x0B` → ""), then
+///   `char::from_u32`.
+/// - **Named**: look up the full body in `web_atoms::NAMED_ENTITIES` (2231
+///   entries; byte-equal to Python `html.entities.html5`). If absent, peel
+///   chars off the right and retry until length 2 — the longest-prefix
+///   fallback that turns `&notreal;` into `¬real;` per the HTML5 standard.
+///   If no prefix matches, return `&` + body verbatim.
+///
+/// Fast path: returns `Cow::Borrowed(s)` when the input contains no `&`
+/// (`html/__init__.py:130` `if '&' not in s: return s`).
+pub(crate) fn python_html_unescape(s: &str) -> Cow<'_, str> {
+    if !s.contains('&') {
+        return Cow::Borrowed(s);
+    }
+
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'&' {
+            // Push a single char (UTF-8 safe).
+            let ch_start = i;
+            // Find char boundary: scan past this UTF-8 sequence.
+            i += 1;
+            while i < bytes.len() && (bytes[i] & 0xC0) == 0x80 {
+                i += 1;
+            }
+            out.push_str(&s[ch_start..i]);
+            continue;
+        }
+
+        // Try to match the `_charref` regex starting at i.
+        // (`html/__init__.py:118-120`)
+        match scan_charref(bytes, i) {
+            Some((body_start, body_end_excl)) => {
+                // body is s[body_start..body_end_excl], match consumed
+                // i..body_end_excl (`body_start` is i+1).
+                let body = &s[body_start..body_end_excl];
+                replace_charref(body, &mut out);
+                i = body_end_excl;
+            }
+            None => {
+                // Bare `&` that did not match `_charref` — copy verbatim.
+                out.push('&');
+                i += 1;
+            }
+        }
+    }
+
+    Cow::Owned(out)
+}
+
+/// Scan a `_charref` match starting at `i` (the `&` byte). Returns the
+/// inclusive-start / exclusive-end byte indices of the captured group
+/// `body` (everything after the leading `&`, including the optional `;`).
+///
+/// Mirrors the alternation order of the regex
+/// `&(#[0-9]+;?|#[xX][0-9a-fA-F]+;?|[^\t\n\f <&#;]{1,32};?)`
+/// (`html/__init__.py:118-120`).
+fn scan_charref(bytes: &[u8], i: usize) -> Option<(usize, usize)> {
+    debug_assert_eq!(bytes[i], b'&');
+    let body_start = i + 1;
+    if body_start >= bytes.len() {
+        return None;
+    }
+
+    if bytes[body_start] == b'#' {
+        // Numeric branch.
+        // Need at least one digit after `#` (decimal) or `#x` / `#X` (hex).
+        let after_hash = body_start + 1;
+        if after_hash >= bytes.len() {
+            return None;
+        }
+        let (digits_start, is_hex) = if bytes[after_hash] == b'x' || bytes[after_hash] == b'X' {
+            (after_hash + 1, true)
+        } else {
+            (after_hash, false)
+        };
+        let mut p = digits_start;
+        while p < bytes.len()
+            && if is_hex {
+                bytes[p].is_ascii_hexdigit()
+            } else {
+                bytes[p].is_ascii_digit()
+            }
+        {
+            p += 1;
+        }
+        if p == digits_start {
+            // No digit followed — not a numeric charref.
+            return None;
+        }
+        // Optional trailing `;`.
+        if p < bytes.len() && bytes[p] == b';' {
+            p += 1;
+        }
+        Some((body_start, p))
+    } else {
+        // Named branch: `[^\t\n\f <&#;]{1,32};?`.
+        let mut p = body_start;
+        let max_end = (body_start + 32).min(bytes.len());
+        while p < max_end {
+            let b = bytes[p];
+            if matches!(b, b'\t' | b'\n' | 0x0C | b' ' | b'<' | b'&' | b'#' | b';') {
+                break;
+            }
+            p += 1;
+        }
+        if p == body_start {
+            // Zero chars matched.
+            return None;
+        }
+        // Optional trailing `;`.
+        if p < bytes.len() && bytes[p] == b';' {
+            p += 1;
+        }
+        Some((body_start, p))
+    }
+}
+
+/// Inline equivalent of Python's `_replace_charref(s)`
+/// (`html/__init__.py:91-115`). `body` is the captured group (no leading
+/// `&`). Appends the decoded replacement to `out`.
+fn replace_charref(body: &str, out: &mut String) {
+    debug_assert!(!body.is_empty());
+    let first = body.as_bytes()[0];
+    if first == b'#' {
+        // Numeric charref. `html/__init__.py:93-105`.
+        // Strip the trailing `;` (if any) then parse.
+        let mut digits_part = &body[1..];
+        if digits_part.ends_with(';') {
+            digits_part = &digits_part[..digits_part.len() - 1];
+        }
+        let num = if let Some(rest) = digits_part
+            .strip_prefix('x')
+            .or_else(|| digits_part.strip_prefix('X'))
+        {
+            u32::from_str_radix(rest, 16).ok()
+        } else {
+            digits_part.parse::<u32>().ok()
+        };
+        // Python's int() does not overflow; on Rust an out-of-range
+        // value would not fit in u32. Treat as undecodable -> verbatim.
+        let Some(num) = num else {
+            out.push('&');
+            out.push_str(body);
+            return;
+        };
+        if let Some(rep) = invalid_charref_replacement(num) {
+            out.push_str(rep);
+            return;
+        }
+        if (0xD800..=0xDFFF).contains(&num) || num > 0x10FFFF {
+            out.push('\u{FFFD}');
+            return;
+        }
+        if is_invalid_codepoint(num) {
+            // Empty-string substitution (`html/__init__.py:103-104`).
+            return;
+        }
+        // Should always succeed given the guards above.
+        if let Some(ch) = char::from_u32(num) {
+            out.push(ch);
+        } else {
+            // Defensive: shouldn't fire — guards above cover surrogates
+            // and >0x10FFFF, the only `char::from_u32` failure modes.
+            out.push('\u{FFFD}');
+        }
+    } else {
+        // Named charref. `html/__init__.py:106-115`.
+        //
+        // NOTE on `web_atoms::NAMED_ENTITIES` vs Python's `html5`: the
+        // PHF map has 9854 entries vs Python's 2231 because web_atoms
+        // also stores **prefix sentinels** (e.g. `"a"`, `"am"`, `"AM"`,
+        // any partial path along the HTML5 entity-trie) with the
+        // value `(0, 0)`. Python's table has no such sentinels —
+        // `html5.get("am")` is `None`. We treat `(cp1=0, cp2=0)` as
+        // "not a real entity" (no real HTML5 entity decodes to U+0000,
+        // and the only `_invalid_charrefs[0x00]` substitution is on the
+        // NUMERIC path, not the named one). This restores Python's
+        // semantics for both the direct lookup AND the longest-prefix
+        // descent (which would otherwise hit a sentinel and emit
+        // garbage instead of falling through to the next prefix).
+        if let Some(decoded) = lookup_named_entity(body) {
+            out.push_str(&decoded);
+            return;
+        }
+        // Longest-prefix descent (`html/__init__.py:110-113`):
+        //   for x in range(len(s)-1, 1, -1):
+        //       if s[:x] in _html5: return _html5[s[:x]] + s[x:]
+        // x iterates as char-count len-1 .. 2 (Python's `len(str)` is
+        // char count). For HTML5 named entities the body is pure ASCII
+        // (entity-name alphabet is alphanumerics + optional trailing
+        // `;`), so byte-count == char-count and slicing by byte index
+        // is equivalent for ASCII bodies; non-ASCII bodies fall through
+        // to a char-by-char peel.
+        if body.is_ascii() {
+            let len = body.len();
+            // Python `range(len(s)-1, 1, -1)` yields len-1, len-2, …, 2.
+            for x in (2..len).rev() {
+                let prefix = &body[..x];
+                if let Some(decoded) = lookup_named_entity(prefix) {
+                    out.push_str(&decoded);
+                    out.push_str(&body[x..]);
+                    return;
+                }
+            }
+        } else {
+            // Non-ASCII body: char-by-char peel.
+            let chars: Vec<char> = body.chars().collect();
+            let n = chars.len();
+            for x in (2..n).rev() {
+                let prefix: String = chars[..x].iter().collect();
+                if let Some(decoded) = lookup_named_entity(&prefix) {
+                    out.push_str(&decoded);
+                    let tail: String = chars[x..].iter().collect();
+                    out.push_str(&tail);
+                    return;
+                }
+            }
+        }
+        // No prefix matched — return `&` + body (`html/__init__.py:115`).
+        out.push('&');
+        out.push_str(body);
+    }
+}
+
+/// Look up a candidate name in `web_atoms::NAMED_ENTITIES`, treating the
+/// table's `(0, 0)` prefix sentinels as "not a real entity" (see the
+/// extended comment in `replace_charref`'s named branch). Returns the
+/// decoded 1- or 2-codepoint replacement string, or `None` if the name
+/// is absent or is a prefix sentinel.
+fn lookup_named_entity(name: &str) -> Option<String> {
+    let (cp1, cp2) = web_atoms::NAMED_ENTITIES.get(name).copied()?;
+    if cp1 == 0 && cp2 == 0 {
+        // Prefix sentinel — not a real entity in Python's html5 table.
+        return None;
+    }
+    let mut s = String::with_capacity(8);
+    if let Some(ch) = char::from_u32(cp1) {
+        s.push(ch);
+    }
+    if cp2 != 0
+        && let Some(ch) = char::from_u32(cp2)
+    {
+        s.push(ch);
+    }
+    Some(s)
+}
+
+/// Python `_invalid_charrefs` (`html/__init__.py:30-65`). 35 entries —
+/// Windows-1252 punctuation substitutions for the C1 range plus a few
+/// oddballs (`0x00` → `U+FFFD`, `0x0D` → `\r`).
+fn invalid_charref_replacement(num: u32) -> Option<&'static str> {
+    match num {
+        0x00 => Some("\u{FFFD}"), // REPLACEMENT CHARACTER
+        0x0D => Some("\r"),       // CARRIAGE RETURN
+        0x80 => Some("\u{20AC}"), // EURO SIGN
+        0x81 => Some("\u{0081}"), // <control>
+        0x82 => Some("\u{201A}"), // SINGLE LOW-9 QUOTATION MARK
+        0x83 => Some("\u{0192}"), // LATIN SMALL LETTER F WITH HOOK
+        0x84 => Some("\u{201E}"), // DOUBLE LOW-9 QUOTATION MARK
+        0x85 => Some("\u{2026}"), // HORIZONTAL ELLIPSIS
+        0x86 => Some("\u{2020}"), // DAGGER
+        0x87 => Some("\u{2021}"), // DOUBLE DAGGER
+        0x88 => Some("\u{02C6}"), // MODIFIER LETTER CIRCUMFLEX ACCENT
+        0x89 => Some("\u{2030}"), // PER MILLE SIGN
+        0x8A => Some("\u{0160}"), // LATIN CAPITAL LETTER S WITH CARON
+        0x8B => Some("\u{2039}"), // SINGLE LEFT-POINTING ANGLE QUOTATION MARK
+        0x8C => Some("\u{0152}"), // LATIN CAPITAL LIGATURE OE
+        0x8D => Some("\u{008D}"), // <control>
+        0x8E => Some("\u{017D}"), // LATIN CAPITAL LETTER Z WITH CARON
+        0x8F => Some("\u{008F}"), // <control>
+        0x90 => Some("\u{0090}"), // <control>
+        0x91 => Some("\u{2018}"), // LEFT SINGLE QUOTATION MARK
+        0x92 => Some("\u{2019}"), // RIGHT SINGLE QUOTATION MARK
+        0x93 => Some("\u{201C}"), // LEFT DOUBLE QUOTATION MARK
+        0x94 => Some("\u{201D}"), // RIGHT DOUBLE QUOTATION MARK
+        0x95 => Some("\u{2022}"), // BULLET
+        0x96 => Some("\u{2013}"), // EN DASH
+        0x97 => Some("\u{2014}"), // EM DASH
+        0x98 => Some("\u{02DC}"), // SMALL TILDE
+        0x99 => Some("\u{2122}"), // TRADE MARK SIGN
+        0x9A => Some("\u{0161}"), // LATIN SMALL LETTER S WITH CARON
+        0x9B => Some("\u{203A}"), // SINGLE RIGHT-POINTING ANGLE QUOTATION MARK
+        0x9C => Some("\u{0153}"), // LATIN SMALL LIGATURE OE
+        0x9D => Some("\u{009D}"), // <control>
+        0x9E => Some("\u{017E}"), // LATIN SMALL LETTER Z WITH CARON
+        0x9F => Some("\u{0178}"), // LATIN CAPITAL LETTER Y WITH DIAERESIS
+        _ => None,
+    }
+}
+
+/// Python `_invalid_codepoints` (`html/__init__.py:67-88`). Dense ranges;
+/// `matches!` keeps the spec literal.
+fn is_invalid_codepoint(num: u32) -> bool {
+    matches!(
+        num,
+        // 0x0001..=0x0008
+        0x01..=0x08
+        // 0x000B (note: 0x09/0x0A/0x0C are whitespace, NOT in the invalid set)
+        | 0x0B
+        // 0x000E..=0x001F
+        | 0x0E..=0x1F
+        // 0x007F..=0x009F
+        | 0x7F..=0x9F
+        // 0xFDD0..=0xFDEF
+        | 0xFDD0..=0xFDEF
+        // plane-end non-characters: 0xnFFFE / 0xnFFFF for n = 0..=16
+        | 0xFFFE | 0xFFFF
+        | 0x1FFFE | 0x1FFFF
+        | 0x2FFFE | 0x2FFFF
+        | 0x3FFFE | 0x3FFFF
+        | 0x4FFFE | 0x4FFFF
+        | 0x5FFFE | 0x5FFFF
+        | 0x6FFFE | 0x6FFFF
+        | 0x7FFFE | 0x7FFFF
+        | 0x8FFFE | 0x8FFFF
+        | 0x9FFFE | 0x9FFFF
+        | 0xAFFFE | 0xAFFFF
+        | 0xBFFFE | 0xBFFFF
+        | 0xCFFFE | 0xCFFFF
+        | 0xDFFFE | 0xDFFFF
+        | 0xEFFFE | 0xEFFFF
+        | 0xFFFFE | 0xFFFFF
+        | 0x10FFFE | 0x10FFFF
+    )
 }
 
 /// Python `str.title()` for ASCII-ish sitenames (`metadata.py:567`).
@@ -1497,6 +1873,258 @@ mod tests {
             tags: vec!["rust".into(), "café".into()],
         };
         let before = m.clone();
+        clean_and_trim_metadata(&mut m);
+        assert_eq!(m, before);
+    }
+
+    // -------------------------------------------------------------------
+    // M10 Phase 2E — cap_at_python_length (HLD §6.1)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn cap_at_python_length_passes_short_input_unchanged() {
+        let v = "hello world";
+        let out = cap_at_python_length(v);
+        assert_eq!(out, "hello world");
+        assert!(matches!(out, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn cap_at_python_length_passes_exactly_10000_chars_unchanged() {
+        // Strict `>` boundary per Python `if len(value) > 10000`.
+        let v: String = "a".repeat(10_000);
+        let out = cap_at_python_length(&v);
+        assert_eq!(out.chars().count(), 10_000);
+        assert!(matches!(out, Cow::Borrowed(_)));
+        assert_eq!(out.as_ref(), v.as_str());
+    }
+
+    #[test]
+    fn cap_at_python_length_truncates_at_9999_with_ellipsis() {
+        let v: String = "a".repeat(10_001);
+        let out = cap_at_python_length(&v);
+        // Final length exactly 10_000 chars: 9999 a's + 1 ellipsis.
+        assert_eq!(out.chars().count(), 10_000);
+        assert!(matches!(out, Cow::Owned(_)));
+        // Last char is U+2026, NOT three ASCII dots.
+        let last = out.chars().last().expect("non-empty");
+        assert_eq!(last, '\u{2026}');
+        // First 9999 chars are 'a's.
+        let prefix: String = out.chars().take(9999).collect();
+        assert_eq!(prefix, "a".repeat(9999));
+    }
+
+    #[test]
+    fn cap_at_python_length_uses_char_count_not_byte_count() {
+        // 5_000 `'中'` is 15_000 bytes but only 5_000 chars; must pass
+        // through (≤ 10_000 chars).
+        let v: String = "中".repeat(5_000);
+        assert_eq!(v.len(), 15_000); // 3-byte UTF-8
+        assert_eq!(v.chars().count(), 5_000);
+        let out = cap_at_python_length(&v);
+        assert!(matches!(out, Cow::Borrowed(_)));
+        assert_eq!(out.chars().count(), 5_000);
+    }
+
+    // -------------------------------------------------------------------
+    // M10 Phase 2E — python_html_unescape (HLD §6.2)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn python_html_unescape_passthrough_no_ampersand() {
+        let v = "hello world";
+        let out = python_html_unescape(v);
+        assert_eq!(out, "hello world");
+        assert!(matches!(out, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn python_html_unescape_named_with_semicolon() {
+        // Headline base case: the XML-mandatory five.
+        let out = python_html_unescape("&amp; &lt; &gt; &quot; &apos;");
+        assert_eq!(out, "& < > \" '");
+    }
+
+    #[test]
+    fn python_html_unescape_named_without_semicolon_legacy() {
+        // Python regex `;?` allows missing `;` on legacy entities.
+        // `&amp` (no semicolon) is one of the 106 legacy entries.
+        let out = python_html_unescape("AT&amp T");
+        assert_eq!(out, "AT& T");
+    }
+
+    #[test]
+    fn python_html_unescape_numeric_decimal() {
+        let out = python_html_unescape("&#8230;");
+        assert_eq!(out, "\u{2026}");
+    }
+
+    #[test]
+    fn python_html_unescape_numeric_hex() {
+        let out = python_html_unescape("&#x2026;");
+        assert_eq!(out, "\u{2026}");
+    }
+
+    #[test]
+    fn python_html_unescape_longest_prefix_fallback() {
+        // `&notreal;` is not in _html5; peel chars to find `not`
+        // (which decodes to U+00AC NOT SIGN). Remainder `real;` is
+        // appended verbatim.
+        let out = python_html_unescape("&notreal;");
+        assert_eq!(out, "\u{00AC}real;");
+    }
+
+    #[test]
+    fn python_html_unescape_windows_1252_substitution() {
+        // `_invalid_charrefs[0x80]` -> U+20AC EURO SIGN.
+        let out = python_html_unescape("&#x80;");
+        assert_eq!(out, "\u{20AC}");
+    }
+
+    #[test]
+    fn python_html_unescape_surrogate_yields_fffd() {
+        let out = python_html_unescape("&#xD800;");
+        assert_eq!(out, "\u{FFFD}");
+    }
+
+    #[test]
+    fn python_html_unescape_invalid_codepoint_yields_empty_string() {
+        // `0x0B` is in _invalid_codepoints -> empty string substitution.
+        // Surrounding text remains.
+        let out = python_html_unescape("&#x000B;x");
+        assert_eq!(out, "x");
+    }
+
+    #[test]
+    fn python_html_unescape_bare_ampersand_no_match() {
+        // Bare `&` followed by space doesn't match `_charref` (space is
+        // in the excluded set for named-entity char class).
+        let out = python_html_unescape("a & b");
+        assert_eq!(out, "a & b");
+    }
+
+    #[test]
+    fn python_html_unescape_empty_input() {
+        let out = python_html_unescape("");
+        assert_eq!(out, "");
+        assert!(matches!(out, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn python_html_unescape_two_codepoint_entity() {
+        // `&acE;` decodes to U+223E U+0333.
+        let out = python_html_unescape("&acE;");
+        assert_eq!(out, "\u{223E}\u{0333}");
+    }
+
+    #[test]
+    fn python_html_unescape_longest_named_entity() {
+        // The 32-char ceiling case.
+        let out = python_html_unescape("&CounterClockwiseContourIntegral;");
+        assert_eq!(out, "\u{2233}");
+    }
+
+    // -------------------------------------------------------------------
+    // M10 Phase 2E — clean_and_trim_metadata combined behaviour (HLD §6.3)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn clean_and_trim_metadata_unescapes_title_entity() {
+        // Step 2 in isolation.
+        let mut m = Metadata {
+            title: Some("AT&amp;T News".into()),
+            ..Default::default()
+        };
+        clean_and_trim_metadata(&mut m);
+        assert_eq!(m.title.as_deref(), Some("AT&T News"));
+    }
+
+    #[test]
+    fn clean_and_trim_metadata_caps_long_description() {
+        // Step 1 in isolation: 10_001 chars truncates to 9999 + U+2026.
+        let long: String = "a".repeat(10_001);
+        let mut m = Metadata {
+            description: Some(long),
+            ..Default::default()
+        };
+        clean_and_trim_metadata(&mut m);
+        let desc = m.description.expect("set");
+        assert_eq!(desc.chars().count(), 10_000);
+        assert_eq!(desc.chars().last(), Some('\u{2026}'));
+    }
+
+    #[test]
+    fn clean_and_trim_metadata_order_cap_before_unescape_truncates_entity() {
+        // Order keystone (HLD §1.2 / §3): cap precedes unescape. A title
+        // of 10_002 chars (`"x" * 9996` + `"&amp;Y"`) truncates to the
+        // first 9999 chars (= "x" * 9996 + "&am") then appends ellipsis,
+        // leaving "&am" as a dangling entity prefix. unescape then sees
+        // "&am" (no semicolon, no longest-prefix down to length 2
+        // matches) so returns it verbatim — exactly what Python does at
+        // settings.py:295-298.
+        let mut title = "x".repeat(9996);
+        title.push_str("&amp;Y");
+        assert_eq!(title.chars().count(), 10_002);
+        let mut m = Metadata {
+            title: Some(title),
+            ..Default::default()
+        };
+        clean_and_trim_metadata(&mut m);
+        let out = m.title.expect("set");
+        // 9999 chars before ellipsis: "x" * 9996 + "&am" then '\u{2026}'.
+        assert_eq!(out.chars().count(), 10_000);
+        assert_eq!(out.chars().last(), Some('\u{2026}'));
+        let prefix: String = out.chars().take(9999).collect();
+        let mut expected = "x".repeat(9996);
+        expected.push_str("&am");
+        assert_eq!(prefix, expected);
+    }
+
+    #[test]
+    fn clean_and_trim_metadata_order_unescape_before_strip() {
+        // Order keystone: unescape -> strip. `&amp;` decodes to `&`,
+        // then the ZWSP (U+200B, Cf) is stripped.
+        let mut m = Metadata {
+            title: Some("&amp;\u{200B}".into()),
+            ..Default::default()
+        };
+        clean_and_trim_metadata(&mut m);
+        assert_eq!(m.title.as_deref(), Some("&"));
+    }
+
+    #[test]
+    fn clean_and_trim_metadata_applies_to_categories_and_tags() {
+        // List-entry coverage: cap+unescape applies to every list slot too.
+        let mut m = Metadata {
+            categories: vec!["AT&amp;T".into(), "news".into()],
+            tags: vec!["rust&lt;3".into(), "café".into()],
+            ..Default::default()
+        };
+        clean_and_trim_metadata(&mut m);
+        assert_eq!(
+            m.categories,
+            vec!["AT&T".to_string(), "news".to_string()]
+        );
+        assert_eq!(
+            m.tags,
+            vec!["rust<3".to_string(), "café".to_string()]
+        );
+    }
+
+    #[test]
+    fn clean_and_trim_metadata_idempotent_on_clean_input() {
+        // Clean ASCII input with no entities and no control chars round-
+        // trips through cap+unescape+strip byte-equal.
+        let mut m = Metadata {
+            title: Some("Clean Title".into()),
+            description: Some("A clean description, no entities.".into()),
+            categories: vec!["news".into(), "tech".into()],
+            tags: vec!["rust".into()],
+            ..Default::default()
+        };
+        let before = m.clone();
+        clean_and_trim_metadata(&mut m);
+        // Second pass — confirms idempotence.
         clean_and_trim_metadata(&mut m);
         assert_eq!(m, before);
     }
