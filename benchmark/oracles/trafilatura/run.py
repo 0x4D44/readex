@@ -278,32 +278,45 @@ def _file_sha256(path):
     return h.hexdigest()
 
 
+# Cached cfg + extract import. Built lazily on first run_oracle call so a
+# pure CLI `--help`-style invocation doesn't pay the trafilatura import cost.
+# Once built, both are reused across every call in this Python process — at
+# 1500 docs * 3 formats = 4500 calls, re-parsing the cfg file each time
+# added ~5-7s/extract of overhead in the M9 Stage-4 batch run; caching once
+# brings it back to ~0.2-0.5s/extract.
+_CACHED_EXTRACT = None
+_CACHED_CFG = None
+
+
+def _ensure_cached():
+    global _CACHED_EXTRACT, _CACHED_CFG
+    if _CACHED_EXTRACT is None:
+        from trafilatura import extract as trafi_extract
+        from trafilatura.settings import use_config
+
+        _CACHED_EXTRACT = trafi_extract
+        _CACHED_CFG = use_config(_trafilatura_cfg_path())
+
+
 def run_oracle(raw, base_url, output_format):
     """THE single config-locked entry point. Every extract-mode call goes here.
 
     Returns the trafilatura.extract() string (None → "") for the given
-    output_format. Imports trafilatura lazily so the cost is paid once per
-    Python process; `use_config` is also called once per call (cheap; it just
-    re-reads the committed cfg file). For --batch we'd ideally cache the
-    `cfg` object across calls, but `use_config` is fast enough on a 51-doc
-    corpus that the simpler "one cfg per call" shape is the right call —
-    keeps the surface tiny and avoids a module-global mutable.
+    output_format. trafilatura and its cfg are cached at module level after
+    the first call (see `_ensure_cached`).
 
     `base_url` may be None (the Python `extract()` signature accepts that;
     it disables URL-derived metadata).
     """
-    from trafilatura import extract as trafi_extract
-    from trafilatura.settings import use_config
-
-    cfg = use_config(_trafilatura_cfg_path())
-    payload = trafi_extract(
+    _ensure_cached()
+    payload = _CACHED_EXTRACT(
         raw,
         url=base_url,
         output_format=output_format,
         with_metadata=False,
         deduplicate=False,
         include_comments=False,
-        config=cfg,
+        config=_CACHED_CFG,
     )
     return "" if payload is None else payload
 
@@ -371,6 +384,15 @@ def _run_batch(corpus_dir, manifest_path):
     # tooling may emit a trailing newline). Each non-blank line must parse
     # as a JSON object with a `sha` key; `source_url` is optional (missing
     # / empty / null → pass base_url=None to run_oracle).
+    #
+    # Per-format extract is wrapped in try/except: fuzzing the real web
+    # surfaces pages that crash trafilatura (lxml C-extension bugs, regex
+    # pathologies, ...). One bad page must NOT kill the whole batch — we
+    # record the error as the output for that (sha, format) pair and move
+    # on. The Rust diff harness then treats it as a divergence-class
+    # ("oracle_error"), which is itself an interesting finding.
+    docs_done = 0
+    errors = 0
     with open(manifest_path, "r", encoding="utf-8") as mfh:
         for line_no, raw_line in enumerate(mfh, start=1):
             line = raw_line.strip()
@@ -403,11 +425,42 @@ def _run_batch(corpus_dir, manifest_path):
 
             outputs = {}
             for fmt in _BATCH_OUTPUT_FORMATS:
-                outputs[fmt] = run_oracle(raw, source_url, fmt)
+                try:
+                    outputs[fmt] = run_oracle(raw, source_url, fmt)
+                except Exception as exc:  # noqa: BLE001
+                    errors += 1
+                    # Sentinel string the Rust diff harness recognises; also
+                    # log to stderr so the live operator can spot pathological
+                    # inputs without grepping the cache.
+                    outputs[fmt] = (
+                        f"__TRAFILATURA_ORACLE_ERROR__: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    print(
+                        f"[run.py] sha={sha[:16]} fmt={fmt} ERROR "
+                        f"{type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
 
             _emit_batch_line(
                 {"sha": sha, "source_url": source_url, "outputs": outputs}
             )
+
+            docs_done += 1
+            if docs_done % 100 == 0:
+                print(
+                    f"[run.py] --batch progress: {docs_done} docs, "
+                    f"{errors} per-format errors so far",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+    print(
+        f"[run.py] --batch done: {docs_done} docs, {errors} per-format errors",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _parse_args(argv):

@@ -2849,7 +2849,7 @@ name = "mdrcel"
 # <teiHeader> to <note type="fingerprint"> only; header+body byte-compared.
 # GREEN 51 = 38 substantive + 11 allowlisted + 2 deferred. No new dependency
 # (regex/unicode-normalization already pinned). All 11 BLOCKER gates green.
-version = "0.18.0"
+version = "0.18.1"
 edition = "2024"
 
 # M7 Stage 1 (2026-05-22): 0.16.2 -> 0.17.0 MINOR. New public function
@@ -3210,3 +3210,15 @@ unicode-normalization = "=0.1.25"
 # gate continues to consume it via the regular dep, with no change to the
 # tokenizer mirror semantics (the version pin is now `=0.1.25` — strictly
 # tighter than the previous `0.1` floor).
+#
+# M9 Stage 4 (2026-05-23): `sha2` lands as a DEV-only dep for the
+# `tests/fuzz_diff.rs` harness. The harness verifies cache integrity by
+# recomputing SHA-256 of `run.py`, `manifest.jsonl`, and a stable JSON
+# encoding of the locked-kwargs descriptor — all four hashes the batch
+# oracle wrote into the cache header. `sha2 0.10.9` is already in the
+# committed `Cargo.lock` (transitive through other deps), so this entry
+# adds zero new crates to the dependency graph; it merely makes the dep
+# usable from integration tests. Pinned EXACTLY per project new-dependency
+# discipline. Not promoted to a regular dep — the runtime extraction path
+# has no need for SHA-256.
+sha2 = "=0.10.9"

@@ -24,4 +24,5 @@ wrk_gold/
 # plus the WARC offsets recorded therein, so we never store it in git.
 benchmark/fuzz_corpus/
 benchmark/fuzz/oracle_cache.jsonl
+benchmark/fuzz/oracle_cache.err
 benchmark/fuzz/divergences.jsonl
