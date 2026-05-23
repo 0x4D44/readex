@@ -83,6 +83,15 @@ const DIFF_WINDOW_BYTES: usize = 120;
 /// Print a progress dot every N docs so a human watching can tell it's alive.
 const PROGRESS_EVERY: usize = 100;
 
+/// HLD §8 — the manifest is partitioned by index into a WORKING slice (the
+/// first `WORKING_SLICE_SIZE` docs, used for triage and fix targeting) and a
+/// HELD-OUT slice (the rest, the §8 fidelity KPI substrate — never used for
+/// triage). The partition is FROZEN at Stage 5 entry; changing it
+/// re-baselines the KPI. Today the working slice is 1000 docs and the
+/// held-out is 500 (manifest is 1500 entries from a single WARC; same CC
+/// distribution).
+const WORKING_SLICE_SIZE: usize = 1000;
+
 // -------------------------------------------------------------------------
 // Minimal JSON value type
 // -------------------------------------------------------------------------
@@ -727,6 +736,7 @@ impl PerFormatStats {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_format(
     sha: &str,
     source_url: &Option<String>,
@@ -738,6 +748,7 @@ fn process_format(
     out: &mut dyn Write,
     divergence_buf: &mut Vec<Divergence>,
     opts: &mdrcel::Options,
+    record_divergence: bool,
 ) {
     stats.pages += 1;
 
@@ -790,9 +801,14 @@ fn process_format(
         mdrcel_window: mw,
         diff_shape_hash: dsh,
     };
-    let line = div.to_jsonl();
-    writeln!(out, "{line}").expect("write divergences.jsonl");
-    divergence_buf.push(div);
+    // HLD §8: held-out divergences are counted in stats but NOT enumerated
+    // here — the held-out slice is the KPI substrate, "look but don't peek."
+    // Triage targets are drawn from the working slice only.
+    if record_divergence {
+        let line = div.to_jsonl();
+        writeln!(out, "{line}").expect("write divergences.jsonl");
+        divergence_buf.push(div);
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -801,23 +817,50 @@ fn process_format(
 
 fn print_summary(
     total_pages: usize,
-    per_format: &BTreeMap<&'static str, PerFormatStats>,
+    per_format_working: &BTreeMap<&'static str, PerFormatStats>,
+    per_format_heldout: &BTreeMap<&'static str, PerFormatStats>,
     divs: &[Divergence],
     divergences_path: &PathBuf,
 ) {
     eprintln!();
     eprintln!("===========================================================");
-    eprintln!("              M9 Stage 4 — fuzz_diff summary");
+    eprintln!("              M9 Stage 5 — fuzz_diff summary");
     eprintln!("===========================================================");
     eprintln!("corpus pages processed: {total_pages}");
+    eprintln!(
+        "  WORKING slice (first {} docs — triage target)",
+        WORKING_SLICE_SIZE
+    );
+    eprintln!("  HELD-OUT slice (rest — HLD §8 fidelity KPI, no triage)");
     eprintln!();
 
-    eprintln!("Per-format tally:");
-    eprintln!("  {:<10} {:>10} {:>10} {:>10}", "format", "pages", "equal", "diverge");
-    for (fmt, s) in per_format {
+    eprintln!("Per-format tally — WORKING:");
+    eprintln!(
+        "  {:<10} {:>10} {:>10} {:>10}",
+        "format", "pages", "equal", "diverge"
+    );
+    for (fmt, s) in per_format_working {
         eprintln!(
             "  {:<10} {:>10} {:>10} {:>10}",
             fmt, s.pages, s.equal, s.diverge
+        );
+    }
+    eprintln!();
+
+    eprintln!("Per-format tally — HELD-OUT (fidelity KPI substrate):");
+    eprintln!(
+        "  {:<10} {:>10} {:>10} {:>10} {:>10}",
+        "format", "pages", "equal", "diverge", "KPI(%eq)"
+    );
+    for (fmt, s) in per_format_heldout {
+        let pct = if s.pages == 0 {
+            0.0
+        } else {
+            100.0 * (s.equal as f64) / (s.pages as f64)
+        };
+        eprintln!(
+            "  {:<10} {:>10} {:>10} {:>10} {:>9.2}%",
+            fmt, s.pages, s.equal, s.diverge, pct
         );
     }
     eprintln!();
@@ -918,13 +961,14 @@ fn fuzz_diff() {
             panic!("cannot create divergences file {divergences_path:?}: {e}")
         });
 
-    // Per-format running stats. Insertion-order is the iteration order we
-    // print, but BTreeMap is fine — sorted alphabetically the formats land
-    // as `markdown` / `txt` / `xml`, which is the natural reading order.
-    let mut per_format: BTreeMap<&'static str, PerFormatStats> = BTreeMap::new();
-    per_format.insert("txt", PerFormatStats::new());
-    per_format.insert("markdown", PerFormatStats::new());
-    per_format.insert("xml", PerFormatStats::new());
+    // Per-format running stats — separated by slice (HLD §8). Working-slice
+    // stats drive triage; held-out-slice stats are the KPI substrate.
+    let mut per_format_working: BTreeMap<&'static str, PerFormatStats> = BTreeMap::new();
+    let mut per_format_heldout: BTreeMap<&'static str, PerFormatStats> = BTreeMap::new();
+    for fmt in ["txt", "markdown", "xml"] {
+        per_format_working.insert(fmt, PerFormatStats::new());
+        per_format_heldout.insert(fmt, PerFormatStats::new());
+    }
 
     let mut divergences: Vec<Divergence> = Vec::new();
     let opts = mdrcel::Options::default();
@@ -933,7 +977,13 @@ fn fuzz_diff() {
     let mut missing_html = 0usize;
     let mut missing_cache = 0usize;
 
-    for m in &manifest {
+    for (idx, m) in manifest.iter().enumerate() {
+        let is_working = idx < WORKING_SLICE_SIZE;
+        let per_format = if is_working {
+            &mut per_format_working
+        } else {
+            &mut per_format_heldout
+        };
         // Locate the matching cache entry. A missing cache row is NOT a
         // divergence — the cache is in-progress / partial; just skip.
         let Some(cache_entry) = cache_entries.get(&m.sha) else {
@@ -960,6 +1010,7 @@ fn fuzz_diff() {
             &mut div_file,
             &mut divergences,
             &opts,
+            is_working,
         );
         process_format(
             &m.sha,
@@ -972,6 +1023,7 @@ fn fuzz_diff() {
             &mut div_file,
             &mut divergences,
             &opts,
+            is_working,
         );
         process_format(
             &m.sha,
@@ -984,6 +1036,7 @@ fn fuzz_diff() {
             &mut div_file,
             &mut divergences,
             &opts,
+            is_working,
         );
 
         processed += 1;
@@ -1003,7 +1056,13 @@ fn fuzz_diff() {
         "[fuzz_diff] done: {processed} docs processed, {missing_cache} skipped (no cache entry), {missing_html} skipped (corpus missing)"
     );
 
-    print_summary(processed, &per_format, &divergences, &divergences_path);
+    print_summary(
+        processed,
+        &per_format_working,
+        &per_format_heldout,
+        &divergences,
+        &divergences_path,
+    );
 }
 
 // -------------------------------------------------------------------------
