@@ -359,7 +359,17 @@ pub(crate) fn remove_empty_elements(tree: &NodeRef) {
         if local_name(&p).as_deref() == Some("code") {
             continue;
         }
-        dom::remove(&element);
+        // lxml's `parent.remove(element)` drops `.tail` with the element
+        // (tails are a field ON the element in lxml). rcdom stores tails as
+        // a run of Text siblings AFTER the element, so a bare `dom::remove`
+        // detaches only the element and leaves the tail Text node behind to
+        // coalesce into a neighbour — re-introducing whitespace that Python
+        // never had. M9 Stage-5 traced this as the trailing-space-before-
+        // inline-tag bug (~36 working-slice records). `delete_element` with
+        // `keep_tail=false` walks the following-Text-sibling run via
+        // `collect_following_text_siblings` and detaches them with the
+        // element, matching lxml.
+        delete_element(&element, false);
     }
 }
 
