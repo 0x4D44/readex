@@ -61,10 +61,48 @@ use std::io::{BufRead, BufReader, Write};
 use std::panic;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
 use common::{escape, first_diff_index, nfc, window_around, workspace_path};
+
+// -------------------------------------------------------------------------
+// Generic timeout wrapper
+// -------------------------------------------------------------------------
+
+/// Run a closure on a dedicated thread with a wall-clock deadline.
+/// Returns `Some(value)` if the closure completes within the timeout,
+/// or `None` if the deadline elapses. The spawned thread continues
+/// running in the background on timeout (Rust has no thread cancellation);
+/// its resources are reclaimed when it finishes or the process exits.
+fn run_with_timeout<T: Send + 'static>(
+    f: impl FnOnce() -> T + Send + 'static,
+    timeout: Duration,
+) -> Option<T> {
+    let (tx, rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(val) => {
+            let _ = handle.join();
+            Some(val)
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => None,
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            // Thread panicked before sending — shouldn't happen when
+            // catch_unwind wraps the inner work, but handle defensively.
+            None
+        }
+    }
+}
+
+/// Per-page extraction timeout. Generous: typical pages process in
+/// < 100 ms; anything > 30 s is pathological.
+const EXTRACT_TIMEOUT: Duration = Duration::from_secs(30);
 
 // -------------------------------------------------------------------------
 // Pinned constants
@@ -250,7 +288,7 @@ fn live_traf_version() -> String {
 
 /// Verify all four cache-integrity fields. Panics on any mismatch with a
 /// pointed diagnostic — "re-run the batch oracle" is the universal remedy.
-fn verify_cache_integrity(cache_path: &PathBuf, hdr: &CacheHeader) {
+fn verify_cache_integrity(cache_path: &PathBuf, hdr: &CacheHeader, manifest_path: &PathBuf) {
     // 1. traf_version — both the header and the live venv must agree with the
     //    pinned constant. Catches "header was hand-edited" AND "venv was
     //    bumped without re-baking the cache."
@@ -294,8 +332,7 @@ fn verify_cache_integrity(cache_path: &PathBuf, hdr: &CacheHeader) {
     }
 
     // 4. manifest_sha — bytes of manifest.jsonl.
-    let manifest = workspace_path("benchmark/fuzz/manifest.jsonl");
-    let live_manifest = file_sha256(&manifest);
+    let live_manifest = file_sha256(manifest_path);
     if hdr.manifest_sha != live_manifest {
         panic!(
             "cache manifest_sha mismatch:\n  header: {}\n  live:   {}\n  -> manifest.jsonl changed; re-bake the cache",
@@ -421,6 +458,7 @@ enum ShapeClass {
     EmptyVsNonempty,
     Panic,
     MdrcelError,
+    Timeout,
 }
 
 impl ShapeClass {
@@ -435,6 +473,7 @@ impl ShapeClass {
             ShapeClass::EmptyVsNonempty => "empty-vs-nonempty",
             ShapeClass::Panic => "panic",
             ShapeClass::MdrcelError => "mdrcel_error",
+            ShapeClass::Timeout => "timeout",
         }
     }
 }
@@ -638,6 +677,8 @@ struct Divergence {
     diff_shape_hash: String,
     dice_similarity: f64,
     jaccard_similarity: f64,
+    mdrcel_len: usize,
+    oracle_len: usize,
 }
 
 impl Divergence {
@@ -658,7 +699,7 @@ impl Divergence {
         let mw = serde_json::Value::String(self.mdrcel_window.clone()).to_string();
         let nt = serde_json::Value::String(self.near_tag.clone()).to_string();
         format!(
-            r#"{{"sha":"{sha}","source_url":{src},"format":"{fmt}","shape_class":"{sc}","near_tag":{nt},"first_diff_byte":{fdb},"oracle_window":{ow},"mdrcel_window":{mw},"diff_shape_hash":"{dsh}","dice_similarity":{dice:.4},"jaccard_similarity":{jacc:.4}}}"#,
+            r#"{{"sha":"{sha}","source_url":{src},"format":"{fmt}","shape_class":"{sc}","near_tag":{nt},"first_diff_byte":{fdb},"oracle_window":{ow},"mdrcel_window":{mw},"diff_shape_hash":"{dsh}","dice_similarity":{dice:.4},"jaccard_similarity":{jacc:.4},"mdrcel_len":{mlen},"oracle_len":{olen}}}"#,
             sha = self.sha,
             src = src,
             fmt = self.format,
@@ -670,6 +711,8 @@ impl Divergence {
             dsh = self.diff_shape_hash,
             dice = self.dice_similarity,
             jacc = self.jaccard_similarity,
+            mlen = self.mdrcel_len,
+            olen = self.oracle_len,
         )
     }
 }
@@ -686,8 +729,9 @@ type ExtractFn = fn(
 
 enum ExtractOutcome {
     Ok(String),
-    Err(String),   // ExtractError -> mdrcel_error class
-    Panic(String), // catch_unwind capture -> panic class
+    Err(String),    // ExtractError -> mdrcel_error class
+    Panic(String),  // catch_unwind capture -> panic class
+    Timeout,        // wall-clock deadline exceeded
 }
 
 fn safe_extract(
@@ -699,26 +743,32 @@ fn safe_extract(
     let html_owned = html.to_string();
     let base_owned = base_url.map(|s| s.to_string());
     let opts_clone = opts.clone();
-    // Move owned values into the closure so the panic payload isn't holding
-    // any borrow when it unwinds.
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(move || {
-        f(&html_owned, base_owned.as_deref(), &opts_clone)
-    }));
-    match result {
-        Ok(Ok(s)) => ExtractOutcome::Ok(s),
-        Ok(Err(e)) => ExtractOutcome::Err(format!("{e}")),
-        Err(payload) => {
-            // Stringify whatever the panic carried.
-            let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
-                (*s).to_string()
-            } else if let Some(s) = payload.downcast_ref::<String>() {
-                s.clone()
-            } else {
-                "<non-string panic payload>".to_string()
-            };
-            ExtractOutcome::Panic(msg)
-        }
-    }
+
+    // The extraction runs on a dedicated thread with catch_unwind inside,
+    // so both panics and wall-clock hangs are captured non-destructively.
+    let maybe = run_with_timeout(
+        move || {
+            let result = panic::catch_unwind(panic::AssertUnwindSafe(move || {
+                f(&html_owned, base_owned.as_deref(), &opts_clone)
+            }));
+            match result {
+                Ok(Ok(s)) => ExtractOutcome::Ok(s),
+                Ok(Err(e)) => ExtractOutcome::Err(format!("{e}")),
+                Err(payload) => {
+                    let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+                        (*s).to_string()
+                    } else if let Some(s) = payload.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "<non-string panic payload>".to_string()
+                    };
+                    ExtractOutcome::Panic(msg)
+                }
+            }
+        },
+        EXTRACT_TIMEOUT,
+    );
+    maybe.unwrap_or(ExtractOutcome::Timeout)
 }
 
 // -------------------------------------------------------------------------
@@ -747,8 +797,12 @@ struct PerFormatStats {
     near_equivalent: usize,
     /// Divergent pages with 0.80 <= Dice < 0.95.
     content_similar: usize,
-    /// Divergent pages with Dice < 0.80.
-    truly_divergent: usize,
+    /// Divergent pages with 0.50 <= Dice < 0.80.
+    weak: usize,
+    /// Divergent pages with 0.10 <= Dice < 0.50.
+    poor: usize,
+    /// Divergent pages with Dice < 0.10.
+    broken: usize,
 }
 
 impl PerFormatStats {
@@ -761,8 +815,15 @@ impl PerFormatStats {
             dice_sum_diverge: 0.0,
             near_equivalent: 0,
             content_similar: 0,
-            truly_divergent: 0,
+            weak: 0,
+            poor: 0,
+            broken: 0,
         }
+    }
+
+    /// The count formerly known as `truly_divergent`: all pages with Dice < 0.80.
+    fn truly_divergent(&self) -> usize {
+        self.weak + self.poor + self.broken
     }
 }
 
@@ -789,6 +850,10 @@ fn process_format(
         ExtractOutcome::Ok(s) => (nfc(&s), None),
         ExtractOutcome::Err(msg) => (msg, Some(ShapeClass::MdrcelError)),
         ExtractOutcome::Panic(msg) => (msg, Some(ShapeClass::Panic)),
+        ExtractOutcome::Timeout => (
+            "<extraction timed out>".to_string(),
+            Some(ShapeClass::Timeout),
+        ),
     };
     let oracle_text_raw = nfc(oracle_text);
 
@@ -815,7 +880,7 @@ fn process_format(
     // §7.6: panic/error divergences get hardcoded 0.0 — computing Dice on
     // error message strings is meaningless.
     let (dice, jaccard) = match force_shape {
-        Some(ShapeClass::Panic | ShapeClass::MdrcelError) => (0.0, 0.0),
+        Some(ShapeClass::Panic | ShapeClass::MdrcelError | ShapeClass::Timeout) => (0.0, 0.0),
         _ => {
             // §7.2: for xml, strip tags before computing similarity.
             // §7.7: for non-xml, pass &str references directly (no clone).
@@ -843,8 +908,12 @@ fn process_format(
         stats.near_equivalent += 1;
     } else if dice >= DICE_CONTENT_SIMILAR {
         stats.content_similar += 1;
+    } else if dice >= 0.50 {
+        stats.weak += 1;
+    } else if dice >= 0.10 {
+        stats.poor += 1;
     } else {
-        stats.truly_divergent += 1;
+        stats.broken += 1;
     }
     // --- END similarity metrics ---
 
@@ -870,6 +939,8 @@ fn process_format(
         diff_shape_hash: dsh,
         dice_similarity: dice,
         jaccard_similarity: jaccard,
+        mdrcel_len: mdrcel_text.len(),
+        oracle_len: oracle_text_n.len(),
     };
     // HLD §8: held-out divergences are counted in stats but NOT enumerated
     // here — the held-out slice is the KPI substrate, "look but don't peek."
@@ -961,7 +1032,7 @@ fn print_summary(
         eprintln!(
             "  {:<10} {:>6} {:>8.2}% {:>14.4} {:>14.4} {:>8} {:>12} {:>10}",
             fmt, s.pages, byte_eq_pct, mean_dice_all, mean_dice_div,
-            s.near_equivalent, s.content_similar, s.truly_divergent
+            s.near_equivalent, s.content_similar, s.truly_divergent()
         );
     }
     eprintln!();
@@ -992,7 +1063,7 @@ fn print_summary(
         eprintln!(
             "  {:<10} {:>6} {:>8.2}% {:>14.4} {:>14.4} {:>8} {:>12} {:>10}",
             fmt, s.pages, byte_eq_pct, mean_dice_all, mean_dice_div,
-            s.near_equivalent, s.content_similar, s.truly_divergent
+            s.near_equivalent, s.content_similar, s.truly_divergent()
         );
     }
     eprintln!();
@@ -1075,7 +1146,7 @@ fn fuzz_diff() {
 
     // Step 1 — cache integrity.
     let header = read_cache_header(&cache_path);
-    verify_cache_integrity(&cache_path, &header);
+    verify_cache_integrity(&cache_path, &header, &manifest_path);
 
     // Step 2 — load manifest + cache.
     let manifest = read_manifest(&manifest_path);
@@ -1198,6 +1269,341 @@ fn fuzz_diff() {
 }
 
 // -------------------------------------------------------------------------
+// Broad sweep — outlier filter + report structures
+// -------------------------------------------------------------------------
+
+/// Outlier filter for the broad sweep's report.jsonl. A divergence is an
+/// outlier if it would concern a human reviewer: low similarity, structural
+/// mismatch, panic, or timeout.
+fn is_outlier(d: &Divergence) -> bool {
+    d.dice_similarity < DICE_CONTENT_SIMILAR
+        || matches!(
+            d.shape_class,
+            ShapeClass::EmptyVsNonempty | ShapeClass::Panic | ShapeClass::Timeout
+        )
+}
+
+/// Lightweight outlier record written to `report.jsonl` by `broad_sweep()`.
+/// Simpler schema than `Divergence` — no diff windows or diff_shape_hash.
+struct OutlierRecord {
+    sha: String,
+    source_url: Option<String>,
+    format: &'static str,
+    dice_similarity: f64,
+    jaccard_similarity: f64,
+    shape_class: ShapeClass,
+    mdrcel_len: usize,
+    oracle_len: usize,
+    mdrcel_empty: bool,
+    oracle_empty: bool,
+    is_panic: bool,
+    is_timeout: bool,
+}
+
+impl OutlierRecord {
+    fn from_divergence(d: &Divergence) -> Self {
+        Self {
+            sha: d.sha.clone(),
+            source_url: d.source_url.clone(),
+            format: d.format,
+            dice_similarity: d.dice_similarity,
+            jaccard_similarity: d.jaccard_similarity,
+            shape_class: d.shape_class,
+            mdrcel_len: d.mdrcel_len,
+            oracle_len: d.oracle_len,
+            mdrcel_empty: d.mdrcel_len == 0,
+            oracle_empty: d.oracle_len == 0,
+            is_panic: matches!(d.shape_class, ShapeClass::Panic),
+            is_timeout: matches!(d.shape_class, ShapeClass::Timeout),
+        }
+    }
+
+    fn to_jsonl(&self) -> String {
+        let src = match &self.source_url {
+            Some(u) => serde_json::Value::String(u.clone()).to_string(),
+            None => "null".to_string(),
+        };
+        format!(
+            r#"{{"sha":"{sha}","source_url":{src},"format":"{fmt}","dice_similarity":{dice:.4},"jaccard_similarity":{jacc:.4},"shape_class":"{sc}","mdrcel_len":{mlen},"oracle_len":{olen},"mdrcel_empty":{me},"oracle_empty":{oe},"panic":{panic},"timeout":{timeout}}}"#,
+            sha = self.sha,
+            src = src,
+            fmt = self.format,
+            dice = self.dice_similarity,
+            jacc = self.jaccard_similarity,
+            sc = self.shape_class.label(),
+            mlen = self.mdrcel_len,
+            olen = self.oracle_len,
+            me = self.mdrcel_empty,
+            oe = self.oracle_empty,
+            panic = self.is_panic,
+            timeout = self.is_timeout,
+        )
+    }
+}
+
+// -------------------------------------------------------------------------
+// Sweep summary — Dice histogram + worst-50
+// -------------------------------------------------------------------------
+
+fn print_sweep_summary(
+    processed: usize,
+    missing_html: usize,
+    missing_cache: usize,
+    per_format: &BTreeMap<&'static str, PerFormatStats>,
+    divergences: &[Divergence],
+    report_path: &std::path::Path,
+) {
+    eprintln!();
+    eprintln!("===========================================================");
+    eprintln!("              M12 — broad_sweep summary");
+    eprintln!("===========================================================");
+    eprintln!("corpus pages processed: {processed}");
+    eprintln!("  missing HTML: {missing_html}");
+    eprintln!("  missing cache: {missing_cache}");
+    eprintln!();
+
+    eprintln!("Per-format tally:");
+    eprintln!(
+        "  {:<12} {:>8} {:>10} {:>10} {:>10}",
+        "format", "pages", "equal", "diverge", "byte-eq%"
+    );
+    for (fmt, s) in per_format {
+        let pct = if s.pages == 0 {
+            0.0
+        } else {
+            100.0 * (s.equal as f64) / (s.pages as f64)
+        };
+        eprintln!(
+            "  {:<12} {:>8} {:>10} {:>10} {:>9.2}%",
+            fmt, s.pages, s.equal, s.diverge, pct
+        );
+    }
+    eprintln!();
+
+    // Dice distribution histogram — bins 0..5 count page-format pairs,
+    // bins 6..7 count distinct SHAs.
+    let mut byte_equal: usize = 0;
+    let mut near_eq: usize = 0;
+    let mut similar: usize = 0;
+    let mut weak: usize = 0;
+    let mut poor: usize = 0;
+    let mut broken: usize = 0;
+    for s in per_format.values() {
+        byte_equal += s.equal;
+        near_eq += s.near_equivalent;
+        similar += s.content_similar;
+        weak += s.weak;
+        poor += s.poor;
+        broken += s.broken;
+    }
+
+    let mut panic_shas: Vec<&str> = Vec::new();
+    let mut timeout_shas: Vec<&str> = Vec::new();
+    for d in divergences {
+        if matches!(d.shape_class, ShapeClass::Panic)
+            && !panic_shas.contains(&d.sha.as_str())
+        {
+            panic_shas.push(&d.sha);
+        }
+        if matches!(d.shape_class, ShapeClass::Timeout)
+            && !timeout_shas.contains(&d.sha.as_str())
+        {
+            timeout_shas.push(&d.sha);
+        }
+    }
+
+    eprintln!("Dice distribution (all formats combined):");
+    eprintln!("  [1.00]  byte-equal:  {:>8}", byte_equal);
+    eprintln!("  [0.95-1.00) near-eq:  {:>8}", near_eq);
+    eprintln!("  [0.80-0.95) similar:  {:>8}", similar);
+    eprintln!("  [0.50-0.80) weak:     {:>8}", weak);
+    eprintln!("  [0.10-0.50) poor:     {:>8}", poor);
+    eprintln!("  [0.00-0.10) broken:   {:>8}", broken);
+    eprintln!("  panics:               {:>8}", panic_shas.len());
+    eprintln!("  timeouts:             {:>8}", timeout_shas.len());
+    eprintln!();
+
+    // Outlier summary.
+    let empty_vs_nonempty_count = divergences
+        .iter()
+        .filter(|d| matches!(d.shape_class, ShapeClass::EmptyVsNonempty))
+        .count();
+    let low_dice_count = divergences
+        .iter()
+        .filter(|d| d.dice_similarity < DICE_CONTENT_SIMILAR)
+        .count();
+
+    eprintln!("Outlier summary:");
+    if panic_shas.is_empty() {
+        eprintln!("  panic SHAs:     (none)");
+    } else {
+        let short: Vec<&str> = panic_shas.iter().map(|s| &s[..s.len().min(8)]).collect();
+        eprintln!("  panic SHAs:     [{}]", short.join(", "));
+    }
+    if timeout_shas.is_empty() {
+        eprintln!("  timeout SHAs:   (none)");
+    } else {
+        let short: Vec<&str> = timeout_shas.iter().map(|s| &s[..s.len().min(8)]).collect();
+        eprintln!("  timeout SHAs:   [{}]", short.join(", "));
+    }
+    eprintln!("  empty-vs-nonempty: {} pages", empty_vs_nonempty_count);
+    eprintln!("  Dice < 0.80: {} page-format pairs", low_dice_count);
+    eprintln!();
+
+    // Worst 50 by Dice.
+    let mut sorted: Vec<&Divergence> = divergences.iter().collect();
+    sorted.sort_by(|a, b| {
+        a.dice_similarity
+            .partial_cmp(&b.dice_similarity)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    eprintln!("Worst 50 by Dice:");
+    eprintln!(
+        "  {:<12} {:<10} {:>6} {:>12} {:>12} {:>16}",
+        "sha", "format", "dice", "mdrcel_len", "oracle_len", "shape_class"
+    );
+    for d in sorted.iter().take(50) {
+        let sha_short = if d.sha.len() > 10 {
+            format!("{}...", &d.sha[..10])
+        } else {
+            d.sha.clone()
+        };
+        eprintln!(
+            "  {:<12} {:<10} {:>6.4} {:>12} {:>12} {:>16}",
+            sha_short,
+            d.format,
+            d.dice_similarity,
+            d.mdrcel_len,
+            d.oracle_len,
+            d.shape_class.label()
+        );
+    }
+    eprintln!();
+    eprintln!("outliers written to: {}", report_path.display());
+    eprintln!("===========================================================");
+}
+
+// -------------------------------------------------------------------------
+// Broad sweep integration test (ignored by default).
+// -------------------------------------------------------------------------
+
+#[test]
+#[ignore]
+fn broad_sweep() {
+    let cache_path = workspace_path("benchmark/broad/oracle_cache.jsonl");
+    let manifest_path = workspace_path("benchmark/broad/manifest.jsonl");
+    let corpus_dir = workspace_path("benchmark/broad_corpus");
+    let report_path = workspace_path("benchmark/broad/report.jsonl");
+
+    if !cache_path.exists() {
+        panic!(
+            "broad oracle cache not found at {cache_path:?} — build it before running broad_sweep"
+        );
+    }
+
+    // Cache integrity.
+    let header = read_cache_header(&cache_path);
+    verify_cache_integrity(&cache_path, &header, &manifest_path);
+
+    // Load manifest + cache.
+    let manifest = read_manifest(&manifest_path);
+    eprintln!("[broad_sweep] manifest entries: {}", manifest.len());
+    let cache_entries = read_cache_entries(&cache_path);
+    eprintln!(
+        "[broad_sweep] cache entries: {} (expected ≈ {})",
+        cache_entries.len(),
+        manifest.len()
+    );
+
+    // Single stats map — no working/held-out split.
+    let mut per_format: BTreeMap<&'static str, PerFormatStats> = BTreeMap::new();
+    for fmt in ["txt", "markdown", "xml"] {
+        per_format.insert(fmt, PerFormatStats::new());
+    }
+
+    let mut divergences: Vec<Divergence> = Vec::new();
+    // A sink that discards writes — broad_sweep does NOT write divergences.jsonl,
+    // only report.jsonl (outliers only, written post-hoc).
+    let mut null_sink = std::io::sink();
+    let opts = mdrcel::Options::default();
+
+    let mut processed = 0usize;
+    let mut missing_html = 0usize;
+    let mut missing_cache = 0usize;
+
+    for m in &manifest {
+        let Some(cache_entry) = cache_entries.get(&m.sha) else {
+            missing_cache += 1;
+            continue;
+        };
+
+        let html_path = corpus_dir.join(format!("{}.html", m.sha));
+        let Ok(html) = fs::read_to_string(&html_path) else {
+            missing_html += 1;
+            continue;
+        };
+
+        for (fmt, extract_fn, oracle_text) in [
+            ("txt", mdrcel::extract_to_txt as ExtractFn, &cache_entry.txt),
+            ("markdown", mdrcel::extract_to_markdown as ExtractFn, &cache_entry.markdown),
+            ("xml", mdrcel::extract_to_xml as ExtractFn, &cache_entry.xml),
+        ] {
+            process_format(
+                &m.sha,
+                &m.source_url,
+                &html,
+                fmt,
+                extract_fn,
+                oracle_text,
+                per_format.get_mut(fmt).unwrap(),
+                &mut null_sink,
+                &mut divergences,
+                &opts,
+                true, // record all divergences — filtering happens at write time
+            );
+        }
+
+        processed += 1;
+        if processed.is_multiple_of(PROGRESS_EVERY) {
+            eprintln!(
+                "[broad_sweep] progress: {processed} docs ({} divergences so far)",
+                divergences.len()
+            );
+        }
+    }
+
+    eprintln!();
+    eprintln!(
+        "[broad_sweep] done: {processed} docs processed, {missing_cache} skipped (no cache entry), {missing_html} skipped (corpus missing)"
+    );
+
+    // Write only outliers to report.jsonl.
+    let mut report_file = fs::File::create(&report_path).unwrap_or_else(|e| {
+        panic!("cannot create report file {report_path:?}: {e}")
+    });
+    let mut outlier_count = 0usize;
+    for d in &divergences {
+        if is_outlier(d) {
+            let record = OutlierRecord::from_divergence(d);
+            writeln!(report_file, "{}", record.to_jsonl()).expect("write report.jsonl");
+            outlier_count += 1;
+        }
+    }
+    report_file.flush().expect("flush report");
+    drop(report_file);
+    eprintln!("[broad_sweep] outliers written: {outlier_count}");
+
+    print_sweep_summary(
+        processed,
+        missing_html,
+        missing_cache,
+        &per_format,
+        &divergences,
+        &report_path,
+    );
+}
+
+// -------------------------------------------------------------------------
 // Self-tests for the shape-class / hash helpers — keep them tiny.
 // -------------------------------------------------------------------------
 
@@ -1260,4 +1666,22 @@ fn cfg_sha_descriptor_format_matches_python_shape() {
         r#"{{"config_file_sha256":"{cfg_hex}","deduplicate":false,"include_comments":false,"with_metadata":false}}"#
     );
     assert_eq!(actual, expected);
+}
+
+#[test]
+fn run_with_timeout_returns_none_on_slow_closure() {
+    let result = run_with_timeout(
+        || {
+            thread::sleep(Duration::from_secs(3));
+            42
+        },
+        Duration::from_secs(1),
+    );
+    assert!(result.is_none());
+}
+
+#[test]
+fn run_with_timeout_returns_value_on_fast_closure() {
+    let result = run_with_timeout(|| 42, Duration::from_secs(5));
+    assert_eq!(result, Some(42));
 }

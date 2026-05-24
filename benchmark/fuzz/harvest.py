@@ -57,16 +57,29 @@ CLI:
     --output-dir    Where to write <sha>.html files (default: benchmark/fuzz_corpus).
     --manifest      Path to the JSONL manifest (default: benchmark/fuzz/manifest.jsonl).
     --verbose       Print per-record progress to stderr.
+    --append        Append to existing manifest and output dir (do not wipe).
+                    Pre-populates seen_sha from the manifest so duplicates are
+                    still rejected. --target-count is cumulative (not "new pages
+                    this run").
+    --max-per-domain N
+                    Max pages per registered domain (default: 50, 0 = no limit).
+                    Uses a two-label heuristic with a country-code SLD exception
+                    list for diversity.
+    --loose-filter  Relax content filter: skip <p> tag / visible-text check.
+                    Only size bounds and control-char ratio still apply. Intended
+                    for the M12 adversarial subset.
 
 Constraints:
     * stdlib + warcio + requests only (no new pip deps).
     * streams the WARC; stops the moment target_count is reached.
-    * idempotent: overwrites manifest.jsonl and replaces output_dir contents.
+    * idempotent: overwrites manifest.jsonl and replaces output_dir contents
+      (unless --append is passed).
     * deterministic JSONL ordering (the order records emerge from the WARC).
 """
 from __future__ import annotations
 
 import argparse
+import collections
 import gzip
 import hashlib
 import io
@@ -76,6 +89,7 @@ import re
 import shutil
 import sys
 from typing import Optional, Tuple
+from urllib.parse import urlparse
 
 import requests
 from warcio.archiveiterator import ArchiveIterator
@@ -96,26 +110,54 @@ TABLE_RE = re.compile(rb"<table[\s>]", re.I)
 TAG_RE = re.compile(rb"<[^>]+>")
 LANG_RE = re.compile(rb"""\blang\s*=\s*["']?([a-zA-Z\-]+)""", re.I)
 
+# Country-code second-level domains where the registered domain is three labels
+# (e.g. "example.co.uk" not "co.uk"). Used by _registered_domain() for corpus
+# diversity tracking — a heuristic, not a DNS lookup.
+_CC_SLDS = frozenset({
+    "co.uk", "com.au", "co.jp", "co.kr", "co.nz", "co.za",
+    "com.br", "com.cn", "com.mx", "co.in",
+})
+
+
+def _registered_domain(url: str) -> str:
+    """Extract registered domain from URL (diversity heuristic, not DNS)."""
+    try:
+        host = urlparse(url).hostname or ""
+    except Exception:  # noqa: BLE001
+        return ""
+    parts = host.lower().split(".")
+    if len(parts) >= 3:
+        sld = ".".join(parts[-2:])  # e.g. "co.uk"
+        if sld in _CC_SLDS:
+            return ".".join(parts[-3:])
+    if len(parts) >= 2:
+        return ".".join(parts[-2:])
+    return host
+
 
 # ---------------------------------------------------------------------------
 # Frozen content filter
 # ---------------------------------------------------------------------------
 
 
-def is_content(raw: bytes) -> bool:
+def is_content(raw: bytes, loose: bool = False) -> bool:
     """Return True iff `raw` (undecoded HTTP body) passes the FROZEN filter.
 
     See module docstring for the literal spec. This function MUST NOT be tuned
     during triage; that would re-baseline the KPI.
+
+    When ``loose=True``, the ``<p>`` tag / visible-text check is skipped
+    (M12 adversarial subset only).
     """
     n = len(raw)
     if n < 1024 or n > 2 * 1024 * 1024:
         return False
     if _control_char_ratio(raw) > 0.02:
         return False
-    n_p = len(P_RE.findall(raw))
-    if n_p < 3 and _visible_text_len(raw) < 200:
-        return False
+    if not loose:
+        n_p = len(P_RE.findall(raw))
+        if n_p < 3 and _visible_text_len(raw) < 200:
+            return False
     return True
 
 
@@ -211,11 +253,16 @@ def harvest(
     output_dir: str,
     manifest_path: str,
     verbose: bool,
+    append: bool = False,
+    max_per_domain: int = 50,
+    loose_filter: bool = False,
 ) -> dict:
     """Stream `warc_url`, keep up to `target_count` content pages."""
     # Idempotency: wipe and recreate the output dir; truncate the manifest.
-    if os.path.isdir(output_dir):
-        shutil.rmtree(output_dir)
+    # In append mode, skip the wipe so prior work is preserved.
+    if not append:
+        if os.path.isdir(output_dir):
+            shutil.rmtree(output_dir)
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(os.path.dirname(manifest_path) or ".", exist_ok=True)
 
@@ -224,7 +271,35 @@ def harvest(
     bucket_non_english = 0
     bucket_table_heavy = 0
     seen_sha: set[str] = set()
+    domain_counts: collections.Counter[str] = collections.Counter()
     manifest_lines: list[str] = []
+
+    # In append mode, pre-populate seen_sha (and domain counts) from the
+    # existing manifest so duplicates are rejected and domain caps are
+    # respected across runs.
+    if append and os.path.isfile(manifest_path):
+        with open(manifest_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                seen_sha.add(rec["sha"])
+                if max_per_domain > 0:
+                    domain_counts[_registered_domain(rec["source_url"])] += 1
+        kept = len(seen_sha)
+
+    # Early exit: if the manifest already meets the target (append mode),
+    # skip streaming entirely — no WARC connection needed.
+    if kept >= target_count:
+        return {
+            "scanned_response_records": scanned,
+            "kept": kept,
+            "unique_domains": len(domain_counts),
+            "non_english_count": bucket_non_english,
+            "table_heavy_count": bucket_table_heavy,
+            "filter_frozen_at": _FILTER_FROZEN_AT,
+        }
 
     resp = requests.get(warc_url, stream=True, timeout=300)
     resp.raise_for_status()
@@ -252,7 +327,7 @@ def harvest(
                 continue
 
             raw = record.content_stream().read()
-            if not is_content(raw):
+            if not is_content(raw, loose=loose_filter):
                 continue
 
             decoded = _decode_best_effort(raw)
@@ -269,6 +344,12 @@ def harvest(
             seen_sha.add(sha)
 
             uri = record.rec_headers.get_header("WARC-Target-URI") or ""
+
+            # Domain diversity cap: skip pages once a domain hits the limit.
+            if max_per_domain > 0:
+                dom = _registered_domain(uri)
+                if domain_counts[dom] >= max_per_domain:
+                    continue
 
             # Stratification counters (observational only — never reject).
             lang = _detect_lang(raw)
@@ -291,6 +372,8 @@ def harvest(
                 "length": len(encoded),
             }
             manifest_lines.append(json.dumps(rec, ensure_ascii=False))
+            if max_per_domain > 0:
+                domain_counts[dom] += 1
             kept += 1
 
             if verbose and kept % 50 == 0:
@@ -308,13 +391,18 @@ def harvest(
         except Exception:  # noqa: BLE001
             pass
 
-    with open(manifest_path, "w", encoding="utf-8", newline="\n") as fh:
+    if append:
+        mode = "a"
+    else:
+        mode = "w"
+    with open(manifest_path, mode, encoding="utf-8", newline="\n") as fh:
         if manifest_lines:
             fh.write("\n".join(manifest_lines) + "\n")
 
     return {
         "scanned_response_records": scanned,
         "kept": kept,
+        "unique_domains": len(domain_counts),
         "non_english_count": bucket_non_english,
         "table_heavy_count": bucket_table_heavy,
         "filter_frozen_at": _FILTER_FROZEN_AT,
@@ -342,6 +430,12 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                    help=f"Manifest JSONL path (default: {DEFAULT_MANIFEST}).")
     p.add_argument("--verbose", action="store_true",
                    help="Print per-50-record progress to stderr.")
+    p.add_argument("--append", action="store_true",
+                   help="Append to existing manifest and output dir (do not wipe).")
+    p.add_argument("--max-per-domain", type=int, default=50,
+                   help="Max pages per registered domain (0 = no limit).")
+    p.add_argument("--loose-filter", action="store_true",
+                   help="Relax content filter: skip <p> tag / visible-text check.")
     return p.parse_args(argv)
 
 
@@ -373,6 +467,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         output_dir=os.path.abspath(args.output_dir),
         manifest_path=os.path.abspath(args.manifest),
         verbose=args.verbose,
+        append=args.append,
+        max_per_domain=args.max_per_domain,
+        loose_filter=args.loose_filter,
     )
     summary["crawl_id"] = crawl_id
     summary["warc_path"] = warc_rel
