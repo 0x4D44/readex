@@ -1274,6 +1274,12 @@ fn scan_charref(bytes: &[u8], i: usize) -> Option<(usize, usize)> {
             }
             p += 1;
         }
+        // Safety: the max_end byte cap may land inside a multi-byte UTF-8
+        // char (e.g. 3-byte CJK). Back up to the char boundary so the
+        // caller's `&s[body_start..p]` slice doesn't panic.
+        while p > body_start && p < bytes.len() && (bytes[p] & 0xC0) == 0x80 {
+            p -= 1;
+        }
         if p == body_start {
             // Zero chars matched.
             return None;
@@ -2127,5 +2133,19 @@ mod tests {
         // Second pass — confirms idempotence.
         clean_and_trim_metadata(&mut m);
         assert_eq!(m, before);
+    }
+
+    #[test]
+    fn unescape_cjk_with_ampersand_does_not_panic() {
+        // Regression: scan_charref's 32-byte named-entity cap could land
+        // inside a multi-byte UTF-8 char (e.g. 3-byte CJK), causing a
+        // char-boundary panic at `&s[body_start..body_end_excl]`.
+        // Surfaced by M12 broad sweep on a Chinese metadata description.
+        let input = "武汉&中神通信息技术有限公司是一家专业从事计算机网络信息安全行业的高科技公司";
+        let result = python_html_unescape(input);
+        // The `&中神通信...` is not a valid HTML entity. The `&` should be
+        // preserved verbatim (bare `&` fallback path).
+        assert!(result.contains('&'), "bare & should be preserved");
+        assert!(!result.is_empty());
     }
 }
