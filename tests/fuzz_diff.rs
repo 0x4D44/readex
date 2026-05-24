@@ -53,6 +53,7 @@
 #![allow(clippy::needless_pass_by_value)]
 
 mod common;
+mod similarity;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -635,6 +636,8 @@ struct Divergence {
     oracle_window: String,
     mdrcel_window: String,
     diff_shape_hash: String,
+    dice_similarity: f64,
+    jaccard_similarity: f64,
 }
 
 impl Divergence {
@@ -655,7 +658,7 @@ impl Divergence {
         let mw = serde_json::Value::String(self.mdrcel_window.clone()).to_string();
         let nt = serde_json::Value::String(self.near_tag.clone()).to_string();
         format!(
-            r#"{{"sha":"{sha}","source_url":{src},"format":"{fmt}","shape_class":"{sc}","near_tag":{nt},"first_diff_byte":{fdb},"oracle_window":{ow},"mdrcel_window":{mw},"diff_shape_hash":"{dsh}"}}"#,
+            r#"{{"sha":"{sha}","source_url":{src},"format":"{fmt}","shape_class":"{sc}","near_tag":{nt},"first_diff_byte":{fdb},"oracle_window":{ow},"mdrcel_window":{mw},"diff_shape_hash":"{dsh}","dice_similarity":{dice:.4},"jaccard_similarity":{jacc:.4}}}"#,
             sha = self.sha,
             src = src,
             fmt = self.format,
@@ -665,6 +668,8 @@ impl Divergence {
             ow = ow,
             mw = mw,
             dsh = self.diff_shape_hash,
+            dice = self.dice_similarity,
+            jacc = self.jaccard_similarity,
         )
     }
 }
@@ -720,10 +725,30 @@ fn safe_extract(
 // Per-doc diff loop
 // -------------------------------------------------------------------------
 
+/// Dice threshold: divergent pages scoring at or above this are
+/// "near-equivalent" — whitespace-only or trivially structural differences.
+/// Empirically calibrated against the M11 Phase B probe data (HLD §5).
+const DICE_NEAR_EQUIVALENT: f64 = 0.95;
+
+/// Dice threshold: divergent pages scoring at or above this (but below
+/// `DICE_NEAR_EQUIVALENT`) are "content-similar" — different paragraphs
+/// selected but substantial content overlap. Below this is "truly divergent."
+const DICE_CONTENT_SIMILAR: f64 = 0.80;
+
 struct PerFormatStats {
     pages: usize,
     equal: usize,
     diverge: usize,
+    /// Sum of Dice scores across ALL pages (byte-equal pages count as 1.0).
+    dice_sum_all: f64,
+    /// Sum of Dice scores across DIVERGENT pages only.
+    dice_sum_diverge: f64,
+    /// Divergent pages with Dice >= 0.95.
+    near_equivalent: usize,
+    /// Divergent pages with 0.80 <= Dice < 0.95.
+    content_similar: usize,
+    /// Divergent pages with Dice < 0.80.
+    truly_divergent: usize,
 }
 
 impl PerFormatStats {
@@ -732,6 +757,11 @@ impl PerFormatStats {
             pages: 0,
             equal: 0,
             diverge: 0,
+            dice_sum_all: 0.0,
+            dice_sum_diverge: 0.0,
+            near_equivalent: 0,
+            content_similar: 0,
+            truly_divergent: 0,
         }
     }
 }
@@ -775,10 +805,48 @@ fn process_format(
     // Byte-equal? Fast path.
     if force_shape.is_none() && mdrcel_text == oracle_text_n {
         stats.equal += 1;
+        stats.dice_sum_all += 1.0; // byte-equal implies Dice = 1.0
         return;
     }
 
     stats.diverge += 1;
+
+    // --- Compute similarity metrics (M11 Phase B) ---
+    // §7.6: panic/error divergences get hardcoded 0.0 — computing Dice on
+    // error message strings is meaningless.
+    let (dice, jaccard) = match force_shape {
+        Some(ShapeClass::Panic | ShapeClass::MdrcelError) => (0.0, 0.0),
+        _ => {
+            // §7.2: for xml, strip tags before computing similarity.
+            // §7.7: for non-xml, pass &str references directly (no clone).
+            if format == "xml" {
+                let stripped_a = similarity::strip_xml_tags(&mdrcel_text);
+                let stripped_b = similarity::strip_xml_tags(&oracle_text_n);
+                (
+                    similarity::dice_bigram_similarity(&stripped_a, &stripped_b),
+                    similarity::jaccard_token_similarity(&stripped_a, &stripped_b),
+                )
+            } else {
+                (
+                    similarity::dice_bigram_similarity(&mdrcel_text, &oracle_text_n),
+                    similarity::jaccard_token_similarity(&mdrcel_text, &oracle_text_n),
+                )
+            }
+        }
+    };
+
+    stats.dice_sum_all += dice;
+    stats.dice_sum_diverge += dice;
+
+    // Bucket classification.
+    if dice >= DICE_NEAR_EQUIVALENT {
+        stats.near_equivalent += 1;
+    } else if dice >= DICE_CONTENT_SIMILAR {
+        stats.content_similar += 1;
+    } else {
+        stats.truly_divergent += 1;
+    }
+    // --- END similarity metrics ---
 
     let first_diff = first_diff_index(oracle_text_n.as_bytes(), mdrcel_text.as_bytes());
     let ow_raw = window_around(&oracle_text_n, first_diff, DIFF_WINDOW_BYTES);
@@ -800,6 +868,8 @@ fn process_format(
         oracle_window: ow,
         mdrcel_window: mw,
         diff_shape_hash: dsh,
+        dice_similarity: dice,
+        jaccard_similarity: jaccard,
     };
     // HLD §8: held-out divergences are counted in stats but NOT enumerated
     // here — the held-out slice is the KPI substrate, "look but don't peek."
@@ -861,6 +931,68 @@ fn print_summary(
         eprintln!(
             "  {:<10} {:>10} {:>10} {:>10} {:>9.2}%",
             fmt, s.pages, s.equal, s.diverge, pct
+        );
+    }
+    eprintln!();
+
+    // Similarity KPI — held-out (M11 Phase B).
+    eprintln!("Similarity KPI — HELD-OUT (fidelity substrate):");
+    eprintln!(
+        "  {:<10} {:>6} {:>9} {:>14} {:>14} {:>8} {:>12} {:>10}",
+        "format", "pages", "byte-eq%", "mean_dice_all", "mean_dice_div",
+        "near-eq", "content-sim", "divergent"
+    );
+    for (fmt, s) in per_format_heldout {
+        let byte_eq_pct = if s.pages == 0 {
+            0.0
+        } else {
+            100.0 * (s.equal as f64) / (s.pages as f64)
+        };
+        let mean_dice_all = if s.pages == 0 {
+            0.0
+        } else {
+            s.dice_sum_all / s.pages as f64
+        };
+        let mean_dice_div = if s.diverge == 0 {
+            0.0
+        } else {
+            s.dice_sum_diverge / s.diverge as f64
+        };
+        eprintln!(
+            "  {:<10} {:>6} {:>8.2}% {:>14.4} {:>14.4} {:>8} {:>12} {:>10}",
+            fmt, s.pages, byte_eq_pct, mean_dice_all, mean_dice_div,
+            s.near_equivalent, s.content_similar, s.truly_divergent
+        );
+    }
+    eprintln!();
+
+    // Similarity KPI — working slice (for triage context).
+    eprintln!("Similarity KPI — WORKING (triage context):");
+    eprintln!(
+        "  {:<10} {:>6} {:>9} {:>14} {:>14} {:>8} {:>12} {:>10}",
+        "format", "pages", "byte-eq%", "mean_dice_all", "mean_dice_div",
+        "near-eq", "content-sim", "divergent"
+    );
+    for (fmt, s) in per_format_working {
+        let byte_eq_pct = if s.pages == 0 {
+            0.0
+        } else {
+            100.0 * (s.equal as f64) / (s.pages as f64)
+        };
+        let mean_dice_all = if s.pages == 0 {
+            0.0
+        } else {
+            s.dice_sum_all / s.pages as f64
+        };
+        let mean_dice_div = if s.diverge == 0 {
+            0.0
+        } else {
+            s.dice_sum_diverge / s.diverge as f64
+        };
+        eprintln!(
+            "  {:<10} {:>6} {:>8.2}% {:>14.4} {:>14.4} {:>8} {:>12} {:>10}",
+            fmt, s.pages, byte_eq_pct, mean_dice_all, mean_dice_div,
+            s.near_equivalent, s.content_similar, s.truly_divergent
         );
     }
     eprintln!();

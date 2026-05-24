@@ -53,6 +53,7 @@
 //! [`Dom::side_tables_are_point_query_only_by_construction`] (a no-op marker
 //! + greppable invariant, NOT a runtime check) plus a unit test.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -114,6 +115,241 @@ impl NodeKey {
     }
 }
 
+// ---------------------------------------------------------------------------
+// HTML pre-processor (M11 Phase A — HLD §3).
+//
+// Transforms the raw HTML string *before* it reaches html5ever's
+// `parse_document()`, rewriting three specific patterns where html5ever's
+// HTML5-spec-strict behaviour produces materially different DOM trees than
+// lxml's permissive parser:
+//
+//   Shape 1: `</br>` end-tags  → stripped entirely
+//   Shape 2: stray table-cell tags outside `<table>` → rewritten to `<div>`
+//   Shape 3: `<xmp>` raw-text elements → rewritten to `<div>`
+//
+// Returns `Cow::Borrowed` (zero allocation) when no transformations are
+// needed (the common case).
+// ---------------------------------------------------------------------------
+
+/// Returns `true` if the byte at position `pos` in `bytes` is a tag-boundary
+/// character — one of `>`, ` `, `\t`, `\n`, `\r`, form-feed (0x0C), or `/`.
+/// Used as the "followed by whitespace or `>`" guard to prevent prefix-tag
+/// matching (e.g. `<thread>` must not match `<thead>`).
+#[inline]
+fn is_tag_boundary(b: u8) -> bool {
+    matches!(b, b'>' | b' ' | b'\t' | b'\n' | b'\r' | 0x0C | b'/')
+}
+
+/// Case-insensitive substring search: returns `true` if `needle` (assumed
+/// all-lowercase ASCII) appears anywhere in `haystack` when both are
+/// lowered. Short-circuits on first match.
+fn contains_ci(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return false;
+    }
+    'outer: for start in 0..=(haystack.len() - needle.len()) {
+        for (i, &nb) in needle.iter().enumerate() {
+            if (haystack[start + i] | 0x20) != nb {
+                continue 'outer;
+            }
+        }
+        return true;
+    }
+    false
+}
+
+/// Case-insensitive tag-name match starting at `pos` in `bytes`.
+/// `tag` must be all-lowercase ASCII (e.g. `b"</br"`, `b"<xmp"`).
+/// Returns `true` iff the bytes at `pos..pos+tag.len()` match `tag`
+/// case-insensitively AND the byte immediately after (if any) is a
+/// tag-boundary character (preventing prefix matches like `<thread>`
+/// matching `<thead>`).
+#[inline]
+fn tag_matches(bytes: &[u8], pos: usize, tag: &[u8]) -> bool {
+    let end = pos + tag.len();
+    if end > bytes.len() {
+        return false;
+    }
+    for (i, &tb) in tag.iter().enumerate() {
+        let b = bytes[pos + i];
+        // For ASCII alpha bytes, `b | 0x20` gives the lowercase form.
+        // Non-alpha bytes in the tag (like `<`, `/`) compare directly
+        // since `b | 0x20` is a no-op for them in the relevant range.
+        if tb.is_ascii_alphabetic() {
+            if (b | 0x20) != tb {
+                return false;
+            }
+        } else if b != tb {
+            return false;
+        }
+    }
+    // Guard: the byte after the tag name must be a tag-boundary or we're at EOF.
+    if end < bytes.len() {
+        is_tag_boundary(bytes[end])
+    } else {
+        true // at EOF — acceptable (the tag is the last thing in the input)
+    }
+}
+
+/// Find the position of the `>` closing a tag that starts at `pos`, or
+/// return `bytes.len()` if no `>` is found (malformed input — consume to end).
+#[inline]
+fn find_closing_angle(bytes: &[u8], pos: usize) -> usize {
+    for (i, &b) in bytes.iter().enumerate().skip(pos) {
+        if b == b'>' {
+            return i + 1; // past the `>`
+        }
+    }
+    bytes.len()
+}
+
+/// Pre-process raw HTML before parsing, rewriting three html5ever/lxml
+/// divergence patterns (M11 Phase A — HLD §3).
+///
+/// - **Common case** (no triggers): returns `Cow::Borrowed(html)` — zero
+///   allocation.
+/// - **Uncommon case** (triggers present): returns `Cow::Owned(modified)`.
+fn preprocess_html(html: &str) -> Cow<'_, str> {
+    let bytes = html.as_bytes();
+
+    // Quick-scan: does the HTML contain any trigger pattern?
+    let has_br_end = contains_ci(bytes, b"</br");
+    let has_xmp = contains_ci(bytes, b"<xmp");
+    let has_stray_cell = contains_ci(bytes, b"<td")
+        || contains_ci(bytes, b"<th")
+        || contains_ci(bytes, b"<tr")
+        || contains_ci(bytes, b"<tbody")
+        || contains_ci(bytes, b"<tfoot")
+        || contains_ci(bytes, b"<thead");
+
+    if !has_br_end && !has_xmp && !has_stray_cell {
+        return Cow::Borrowed(html);
+    }
+
+    // Transformation pass: single forward O(n) scan.
+    let mut out = String::with_capacity(bytes.len());
+    let mut pos: usize = 0;
+    let mut table_depth: usize = 0;
+
+    // The cell tag names we recognise (all lowercase, without the `<` or `</`).
+    const CELL_TAGS: &[&[u8]] = &[b"thead", b"tfoot", b"tbody", b"tr", b"th", b"td"];
+
+    while pos < bytes.len() {
+        if bytes[pos] != b'<' {
+            // Bulk copy: find next '<' and copy everything before it.
+            let rest = &bytes[pos..];
+            let next_lt = rest.iter().position(|&b| b == b'<').unwrap_or(rest.len());
+            out.push_str(&html[pos..pos + next_lt]);
+            pos += next_lt;
+            continue;
+        }
+
+        // We're at a '<'. Try to match trigger patterns in priority order.
+
+        // Shape 1: </br...> — strip entirely.
+        if has_br_end && tag_matches(bytes, pos, b"</br") {
+            pos = find_closing_angle(bytes, pos);
+            continue;
+        }
+
+        // Shape 3: <xmp...> → <div...>
+        if has_xmp && tag_matches(bytes, pos, b"<xmp") {
+            let tag_name_end = pos + 4; // past "<xmp"
+            let close = find_closing_angle(bytes, pos);
+            out.push_str("<div");
+            out.push_str(&html[tag_name_end..close]);
+            pos = close;
+            continue;
+        }
+
+        // Shape 3: </xmp...> → </div...>
+        if has_xmp && tag_matches(bytes, pos, b"</xmp") {
+            let tag_name_end = pos + 5; // past "</xmp"
+            let close = find_closing_angle(bytes, pos);
+            out.push_str("</div");
+            out.push_str(&html[tag_name_end..close]);
+            pos = close;
+            continue;
+        }
+
+        // Table depth tracking: <table...>
+        if tag_matches(bytes, pos, b"<table") {
+            table_depth += 1;
+            let close = find_closing_angle(bytes, pos);
+            out.push_str(&html[pos..close]);
+            pos = close;
+            continue;
+        }
+
+        // Table depth tracking: </table...>
+        if tag_matches(bytes, pos, b"</table") {
+            table_depth = table_depth.saturating_sub(1);
+            let close = find_closing_angle(bytes, pos);
+            out.push_str(&html[pos..close]);
+            pos = close;
+            continue;
+        }
+
+        // Shape 2: stray cell start tags (outside table → rewrite to <div>).
+        if has_stray_cell {
+            let mut matched_cell = false;
+            for &cell_tag in CELL_TAGS {
+                // Build the open-tag prefix: "<" + cell_tag
+                let mut prefix = Vec::with_capacity(1 + cell_tag.len());
+                prefix.push(b'<');
+                prefix.extend_from_slice(cell_tag);
+                if tag_matches(bytes, pos, &prefix) {
+                    let tag_name_end = pos + prefix.len();
+                    let close = find_closing_angle(bytes, pos);
+                    if table_depth == 0 {
+                        out.push_str("<div");
+                        out.push_str(&html[tag_name_end..close]);
+                    } else {
+                        out.push_str(&html[pos..close]);
+                    }
+                    pos = close;
+                    matched_cell = true;
+                    break;
+                }
+            }
+            if matched_cell {
+                continue;
+            }
+
+            // Stray cell end tags: </td, </th, </tr, </tbody, </tfoot, </thead
+            let mut matched_close_cell = false;
+            for &cell_tag in CELL_TAGS {
+                // Build the close-tag prefix: "</" + cell_tag
+                let mut prefix = Vec::with_capacity(2 + cell_tag.len());
+                prefix.extend_from_slice(b"</");
+                prefix.extend_from_slice(cell_tag);
+                if tag_matches(bytes, pos, &prefix) {
+                    let tag_name_end = pos + prefix.len();
+                    let close = find_closing_angle(bytes, pos);
+                    if table_depth == 0 {
+                        out.push_str("</div");
+                        out.push_str(&html[tag_name_end..close]);
+                    } else {
+                        out.push_str(&html[pos..close]);
+                    }
+                    pos = close;
+                    matched_close_cell = true;
+                    break;
+                }
+            }
+            if matched_close_cell {
+                continue;
+            }
+        }
+
+        // No match — copy the '<' and advance.
+        out.push('<');
+        pos += 1;
+    }
+
+    Cow::Owned(out)
+}
+
 impl Dom {
     /// Parse `html` into a DOM exactly as the oracle's jsdom does
     /// (`run.mjs:184` — `new jsdom.JSDOM(html)`): full-document HTML5 parse,
@@ -125,6 +361,9 @@ impl Dom {
     /// `text_content` is token-identical to jsdom's for the gold + table-heavy
     /// snapshots before any extraction logic is built on it.
     pub fn parse(html: &str) -> Self {
+        // M11 Phase A: pre-process HTML to normalise three html5ever/lxml
+        // divergence patterns before parsing (HLD §3).
+        let html = preprocess_html(html);
         // scripting_enabled = false: jsdom in the oracle is inert (no
         // runScripts), so <noscript> content is parsed as markup (children),
         // matching jsdom. Default quirks/iframe-srcdoc handling otherwise.
@@ -135,7 +374,7 @@ impl Dom {
             },
             ..ParseOpts::default()
         };
-        let dom = parse_document(RcDom::default(), opts).one(html);
+        let dom = parse_document(RcDom::default(), opts).one(&*html);
         // M5 Stage 6e-a: strip HTML comments and processing instructions
         // immediately after parse, mirroring Python trafilatura's source-truth
         // parser config:
@@ -2910,5 +3149,145 @@ mod tests {
         assert_eq!(get_elements_by_tag_name(&cloned, "i").len(), 1);
         let i = get_elements_by_tag_name(&cloned, "i")[0].clone();
         assert_eq!(element_text(&i).as_deref(), Some("x"));
+    }
+
+    // -----------------------------------------------------------------
+    // M11 Phase A — preprocess_html unit tests (HLD §6.1)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn preprocess_a_no_op_on_clean_html() {
+        let input = "<html><body><p>Hello</p></body></html>";
+        let result = preprocess_html(input);
+        assert_eq!(&*result, input);
+        assert!(matches!(result, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn preprocess_b_strips_closing_br() {
+        let result = preprocess_html("before</br>after");
+        assert_eq!(&*result, "beforeafter");
+        assert!(matches!(result, Cow::Owned(_)));
+    }
+
+    #[test]
+    fn preprocess_c_strips_closing_br_case_insensitive() {
+        let result = preprocess_html("before</BR>after");
+        assert_eq!(&*result, "beforeafter");
+        assert!(matches!(result, Cow::Owned(_)));
+    }
+
+    #[test]
+    fn preprocess_d_strips_closing_br_with_whitespace() {
+        let result = preprocess_html("before</br >after");
+        assert_eq!(&*result, "beforeafter");
+        assert!(matches!(result, Cow::Owned(_)));
+    }
+
+    #[test]
+    fn preprocess_e_rewrites_xmp_open_to_div() {
+        let result = preprocess_html(r#"<xmp id="x"><p>hi</p></xmp>"#);
+        assert_eq!(&*result, r#"<div id="x"><p>hi</p></div>"#);
+        assert!(matches!(result, Cow::Owned(_)));
+    }
+
+    #[test]
+    fn preprocess_f_rewrites_xmp_case_insensitive() {
+        let result = preprocess_html("<XMP>text</XMP>");
+        assert_eq!(&*result, "<div>text</div>");
+        assert!(matches!(result, Cow::Owned(_)));
+    }
+
+    #[test]
+    fn preprocess_g_rewrites_stray_td_outside_table() {
+        let result = preprocess_html(r#"<div><td class="a">text</td></div>"#);
+        assert_eq!(&*result, r#"<div><div class="a">text</div></div>"#);
+        assert!(matches!(result, Cow::Owned(_)));
+    }
+
+    #[test]
+    fn preprocess_h_leaves_td_inside_table_alone() {
+        let input = "<table><tr><td>cell</td></tr></table>";
+        let result = preprocess_html(input);
+        assert_eq!(&*result, input);
+        // Cow variant is Owned because the quick-scan triggers (has <td>),
+        // but the transformation pass leaves everything unchanged.
+        // We only assert output equality, not the Cow variant (HLD §6.1 note).
+    }
+
+    #[test]
+    fn preprocess_i_handles_nested_tables() {
+        let input = concat!(
+            "<div>",
+            "<td>stray cell 1</td>",
+            "<table><tr><td>legit cell</td>",
+            "<table><tr><td>inner cell</td></tr></table>",
+            "</tr></table>",
+            "<td>stray cell 2</td>",
+            "</div>"
+        );
+        let result = preprocess_html(input);
+        let expected = concat!(
+            "<div>",
+            "<div>stray cell 1</div>",
+            "<table><tr><td>legit cell</td>",
+            "<table><tr><td>inner cell</td></tr></table>",
+            "</tr></table>",
+            "<div>stray cell 2</div>",
+            "</div>"
+        );
+        assert_eq!(&*result, expected);
+    }
+
+    #[test]
+    fn preprocess_j_preserves_attributes_on_cell_rewrite() {
+        let result = preprocess_html(r#"<td colspan="2" class="x">text</td>"#);
+        assert_eq!(&*result, r#"<div colspan="2" class="x">text</div>"#);
+        assert!(matches!(result, Cow::Owned(_)));
+    }
+
+    #[test]
+    fn preprocess_k_does_not_match_prefix_tags() {
+        // `<thread>` must NOT match the `<thead>` rule. The quick-scan will
+        // trigger (it sees `<th`), but the transformation pass's tag-boundary
+        // guard prevents the match. Output is unchanged; the Cow variant may
+        // be Owned (false-Owned — HLD §7.1 deferred optimisation).
+        let input = "<thread>text</thread>";
+        let result = preprocess_html(input);
+        assert_eq!(&*result, input);
+    }
+
+    #[test]
+    fn preprocess_l_rewrites_all_cell_tag_types() {
+        let input = "<tr><th>h</th><td>d</td><tbody><tfoot><thead>";
+        let result = preprocess_html(input);
+        let expected = "<div><div>h</div><div>d</div><div><div><div>";
+        assert_eq!(&*result, expected);
+        assert!(matches!(result, Cow::Owned(_)));
+    }
+
+    #[test]
+    fn preprocess_m_handles_multiple_shapes_together() {
+        let input = r#"<p>a</br>b</p><td class="s">c</td><xmp>d</xmp>"#;
+        let result = preprocess_html(input);
+        let expected = r#"<p>ab</p><div class="s">c</div><div>d</div>"#;
+        assert_eq!(&*result, expected);
+        assert!(matches!(result, Cow::Owned(_)));
+    }
+
+    #[test]
+    fn preprocess_n_empty_input() {
+        let result = preprocess_html("");
+        assert_eq!(&*result, "");
+        assert!(matches!(result, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn preprocess_o_saturating_table_depth() {
+        // </table> at depth 0 should saturate to 0, not underflow.
+        // The subsequent <td> should still be rewritten (depth == 0).
+        let result = preprocess_html("</table><td>stray</td>");
+        assert_eq!(&*result, "</table><div>stray</div>");
+        assert!(matches!(result, Cow::Owned(_)));
     }
 }

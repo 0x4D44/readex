@@ -2880,7 +2880,7 @@ name = "mdrcel"
 # (`web_atoms = "=0.2.4"`) is a promotion of an existing transitive dep
 # (zero new crates in the build graph). Patch per CLAUDE.md "Patch (0.0.X)
 # — bug fixes ... with no API changes".
-version = "0.18.4"
+version = "0.18.6"
 edition = "2024"
 
 # M7 Stage 1 (2026-05-22): 0.16.2 -> 0.17.0 MINOR. New public function
