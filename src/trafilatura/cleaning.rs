@@ -65,7 +65,7 @@ use crate::trafilatura::settings_constants::{
 /// `bare_extraction`'s harness invocation (`run.py:244-251`).
 ///
 /// **NOT YET PUBLIC.** This struct is `pub(crate)` because the public
-/// `mdrcel::Options::extractor` enum is HLD §5.2 / DECISION-C work for a
+/// `readex::Options::extractor` enum is HLD §5.2 / DECISION-C work for a
 /// later stage. Stage 1b's gate runs with defaults — the Stage 0c gate
 /// compares Trafilatura's `bare_extraction(... default options ...)` against
 /// the Rust port with `Options::default()`.

@@ -53,7 +53,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use mdrcel::readability::dom::{self, Dom, NodeRef};
+use readex::readability::dom::{self, Dom, NodeRef};
 use unicode_normalization::UnicodeNormalization;
 
 /// **Byte-exact mirror of `benchmark/src/metrics.rs::tokens`** (HLD §8 / §6.1

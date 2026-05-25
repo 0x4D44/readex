@@ -1,5 +1,5 @@
 //! M4 Stage 1 sub-stage H — **5th BLOCKER gate**: byte-equivalent parity
-//! between mdrcel's [`mdrcel::htmldate::core::find_date`] and Python's
+//! between mdrcel's [`readex::htmldate::core::find_date`] and Python's
 //! `htmldate.find_date(text, original_date=False, outputformat="%Y-%m-%d")`
 //! on a 10-snapshot subset of the M3 Stage 3-B corpus.
 //!
@@ -35,8 +35,8 @@
 use std::fs;
 use std::path::PathBuf;
 
-use mdrcel::htmldate::{core::find_date, settings::MIN_DATE, utils::Extractor};
-use mdrcel::readability::dom::Dom;
+use readex::htmldate::{core::find_date, settings::MIN_DATE, utils::Extractor};
+use readex::readability::dom::Dom;
 
 /// The 10-fixture parity oracle.
 ///

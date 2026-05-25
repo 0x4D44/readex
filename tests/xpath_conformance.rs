@@ -10,7 +10,7 @@
 //!
 //! The harness:
 //! 1. For each row, evaluates the XPath against the input HTML in Rust
-//!    (via `mdrcel::trafilatura::xpath_engine::evaluate`).
+//!    (via `readex::trafilatura::xpath_engine::evaluate`).
 //! 2. Spawns the Python probe at
 //!    `benchmark/oracles/xpath_conformance/conformance_probe.py` with the
 //!    same XPath and HTML, parsing its JSON envelope.
@@ -54,8 +54,8 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use mdrcel::readability::dom::{self, Dom, NodeRef};
-use mdrcel::trafilatura::xpath_engine;
+use readex::readability::dom::{self, Dom, NodeRef};
+use readex::trafilatura::xpath_engine;
 
 /// A single conformance row. Both Rust and lxml are evaluated with `body` as
 /// the context node.

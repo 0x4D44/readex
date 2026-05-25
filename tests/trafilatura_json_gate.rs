@@ -33,7 +33,7 @@
 //! pinned to a future milestone; ADR under `wrk_docs/m7-deferred/`). Any
 //! untriaged bucket count > 0 fails the gate.
 
-use mdrcel::{extract_to_json, Options};
+use readex::{extract_to_json, Options};
 
 mod common;
 use common::{

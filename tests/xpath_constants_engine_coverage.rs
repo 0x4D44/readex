@@ -1,9 +1,9 @@
 //! Stage 2a engine-gap survey (HLD M3 §7).
 //!
 //! For every XPath expression vendored in
-//! `mdrcel::trafilatura::xpaths_constants`, this test attempts to evaluate the
+//! `readex::trafilatura::xpaths_constants`, this test attempts to evaluate the
 //! expression through the Stage 0b engine
-//! (`mdrcel::trafilatura::xpath_engine::evaluate`) against a trivial DOM. The
+//! (`readex::trafilatura::xpath_engine::evaluate`) against a trivial DOM. The
 //! engine has three possible outcomes per expression:
 //!
 //! 1. **Accept (Ok)** — the expression parsed AND evaluated cleanly. The
@@ -44,9 +44,9 @@ use std::fs;
 use std::panic;
 use std::path::PathBuf;
 
-use mdrcel::readability::dom::Dom;
-use mdrcel::trafilatura::xpath_engine;
-use mdrcel::trafilatura::xpaths_constants::ALL_XPATHS;
+use readex::readability::dom::Dom;
+use readex::trafilatura::xpath_engine;
+use readex::trafilatura::xpaths_constants::ALL_XPATHS;
 
 /// One row of the survey: every vendored XPath gets one of these.
 struct SurveyRow {
@@ -63,7 +63,7 @@ struct SurveyRow {
 /// Run the engine against `xpath` with a trivial body context. Treats panic as
 /// rejection (defensively — the Stage 0b engine is Err-only by contract, but
 /// we don't want a regression to crash the test binary).
-fn try_engine(xpath: &str, body: &mdrcel::readability::dom::NodeRef) -> Option<String> {
+fn try_engine(xpath: &str, body: &readex::readability::dom::NodeRef) -> Option<String> {
     let body_clone = body.clone();
     let xpath_owned: String = xpath.to_string();
     let result = panic::catch_unwind(panic::AssertUnwindSafe(move || {

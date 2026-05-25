@@ -1,0 +1,58 @@
+readex
+Copyright 2026 Martin Davidson
+
+This product includes algorithms reimplemented from three upstream
+open-source projects. readex is a clean-room reimplementation in
+Rust — no source from the projects below is vendored or included —
+but the algorithmic ideas, scoring constants, and extraction
+strategies originate with them and are gratefully acknowledged here.
+
+----------------------------------------------------------------------
+
+1. Mozilla Readability (readability.js)
+   https://github.com/mozilla/readability
+   Copyright (c) Mozilla Foundation
+   Licensed under the Apache License, Version 2.0
+
+   readex's `readability` module is a Rust port of the
+   `Readability.prototype.parse` pipeline: `_removeScripts`,
+   `_prepDocument`, `_getArticleTitle`, `_grabArticle` (with the full
+   flag-sieve, sibling-append, longest-text-fallback retry loop), and
+   `_prepArticle` (`_markDataTables`, `_cleanConditionally`,
+   `_cleanHeaders`, `_cleanStyles`, `_cleanMatchedNodes`).
+
+2. Trafilatura
+   https://github.com/adbar/trafilatura
+   Copyright (c) Adrien Barbaresi
+   Licensed under the Apache License, Version 2.0
+
+   readex's `trafilatura` module is a Rust port of the
+   `bare_extraction` cascade: `tree_cleaning`, `convert_tags`, the
+   own/readability_fork/jusText three-arm cascade with the 7-branch
+   arbiter, `extract_metadata` (OpenGraph, meta-name, itemprop,
+   JSON-LD, URL, date), `extract_comments`, the deduplication
+   primitives (Simhash, content_fingerprint, is_similar_domain), and
+   the XPath 1.0 evaluator that drives the BODY/COMMENTS/DISCARD
+   constant tables.
+
+   The Trafilatura algorithm is documented in:
+     Barbaresi, A. (2021). "Trafilatura: A Web Scraping Library and
+     Command-Line Tool for Text Discovery and Extraction." In
+     Proceedings of ACL-IJCNLP 2021: System Demonstrations.
+
+3. htmldate
+   https://github.com/adbar/htmldate
+   Copyright (c) Adrien Barbaresi
+   Licensed under the Apache License, Version 2.0
+
+   readex's `htmldate` module is a Rust port of the date-extraction
+   pipeline (fast and extensive modes) with the same precedence
+   rules over `<meta>` tags, JSON-LD, URL patterns, and free-text
+   date scanning that upstream uses.
+
+----------------------------------------------------------------------
+
+This NOTICE file is provided in line with the spirit of the Apache
+License, Version 2.0 §4(d): it credits the upstream work whose ideas
+readex carries forward. None of the upstream projects' source is
+distributed with this crate.

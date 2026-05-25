@@ -80,7 +80,7 @@
 //! `deferred_known_defect` (ADR under `wrk_docs/m7-deferred/` or
 //! `wrk_docs/m8-deferred/`). Any untriaged bucket count > 0 fails the gate.
 
-use mdrcel::{extract_to_tei, Options};
+use readex::{extract_to_tei, Options};
 
 mod common;
 use common::{

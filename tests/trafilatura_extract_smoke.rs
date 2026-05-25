@@ -18,9 +18,9 @@
 
 use std::path::{Path, PathBuf};
 
-use mdrcel::readability::dom::Dom;
-use mdrcel::trafilatura::cleaning;
-use mdrcel::trafilatura::main_extractor;
+use readex::readability::dom::Dom;
+use readex::trafilatura::cleaning;
+use readex::trafilatura::main_extractor;
 
 /// Same 10 fixtures the converted-tree gate uses (HLD §6.2).
 const FIXTURES: &[&str] = &[

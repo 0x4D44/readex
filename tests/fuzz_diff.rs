@@ -724,8 +724,8 @@ impl Divergence {
 type ExtractFn = fn(
     html: &str,
     base_url: Option<&str>,
-    opts: &mdrcel::Options,
-) -> Result<String, mdrcel::ExtractError>;
+    opts: &readex::Options,
+) -> Result<String, readex::ExtractError>;
 
 enum ExtractOutcome {
     Ok(String),
@@ -738,7 +738,7 @@ fn safe_extract(
     f: ExtractFn,
     html: &str,
     base_url: Option<&str>,
-    opts: &mdrcel::Options,
+    opts: &readex::Options,
 ) -> ExtractOutcome {
     let html_owned = html.to_string();
     let base_owned = base_url.map(|s| s.to_string());
@@ -838,7 +838,7 @@ fn process_format(
     stats: &mut PerFormatStats,
     out: &mut dyn Write,
     divergence_buf: &mut Vec<Divergence>,
-    opts: &mdrcel::Options,
+    opts: &readex::Options,
     record_divergence: bool,
 ) {
     stats.pages += 1;
@@ -1174,7 +1174,7 @@ fn fuzz_diff() {
     }
 
     let mut divergences: Vec<Divergence> = Vec::new();
-    let opts = mdrcel::Options::default();
+    let opts = readex::Options::default();
 
     let mut processed = 0usize;
     let mut missing_html = 0usize;
@@ -1207,7 +1207,7 @@ fn fuzz_diff() {
             &m.source_url,
             &html,
             "txt",
-            mdrcel::extract_to_txt,
+            readex::extract_to_txt,
             &cache_entry.txt,
             per_format.get_mut("txt").unwrap(),
             &mut div_file,
@@ -1220,7 +1220,7 @@ fn fuzz_diff() {
             &m.source_url,
             &html,
             "markdown",
-            mdrcel::extract_to_markdown,
+            readex::extract_to_markdown,
             &cache_entry.markdown,
             per_format.get_mut("markdown").unwrap(),
             &mut div_file,
@@ -1233,7 +1233,7 @@ fn fuzz_diff() {
             &m.source_url,
             &html,
             "xml",
-            mdrcel::extract_to_xml,
+            readex::extract_to_xml,
             &cache_entry.xml,
             per_format.get_mut("xml").unwrap(),
             &mut div_file,
@@ -1525,7 +1525,7 @@ fn broad_sweep() {
     // A sink that discards writes — broad_sweep does NOT write divergences.jsonl,
     // only report.jsonl (outliers only, written post-hoc).
     let mut null_sink = std::io::sink();
-    let opts = mdrcel::Options::default();
+    let opts = readex::Options::default();
 
     let mut processed = 0usize;
     let mut missing_html = 0usize;
@@ -1544,9 +1544,9 @@ fn broad_sweep() {
         };
 
         for (fmt, extract_fn, oracle_text) in [
-            ("txt", mdrcel::extract_to_txt as ExtractFn, &cache_entry.txt),
-            ("markdown", mdrcel::extract_to_markdown as ExtractFn, &cache_entry.markdown),
-            ("xml", mdrcel::extract_to_xml as ExtractFn, &cache_entry.xml),
+            ("txt", readex::extract_to_txt as ExtractFn, &cache_entry.txt),
+            ("markdown", readex::extract_to_markdown as ExtractFn, &cache_entry.markdown),
+            ("xml", readex::extract_to_xml as ExtractFn, &cache_entry.xml),
         ] {
             process_format(
                 &m.sha,

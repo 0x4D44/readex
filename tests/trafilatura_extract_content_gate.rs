@@ -56,8 +56,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use mdrcel::readability::dom::{self, Dom};
-use mdrcel::trafilatura::{cleaning, main_extractor};
+use readex::readability::dom::{self, Dom};
+use readex::trafilatura::{cleaning, main_extractor};
 
 /// Stage 3-B activator: corpus paths the gate runs against. **Born small** —
 /// see file-level docs for the phased rollout rationale.

@@ -37,7 +37,7 @@
 //!
 //! Every number is recomputed from the `.text` fields with the single
 //! tokenizer in `metrics.rs`. The harness **never** trusts
-//! [`OracleResult::word_count`] or [`mdrcel::Extracted::word_count`] (HLD §8 —
+//! [`OracleResult::word_count`] or [`readex::Extracted::word_count`] (HLD §8 —
 //! "The harness never trusts an external word count"); there is exactly one
 //! word-count definition in the whole harness.
 //!
@@ -1020,7 +1020,7 @@ pub fn write_results(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mdrcel::Extracted;
+    use readex::Extracted;
 
     /// Epsilon for non-exact f64 ratio comparisons (same rationale as
     /// `metrics.rs`: ratios of small token counts, error ≪ 1e-9).

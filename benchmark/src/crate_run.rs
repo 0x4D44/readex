@@ -1,4 +1,4 @@
-//! Crate adapter: call `mdrcel::extract` **in-process** and map the outcome
+//! Crate adapter: call `readex::extract` **in-process** and map the outcome
 //! onto the harness's first-class status taxonomy.
 //!
 //! This is the crate-under-test side of the differential harness. Unlike the
@@ -11,7 +11,7 @@
 //!
 //! Mirrors the oracle tri-state philosophy, the anti-Bug-E2 doctrine:
 //!
-//! | `mdrcel::extract` result                       | [`CrateStatus`]                                         |
+//! | `readex::extract` result                       | [`CrateStatus`]                                         |
 //! |------------------------------------------------|---------------------------------------------------------|
 //! | `Ok(Extracted)` — **even if `text` is `""`**   | [`Ok`](CrateStatus::Ok) (carries it)                    |
 //! | `Err(ExtractError::NotImplemented)`            | [`NotImplemented`](CrateStatus::NotImplemented)         |
@@ -20,7 +20,7 @@
 //!
 //! At Stage 4 (M2, HLD §7.6) the M1 `ExtractError::NotImplemented` is **no
 //! longer** the only variant: the long-anticipated
-//! [`ExtractError::ContentTooShort`](mdrcel::ExtractError::ContentTooShort)
+//! [`ExtractError::ContentTooShort`](readex::ExtractError::ContentTooShort)
 //! variant has landed and **the compile-fence below fired** — a conscious
 //! match arm was added per its doctrine. The match remains **exhaustive,
 //! WITHOUT a wildcard**, so the next future variant will fire the fence
@@ -62,7 +62,7 @@
 //!
 //! # Panic isolation (forward-looking robustness)
 //!
-//! At M1 `mdrcel::extract` only returns `NotImplemented` and cannot panic. But
+//! At M1 `readex::extract` only returns `NotImplemented` and cannot panic. But
 //! once the extraction algorithm lands (later milestones) a single pathological
 //! corpus URL could panic (slicing a non-char-boundary, an `unwrap` on a
 //! malformed DOM, recursion depth, …). Because the crate runs **in-process**,
@@ -90,7 +90,7 @@
 //! # Testable seam (mirrors `oracle.rs`'s minimal approach)
 //!
 //! The status-mapping + panic-isolation logic must be unit-testable **now**,
-//! even though the real `mdrcel::extract` only ever returns `NotImplemented`
+//! even though the real `readex::extract` only ever returns `NotImplemented`
 //! at M1 (so the `Ok`, empty-`Ok`, other-`Err`, and panic arms would otherwise
 //! be unreachable from tests). Following the established `oracle.rs` pattern —
 //! a single function taking the variable part as a parameter, **not** a
@@ -98,7 +98,7 @@
 //! [`run_extraction`]: it takes an injectable `FnOnce() -> Result<Extracted,
 //! ExtractError>` and owns *only* the catch-unwind + tri-state mapping.
 //! Production goes through the thin [`run_crate`] wrapper, whose closure simply
-//! calls `mdrcel::extract`. Tests inject closures that return each variant (and
+//! calls `readex::extract`. Tests inject closures that return each variant (and
 //! one that `panic!`s) to exercise every arm without the algorithm existing.
 
 // O4 status (Stage 6, 2026-05-17). `score.rs` (reachable from `main`'s
@@ -124,9 +124,9 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use mdrcel::{ExtractError, Extracted};
+use readex::{ExtractError, Extracted};
 
-/// First-class outcome of one in-process `mdrcel::extract` call (harness
+/// First-class outcome of one in-process `readex::extract` call (harness
 /// HLD §5 status taxonomy — the anti-Bug-E2 tri-state, crate side).
 ///
 /// Deliberately a sibling of `oracle::OracleStatus`, not a shared type: the
@@ -152,7 +152,7 @@ use mdrcel::{ExtractError, Extracted};
 // `score.rs` actually constructing them, not by the dead-code lint.
 #[derive(Debug)]
 pub enum CrateStatus {
-    /// `mdrcel::extract` returned `Ok` — **even if `text` is `""`** ("found
+    /// `readex::extract` returned `Ok` — **even if `text` is `""`** ("found
     /// little" is a valid result, NOT an error and NOT `not_implemented`).
     /// Carries the parsed [`Extracted`].
     ///
@@ -165,11 +165,11 @@ pub enum CrateStatus {
     /// (a deliberate empty extraction), never from `NotImplemented` or
     /// `CrateError` laundered into emptiness.
     Ok(Box<Extracted>),
-    /// `mdrcel::extract` returned [`ExtractError::NotImplemented`] — the
+    /// `readex::extract` returned [`ExtractError::NotImplemented`] — the
     /// Milestone-1 floor. A **distinct** first-class status: never folded into
     /// [`CrateError`](Self::CrateError), never laundered into an empty `Ok`.
     NotImplemented,
-    /// `mdrcel::extract` **panicked** — the catch_unwind layer recovered it
+    /// `readex::extract` **panicked** — the catch_unwind layer recovered it
     /// (`"panic: …"`). Never silently treated as empty content (the Bug-E2
     /// lesson, crate side). Carries a human-readable reason.
     ///
@@ -181,11 +181,11 @@ pub enum CrateStatus {
     CrateError(String),
 }
 
-/// Run `mdrcel::extract` for `html` / `base_url` and map the outcome onto
+/// Run `readex::extract` for `html` / `base_url` and map the outcome onto
 /// [`CrateStatus`] (the production entry point).
 ///
 /// Thin wrapper over the [`run_extraction`] seam: it only supplies the
-/// closure that calls `mdrcel::extract`, so the catch-unwind + tri-state
+/// closure that calls `readex::extract`, so the catch-unwind + tri-state
 /// mapping is exercised by tests **without** depending on the algorithm
 /// existing (at M1 the real call only ever yields `NotImplemented`). An
 /// end-to-end test asserts this production path yields
@@ -198,7 +198,7 @@ pub enum CrateStatus {
 // exists); the private / enum-variant half remains uncaught (see the
 // module-level O4 status note).
 pub fn run_crate(html: &str, base_url: Option<&str>) -> CrateStatus {
-    run_extraction(|| mdrcel::extract(html, base_url))
+    run_extraction(|| readex::extract(html, base_url))
 }
 
 /// The testable seam: invoke `f` (an extraction call), isolating any panic,
@@ -421,13 +421,13 @@ mod tests {
         }
     }
 
-    /// End-to-end: the **production** path (real `mdrcel::extract`, not an
+    /// End-to-end: the **production** path (real `readex::extract`, not an
     /// injected closure) on a page that yields a readable article surfaces
     /// as [`CrateStatus::Ok`] carrying the extracted body.
     ///
     /// **History.** This test used to assert `CrateStatus::NotImplemented` —
     /// the M1 floor every URL produced. The floor was retired at M2 Stage 1a
-    /// (`d426df1`): `mdrcel::extract` now runs a real Readability port and
+    /// (`d426df1`): `readex::extract` now runs a real Readability port and
     /// returns a populated `Ok` for an article-bearing page. The original
     /// "yields_not_implemented_at_m1" assertion has been faithfully retired
     /// at M2 Stage 4 in line with that reality.
@@ -494,7 +494,7 @@ mod tests {
     #[test]
     fn content_too_short_maps_to_crate_error_with_reason_string() {
         let status = run_extraction(|| {
-            Err(mdrcel::ExtractError::ContentTooShort {
+            Err(readex::ExtractError::ContentTooShort {
                 word_count: 3,
                 threshold: 50,
             })

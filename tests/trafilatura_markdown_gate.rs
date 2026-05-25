@@ -33,7 +33,7 @@
 //! The end-of-report tally totals each bucket so Stage 3 can pick the
 //! highest-value fix target.
 
-use mdrcel::{extract_to_markdown, Options};
+use readex::{extract_to_markdown, Options};
 
 mod common;
 use common::{

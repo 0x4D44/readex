@@ -52,8 +52,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use mdrcel::readability::dom::{self, Dom};
-use mdrcel::trafilatura::cleaning;
+use readex::readability::dom::{self, Dom};
+use readex::trafilatura::cleaning;
 
 /// Stage 1b activator: 10 corpus URL paths the gate runs against on every
 /// `cargo test`. Paths are RELATIVE to the workspace root (the test runner's
