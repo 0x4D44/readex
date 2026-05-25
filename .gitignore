@@ -26,3 +26,19 @@ benchmark/fuzz_corpus/
 benchmark/fuzz/oracle_cache.jsonl
 benchmark/fuzz/oracle_cache.err
 benchmark/fuzz/divergences.jsonl
+benchmark/fuzz/stage0/
+benchmark/fuzz/stage2_validation/
+
+# M12 broad sweep: same pattern as M9. The 52K HTML corpus, oracle cache,
+# outlier report, and per-run scratch are all regenerable from
+# benchmark/broad/manifest.jsonl (committed) + the harvest pipeline.
+benchmark/broad_corpus/
+benchmark/broad/oracle_cache.jsonl
+benchmark/broad/oracle_cache.err
+benchmark/broad/report.jsonl
+benchmark/broad/sweep_output.txt
+benchmark/broad/sweep_stderr.txt
+benchmark/broad/sweep.pid
+
+# Claude Code per-project config — local environment, not source.
+.claude/
