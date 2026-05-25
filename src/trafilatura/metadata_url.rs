@@ -356,11 +356,15 @@ pub(crate) fn meta_url_sitename(url: &str) -> Option<String> {
 /// Strip the `http://` / `https://` (or `ftp[s]://`) prefix; return `None` if
 /// the URL does not begin with one of these.
 fn strip_scheme(url: &str) -> Option<&str> {
+    let bytes = url.as_bytes();
     for scheme in &["https://", "http://", "ftps://", "ftp://"] {
-        if url.len() >= scheme.len()
-            && url[..scheme.len()].eq_ignore_ascii_case(scheme)
-        {
-            return Some(&url[scheme.len()..]);
+        let s = scheme.as_bytes();
+        // Compare on raw bytes so the byte-length cap doesn't land inside
+        // a multi-byte UTF-8 char (e.g. Japanese metadata `このページのURL`).
+        // Schemes are pure ASCII; a successful match guarantees `s.len()`
+        // is on a char boundary.
+        if bytes.len() >= s.len() && bytes[..s.len()].eq_ignore_ascii_case(s) {
+            return Some(&url[s.len()..]);
         }
     }
     None
@@ -1511,5 +1515,18 @@ mod tests {
             fix_relative_urls("https://e.com/a", "https://e.com/b"),
             "https://e.com/b"
         );
+    }
+
+    // ---- M12 regression: char-boundary safety on non-ASCII URLs --------
+
+    #[test]
+    fn strip_scheme_handles_non_ascii_url_prefix() {
+        // Regression: M12 broad sweep surfaced a panic where `url[..7]`
+        // landed inside a 3-byte Japanese char (`ペ`, bytes 6..9) when a
+        // page's metadata contained `このページのURL` as a URL value.
+        // The byte-slice comparison must not panic on non-ASCII input.
+        assert!(strip_scheme("このページのURL").is_none());
+        assert!(strip_scheme("中神通信息技术有限公司").is_none());
+        assert!(strip_scheme("ペ").is_none()); // shorter than any scheme
     }
 }
