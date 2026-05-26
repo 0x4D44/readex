@@ -6,6 +6,29 @@ as a comment in the project's `Cargo.toml` manifest and is preserved verbatim so
 the institutional memory is not lost. Future releases (0.19.1+) will be recorded
 in standard Markdown sections at the top of this file as they ship.
 
+## 0.19.2 — 2026-05-26 — test-coverage push (no runtime change)
+
+- Test-coverage initiative: added ~22.7K lines of inline `#[cfg(test)]
+  mod tests` across the `htmldate`, `readability`, and `trafilatura`
+  modules, lifting production branch coverage from a 72.03% baseline to
+  93.32% (against a 96.6% reachable ceiling — the remainder is
+  defensively-unreachable or oracle-inversion-prone code documented in
+  `wrk_docs/coverage_baseline/`). These tests are `#[cfg(test)]`-gated,
+  so they have **no effect on the public API, runtime behaviour, or
+  consumers' builds**; they ship in the source tarball per standard Rust
+  practice.
+- Crate root now declares `#![cfg_attr(coverage_nightly,
+  feature(coverage_attribute))]` and every inline test module carries
+  `#[cfg_attr(coverage_nightly, coverage(off))]`, so `cargo-llvm-cov`
+  (which sets `--cfg coverage_nightly`) excludes test code from
+  instrumentation and reports accurate *production* coverage. The cfg is
+  only ever set by the coverage tooling; ordinary builds are unaffected.
+- `Cargo.toml`: added `[lints.rust]` declaring the `coverage_nightly`
+  cfg via `check-cfg`, so ordinary (non-coverage) builds don't emit an
+  `unexpected_cfgs` warning.
+- No source-code behaviour change. No public API change. No new runtime
+  dependency. PATCH per the project's version-management policy.
+
 ## 0.19.1 — 2026-05-26 — cosmetic cleanup
 
 - `src/**/*.rs` rustdoc references renamed `mdrcel` → `readex`. The
