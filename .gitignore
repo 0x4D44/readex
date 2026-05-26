@@ -42,3 +42,8 @@ benchmark/broad/sweep.pid
 
 # Claude Code per-project config — local environment, not source.
 .claude/
+
+# One-time pre-publication scrub tooling (replace-patterns + filter-repo
+# runbook). Contains the literal target strings the history scrub looks
+# for, so committing it would defeat the scrub's purpose.
+.publish-prep/
