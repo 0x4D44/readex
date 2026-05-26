@@ -2294,6 +2294,33 @@ mod tests {
         assert_eq!(m.image.as_deref(), Some("first.jpg"));
     }
 
+    #[test]
+    fn assign_og_property_preserves_image_when_some_og_image_key() {
+        // rationale: `metadata.py:146-148` — the `if metadata.image.is_none()`
+        // guard on the `"og:image"` alternative of the multi-pattern arm takes
+        // its FALSE side (metadata.rs:254) when image is already set, so the bare
+        // `og:image` key does NOT overwrite an existing image.
+        let mut m = Metadata {
+            image: Some("first.jpg".into()),
+            ..Default::default()
+        };
+        assign_og_property(&mut m, "og:image", "second.jpg");
+        assert_eq!(m.image.as_deref(), Some("first.jpg"));
+    }
+
+    #[test]
+    fn assign_og_property_preserves_image_when_some_og_image_url_key() {
+        // rationale: `metadata.py:147` — the same is_none() guard FALSE side
+        // (metadata.rs:254) for the `"og:image:url"` alternative: an existing
+        // image is not overwritten by the alternative key.
+        let mut m = Metadata {
+            image: Some("first.jpg".into()),
+            ..Default::default()
+        };
+        assign_og_property(&mut m, "og:image:url", "second.jpg");
+        assert_eq!(m.image.as_deref(), Some("first.jpg"));
+    }
+
     // ---- examine_meta — property attr branch ----------------------------
 
     #[test]
@@ -3521,5 +3548,115 @@ mod tests {
         // `&`.
         let out = python_html_unescape("&#38");
         assert_eq!(out, "&");
+    }
+
+    // ===================================================================
+    // M13 Stage — final branch-coverage push (metadata.rs)
+    // examine_opengraph / examine_meta guard FALSE-and-second-operand sides;
+    // extract_author empty-blacklist path; html-lang / sitename normalisation.
+    // ===================================================================
+
+    #[test]
+    fn examine_meta_og_whitespace_content_is_skipped() {
+        // rationale: `metadata.py:226` examine_opengraph — an `og:` meta whose
+        // `content` is whitespace-only makes `content.trim().is_empty()` take its
+        // TRUE side (metadata.rs:535), so the `continue` fires and og:title is not
+        // assigned.
+        let html = r#"<html><head>
+            <meta property="og:title" content="   ">
+            </head><body><p>x</p></body></html>"#;
+        let m = extract_metadata(html, None, true, &[]);
+        assert!(m.title.is_none(), "whitespace og:title content is skipped");
+    }
+
+    #[test]
+    fn examine_meta_second_og_url_does_not_overwrite() {
+        // rationale: `metadata.py:211-212` — the `og:url` arm's
+        // `&& metadata.url.is_none()` second operand takes its FALSE side
+        // (metadata.rs:549) on a SECOND og:url meta, so the first URL survives.
+        let html = r#"<html><head>
+            <meta property="og:url" content="https://first.example/page">
+            <meta property="og:url" content="https://second.example/page">
+            </head><body><p>x</p></body></html>"#;
+        let m = extract_metadata(html, None, true, &[]);
+        assert_eq!(m.url.as_deref(), Some("https://first.example/page"));
+    }
+
+    #[test]
+    fn examine_meta_second_description_does_not_overwrite() {
+        // rationale: `metadata.py:271-272` METANAME_DESCRIPTION arm — the
+        // `if document.description.is_none()` guard takes its FALSE side
+        // (metadata.rs:622) on a SECOND name=description meta, so the first
+        // description is preserved.
+        let html = r#"<html><head>
+            <meta name="description" content="First description here.">
+            <meta name="description" content="Second description ignored.">
+            </head><body><p>x</p></body></html>"#;
+        let m = extract_metadata(html, None, true, &[]);
+        assert_eq!(m.description.as_deref(), Some("First description here."));
+    }
+
+    #[test]
+    fn examine_meta_content_only_meta_without_itemprop_is_noop() {
+        // rationale: `metadata.py:264-298` — a `<meta>` carrying `content` but
+        // NO property / name / itemprop reaches the itemprop branch and takes the
+        // `if let Some(itemprop_raw)` FALSE (None) side (metadata.rs:647), writing
+        // nothing.
+        let html = r#"<html><head>
+            <meta content="orphan content with no key attribute">
+            </head><body><p>x</p></body></html>"#;
+        let m = extract_metadata(html, None, true, &[]);
+        assert!(
+            m.author.is_none() && m.description.is_none() && m.title.is_none(),
+            "content-only meta writes nothing"
+        );
+    }
+
+    #[test]
+    fn extract_metadata_xpath_author_with_empty_blacklist() {
+        // rationale: `metadata.py:382-385` extract_author — with NO meta author the
+        // XPath fallback succeeds, and an EMPTY blacklist takes the
+        // `if !blacklist.is_empty()` FALSE side (metadata.rs:857), returning the
+        // normalized author directly (no blacklist recheck).
+        let html = r#"<html><head></head><body>
+            <p class="author">Marie Curie</p>
+            <p>article body text goes here</p>
+            </body></html>"#;
+        let m = extract_metadata(html, None, true, &[]);
+        assert_eq!(m.author.as_deref(), Some("Marie Curie"));
+    }
+
+    #[test]
+    fn extract_metadata_no_root_element_is_noop() {
+        // rationale: `metadata.py:Document.language` — a bare text fragment parses
+        // to a Dom with NO root element, so `if let Some(html_elem) =
+        // dom.root_element()` takes its FALSE (None) side (metadata.rs:964) and no
+        // language is set.
+        let m = extract_metadata("just a bare text fragment with no elements", None, true, &[]);
+        assert!(m.language.is_none(), "no root element yields no language");
+    }
+
+    #[test]
+    fn extract_metadata_blank_html_lang_is_ignored() {
+        // rationale: the `<html lang="...">` reader — a whitespace-only `lang`
+        // attribute trims to "" so `if !t.is_empty()` takes its FALSE side
+        // (metadata.rs:968) and language stays None.
+        let html = r#"<html lang="   "><head><title>x</title></head>
+            <body><p>x</p></body></html>"#;
+        let m = extract_metadata(html, None, true, &[]);
+        assert!(m.language.is_none(), "blank lang attribute is ignored");
+    }
+
+    #[test]
+    fn extract_metadata_lowercase_sitename_is_title_cased() {
+        // rationale: `metadata.py:562-567` — a backup sitename with NO "." whose
+        // first char is lowercase ("acme news") satisfies all three operands of the
+        // title-case guard, including the `!first_char.is_uppercase()` TRUE side
+        // (metadata.rs:1072), so it is python-title-cased.
+        let html = r#"<html><head>
+            <meta name="twitter:site" content="@acme news">
+            </head><body><p>x</p></body></html>"#;
+        let m = extract_metadata(html, None, true, &[]);
+        assert_eq!(m.site_name.as_deref(), Some("Acme News"));
     }
 }

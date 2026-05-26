@@ -859,6 +859,11 @@ fn normalize_json(s: &str) -> String {
         t = json_unicode_replace_re()
             .replace_all(&t, |caps: &regex::Captures| {
                 let hex = &caps[1];
+                // llvm-cov:branch-not-reachable: JSON_UNICODE_REPLACE captures
+                // exactly 4 hex digits (`[0-9a-fA-F]{4}`), so the parsed value is
+                // at most 0xFFFF — `u32::from_str_radix` on a 4-digit hex string
+                // always succeeds. The `Err` (returning the empty fallback) side
+                // cannot occur.
                 if let Ok(cp) = u32::from_str_radix(hex, 16) {
                     if (0xD800..=0xDFFF).contains(&cp) {
                         // Lone surrogate — drop.
@@ -3052,5 +3057,100 @@ mod tests {
         // decodes to 'A' via the `char::from_u32` Some arm. The "\\u0041" string
         // literal is the literal backslash sequence (NOT a Rust unicode escape).
         assert_eq!(normalize_json("x\\u0041y"), "xAy");
+    }
+
+    // ===================================================================
+    // M13 Stage — final branch-coverage push (metadata_jsonld.rs)
+    // process_parent publisher/person/article else-if cascade FALSE sides;
+    // keywords-array non-string element; extract_author_names empty-after-strip.
+    // ===================================================================
+
+    #[test]
+    fn process_parent_publisher_type_with_no_name_keys_sets_no_sitename() {
+        // rationale: `json_metadata.py:85-88` — a JSON_PUBLISHER_SCHEMA entry
+        // (Organization) carrying NONE of name/legalName/alternateName makes the
+        // `candidate` OR-chain None, so `if let Some(name) = candidate` takes its
+        // FALSE side (metadata_jsonld.rs:341) and no sitename is written.
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Organization",
+         "url": "https://example.com"}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.site_name.is_none(), "publisher with no name keys yields no sitename");
+    }
+
+    #[test]
+    fn process_parent_publisher_implausible_candidate_does_not_overwrite() {
+        // rationale: `json_metadata.py:57-64` is_plausible_sitename — the first
+        // (longer, non-webpage) Organization sets site_name; a later WebPage entry
+        // with a longer name is rejected by the `content_type != "webpage"` rule,
+        // so `if is_plausible_sitename(...)` takes its FALSE side
+        // (metadata_jsonld.rs:343) and the original sitename survives.
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org",
+         "@graph": [
+            {"@type": "Organization", "name": "Acme"},
+            {"@type": "WebPage", "name": "A Much Longer Page Title Here"}
+         ]}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.site_name.as_deref(), Some("Acme"));
+    }
+
+    #[test]
+    fn process_parent_person_type_with_no_name_key_writes_no_author() {
+        // rationale: `json_metadata.py:90-92` — a top-level Person entry with NO
+        // `name` key makes `obj.get("name").and_then(as_str)` None, so the
+        // let-chain `if let Some(name) = ... && !name.starts_with("http")` takes
+        // its FALSE side at the binding (metadata_jsonld.rs:353) and no author is
+        // produced. (Top-level array keeps process_parent's per-entity dispatch.)
+        let html = r#"<html><head><script type="application/ld+json">
+        [{"@context": "https://schema.org", "@type": "Person",
+          "url": "https://example.com/jane"}]
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.author.is_none(), "Person with no name key yields no author");
+    }
+
+    #[test]
+    fn process_parent_unrecognised_type_falls_through_cascade() {
+        // rationale: `json_metadata.py:74-92` — a well-formed entry whose @type is
+        // none of publisher/person/article schema (here "Recipe") fails the
+        // publisher `if`, the `person` else-if, AND the JSON_ARTICLE_SCHEMA
+        // else-if (metadata_jsonld.rs:359 FALSE side), so walk_article never runs
+        // and the headline is NOT surfaced as a title.
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Recipe",
+         "headline": "Should Not Become Title", "name": "Recipe Name"}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.title.is_none(), "non-article/publisher/person type does not set title");
+    }
+
+    #[test]
+    fn walk_article_keywords_array_non_string_element_skipped() {
+        // rationale: `walk_article` keywords Array arm — `if let Some(s) =
+        // item.as_str()` takes its FALSE side (metadata_jsonld.rs:454) for a
+        // non-string array element (number); the real string tag survives.
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "keywords": [42, "kept-tag"]}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.tags, vec!["kept-tag"]);
+    }
+
+    #[test]
+    fn extract_author_names_object_name_empty_after_strip_not_pushed() {
+        // rationale: `json_metadata.py:113-118` — an author-list object whose
+        // `name` strips (tag-strip + trim) to "" makes `!cleaned.is_empty()` take
+        // its FALSE side (metadata_jsonld.rs:610), so that entry is not pushed;
+        // the sibling valid author still surfaces.
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article", "headline": "x",
+         "author": [{"name": "<b></b>"}, {"name": "Real Author"}]}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.author.as_deref(), Some("Real Author"));
     }
 }

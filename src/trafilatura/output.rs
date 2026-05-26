@@ -358,6 +358,10 @@ pub(crate) fn remove_empty_elements(tree: &NodeRef) {
             continue;
         }
         // xml.py:98 — `parent = element.getparent()`.
+        // llvm-cov:branch-not-reachable: `element` is a descendant from
+        // `get_elements_by_tag_name(tree, "*")` (tree itself is excluded), so it
+        // always has a parent within the tree; the `None` (continue) side cannot
+        // occur (faithful port of Python's `if parent is not None`).
         let Some(p) = parent(&element) else { continue };
         // xml.py:100-102 — `if parent is not None and element.tag !=
         // "graphic" and parent.tag != 'code': parent.remove(element)`.
@@ -420,6 +424,9 @@ fn prune_childless_textless(tree: &NodeRef) {
             continue;
         }
         // parent is not None and parent.tag != "code".
+        // llvm-cov:branch-not-reachable: `element` is a descendant from the `"*"`
+        // snapshot (tree excluded), so it always has a parent; the `None`
+        // (continue) side cannot occur (faithful port of `if parent is not None`).
         let Some(p) = parent(&element) else { continue };
         if local_name(&p).as_deref() == Some("code") {
             continue;
@@ -478,6 +485,10 @@ pub(crate) fn strip_double_tags(tree: &NodeRef) {
             if local_name(subelem).unwrap_or_default() != elem_tag {
                 continue;
             }
+            // llvm-cov:branch-not-reachable: `subelem` is a descendant of `elem`
+            // (itself a descendant of `tree`), so it always has a parent; the
+            // `None` (continue) side cannot occur (faithful port of Python's
+            // `subelem.getparent()` which is never None for a descendant).
             let Some(sp) = parent(subelem) else { continue };
             let sp_tag = local_name(&sp).unwrap_or_default();
             if NESTING_WHITELIST.contains(&sp_tag.as_str()) {
@@ -508,6 +519,9 @@ pub(crate) fn clean_attributes(tree: &NodeRef) {
     for elem in all {
         // xml.py:140-141 — `if elem.tag not in WITH_ATTRIBUTES:
         // elem.attrib.clear()`.
+        // llvm-cov:branch-not-reachable: `all` is `tree` plus its `"*"`
+        // descendants — every entry is an Element, and `local_name` returns Some
+        // for every Element; the `None` (continue) side cannot occur.
         let Some(tag) = local_name(&elem) else { continue };
         if !WITH_ATTRIBUTES.contains(&tag.as_str()) {
             clear_attributes(&elem);
@@ -602,6 +616,10 @@ pub(crate) fn replace_element_text(element: &NodeRef, include_formatting: bool) 
     let elem_child_count = children(element).len();
     if tag == "cell" && !elem_text.is_empty() && elem_child_count > 0 {
         // xml.py:288-290 — first <p>-child cell branch.
+        // llvm-cov:branch-not-reachable (`if let Some(first_child)` None side):
+        // this arm is guarded by `elem_child_count > 0` above, so
+        // `children(element).first()` is always Some here — only the
+        // `== Some("p")` second operand decides the branch.
         if let Some(first_child) = children(element).first()
             && local_name(first_child).as_deref() == Some("p")
         {
@@ -1937,6 +1955,11 @@ fn _handle_unwanted_tails(element: &NodeRef) {
         // xml.py:523-528 — new `<p>` sibling at index+1, with text=trimmed_tail.
         let new_sibling = dom::create_element("p");
         set_element_text(&new_sibling, Some(&trimmed));
+        // llvm-cov:branch-not-reachable (both let-chain None sides): the sole
+        // caller passes an `element` that is already attached to the tree at a
+        // known position, so `parent(element)` is always Some and `position_of`
+        // always finds it — neither None side can occur (faithful port of
+        // Python's `parent.insert(parent.index(element) + 1, ...)`).
         if let Some(p) = parent(element)
             && let Some(idx) = position_of(&p, element)
         {
@@ -1986,6 +2009,10 @@ fn _tei_handle_complex_head(element: &NodeRef) -> NodeRef {
                     dom::append_child(&new_element, &lb);
                 }
                 // xml.py:542 — `new_element[-1].tail = child.text`.
+                // llvm-cov:branch-not-reachable (None side): this block is entered
+                // only when `!kids.is_empty() || new_text.is_some()`, and an <lb>
+                // was just appended when `kids.is_empty()` — so `new_element` has
+                // at least one child here and `last()` is always Some.
                 if let Some(latest) = children(&new_element).last() {
                     set_tail(latest, Some(&child_text));
                 }
@@ -2148,6 +2175,10 @@ fn _move_element_one_level_up(element: &NodeRef) {
     let new_elem_tail = tail(&p)
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty());
+    // llvm-cov:branch-not-reachable (TRUE side): per the invariant documented
+    // above (output.rs:2140-2147), `element` was just spliced between `p` and any
+    // tail-text node, so `tail(&p)` is always None here and `new_elem_tail` is
+    // always None — the `is_some()` TRUE side cannot occur.
     if new_elem_tail.is_some() {
         set_tail(&p, None);
     }
@@ -2156,11 +2187,19 @@ fn _move_element_one_level_up(element: &NodeRef) {
     let has_kids = !children(&new_elem).is_empty();
     let has_text = element_text(&new_elem).is_some_and(|s| !s.is_empty());
     let has_tail = new_elem_tail.is_some();
+    // llvm-cov:branch-not-reachable (`|| has_tail` third-operand TRUE side):
+    // `new_elem_tail` is always None (the invariant above), so `has_tail` is
+    // always false — its TRUE side cannot occur.
     if has_kids || has_text || has_tail {
         // grand_parent.index(element) + 1.
+        // llvm-cov:branch-not-reachable (None side): `element` is a child of `gp`
+        // (it was spliced in earlier at output.rs:2100-2112), so `position_of`
+        // always finds it — the None side cannot occur.
         if let Some(idx) = position_of(&gp, element) {
             insert_child_at(&gp, &new_elem, idx + 1);
             // Now attached: apply the captured tail (xml.py:600 `new_elem.tail`).
+            // llvm-cov:branch-not-reachable (Some side): `new_elem_tail` is always
+            // None here (invariant above), so the Some(t) side cannot occur.
             if let Some(t) = new_elem_tail {
                 set_tail(&new_elem, Some(&t));
             }
@@ -2420,6 +2459,10 @@ fn check_tei(xmldoc: &NodeRef) -> &NodeRef {
         set_attribute(&ab, "type", "header");
 
         // xml.py:202-204 — `parent = elem.getparent(); if parent is None: continue`.
+        // llvm-cov:branch-not-reachable: `ab` is the freshly-renamed `<head>`,
+        // which `replace_element_tag` splices back into the original head's
+        // parent position — so it always has a parent here; the `None` (continue)
+        // side cannot occur (faithful port of `if parent is None: continue`).
         let Some(p) = parent(&ab) else { continue };
 
         // xml.py:205-208 — non-leaf head: complex-head conversion.
@@ -2435,6 +2478,9 @@ fn check_tei(xmldoc: &NodeRef) -> &NodeRef {
             let head_tail = tail(&ab).map(|t| t.trim().to_string());
             let new_elem = _tei_handle_complex_head(&ab);
             // parent.replace(elem, new_elem) — find ab in parent, swap.
+            // llvm-cov:branch-not-reachable (None side): `ab` is a child of `p`
+            // (we just read its parent above), so `position_of` always finds it —
+            // the None side cannot occur.
             if let Some(idx) = position_of(&p, &ab) {
                 dom::remove(&ab);
                 insert_child_at(&p, &new_elem, idx);

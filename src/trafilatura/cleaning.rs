@@ -565,6 +565,11 @@ pub fn convert_tags(tree: &NodeRef, options: &Options) {
                 // arm cannot fire.
                 _ => continue,
             };
+            // llvm-cov:branch-not-reachable: `candidates` is filtered to exactly
+            // `REND_TAG_NAMES` (settings_constants.rs:173-175), which is the key
+            // list of `REND_TAG_MAPPING`; `rend_of` looks each tag up in that same
+            // map, so it always returns Some here — the `else { continue }` (None)
+            // side cannot occur.
             let Some(rend) = rend_of(&tag) else { continue };
             // elem.attrib.clear() — drop the original attributes
             // (htmlprocessing.py:403). replace_element_tag clones attrs;
@@ -992,6 +997,11 @@ pub fn prune_unwanted_nodes(tree: &NodeRef, nodelist: &[&str], with_backup: bool
                 // subtree.getparent().
                 let prev = previous_element_sibling(&subtree).or_else(|| dom::parent(&subtree));
                 // htmlprocessing.py:108-110 — append tail to prev.tail.
+                // llvm-cov:branch-not-reachable: `subtree` is an XPath `.//`
+                // descendant match of `tree`, so it always has a parent; the
+                // `or_else(parent)` therefore makes `prev` always Some — the
+                // `None` side cannot occur (faithful port of Python's `if prev is
+                // not None` defensive guard).
                 if let Some(prev) = prev {
                     let old_tail = tail(&prev).unwrap_or_default();
                     let mut new_tail = old_tail;
@@ -1261,6 +1271,13 @@ pub fn delete_by_link_density(
             // Python's `dict.fromkeys(deletions)` dedups by identity (since
             // `_Element.__hash__` is identity-based). Rust: dedup by Rc
             // pointer identity.
+            // llvm-cov:branch-not-reachable: `candidates` is `[root-if-matching]`
+            // followed by `get_elements_by_tag_name` descendants — the root is
+            // never one of its own descendants and the collector yields each node
+            // once, so no element appears twice. The `.any()` is therefore always
+            // false here (push side); the duplicate-found side cannot occur. (The
+            // dedup mirrors Python's `dict.fromkeys`, which IS needed there because
+            // lxml's iter can re-yield, but our snapshot collection cannot.)
             if !deletions.iter().any(|e| std::rc::Rc::ptr_eq(e, &elem)) {
                 deletions.push(elem);
             }
@@ -1667,6 +1684,11 @@ pub fn sanitize_tree(tree: &NodeRef, options: &Options) -> (String, usize) {
         if tag.as_str() == "tr" {
             // external.py:176 — `elem.tag = 'row'`.
             let _ = replace_element_tag(&elem, "row");
+            // llvm-cov:branch-not-reachable (`|| tag == "th"` second-operand FALSE
+            // side): this loop iterates ONLY td/th/tr nodes; `tr` is handled by the
+            // `if` above, so reaching the `||` second operand means the first
+            // operand (`tag == "td"`) was false, which leaves only `th` — the
+            // second operand is therefore always true here.
         } else if tag.as_str() == "td" || tag.as_str() == "th" {
             // external.py:177-180 — th gets `role="head"`, then both
             // retag to `cell`. Order matters: set the attribute BEFORE
@@ -1687,6 +1709,10 @@ pub fn sanitize_tree(tree: &NodeRef, options: &Options) -> (String, usize) {
     // never an element with a non-TEI tag, so the divergence is moot).
     let mut bad_tags: Vec<String> = Vec::new();
     for elem in dom::get_elements_by_tag_name(tree, "*") {
+        // llvm-cov:branch-not-reachable (`if let Some(tag)` None side): the loop
+        // iterates `get_elements_by_tag_name(_, "*")` output, which contains ONLY
+        // Element nodes (dom.rs:1101-1104), and `local_name` returns Some for
+        // every Element — the None side cannot occur.
         if let Some(tag) = local_name(&elem)
             && !TEI_VALID_TAGS.contains(&tag.as_str())
             && !bad_tags.iter().any(|t| t == tag.as_str())
@@ -3416,6 +3442,301 @@ mod tests {
             head_cells.len(),
             1,
             "only the former <th> cell carries role=head"
+        );
+    }
+
+    // ===================================================================
+    // M13 Stage — final branch-coverage push (cleaning.rs)
+    // convert_link href guards; has_ancestor table-guard FALSE; convert_quotes
+    // single-non-span <pre>; link_density limitlen/multi-ref arms;
+    // delete_by_link_density backtracking; dedup arms; sanitize_tree links=true.
+    // ===================================================================
+
+    // ---- convert_link — href Option / empty-string guards ----
+
+    #[test]
+    fn convert_link_without_href_sets_no_target() {
+        // rationale: `htmlprocessing.py:371-378` — an `<a>` with NO href makes
+        // `target` None, so `if let Some(href) = target` takes its FALSE side
+        // (cleaning.rs:694) and the resulting <ref> carries no target.
+        let dom = parse(r#"<html><body><a>plain link text</a></body></html>"#);
+        let b = body(&dom);
+        let a = get_elements_by_tag_name(&b, "a")[0].clone();
+        convert_link(&a, Some("https://e.com"));
+        let refs = get_elements_by_tag_name(&b, "ref");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(
+            crate::readability::dom::get_attribute(&refs[0], "target"),
+            None,
+            "no href -> no target"
+        );
+    }
+
+    #[test]
+    fn convert_link_empty_href_sets_no_target() {
+        // rationale: `htmlprocessing.py:374` — an `<a href="">` makes `target`
+        // Some("") so the `&& !href.is_empty()` second operand takes its FALSE
+        // side (cleaning.rs:695); no target is written.
+        let dom = parse(r#"<html><body><a href="">empty href</a></body></html>"#);
+        let b = body(&dom);
+        let a = get_elements_by_tag_name(&b, "a")[0].clone();
+        convert_link(&a, Some("https://e.com"));
+        let refs = get_elements_by_tag_name(&b, "ref");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(
+            crate::readability::dom::get_attribute(&refs[0], "target"),
+            None,
+            "empty href -> no target"
+        );
+    }
+
+    // ---- has_ancestor_matching — table guard when tables=false ----
+
+    #[test]
+    fn has_ancestor_matching_table_ancestor_excluded_when_tables_false() {
+        // rationale: `htmlprocessing.py:387-388` — an `<a>` whose ONLY block
+        // ancestor is a `<table>` (no div/li/p) is NOT matched when allow_table
+        // is false: the `"table" if allow_table` guard takes its FALSE side
+        // (cleaning.rs:714) and the match falls through to the final `false`.
+        let dom = parse("<table><tr><td><a>x</a></td></tr></table>");
+        let b = body(&dom);
+        let a = get_elements_by_tag_name(&b, "a")[0].clone();
+        // td IS a block ancestor of <a>; to isolate the table guard we walk from
+        // a node whose only matching ancestor is the table itself. Use the <td>'s
+        // parent chain: the <td> would match div/li/p? No — td is none of those,
+        // so the only candidate is <table>. allow_table=false -> not matched.
+        assert!(
+            !has_ancestor_matching(&a, false),
+            "table ancestor not matched when allow_table=false"
+        );
+        // And WITH allow_table=true the same <a> IS matched (table guard TRUE).
+        assert!(
+            has_ancestor_matching(&a, true),
+            "table ancestor matched when allow_table=true"
+        );
+    }
+
+    // ---- convert_quotes — <pre> with single non-span child ----
+
+    #[test]
+    fn convert_quotes_pre_single_non_span_child_becomes_quote() {
+        // rationale: `htmlprocessing.py:309-311` — a `<pre>` whose single element
+        // child is NOT a `<span>` makes the `&& tag_name == Some("SPAN")` second
+        // operand take its FALSE side (cleaning.rs:806); with no hljs spans either,
+        // code_flag stays false and the `<pre>` becomes `<quote>` (not `<code>`).
+        let dom = parse("<div><pre><div>not a span</div></pre></div>");
+        let b = body(&dom);
+        let opts = Options::default();
+        convert_tags(&b, &opts);
+        assert!(
+            get_elements_by_tag_name(&b, "quote").len() == 1,
+            "single non-span child -> quote"
+        );
+        assert!(get_elements_by_tag_name(&b, "code").is_empty(), "not code");
+    }
+
+    // ---- link_density_test — multi-ref / limitlen / favor_precision arms ----
+
+    #[test]
+    fn link_density_test_single_link_favor_precision_threshold_10() {
+        // rationale: `htmlprocessing.py:142` — with favor_precision=true the
+        // single-link threshold is 10 (the `if favor_precision { 10 }` TRUE side,
+        // cleaning.rs:1119/1124). A 12-char link that IS the whole element text
+        // (>10 AND >90%) trips the shortcut.
+        let dom = parse("<p><ref>twelve charsX</ref></p>");
+        let b = body(&dom);
+        let p = get_elements_by_tag_name(&b, "p")[0].clone();
+        let text = trim(&text_content(&p));
+        let (hit, _) = link_density_test(&p, &text, true);
+        assert!(hit, "favor_precision single-link shortcut fires at threshold 10");
+    }
+
+    #[test]
+    fn link_density_test_single_link_not_dominant_falls_through() {
+        // rationale: `htmlprocessing.py:143` — a single long link (>100 chars) that
+        // is NOT > 90% of element text makes the `&& link_text_len > text_len*0.9`
+        // second operand take its FALSE side (cleaning.rs:1124), so the shortcut
+        // does not fire; the function continues to the limitlen path.
+        let link = "a".repeat(110);
+        let filler = "b".repeat(400); // pushes link below 90% of total text
+        let dom = parse(&format!("<p><ref>{link}</ref>{filler}</p>"));
+        let b = body(&dom);
+        let p = get_elements_by_tag_name(&b, "p")[0].clone();
+        let text = trim(&text_content(&p));
+        let (hit, _) = link_density_test(&p, &text, false);
+        // elemlen ~510 >= limitlen (300/100) so the short-element check is skipped
+        // and the shortcut did not fire -> not link-heavy.
+        assert!(!hit, "single non-dominant link is not flagged");
+    }
+
+    #[test]
+    fn link_density_test_non_p_no_next_sibling_limitlen_300() {
+        // rationale: `htmlprocessing.py:148-150` — a NON-`p` element (div) with NO
+        // next sibling uses limitlen 300 (the `else if !has_next { 300 }` TRUE
+        // side, cleaning.rs:1134). Two short refs whose link text exceeds 80% of
+        // the (short) element text flag it as link-heavy.
+        let dom = parse("<section><div><ref>aa</ref><ref>bb</ref></div></section>");
+        let b = body(&dom);
+        let div = get_elements_by_tag_name(&b, "div")[0].clone();
+        assert!(dom::next_element_sibling(&div).is_none(), "div has no next sibling");
+        let text = trim(&text_content(&div));
+        let (hit, _) = link_density_test(&div, &text, false);
+        assert!(hit, "non-p no-sibling short element with dominant links is flagged");
+    }
+
+    #[test]
+    fn link_density_test_all_empty_refs_returns_true() {
+        // rationale: `htmlprocessing.py:160-161` — when every `<ref>` has empty
+        // trimmed text, collect_link_info reports elemnum 0, so `if elemnum == 0`
+        // takes its TRUE side (cleaning.rs:1145) and the element is flagged (true,
+        // mylist). The two empty refs make the element pass the short-element gate.
+        let dom = parse("<div><ref></ref><ref></ref>tiny</div>");
+        let b = body(&dom);
+        let div = get_elements_by_tag_name(&b, "div")[0].clone();
+        let text = trim(&text_content(&div));
+        let (hit, _) = link_density_test(&div, &text, false);
+        assert!(hit, "all-empty refs -> elemnum 0 -> flagged");
+    }
+
+    // ---- link_density_test_tables — large-table 50% threshold ----
+
+    #[test]
+    fn link_density_test_tables_large_table_uses_50_percent_threshold() {
+        // rationale: `htmlprocessing.py:188` — a table with >= 1000 chars uses the
+        // 50% threshold (the `if elemlen < 1000` FALSE side, cleaning.rs:1187).
+        // Link text is ~55% of total here: below 80% (would fail a small table)
+        // but above 50% (flags a large one).
+        let link = "x".repeat(600);
+        let filler = "y".repeat(500); // total ~1100; link ~55%
+        let html = format!("<table><tr><td><ref>{link}</ref>{filler}</td></tr></table>");
+        let dom = parse(&html);
+        let b = body(&dom);
+        let tbl = get_elements_by_tag_name(&b, "table")[0].clone();
+        assert!(
+            link_density_test_tables(&tbl),
+            "large table flagged at 50% link density"
+        );
+    }
+
+    // ---- delete_by_link_density — backtracking path ----
+    //
+    // NOTE: a `delete_by_link_density_backtracking_*` test was drafted by an
+    // interrupted agent but its precondition was wrong (the 3 short <ref>
+    // children trip link_density_test's `shortelems/elemnum > 0.8` clause, so
+    // `result` is TRUE, not FALSE). Removed rather than committed broken; the
+    // backtracking-deletion branch (cleaning.rs ~1256-1264) remains a known
+    // residual to revisit with llvm-cov-in-the-loop. (Lead-agent cleanup of
+    // the API-interrupted Wave-4-final trafilatura run.)
+
+    // ---- handle_textnode / process_node — dedup arm (options.dedup TRUE) ----
+
+    #[test]
+    fn handle_textnode_finish_dedup_drops_repeated_text() {
+        // rationale: `htmlprocessing.py:259-264` final filter — with options.dedup
+        // true, the `options.dedup() && duplicate_test` second operand is reached
+        // (cleaning.rs:1444) and, on the THIRD sight of the same >min_duplcheck_size
+        // text, duplicate_test returns true so handle_textnode returns None
+        // (dedup_hit TRUE, cleaning.rs:1445). A unique text keeps the LRU key
+        // isolated from other tests.
+        let opts = Options {
+            dedup: true,
+            min_duplcheck_size: 100,
+            max_repetitions: 1,
+            ..Default::default()
+        };
+        let unique = format!("handle-textnode-dedup-marker {}", "w ".repeat(80));
+        for _ in 0..2 {
+            let dom = parse(&format!("<p>{unique}</p>"));
+            let b = body(&dom);
+            let p = get_elements_by_tag_name(&b, "p")[0].clone();
+            let _ = handle_textnode(&p, &opts, true, false);
+        }
+        // Third sighting: count exceeds max_repetitions (1) -> duplicate.
+        let dom = parse(&format!("<p>{unique}</p>"));
+        let b = body(&dom);
+        let p = get_elements_by_tag_name(&b, "p")[0].clone();
+        assert!(
+            handle_textnode(&p, &opts, true, false).is_none(),
+            "repeated text dropped by dedup"
+        );
+    }
+
+    #[test]
+    fn process_node_dedup_drops_repeated_text() {
+        // rationale: `htmlprocessing.py:281-283` — same dedup arm in process_node:
+        // the `options.dedup() && duplicate_test` second operand (cleaning.rs:1519)
+        // and the `dedup_hit` operand of the final filter (cleaning.rs:1520) take
+        // their TRUE sides on the third sighting of the same long text.
+        let opts = Options {
+            dedup: true,
+            min_duplcheck_size: 100,
+            max_repetitions: 1,
+            ..Default::default()
+        };
+        let unique = format!("process-node-dedup-marker {}", "q ".repeat(80));
+        for _ in 0..2 {
+            let dom = parse(&format!("<p>{unique}</p>"));
+            let b = body(&dom);
+            let p = get_elements_by_tag_name(&b, "p")[0].clone();
+            let _ = process_node(&p, &opts);
+        }
+        let dom = parse(&format!("<p>{unique}</p>"));
+        let b = body(&dom);
+        let p = get_elements_by_tag_name(&b, "p")[0].clone();
+        assert!(
+            process_node(&p, &opts).is_none(),
+            "repeated text dropped by dedup in process_node"
+        );
+    }
+
+    // ---- delete_elements_by_tag — detached nested same-tag element ----
+
+    #[test]
+    fn tree_cleaning_nested_same_tag_detach_path() {
+        // rationale: `htmlprocessing.py:75-78` / Stage-1b lxml iter-while-mutating
+        // parity — a `<nav>` nested inside another `<nav>` makes the inner match
+        // detach after the outer is deleted, so `is_reachable_from` returns false
+        // for the inner node (cleaning.rs:352 FALSE side) and the loop does the
+        // defensive remove + break. Both navs end up gone.
+        let dom = parse("<div><nav>outer<nav>inner</nav></nav><p>keep</p></div>");
+        let b = body(&dom);
+        tree_cleaning(&b, &Options::default());
+        let div = get_elements_by_tag_name(&b, "div")[0].clone();
+        assert!(get_elements_by_tag_name(&div, "nav").is_empty(), "all navs removed");
+        assert_eq!(get_elements_by_tag_name(&div, "p").len(), 1, "p preserved");
+    }
+
+    // ---- sanitize_tree — links=true keeps anchors out of the strip pass ----
+
+    #[test]
+    fn sanitize_tree_links_true_skips_anchor_strip() {
+        // rationale: `external.py:167-168` — with options.links=true the
+        // `if !options.links` guard takes its FALSE side (cleaning.rs:1645), so the
+        // `strip_tags(_, "a")` pass is skipped and convert_tags' links=true branch
+        // converts `<a>` to `<ref target=...>` instead.
+        let dom = parse(r#"<html><body><div><a href="https://e.com/x">link</a> text</div></body></html>"#);
+        let b = body(&dom);
+        let opts = Options { links: true, ..Default::default() };
+        let _ = sanitize_tree(&b, &opts);
+        // No bare <a> survives (converted to <ref>), and a <ref> with target exists.
+        assert!(get_elements_by_tag_name(&b, "a").is_empty(), "no bare <a>");
+    }
+
+    // ---- sanitize_tree — duplicate non-TEI bad tag dedup FALSE side ----
+
+    #[test]
+    fn sanitize_tree_duplicate_bad_tag_collected_once() {
+        // rationale: `external.py:182-187` — two elements sharing the SAME non-TEI
+        // tag make the `!bad_tags.iter().any(...)` guard take its FALSE side
+        // (cleaning.rs:1692) on the second occurrence, so the tag is collected only
+        // once. Both wrappers are stripped; their text survives.
+        let dom = parse("<body><section>one</section><section>two</section></body>");
+        let b = body(&dom);
+        let opts = Options::default();
+        let _ = sanitize_tree(&b, &opts);
+        assert!(
+            get_elements_by_tag_name(&b, "section").is_empty(),
+            "duplicate non-TEI <section> tags stripped"
         );
     }
 }

@@ -587,6 +587,11 @@ pub fn select_candidate(
     // core.py:378-382 — extract year from each pattern via yearpat.
     let mut years: Vec<String> = Vec::new();
     for p in &patterns {
+        // llvm-cov:branch-not-reachable: the `c.get(1)` None arm is dead —
+        // every `yearpat` consumed here (YEAR_PATTERN / *_YEAR) wraps its
+        // 4-digit body in capture group 1, so a successful `captures` always
+        // exposes group 1 (mirrors Python `year_match[1]` at core.py:382,
+        // which assumes the group exists).
         if let Some(c) = yearpat.captures(p)
             && let Some(g) = c.get(1)
         {
@@ -596,6 +601,10 @@ pub fn select_candidate(
     if years.len() < 2 {
         // Python zips assume both arms have 2 entries; if not, fall through
         // to the "any(validation)" branch defensively.
+        // llvm-cov:branch-not-reachable: the `first.parse::<i32>()` Err arm is
+        // dead — `first` is a `yearpat`-captured 4-ASCII-digit year string, so
+        // the parse to i32 always succeeds (mirrors Python `int(year)` at
+        // core.py:386, which never guards the conversion).
         if let Some(first) = years.first()
             && let Ok(y) = first.parse::<i32>()
         {
@@ -995,6 +1004,14 @@ pub fn search_page(htmlstring: &str, options: &Extractor) -> Option<String> {
         year_pattern(),
         options,
     );
+    // llvm-cov:branch-not-reachable (two dead arms below):
+    // - `s.parse::<i32>()` Err: `s` is the YEAR_PATTERN catch substring (a
+    //   4-ASCII-digit year), so the parse always succeeds (Python `int(
+    //   bestmatch[0])` at core.py:600 is likewise unguarded).
+    // - the `is_valid_date(...)` FALSE side: `bestmatch` came from
+    //   `search_pattern` → `plausible_year_filter`, which already dropped any
+    //   year outside (min, max) using the SAME `is_valid_date(datetime(year,
+    //   1,1), "%Y", ...)` check, so re-validating here is always true.
     if let Some(s) = bestmatch
         && let Ok(year) = s.parse::<i32>()
     {
@@ -1042,6 +1059,12 @@ pub fn search_page(htmlstring: &str, options: &Extractor) -> Option<String> {
     // core.py:639-645 — replace each candidate with normalize_match output.
     let mut replacement: HashMap<String, usize> = HashMap::new();
     for (item, count) in &candidates {
+        // llvm-cov:branch-not-reachable: the `captures` None arm is dead —
+        // every `item` here was produced by `plausible_year_filter(
+        // SELECT_YMD_PATTERN, ...)`, whose body is a superset of
+        // THREE_COMP_REGEX_A's `(DAY)[/.-](MONTH)[/.-](YEAR)`, so the
+        // re-parse always matches (mirrors Python core.py:642's unguarded
+        // `THREE_COMP_REGEX_A.match(item)` → `normalize_match(match)`).
         if let Some(caps) = three_comp_regex_a().captures(item) {
             // THREE_COMP_REGEX_A groups: (day, month, year) per
             // extractors.py:183. Python `match.groups()` includes ALL groups;
@@ -1050,6 +1073,13 @@ pub fn search_page(htmlstring: &str, options: &Extractor) -> Option<String> {
             let day = caps.get(1).map(|m| m.as_str()).unwrap_or("");
             let month = caps.get(2).map(|m| m.as_str()).unwrap_or("");
             let year = caps.get(3).map(|m| m.as_str()).unwrap_or("");
+            // llvm-cov:branch-not-reachable: the three `is_empty()` FALSE-side
+            // guards are dead — THREE_COMP_REGEX_A's three groups are all
+            // mandatory (`DAY`/`MONTH`/`YEAR`, no `?`-optional wrapper), so a
+            // successful match fills all three with non-empty text. The guard
+            // mirrors Python's `if g` truthiness filter (core.py via
+            // normalize_match's `match.groups()`), which can't drop a
+            // mandatory group.
             if !day.is_empty() && !month.is_empty() && !year.is_empty() {
                 let key = normalize_match(day, month, year);
                 replacement.insert(key, *count);
@@ -1118,9 +1148,21 @@ pub fn search_page(htmlstring: &str, options: &Extractor) -> Option<String> {
         // groups; `if g` filters None entries. The Rust port iterates
         // captures and takes the first three non-empty groups in declaration
         // order, mirroring Python's filter-by-truthiness.
+        // llvm-cov:branch-not-reachable: the `captures` None arm is dead —
+        // every `item` came from `plausible_year_filter(SLASHES_PATTERN, ...)`,
+        // whose body is a superset of THREE_COMP_REGEX_B's two `(D)sep(M)sep(yy)`
+        // alternatives, so the re-parse always matches (mirrors Python
+        // core.py:692's unguarded `THREE_COMP_REGEX_B.match(item)`).
         if let Some(caps) = three_comp_regex_b().captures(item) {
             let mut parts: Vec<&str> = Vec::new();
             for i in 1..caps.len() {
+                // llvm-cov:branch-not-reachable: the `!is_empty()` FALSE side
+                // is dead — whenever `caps.get(i)` is Some, that group is one
+                // of THREE_COMP_REGEX_B's mandatory `[0-9]{...}` captures, so
+                // its matched slice is always non-empty (mirrors Python's
+                // `filter(None, match.groups())` belt-and-braces at the
+                // normalize_match call site, which only drops the None groups
+                // — already handled by the `caps.get(i)` is-Some test).
                 if let Some(m) = caps.get(i)
                     && !m.as_str().is_empty()
                 {
@@ -1130,6 +1172,12 @@ pub fn search_page(htmlstring: &str, options: &Extractor) -> Option<String> {
                     }
                 }
             }
+            // llvm-cov:branch-not-reachable: the `parts.len() == 3` FALSE side
+            // is dead — exactly one of THREE_COMP_REGEX_B's two alternatives
+            // matches, each contributing its three mandatory `[0-9]{...}`
+            // groups, so the non-empty walk above always collects precisely 3
+            // parts (mirrors Python core.py:692-693 feeding all three groups
+            // straight into normalize_match without a length guard).
             if parts.len() == 3 {
                 let key = normalize_match(parts[0], parts[1], parts[2]);
                 replacement.insert(key, *count);
@@ -1163,12 +1211,22 @@ pub fn search_page(htmlstring: &str, options: &Extractor) -> Option<String> {
         year_pattern(),
         options,
     );
+    // llvm-cov:branch-not-reachable: the `yyyymm_catch().captures(s)` None
+    // arm is dead — `s` is the substring `select_candidate` produced by
+    // running this very `YYYYMM_CATCH` regex (passed as the `catch` argument
+    // through `search_pattern`), so re-matching it always succeeds (Python
+    // core.py:719-720 indexes `bestmatch[1]`/`[2]` without re-checking).
     if let Some(s) = bestmatch.as_deref()
         && let Some(caps) = yyyymm_catch().captures(s)
     {
         // YYYYMM_CATCH groups: (year, month). Python `bestmatch[1]`/`[2]`.
         let year: i32 = caps.get(1).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
         let month: u32 = caps.get(2).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+        // llvm-cov:branch-not-reachable: the `make_date(...)` None arm is dead
+        // — YYYYMM_CATCH's month group is `(0[1-9]|1[0-2])` (always 1..=12) and
+        // the day is the literal 1, so `make_date(year, month, 1)` always
+        // yields a valid calendar date (Python core.py:720 builds
+        // `datetime(int(bestmatch[1]), int(bestmatch[2]), 1)` unguarded).
         if let Some(dt) = make_date(year, month, 1)
             && (copyear == 0 || dt.year >= copyear)
         {
@@ -1195,6 +1253,14 @@ pub fn search_page(htmlstring: &str, options: &Extractor) -> Option<String> {
     for (item, count) in &candidates {
         // TWO_COMP_REGEX: (month, year). Python builds `"-".join([year,
         // zfilled_month, "01"])` per core.py:746-751.
+        // llvm-cov:branch-not-reachable (two dead arms):
+        // - the `two_comp_regex().captures(item)` None arm: every `item` came
+        //   from `plausible_year_filter(MMYYYY_PATTERN, ...)`, whose body is a
+        //   superset of TWO_COMP_REGEX's `(MONTH)[/.-](YEAR)`, so the re-parse
+        //   always matches (Python core.py:746 `TWO_COMP_REGEX.match(item)` is
+        //   unguarded);
+        // - the `(Some, Some)` else arm: TWO_COMP_REGEX's two groups are both
+        //   mandatory, so a successful match exposes both.
         if let Some(caps) = two_comp_regex().captures(item)
             && let (Some(month_m), Some(year_m)) = (caps.get(1), caps.get(2))
         {
@@ -1247,6 +1313,15 @@ pub fn search_page(htmlstring: &str, options: &Extractor) -> Option<String> {
         // Python: `dateobject.strftime(options.format)`. Use validate_and_convert
         // for format emission — copyear was already validated by is_valid_date.
         let di = DateInput::DateTime(dt);
+        // llvm-cov:branch-not-reachable: the `validate_and_convert` None arm is
+        // dead — `copyear` was only set after `is_valid_date(datetime(copyear,
+        // 1, 1), "%Y", min, max)` (the COPYRIGHT arm above) succeeded, and that
+        // check already compares the FULL `copyear-01-01` timestamp against the
+        // (min, max) window. `validate_and_convert` re-runs the identical
+        // window check on the identical date, plus an `options.format` emit
+        // that `find_date`'s outputformat gate (core.rs:1389) guarantees valid
+        // — so it always returns Some. (Python core.py:780-781 just does
+        // `datetime(copyear,1,1).strftime(options.format)`, unconditionally.)
         if let Some(r) = validate_and_convert(Some(&di), &options.format, &min, &max) {
             return Some(r);
         }
@@ -1261,6 +1336,9 @@ pub fn search_page(htmlstring: &str, options: &Extractor) -> Option<String> {
     // feeding plausible_year_filter / select_candidate.
     let mut occurrences: HashMap<String, usize> = HashMap::new();
     for caps in simple_pattern().captures_iter(htmlstring) {
+        // llvm-cov:branch-not-reachable: `caps.get(0)` (the whole match) is
+        // always Some for any successful `captures_iter` item, so the None arm
+        // never runs (the guard exists only to obtain `m0.start()` safely).
         if let Some(m0) = caps.get(0) {
             // The lookbehind in Python sits BEFORE the `\D` byte at
             // simple_pattern's start: `(?<!w3.org)\D({YEAR_RE})\D`. The
@@ -1270,6 +1348,10 @@ pub fn search_page(htmlstring: &str, options: &Extractor) -> Option<String> {
                 continue;
             }
         }
+        // llvm-cov:branch-not-reachable: SIMPLE_PATTERN is `\D({YEAR_RE})\D`
+        // with a single mandatory capture group, so group 1 is always present
+        // on a match — the None arm is dead (Python core.py reads the year
+        // group without guarding).
         if let Some(g1) = caps.get(1) {
             *occurrences.entry(g1.as_str().to_string()).or_insert(0) += 1;
         }
@@ -1280,6 +1362,13 @@ pub fn search_page(htmlstring: &str, options: &Extractor) -> Option<String> {
     // 4-digit candidates.
     let keys: Vec<String> = occurrences.keys().cloned().collect();
     for k in keys {
+        // llvm-cov:branch-not-reachable (the `else` removal arm is reachable,
+        // but the two trailing operands below are dead): each `k` was inserted
+        // from SIMPLE_PATTERN's YEAR_RE group, which is byte-identical to
+        // YEAR_PATTERN's body, so `year_pattern().captures(&k)` always matches,
+        // its group 1 is always present, and the 4-ASCII-digit year always
+        // parses to i32. Only the leading `captures` Some-side and the inner
+        // window comparison vary at runtime.
         if let Some(caps) = year_pattern().captures(&k)
             && let Some(g) = caps.get(1)
             && let Ok(y) = g.as_str().parse::<i32>()
@@ -1291,6 +1380,15 @@ pub fn search_page(htmlstring: &str, options: &Extractor) -> Option<String> {
             occurrences.remove(&k);
         }
     }
+    // llvm-cov:branch-not-reachable (the chained operands after the leading
+    // `select_candidate` are dead): `bestmatch` is the substring
+    // `select_candidate` produced via YEAR_PATTERN (the `catch` argument), so
+    // `year_pattern().captures(&bestmatch)` always re-matches, group 1 is
+    // always present, the 4-digit year always parses, and `make_date(year, 1,
+    // 1)` (month/day literal 1) always yields a valid date. Additionally, the
+    // `year >= copyear` FALSE side is dead at this site: this SIMPLE arm is
+    // only reached when copyear == 0 (a non-zero copyear returns at the
+    // copyright catchall above, core.rs §9), so `year >= 0` always holds.
     if let Some(bestmatch) = select_candidate(&occurrences, year_pattern(), year_pattern(), options)
         && let Some(caps) = year_pattern().captures(&bestmatch)
         && let Some(year_m) = caps.get(1)
@@ -1303,6 +1401,13 @@ pub fn search_page(htmlstring: &str, options: &Extractor) -> Option<String> {
         let di = DateInput::Str(&synth);
         if is_valid_date(Some(&di), "%Y-%m-%d", &min, &max) {
             let di2 = DateInput::DateTime(dt);
+            // llvm-cov:branch-not-reachable: the `validate_and_convert` None
+            // arm is dead — the synthesised `year-01-01` just passed the
+            // identical (min, max) timestamp window via `is_valid_date` on the
+            // line above, and `options.format` is gated valid by `find_date`'s
+            // outputformat check (core.rs:1389), so the conversion always
+            // emits Some (Python core.py:803 does `dateobject.strftime(
+            // options.format)` unconditionally).
             if let Some(r) = validate_and_convert(Some(&di2), &options.format, &min, &max) {
                 return Some(r);
             }
@@ -2653,6 +2758,121 @@ mod tests {
         assert_eq!(examine_header(&root, &o), None);
     }
 
+    /// rationale: pin `examine_header`'s `property=` assignment-condition
+    /// `!options.original` FALSE side (core.rs:442 last `&&` operand) — a
+    /// PROPERTY_MODIFIED marker read under `original=true` makes `is_mod`
+    /// true but `!options.original` false, so the right disjunct is false and
+    /// the whole condition fails → the parsed date is stashed as `reserve`,
+    /// not headerdate (core.py:294-298). With no publication date present, the
+    /// reserve surfaces as the final result.
+    #[test]
+    fn examine_header_property_modified_under_original_goes_to_reserve() {
+        let html = r#"<html><head>
+            <meta property="article:modified_time" content="2024-06-15">
+        </head><body></body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        // original=true: is_date=false, is_mod=true → (false&&true)||(true&&false)
+        // = false → reserve path; reserve surfaces because headerdate stays None.
+        let o = opts_orig("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(examine_header(&root, &o).as_deref(), Some("2024-06-15"));
+    }
+
+    /// rationale: pin `examine_header`'s itemprop assignment-condition
+    /// `!options.original` FALSE side (core.rs:463 last `&&` operand) — an
+    /// ITEMPROP_ATTRS_MODIFIED marker (`dateModified`) read under
+    /// `original=true` makes `is_mod` true but `!options.original` false, so
+    /// neither disjunct holds and the parsed date is dropped (Python's "put on
+    /// hold" else, core.py:312-314) → headerdate stays None.
+    #[test]
+    fn examine_header_itemprop_modified_under_original_dropped() {
+        let html = r#"<html><head>
+            <meta itemprop="dateModified" content="2024-06-15">
+        </head><body></body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        // original=true: is_orig=false, is_mod=true → (false&&true)||(true&&false)
+        // = false → dropped (no itemprop reserve fallback) → None.
+        let o = opts_orig("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(examine_header(&root, &o), None);
+    }
+
+    /// rationale: pin `examine_header`'s copyrightyear `let Some(content)`
+    /// FALSE side (core.rs:472 `&&` second operand) — an
+    /// `itemprop="copyrightYear"` meta that carries ONLY a `datetime`
+    /// attribute (so it passes the content-or-datetime safeguard) but NO
+    /// `content` attribute leaves `content_ref` None, so the synthesised
+    /// "<year>-01-01" path is skipped (core.py:316-318 reads `elem.get(
+    /// "content")`) → headerdate stays None.
+    #[test]
+    fn examine_header_copyrightyear_without_content_attr_skipped() {
+        let html = r#"<html><head>
+            <meta itemprop="copyrightYear" datetime="2020">
+        </head><body></body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        // datetime present (safeguard passes) but no content → content_ref None
+        // → copyrightyear branch's `let Some(content)` is false → None.
+        let o = opts_orig("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(examine_header(&root, &o), None);
+    }
+
+    /// rationale: pin `examine_header`'s `http-equiv` `attribute ==
+    /// "last-modified"` FALSE side (core.rs:496) — an `http-equiv` value that
+    /// is neither "date" nor "last-modified" (e.g. "content-type") falls
+    /// through both arms of the http-equiv branch with no assignment
+    /// (core.py:330-343) → headerdate stays None.
+    #[test]
+    fn examine_header_http_equiv_unrelated_value_skipped() {
+        let html = r#"<html><head>
+            <meta http-equiv="content-type" content="2024-06-15">
+        </head><body></body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        // "content-type" != "date" and != "last-modified" → both arms skipped.
+        let o = opts_orig("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(examine_header(&root, &o), None);
+    }
+
+    /// rationale: pin `examine_header`'s itemprop `attribute ==
+    /// "copyrightyear"` FALSE side (core.rs:471) — an `itemprop` value that is
+    /// NOT in ITEMPROP_ATTRS and NOT "copyrightyear" (e.g. "author") reaches
+    /// the copyrightyear `else if` with a false guard, so neither itemprop arm
+    /// fires and headerdate stays None (core.py:300-323).
+    #[test]
+    fn examine_header_itemprop_unrelated_value_skipped() {
+        let html = r#"<html><head>
+            <meta itemprop="author" content="2024-06-15">
+        </head><body></body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        // "author" is neither in ITEMPROP_ATTRS nor == "copyrightyear" → the
+        // `else if attribute == "copyrightyear"` guard is false → None.
+        let o = opts_orig("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(examine_header(&root, &o), None);
+    }
+
+    /// rationale: pin `examine_header`'s `http-equiv` branch
+    /// `let Some(httpeq_raw)` FALSE side (core.rs:488) — a `<meta>` that
+    /// reaches the final `else if` of the dispatch cascade (no name/property/
+    /// itemprop/pubdate) but carries NO `http-equiv` attribute (only an
+    /// unrecognised attribute plus content) fails the `get_attribute(
+    /// "http-equiv")` guard, so the cascade ends with no assignment
+    /// (core.py:330) → headerdate stays None.
+    #[test]
+    fn examine_header_meta_reaches_http_equiv_branch_without_attr() {
+        let html = r#"<html><head>
+            <meta data-custom="x" content="2024-06-15">
+        </head><body></body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        // `data-custom` is none of name/property/itemprop/pubdate/http-equiv,
+        // so the cascade reaches the http-equiv `else if` whose
+        // `get_attribute("http-equiv")` is None → loop body does nothing.
+        let o = opts_orig("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(examine_header(&root, &o), None);
+    }
+
     /// rationale: pin `examine_header`'s meta-safeguard second-operand
     /// (core.rs:407 `!has_datetime` FALSE side) — a meta carrying ONLY a
     /// `datetime` attribute (NO `content`) passes the
@@ -3214,4 +3434,525 @@ mod tests {
         let r = examine_date_elements(&root, ".//span", &o);
         assert_eq!(r.as_deref(), Some("2024-06-15"));
     }
+
+    // -----------------------------------------------------------------------
+    // Over-MAX_POSSIBLE_CANDIDATES early-return arms (core.py:218 / :447 / :504)
+    // -----------------------------------------------------------------------
+
+    /// rationale: pin `examine_date_elements`'s `elements.len() >
+    /// MAX_POSSIBLE_CANDIDATES` TRUE side (core.rs:346 — `elements.len() >
+    /// MAX_POSSIBLE_CANDIDATES` → early None). Python core.py:218 bails when
+    /// `len(elements) > MAX_POSSIBLE_CANDIDATES` (= 1000). With >1000 matching
+    /// `<span>` elements the over-capacity guard fires and returns None even
+    /// though some carry dates.
+    #[test]
+    fn examine_date_elements_over_max_candidates_returns_none() {
+        let mut body = String::from("<html><body>");
+        for _ in 0..(MAX_POSSIBLE_CANDIDATES + 1) {
+            body.push_str("<span>2024-06-15</span>");
+        }
+        body.push_str("</body></html>");
+        let dom = Dom::parse(&body);
+        let root = dom.root_element().expect("html");
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(examine_date_elements(&root, ".//span", &o), None);
+    }
+
+    /// rationale: pin `examine_abbr_elements`'s `elements.len() >=
+    /// MAX_POSSIBLE_CANDIDATES` TRUE side (core.rs:713 — over-capacity guard
+    /// → early None). Python core.py:447 bails when `len(elements) >=
+    /// MAX_POSSIBLE_CANDIDATES` (= 1000).
+    #[test]
+    fn examine_abbr_elements_over_max_candidates_returns_none() {
+        let mut body = String::from("<html><body>");
+        for _ in 0..MAX_POSSIBLE_CANDIDATES {
+            body.push_str(r#"<abbr class="published" title="2024-06-15">x</abbr>"#);
+        }
+        body.push_str("</body></html>");
+        let dom = Dom::parse(&body);
+        let root = dom.root_element().expect("html");
+        let o = opts_orig("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(examine_abbr_elements(&root, &o), None);
+    }
+
+    /// rationale: pin `examine_time_elements`'s `elements.len() >=
+    /// MAX_POSSIBLE_CANDIDATES` TRUE side (core.rs:804 — over-capacity guard
+    /// → early None). Python core.py:504 bails when `len(elements) >=
+    /// MAX_POSSIBLE_CANDIDATES` (= 1000).
+    #[test]
+    fn examine_time_elements_over_max_candidates_returns_none() {
+        let mut body = String::from("<html><body>");
+        for _ in 0..MAX_POSSIBLE_CANDIDATES {
+            body.push_str(r#"<time datetime="2024-06-15T10:00:00">x</time>"#);
+        }
+        body.push_str("</body></html>");
+        let dom = Dom::parse(&body);
+        let root = dom.root_element().expect("html");
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(examine_time_elements(&root, &o), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // select_candidate — years.len()<2 recovery negative arms (core.py:378-389)
+    // -----------------------------------------------------------------------
+
+    /// rationale: pin `select_candidate`'s years-empty recovery arm
+    /// (core.rs:599 `years.first()` FALSE side — `years` is empty). When NEITHER
+    /// of the top-2 candidate strings yields a `yearpat` capture, `years` is
+    /// empty (len 0 < 2), the `if let Some(first)` guard is false, and the
+    /// function returns None (mirrors Python's `zip(*bestones)` producing no
+    /// years to validate).
+    #[test]
+    fn select_candidate_no_years_captured_returns_none() {
+        use super::super::regex_catalogues::{year_pattern, ymd_pattern};
+        let mut m = HashMap::new();
+        // Neither key contains a yearpat-matchable 4-digit year (1990-2039),
+        // so `years` ends up empty.
+        m.insert(" no-year-alpha ".to_string(), 2usize);
+        m.insert(" no-year-beta ".to_string(), 1usize);
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(select_candidate(&m, ymd_pattern(), year_pattern(), &o), None);
+    }
+
+    /// rationale: pin `select_candidate`'s one-year recovery `is_valid_date`
+    /// FALSE side (core.rs:606) — exactly one of the top-2 candidates yields a
+    /// year, but that year falls outside the (min, max) window, so the recovery
+    /// arm rejects it and returns None.
+    #[test]
+    fn select_candidate_one_year_out_of_window_returns_none() {
+        use super::super::regex_catalogues::{year_pattern, ymd_pattern};
+        let mut m = HashMap::new();
+        // "2038" matches year_pattern (20[0-3][0-9]) but exceeds max 2030;
+        // the other key has no year. years.len()==1 → recovery → is_valid_date
+        // false → None.
+        m.insert(" 2038-06-15 ".to_string(), 2usize);
+        m.insert(" no-year-here ".to_string(), 1usize);
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(select_candidate(&m, ymd_pattern(), year_pattern(), &o), None);
+    }
+
+    /// rationale: pin `select_candidate`'s "both valid, equal years" arm
+    /// (core.rs:633 `years[1] != years[0]` FALSE side) — when the two top
+    /// candidates carry the SAME year but DIFFERENT strings with unequal
+    /// counts, the `years[1] != years[0]` first operand is false, so the
+    /// `else if` fails and patterns[0] is taken (core.py:397 `years[1] !=
+    /// years[0]`).
+    #[test]
+    fn select_candidate_same_year_different_strings_takes_first() {
+        use super::super::regex_catalogues::{year_pattern, ymd_pattern};
+        let mut m = HashMap::new();
+        // Same year 2024, different day → years[0]==years[1], counts differ
+        // (3 vs 1) so we reach the elif whose first operand (years differ) is
+        // false → else → patterns[0].
+        m.insert(" 2024-06-15 ".to_string(), 3usize);
+        m.insert(" 2024-03-10 ".to_string(), 1usize);
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        let r = select_candidate(&m, ymd_pattern(), year_pattern(), &o);
+        // original=false → reverse sort → "2024-06-15" (lex larger) is
+        // patterns[0]; equal-year else branch returns it.
+        assert!(r.as_deref().unwrap().contains("2024-06-15"));
+    }
+
+    // -----------------------------------------------------------------------
+    // search_page — copyright validation + regex_parse copyear-gate arms
+    // -----------------------------------------------------------------------
+
+    /// rationale: pin `search_page`'s COPYRIGHT_PATTERN `is_valid_date` FALSE
+    /// side (core.rs:1004) — a copyright year that `year_pattern` DOES match
+    /// (1990-2039) but that lies OUTSIDE the (min, max) window, so copyear
+    /// stays 0 (core.py:601-605). Here © 2024 with min=2025 fails the year
+    /// validation; no other date present → None.
+    #[test]
+    fn search_page_copyright_year_above_window_not_set() {
+        // © 2024 matches year_pattern but is below min 2025 → is_valid_date
+        // false → copyear stays 0. Bare 2024 elsewhere is likewise out of
+        // window, so every arm misses → None.
+        let html = "<html><body><footer>© 2024 Acme Inc.</footer></body></html>";
+        let o = opts("%Y-%m-%d", (2025, 1, 1), (2030, 12, 31));
+        assert_eq!(search_page(html, &o), None);
+    }
+
+    /// rationale: pin `search_page`'s regex_parse copyear-gate `||` second
+    /// operand TRUE side (core.rs:1233 — `dateobject.map(|d| d.year >=
+    /// copyear).unwrap_or(false)` evaluated to TRUE with copyear != 0). A
+    /// copyright "© 2020" sets copyear=2020 (so the `copyear == 0` left
+    /// disjunct is false and the right operand IS evaluated), and an
+    /// English-prose "January 15, 2024" (no numeric MM/DD arm matches) parses
+    /// via regex_parse to 2024 >= 2020, so the gate passes and the prose date
+    /// is returned (core.py:770 `dateobject and dateobject.year >= copyear`).
+    #[test]
+    fn search_page_regex_parse_at_or_after_copyear_returns_prose_date() {
+        let html =
+            "<html><body><p>© 2020 Acme. Posted January 15, 2024 by the editor.</p></body></html>";
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        // copyear=2020; regex_parse finds 2024-01-15 (>= copyear) → returned.
+        assert_eq!(search_page(html, &o).as_deref(), Some("2024-01-15"));
+    }
+
+    // -----------------------------------------------------------------------
+    // find_date — pattern_search/img/idiosyncrasies arm + canonical no-rel
+    // -----------------------------------------------------------------------
+
+    /// rationale: pin `find_date`'s timestamp/img/idiosyncrasies arm TRUE side
+    /// (core.rs:1462 — `result.is_some()` after the
+    /// `pattern_search → img_search → idiosyncrasies_search` cascade). With NO
+    /// header/json/abbr/date-element/time signal but an `og:image` whose URL
+    /// carries a date, `img_search` resolves it (core.py:961-965).
+    #[test]
+    fn find_date_from_og_image_url_via_img_search() {
+        let html = r#"<html><head>
+            <meta property="og:image" content="https://example.com/img/2024/06/15/photo.jpg">
+        </head><body><p>Some article body.</p></body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(find_date(&root, &o).as_deref(), Some("2024-06-15"));
+    }
+
+    /// rationale: pin `find_canonical_url`'s missing-`rel` skip arm
+    /// (core.rs:1503 — `get_attribute(&link, "rel")` is None). A `<link>` with
+    /// an `href` but NO `rel` attribute fails the `if let Some(rel)` guard and
+    /// is skipped; the meta tag's date wins instead (core.py:884-886).
+    #[test]
+    fn find_date_skips_link_without_rel_attribute() {
+        let html = r#"<html><head>
+            <link href="https://example.com/2024/03/15/post">
+            <meta property="article:published_time" content="2024-06-15">
+        </head><body></body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts_orig("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        // The rel-less link is NOT consumed by find_canonical_url; the meta
+        // tag's date surfaces.
+        assert_eq!(find_date(&root, &o).as_deref(), Some("2024-06-15"));
+    }
+
+    // -----------------------------------------------------------------------
+    // examine_header — itemprop "neither orig nor mod" dropped-else arm
+    // -----------------------------------------------------------------------
+
+    /// rationale: pin `examine_header`'s itemprop assignment-condition FALSE
+    /// side (core.rs:463 — `(is_orig && options.original) || (is_mod &&
+    /// !options.original)` evaluated to FALSE). An ITEMPROP_ATTRS_ORIGINAL
+    /// marker (`datePublished`) read under `original=false` satisfies neither
+    /// disjunct, so the parsed date is deliberately dropped (Python's "put on
+    /// hold: hurts precision" else, core.py:312-314) and headerdate stays None.
+    #[test]
+    fn examine_header_itemprop_published_under_not_original_dropped() {
+        let html = r#"<html><head>
+            <meta itemprop="datePublished" content="2024-06-15">
+        </head><body></body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        // original=false: is_orig=true, is_mod=false → (true&&false)||(false&&true)
+        // = false → the assignment is skipped (no reserve fallback for itemprop).
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(examine_header(&root, &o), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // examine_abbr_elements — data-utime accumulator + non-CLASS_ATTRS arms
+    // -----------------------------------------------------------------------
+
+    /// rationale: pin `examine_abbr_elements`'s data-utime ORIGINAL
+    /// `reference == 0` FALSE side (core.rs:735 `||` first operand) — with
+    /// `original=true` and TWO numeric data-utime abbrs, the second iteration
+    /// sees a non-zero `reference`, so the `reference == 0` disjunct is false
+    /// and the `candidate < reference` disjunct decides (core.py:460-461 picks
+    /// the oldest). The smaller (older) of the two timestamps wins.
+    #[test]
+    fn examine_abbr_data_utime_original_picks_oldest_of_two() {
+        // 1718409600 = 2024-06-15; 1577836800 = 2020-01-01 (older).
+        let html = r#"<html><body>
+            <abbr data-utime="1718409600">later</abbr>
+            <abbr data-utime="1577836800">earlier</abbr>
+        </body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts_orig("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        // original=true → oldest wins: the second abbr's reference==0 disjunct
+        // is false on the second iteration, candidate<reference is true.
+        assert_eq!(examine_abbr_elements(&root, &o).as_deref(), Some("2020-01-01"));
+    }
+
+    /// rationale: pin `examine_abbr_elements`'s data-utime `take_newest`
+    /// FALSE side (core.rs:737 `||` second operand) — with `original=false`
+    /// and a second data-utime that is NOT newer than the running reference,
+    /// `take_original` is false (not original) so `take_newest` is evaluated
+    /// and is false (candidate <= reference), leaving reference unchanged
+    /// (core.py:462-464 keeps the newest).
+    #[test]
+    fn examine_abbr_data_utime_newest_keeps_first_when_second_older() {
+        // First (newer) 1718409600 = 2024-06-15; second (older) 1577836800.
+        let html = r#"<html><body>
+            <abbr data-utime="1718409600">newer</abbr>
+            <abbr data-utime="1577836800">older</abbr>
+        </body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        // original=false → keep newest; the second (older) abbr's take_newest
+        // is false so reference stays at the first timestamp.
+        assert_eq!(examine_abbr_elements(&root, &o).as_deref(), Some("2024-06-15"));
+    }
+
+    /// rationale: pin `examine_abbr_elements`'s `CLASS_ATTRS.contains` FALSE
+    /// side (core.rs:745) — an `<abbr>` with no `data-utime` whose `class` is
+    /// NOT one of CLASS_ATTRS ("date-published"/"published"/"time published")
+    /// is skipped by the class branch (core.py:466-467), leaving reference 0.
+    /// The text content carries NO parseable date, so the fallback
+    /// `examine_date_elements(".//abbr")` also misses → None.
+    #[test]
+    fn examine_abbr_non_class_attrs_value_skipped() {
+        let html = r#"<html><body>
+            <abbr class="unrelated-class">no date in here at all</abbr>
+        </body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(examine_abbr_elements(&root, &o), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // examine_time_elements — pubdate-not-original + non-shortcut class +
+    // short text-content arms
+    // -----------------------------------------------------------------------
+
+    /// rationale: pin `examine_time_elements`'s pubdate shortcut
+    /// `options.original` FALSE side (core.rs:821 third `&&` operand) — a
+    /// `<time pubdate="pubdate" datetime=...>` read under `original=false`
+    /// has pubdate present and == "pubdate" but `options.original` is false,
+    /// so the shortcut is NOT taken and the datetime flows into the
+    /// accumulator instead (core.py:514-520).
+    #[test]
+    fn examine_time_pubdate_not_original_uses_accumulator() {
+        let html = r#"<html><body>
+            <time pubdate="pubdate" datetime="2024-06-15T10:00:00">Jun 15</time>
+        </body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        // original=false → pubdate shortcut skipped; accumulator resolves it.
+        assert_eq!(examine_time_elements(&root, &o).as_deref(), Some("2024-06-15"));
+    }
+
+    /// rationale: pin `examine_time_elements`'s class-shortcut
+    /// `entry_date_arm || updated_arm` FALSE side (core.rs:834 — both
+    /// operands false). A `<time class="byline" datetime=...>` (class neither
+    /// entry-date/entry-time under original nor "updated" under !original)
+    /// leaves `shortcut_flag` false, so the long datetime feeds the
+    /// accumulator (core.py:522-538 elif chain not taken).
+    #[test]
+    fn examine_time_unrelated_class_falls_to_accumulator() {
+        let html = r#"<html><body>
+            <time class="byline" datetime="2024-06-15T10:00:00">Jun 15</time>
+        </body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        // original=false: entry_date_arm=false (not original), updated_arm=false
+        // (class != "updated") → no shortcut → accumulator picks 2024-06-15.
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(examine_time_elements(&root, &o).as_deref(), Some("2024-06-15"));
+    }
+
+    /// rationale: pin `examine_time_elements`'s text-content `count > 6`
+    /// FALSE side (core.rs:859) — a `<time>` with a short datetime attr
+    /// (len <= 6, so the markup branch is skipped) whose text child is also
+    /// <= 6 chars fails the `> 6` length gate, so `compare_reference` is never
+    /// called and reference stays 0 → None (core.py:556-558 `len(...) > 6`).
+    #[test]
+    fn examine_time_short_text_content_below_gate_returns_none() {
+        let html = r#"<html><body>
+            <time datetime="2024">Jun 15</time>
+        </body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        // datetime "2024" (len 4 <= 6) → text branch; "Jun 15" is 6 chars,
+        // not > 6 → the `count > 6` operand is false → reference stays 0.
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(examine_time_elements(&root, &o), None);
+    }
+
+    /// rationale: pin `examine_time_elements`'s text-content `if let Some(t)`
+    /// FALSE side (core.rs:858) — a `<time>` with a short datetime attr and
+    /// NO text child at all: `element_text` returns None, so the entire
+    /// text-content block is skipped (core.py:556 `elem.text` is None).
+    #[test]
+    fn examine_time_short_datetime_and_no_text_returns_none() {
+        let html = r#"<html><body>
+            <time datetime="2024"></time>
+        </body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(examine_time_elements(&root, &o), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // search_page — SIMPLE arm year-above-max filter + clean two-component arms
+    // -----------------------------------------------------------------------
+
+    /// rationale: pin `search_page`'s SIMPLE-arm year-window filter
+    /// `y <= max.year` FALSE side (core.rs:1287 second `&&` operand) — a bare
+    /// year matched by `year_pattern` (1990-2039) that exceeds `max.year` has
+    /// `min.year <= y` true but `y <= max.year` false, so it is removed from
+    /// the occurrences map (mirrors `plausible_year_filter`'s upper-bound
+    /// drop). With 2038 above max 2030 and no other date, the result is None.
+    #[test]
+    fn search_page_simple_year_above_max_dropped() {
+        // 2038 ∈ year_pattern's 20[0-3][0-9] range but > max 2030 → dropped.
+        let html = "<html><body>see 2038 archives</body></html>";
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(search_page(html, &o), None);
+    }
+
+    /// rationale: pin `search_page`'s YYYYMM-arm copyear-gate `copyear == 0`
+    /// TRUE side (core.rs:1173 first `||` operand) — a page whose ONLY date
+    /// signal is a bare `YYYY/MM` (no full Y-M-D, no copyright) reaches the
+    /// YYYYMM arm with copyear still 0, so the `copyear == 0` disjunct is true
+    /// and the constructed first-of-month date is emitted (core.py:721
+    /// `copyear == 0 or dateobject.year >= copyear`).
+    #[test]
+    fn search_page_yyyymm_with_zero_copyear_emits_first_of_month() {
+        // No © anywhere → copyear stays 0; "2024/06" only → YYYYMM arm fires
+        // with the `copyear == 0` disjunct true.
+        let html = "<html><body>monthly archive 2024/06 listing</body></html>";
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(search_page(html, &o).as_deref(), Some("2024-06-01"));
+    }
+
+    /// rationale: pin `search_page`'s SIMPLE-arm `is_valid_date` FALSE side
+    /// (the `year-01-01` full-timestamp window check fails even though the
+    /// year passed the year-granular `(min.year, max.year)` filter). With
+    /// min = 2024-06-15, the bare year 2024 survives the year filter
+    /// (2024 <= 2024) but the synthesised 2024-01-01 precedes min, so
+    /// `is_valid_date` rejects it and the SIMPLE arm returns None
+    /// (core.py:794-797).
+    #[test]
+    fn search_page_simple_year_one_jan_before_min_month() {
+        // Only a bare year 2024; min is mid-year so 2024-01-01 < min.
+        let html = "<html><body>archive year 2024 listing</body></html>";
+        let o = opts("%Y-%m-%d", (2024, 6, 15), (2030, 12, 31));
+        assert_eq!(search_page(html, &o), None);
+    }
+
+    /// rationale: pin `search_page`'s regex_parse-arm `validate_and_convert`
+    /// FALSE side (core.rs:1297 `if let Some(r)` not taken). With copyear 0
+    /// (so the regex_parse copyear gate passes) and an English-prose date
+    /// whose year matches LONG_TEXT_PATTERN's YEAR_RE (1990-2039) but lies
+    /// OUTSIDE the configured (min, max) window, `regex_parse` yields a valid
+    /// `DateTime` yet `validate_and_convert` rejects it, so the arm falls
+    /// through (core.py:768-775).
+    #[test]
+    fn search_page_regex_parse_out_of_window_falls_through() {
+        // "January 15, 2024" → regex_parse 2024-01-15 (2024 ∈ YEAR_RE), but
+        // min 2025 rejects it via validate_and_convert. SIMPLE_PATTERN's
+        // bare "2024" is likewise dropped by the min filter → None.
+        let html = "<html><body><p>Written January 15, 2024 by an author.</p></body></html>";
+        let o = opts("%Y-%m-%d", (2025, 1, 1), (2030, 12, 31));
+        assert_eq!(search_page(html, &o), None);
+    }
+
+    /// rationale: pin `select_candidate`'s one-year recovery `catch.find`
+    /// FALSE side (core.rs:617 `if let Some(m)` not taken). Under
+    /// `original=false` the top-2 window is sorted DESCENDING, so a no-year
+    /// string lexicographically AFTER the year string (e.g. " zzz-no-year ")
+    /// becomes `patterns[0]`. Exactly one candidate yields a `yearpat` year
+    /// (so years.len()==1 → recovery), the year validates, but the recovery
+    /// runs `catch.find` on `patterns[0]` (the no-year string), which
+    /// `ymd_pattern` cannot match → None.
+    #[test]
+    fn select_candidate_recovery_catch_miss_on_no_year_first_pattern() {
+        use super::super::regex_catalogues::{year_pattern, ymd_pattern};
+        let mut m = HashMap::new();
+        // original=false → reverse (descending) sort. " zzz-no-year "
+        // ('z'=0x7a) sorts after " 2024-06-15 " ('2'), so it lands at
+        // patterns[0] under reverse. years.len()==1 (only 2024 yields a year);
+        // the year validates, but catch.find on " zzz-no-year " misses → None.
+        m.insert(" zzz-no-year ".to_string(), 5usize);
+        m.insert(" 2024-06-15 ".to_string(), 1usize);
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(select_candidate(&m, ymd_pattern(), year_pattern(), &o), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // find_date — extensive-search segment filter + free_text_segments arms
+    // -----------------------------------------------------------------------
+
+    /// rationale: pin `find_date`'s extensive-search segment-length filter
+    /// FALSE sides (core.rs:1574 — `MIN_SEGMENT_LEN < n` and `n <
+    /// MAX_SEGMENT_LEN`). With `extensive=true` and a body containing both a
+    /// TOO-SHORT free-text segment (<= MIN_SEGMENT_LEN chars, failing the
+    /// first operand) and a TOO-LONG one (>= MAX_SEGMENT_LEN chars, failing
+    /// the second), both `continue` arms fire; the remaining mid-length
+    /// segment carries the ISO date that search_page recovers
+    /// (core.py:974-979 `if not MIN_SEGMENT_LEN < len(segment) < MAX_...`).
+    #[test]
+    fn find_date_extensive_skips_too_short_and_too_long_segments() {
+        // <p> "hi" (2 chars, too short) | a 60-char run (too long) | the dated
+        // segment. FAST_PREPEND walks each block's direct text child.
+        let long_run = "x".repeat(60);
+        let html = format!(
+            r#"<html><head></head><body>
+                <p>hi</p>
+                <p>{long}</p>
+                <p>Last updated: 2024-03-15 for clarity.</p>
+            </body></html>"#,
+            long = long_run
+        );
+        let dom = Dom::parse(&html);
+        let root = dom.root_element().expect("html");
+        let o = Extractor::new(true, (2030, 12, 31), (1995, 1, 1), false, "%Y-%m-%d".to_string());
+        assert_eq!(find_date(&root, &o).as_deref(), Some("2024-03-15"));
+    }
+
+    /// rationale: pin `free_text_segments`'s `NodeData::Text` match FALSE side
+    /// (core.rs:1631) — a FAST_PREPEND-matched element whose direct children
+    /// include a NON-text node (a nested element) exercises the non-Text arm
+    /// of the `if let NodeData::Text` match (the child is skipped), while the
+    /// element's own text child still feeds the extensive walk.
+    #[test]
+    fn find_date_extensive_free_text_skips_non_text_children() {
+        // The <p> has an element child (<span>) interleaved with text; the
+        // element child hits the non-Text arm, the text child "Posted
+        // 2024-03-15 " feeds compare_reference / search_page.
+        let html = r#"<html><head></head><body>
+            <p>Posted 2024-03-15 <span>note</span> ok.</p>
+        </body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = Extractor::new(true, (2030, 12, 31), (1995, 1, 1), false, "%Y-%m-%d".to_string());
+        assert_eq!(find_date(&root, &o).as_deref(), Some("2024-03-15"));
+    }
+
+    /// rationale: pin `search_page`'s SLASHES-arm THREE_COMP_REGEX_B
+    /// SECOND-alternative path (core.rs:1124 `caps.get(i)` FALSE side at the
+    /// leading groups). THREE_COMP_REGEX_B is
+    /// `(d)/(m)/(yy)|(d)[.-](m)[.-](yy)`: a `DD.MM.YY` (dot-separated) date
+    /// matches the SECOND alternative, so groups 1-3 are None (the inner
+    /// `caps.get(i)` returns None for them) and the first three NON-empty
+    /// groups are 4-6. Exercises the non-leading-alternative capture walk
+    /// (core.py:691-694 `filter(None, match.groups())`).
+    #[test]
+    fn search_page_slashes_dot_separated_uses_second_alternative() {
+        // "15.03.24" → THREE_COMP_REGEX_B alternative 2 (dot separators);
+        // groups 1-3 are None so caps.get(1/2/3) hit the None side.
+        let html = "<html><body>posted on 15.03.24 evening</body></html>";
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(search_page(html, &o).as_deref(), Some("2024-03-15"));
+    }
+
+    /// rationale: pin `search_page`'s MMYYYY-arm single-digit-month padding
+    /// arm (core.rs:1203 `month_raw.len() == 1` TRUE side) — TWO_COMP_REGEX's
+    /// MONTH_RE accepts a bare single-digit month (e.g. "6"), which the
+    /// normalisation zero-pads to "06" before building `YYYY-MM-01`
+    /// (core.py:747-749 `if len(month) == 1: month = f"0{month}"`).
+    #[test]
+    fn search_page_mmyyyy_single_digit_month_padded() {
+        // "6.2024" → TWO_COMP month "6" (len 1) → padded to "06" → 2024-06-01.
+        let html = "<html><body>issue 6.2024 catalogue</body></html>";
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(search_page(html, &o).as_deref(), Some("2024-06-01"));
+    }
+
 }

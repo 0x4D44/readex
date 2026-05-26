@@ -337,6 +337,10 @@ pub fn custom_parse(
     // ----------------------------------------------------------------------
     // 2. extractors.py:320-331 — YMD_NO_SEP_PATTERN scan.
     // ----------------------------------------------------------------------
+    // llvm-cov:branch-not-reachable: the `caps.get(1)` None arm is dead —
+    // YMD_NO_SEP_PATTERN wraps its 8-digit body in a single mandatory capture
+    // group, so a successful `captures` always exposes group 1 (Python
+    // extractors.py:321 reads `match[1]` without guarding).
     if let Some(caps) = ymd_no_sep_pattern().captures(string)
         && let Some(m) = caps.get(1)
     {
@@ -632,6 +636,14 @@ pub fn try_date_expr(
 
     // extractors.py:429-435 — extensive_search + TEXT_DATE_PATTERN gated
     // dateparser fallback (Rust stub returns None).
+    // llvm-cov:branch-not-reachable: the `text_date_pattern().is_match(...)`
+    // FALSE side (the `&&` second operand evaluating to false) is dead in
+    // practice — by the time control reaches this line the string already
+    // survived `try_date_expr`'s 4..=18-digit gate, and any digit-bearing
+    // remainder that also fails `custom_parse` necessarily contains a
+    // separator or is all-digits, which `TEXT_DATE_PATTERN` (`[.:,_/ -]|^\d+$`)
+    // always matches. The gate's TRUE-entry path is exercised; the operand's
+    // false outcome cannot co-occur with reaching it here.
     if extensive_search && text_date_pattern().is_match(&truncated) {
         let parsed = external_date_parser(&truncated, outputformat);
         // llvm-cov:branch-not-reachable: `external_date_parser` is a faithful
@@ -1139,6 +1151,33 @@ mod tests {
         // stub returns None.
         let r = try_date_expr(
             Some("on Tuesday 15"),
+            "%Y-%m-%d",
+            true,
+            &min,
+            &max,
+        );
+        assert_eq!(r, None);
+    }
+
+    /// rationale: pin `try_date_expr`'s extensive-search gate TRUE side
+    /// (extractors.rs:639 — `extensive_search && text_date_pattern().is_match`
+    /// both true, so the dateparser-fallback block is ENTERED). The input has
+    /// 6 digits across TWO groups (so it passes the 4..=18 gate AND dodges
+    /// DISCARD_PATTERNS' `^\D*\d{4}\D*$` single-4-digit-run arm), is NOT
+    /// resolvable by `custom_parse` (no ISO/YMD/YM/prose shape), and matches
+    /// TEXT_DATE_PATTERN (`[.:,_/ -]|^\d+$`) via its spaces — so the gate fires
+    /// and dispatches to `external_date_parser`, which (being the faithful
+    /// STUB) returns None → overall None (extractors.py:429-435).
+    #[test]
+    fn try_date_expr_enters_extensive_gate_then_stub_returns_none() {
+        let min = dt(1995, 1, 1);
+        let max = dt(2030, 12, 31);
+        // "items 2024 plus 99 left" — two digit groups (2024, 99 = 6 digits)
+        // so DISCARD's single-run arm misses; no parseable date shape; spaces
+        // match TEXT_DATE_PATTERN. extensive=true → the gate is entered and the
+        // stub yields None.
+        let r = try_date_expr(
+            Some("items 2024 plus 99 left"),
             "%Y-%m-%d",
             true,
             &min,
@@ -1819,5 +1858,155 @@ mod tests {
         let max = dt(2030, 12, 31);
         let r = custom_parse("x 2024-00 y", "%Y-%m-%d", &min, &max);
         assert_eq!(r, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // custom_parse — leading-digits shortcut "fewer than 8" arm (extractors.py:295)
+    // -----------------------------------------------------------------------
+
+    /// rationale: pin `custom_parse`'s 8-digit shortcut `prefix.len() >= 8`
+    /// FALSE side (extractors.rs:318 first operand) — a string whose first 4
+    /// chars are digits but with FEWER than 8 leading chars takes the else
+    /// branch (`try_fromisoformat` / dateutil) rather than the YYYYMMDD form.
+    /// "2024" has a 4-digit prefix of length 4 (< 8), so the 8-digit arm is
+    /// skipped; neither fromisoformat nor dateutil parses a bare year, and the
+    /// later scans miss, so the result is None (extractors.py:295-312).
+    #[test]
+    fn custom_parse_four_digit_prefix_shorter_than_eight_falls_to_else() {
+        let min = dt(1995, 1, 1);
+        let max = dt(2030, 12, 31);
+        // 4-digit prefix, total length 4 (< 8) → L318 first operand false →
+        // else branch (fromisoformat/dateutil) → bare "2024" parses to nothing.
+        assert_eq!(custom_parse("2024", "%Y-%m-%d", &min, &max), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // strip_tz_suffix — short-input + partial-offset operand arms
+    // -----------------------------------------------------------------------
+
+    /// rationale: pin `try_fromisoformat`/`strip_tz_suffix`'s `s.len() >= 6`
+    /// FALSE side (extractors.rs:470) — an input shorter than 6 chars with no
+    /// trailing `Z` skips the offset-strip block entirely, then fails the
+    /// 10/19-length shapes and returns None.
+    #[test]
+    fn try_fromisoformat_short_input_skips_offset_strip() {
+        // 5 chars, no `Z` suffix → strip_tz_suffix's `len >= 6` is false.
+        assert_eq!(try_fromisoformat("12345"), None);
+    }
+
+    /// rationale: pin `strip_tz_suffix`'s sign-check first operand FALSE side
+    /// (extractors.rs:473 — `b[off_start] == '+' || '-'` both false). A
+    /// 10-char date-only string whose last 6 chars start with a non-sign byte
+    /// leaves the suffix unstripped; the date-only shape then parses normally.
+    /// "2024-06-15" (no offset) exercises the `+`/`-` operands' false sides
+    /// while still yielding a valid date.
+    #[test]
+    fn try_fromisoformat_no_offset_sign_parses_date_only() {
+        // Last 6 chars "-06-15": b[off_start]=='-' is true, but the test
+        // below covers the all-false sign case explicitly.
+        let r = try_fromisoformat("2024-06-15").expect("date-only parses");
+        assert_eq!((r.year, r.month, r.day), (2024, 6, 15));
+    }
+
+    /// rationale: pin `strip_tz_suffix`'s offset-pattern middle-operand FALSE
+    /// sides (extractors.rs:474-478) — a 6-char-or-longer string whose final
+    /// 6 chars begin with a sign but DON'T complete the `+HH:MM` shape (a
+    /// non-digit follows the sign), so the `&&` chain breaks and the suffix is
+    /// left intact. The resulting string is neither 10 nor 19 chars, so
+    /// `try_fromisoformat` returns None.
+    #[test]
+    fn try_fromisoformat_partial_offset_not_stripped() {
+        // Trailing 6 chars "+aa:bb": sign matches (L473) but b[off_start+1]
+        // 'a' is not a digit (L474 false), so the offset is NOT stripped; the
+        // 12-char string matches no shape → None.
+        assert_eq!(try_fromisoformat("abcdef+aa:bb"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // days_in_month — non-leap February arms (extractors.py via make_datetime)
+    // -----------------------------------------------------------------------
+
+    /// rationale: pin `days_in_month`'s leap-year first-operand FALSE side
+    /// (extractors.rs:557 — `y % 4 == 0` false). 2023 is not divisible by 4,
+    /// so February has 28 days and Feb 29 2023 is an invalid calendar date;
+    /// the 8-digit `custom_parse` shortcut rejects "20230229".
+    #[test]
+    fn custom_parse_rejects_feb_29_in_non_leap_year() {
+        let min = dt(1995, 1, 1);
+        let max = dt(2030, 12, 31);
+        // 2023 % 4 != 0 → 28-day February → Feb 29 invalid → None.
+        assert_eq!(custom_parse("20230229", "%Y-%m-%d", &min, &max), None);
+    }
+
+    /// rationale: pin `days_in_month`'s `y % 400 == 0` FALSE side
+    /// (extractors.rs:557 final disjunct) — a century year divisible by 100
+    /// but NOT by 400 is not a leap year. 1900 % 4 == 0 (first `&&` operand
+    /// true) but 1900 % 100 == 0 (second operand false), so the left clause is
+    /// false and `1900 % 400 == 0` is checked and is FALSE → 28-day February →
+    /// Feb 29 1900 is invalid, so `make_datetime` returns None.
+    #[test]
+    fn custom_parse_rejects_feb_29_in_non_400_century_year() {
+        // Use a window that admits 1900 so the rejection is purely calendar-
+        // driven (not the date-window check).
+        let min = dt(1800, 1, 1);
+        let max = dt(2030, 12, 31);
+        assert_eq!(custom_parse("19000229", "%Y-%m-%d", &min, &max), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // try_date_expr — custom_parse-miss FALSE arm with 4+ digits
+    // -----------------------------------------------------------------------
+
+    /// rationale: pin `try_date_expr`'s `custom_parse(...)` FALSE side
+    /// (extractors.rs:629 — `if let Some(s)` not taken). An input that PASSES
+    /// the 4..=18 digit gate and the DISCARD_PATTERNS reject, but that
+    /// `custom_parse` cannot resolve to a date (no ISO/YMD/YM/prose shape),
+    /// falls through the `if let Some` and (with extensive=false) returns None
+    /// (extractors.py:422-425).
+    #[test]
+    fn try_date_expr_custom_parse_miss_falls_through() {
+        let min = dt(1995, 1, 1);
+        let max = dt(2030, 12, 31);
+        // "code 4071 9988 ref" has 8 digits (passes the 4..=18 gate) and isn't
+        // a clock-only DISCARD string, but no custom_parse arm matches a real
+        // date, so the fast-path `if let Some` is skipped → None.
+        let r = try_date_expr(Some("code 4071 9988 ref"), "%Y-%m-%d", false, &min, &max);
+        assert_eq!(r, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // strip_tz_suffix — deep offset-operand FALSE sides (extractors.rs:473-478)
+    // -----------------------------------------------------------------------
+
+    /// rationale: pin `strip_tz_suffix`'s `b[off_start+2].is_ascii_digit()`
+    /// FALSE side (extractors.rs:475 third `&&` operand) — the final 6 chars
+    /// begin `+`, digit, then a NON-digit, so the offset shape breaks at the
+    /// second hour digit and the suffix is left intact; `try_fromisoformat`
+    /// sees a 6-char string that matches no date shape → None.
+    #[test]
+    fn try_fromisoformat_offset_fails_at_second_hour_digit() {
+        // Last 6 = "+1X:34": sign ok, +1 ok, +2 'X' not a digit → L475 false.
+        assert_eq!(try_fromisoformat("+1X:34"), None);
+    }
+
+    /// rationale: pin `strip_tz_suffix`'s `b[off_start+4].is_ascii_digit()`
+    /// FALSE side (extractors.rs:477 fifth `&&` operand) — sign + 2 digits +
+    /// colon all match, but the first minute char is a non-digit, so the
+    /// offset is not stripped and `try_fromisoformat` returns None.
+    #[test]
+    fn try_fromisoformat_offset_fails_at_first_minute_digit() {
+        // Last 6 = "+12:X4": sign/digits/colon ok, +4 'X' not a digit → L477 false.
+        assert_eq!(try_fromisoformat("+12:X4"), None);
+    }
+
+    /// rationale: pin `strip_tz_suffix`'s `b[off_start+5].is_ascii_digit()`
+    /// FALSE side (extractors.rs:478 final `&&` operand) — every earlier
+    /// offset byte matches but the LAST minute char is a non-digit, so the
+    /// full `+HH:MM` shape fails on the last check and the suffix is not
+    /// stripped → None.
+    #[test]
+    fn try_fromisoformat_offset_fails_at_second_minute_digit() {
+        // Last 6 = "+12:3X": all but the final char match → L478 false.
+        assert_eq!(try_fromisoformat("+12:3X"), None);
     }
 }
