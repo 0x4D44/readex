@@ -92,7 +92,7 @@
 //! [`Ok`](OracleStatus::Ok) on the strength of `ok` alone. **Timeout is a
 //! first-class status, never folded into `OracleError`** — conflating a
 //! legitimately-slow large SEC filing with a hard error would be a
-//! Bug-E2-class loss of information on exactly the named acceptance-critical cases.
+//! Bug-E2-class loss of information on exactly the performance-critical cases.
 
 // O4 status (Stage 6, 2026-05-17). `score.rs` (reachable from `main`'s
 // no-subcommand path) now constructs `OracleKind` and calls `run_oracle`,
@@ -286,7 +286,7 @@ pub struct OracleResult {
 ///
 /// [`OracleTimeout`](Self::OracleTimeout) is **deliberately distinct** from
 /// [`OracleError`](Self::OracleError): a legitimately slow large filing must
-/// be distinguishable from a hard failure (load-bearing for the consumer-critical
+/// be distinguishable from a hard failure (load-bearing for performance-critical
 /// slow filings). The error/timeout variants carry a human-readable reason so
 /// the report (Stage 7) can surface *why* without re-deriving it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -428,7 +428,7 @@ pub fn run_oracle(kind: OracleKind, snapshot_abs: &Path, base_url: Option<&str>)
 /// child whose stdout exceeds the buffer (every real SEC 10-K — text alone is
 /// far over 64 KB) block in `write()`, never exit, and be falsely recorded as
 /// [`OracleStatus::OracleTimeout`] — a Bug-E2-class conflation on exactly the
-/// the consumer-critical large filings. The reader `read_to_end`s into a `Vec<u8>`
+/// performance-critical large filings. The reader `read_to_end`s into a `Vec<u8>`
 /// while the poll loop independently watches the deadline. On the **success**
 /// path the child has exited and closed its write end, so the reader is at
 /// EOF and `join()` returns promptly with the full stdout; bytes → `String`
@@ -1406,7 +1406,7 @@ mod tests {
         // that blocks in `write()` (full-buffer writes block regardless of the
         // single-write atomicity in sibling §3.3), never exits, and the harness
         // hits the wall-clock timeout — a FALSE `OracleTimeout` on every real
-        // SEC 10-K (large-but-VALID output; the named acceptance-critical case Bug E2
+        // SEC 10-K (large-but-VALID output; the performance-critical case Bug E2
         // warns about). This test pushes ≥256 KB of VALID contract JSON through
         // the cross-platform seam with the FULL production ORACLE_TIMEOUT and
         // asserts the verdict is `Ok` — NOT `OracleTimeout`. It deadlocks (and
