@@ -1545,6 +1545,7 @@ fn _stage7a_reserved_imports() {
 // ===========================================================================
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

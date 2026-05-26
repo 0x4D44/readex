@@ -1054,6 +1054,7 @@ pub fn get_max_date_with(max_date: Option<&DateInput<'_>>, now: &DateTime) -> Da
 // ===========================================================================
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

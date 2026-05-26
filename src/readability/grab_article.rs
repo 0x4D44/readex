@@ -1129,6 +1129,7 @@ fn split_len(s: &str) -> usize {
 // metadata (HLD §7.6) and is deliberately not produced here.
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     //! Expected selections hand-derived by tracing `Readability.js:1031-1413`
     //! (NOT by running an oracle — inversion, HLD §4).

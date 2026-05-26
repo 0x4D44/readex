@@ -520,6 +520,7 @@ pub const DEFAULT_TAGS_TO_SCORE: &[&str] =
 pub const CLASSES_TO_PRESERVE: &[&str] = &["page"];
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     //! HLD §8 per-regex conformance table — the Stage-1a oracle.
     //!

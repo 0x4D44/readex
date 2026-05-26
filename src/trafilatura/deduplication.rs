@@ -898,6 +898,7 @@ pub fn is_similar_domain_with(reference: &str, new_string: &str, threshold: f64)
 // ===========================================================================
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use std::sync::Mutex as TestMutex;

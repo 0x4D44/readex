@@ -397,6 +397,7 @@ pub fn element_child_count(node: &NodeRef) -> usize {
 // ===========================================================================
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::readability::dom::{

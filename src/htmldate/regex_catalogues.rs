@@ -721,6 +721,7 @@ pub fn simple_pattern_post_filter(haystack: &str, match_start: usize) -> bool {
 // ===========================================================================
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

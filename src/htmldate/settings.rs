@@ -49,6 +49,7 @@ pub const CLEANING_LIST: &[&str] = &[
 ];
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

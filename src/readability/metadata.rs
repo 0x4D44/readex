@@ -912,6 +912,7 @@ fn strip_js_ws(s: &str) -> String {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     //! Expected titles hand-derived by tracing `Readability.js:572-651` /
     //! `:1803-1816` (NOT by running an oracle — inversion, HLD §4).

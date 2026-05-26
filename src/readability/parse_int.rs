@@ -133,6 +133,7 @@ pub fn row_or_col_span_or_one(attr: Option<&str>) -> i64 {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

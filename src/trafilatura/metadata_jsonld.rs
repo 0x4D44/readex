@@ -943,6 +943,7 @@ fn extract_json_parse_error(elem: &str, metadata: &mut Metadata) {
 // ===========================================================================
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

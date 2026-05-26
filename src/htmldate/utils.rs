@@ -163,6 +163,7 @@ pub fn clean_html(tree: &NodeRef, cleaning_list: &[&str]) {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

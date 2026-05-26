@@ -78,6 +78,24 @@
 //! is provided for direct library consumers (e.g. the consumer) as a convenience;
 //! it is informational, not the harness's comparability surface.
 
+// Coverage-measurement infrastructure (NOT part of any normal build).
+//
+// `cargo-llvm-cov` sets `--cfg coverage_nightly` when run on a nightly
+// toolchain. Under that (and ONLY that) cfg we opt into the unstable
+// `coverage_attribute` feature so the per-file `#[cfg_attr(coverage_nightly,
+// coverage(off))]` markers on each `mod tests` block take effect. Stable and
+// ordinary nightly builds never set `coverage_nightly`, so this attribute is a
+// no-op for them and the crate continues to build on stable Rust 1.85+.
+//
+// Rationale: test-module code (assertions, table-driven `for tag in [...]`
+// loops, `let x = A || B;` membership probes) emits its own conditional
+// branches whose "unused" side can never be exercised by a passing test. Left
+// in, those test-only branch-sides depress the *production* branch-coverage
+// number and make a "98% branch coverage" target ill-defined. Excluding test
+// modules from instrumentation is the standard, correct way to measure the
+// coverage of the code that actually ships.
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 // M2 Readability port (HLD `2026.05.18 - HLD - mdrcel Readability Port (M2)`).
 //
 // `#[doc(hidden)] pub`: this is **internal infrastructure + in-workspace
@@ -1350,6 +1368,7 @@ pub fn extract_via_readability(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

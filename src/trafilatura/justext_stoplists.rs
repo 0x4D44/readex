@@ -528,6 +528,7 @@ static SLOT_WESTERN_PANJABI: OnceLock<Vec<String>> = OnceLock::new();
 static SLOT_YORUBA: OnceLock<Vec<String>> = OnceLock::new();
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

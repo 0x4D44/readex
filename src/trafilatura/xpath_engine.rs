@@ -1456,6 +1456,7 @@ pub fn first_tag(xpath: &str, root: &NodeRef) -> Result<Option<String>, XPathErr
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::readability::dom::Dom;

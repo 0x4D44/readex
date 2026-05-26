@@ -640,6 +640,7 @@ fn iter_elements_by_tags(dom: &Dom, root: &NodeRef, tags: &[&str]) -> Vec<NodeRe
 // ===========================================================================
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::readability::dom::{get_attribute, get_elements_by_tag_name, tag_name};

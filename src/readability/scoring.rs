@@ -202,6 +202,7 @@ fn join_space_len(parts: &[&str]) -> usize {
 pub(crate) use dom::create_text_node;
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     //! Every expected number hand-derived by tracing `Readability.js`
     //! arithmetic (NOT by running an oracle — inversion, HLD §4).

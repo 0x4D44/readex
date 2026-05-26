@@ -175,6 +175,7 @@ pub(crate) const REND_TAG_NAMES: &[&str] = &[
 ];
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

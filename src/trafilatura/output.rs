@@ -2894,6 +2894,7 @@ fn escape_xml_attr_into(s: &str, out: &mut String) {
 // ===========================================================================
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::readability::dom::{

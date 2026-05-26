@@ -1689,6 +1689,7 @@ pub fn sanitize_tree(tree: &NodeRef, options: &Options) -> (String, usize) {
 // ===========================================================================
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::readability::dom::{Dom, get_elements_by_tag_name, serialize_converted_tree};

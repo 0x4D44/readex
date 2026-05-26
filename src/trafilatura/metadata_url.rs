@@ -1063,6 +1063,7 @@ fn match_text_license_regex(text: &str) -> Option<String> {
 // ===========================================================================
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::trafilatura::metadata::extract_metadata;

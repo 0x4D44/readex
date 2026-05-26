@@ -373,6 +373,7 @@ struct PreGrabMetadata {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     //! End-to-end `Readability::parse` Stage-1a behaviour, expected values
     //! hand-derived by tracing `Readability.js` (NOT by running an oracle —

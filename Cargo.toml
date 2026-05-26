@@ -3,7 +3,7 @@ members = ["benchmark"]
 
 [package]
 name = "readex"
-version = "0.19.1"
+version = "0.19.2"
 edition = "2024"
 rust-version = "1.85"
 authors = ["Martin Davidson <martingdavidson@gmail.com>"]
@@ -63,3 +63,12 @@ unicode-normalization = "=0.1.25"
 [dev-dependencies]
 # SHA-256 for the in-tree fuzz harness cache integrity check.
 sha2 = "=0.10.9"
+
+[lints.rust]
+# `cargo-llvm-cov` sets `--cfg coverage_nightly` on a nightly toolchain; the
+# crate root opts into the `coverage_attribute` feature under that cfg so the
+# per-module `#[cfg_attr(coverage_nightly, coverage(off))]` markers exclude
+# `#[cfg(test)] mod tests` blocks from coverage instrumentation. Declare the
+# cfg so ordinary (non-coverage) builds don't emit an `unexpected_cfgs`
+# warning. This has no effect on the produced binary on any toolchain.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }

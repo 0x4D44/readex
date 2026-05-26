@@ -580,6 +580,7 @@ pub fn share_strip(article_content: &NodeRef) {
 pub(crate) use prep::clean as clean_unconditional;
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     //! Every expected value hand-derived by tracing `Readability.js`
     //! (NOT by running an oracle — anti-inversion, HLD §4).

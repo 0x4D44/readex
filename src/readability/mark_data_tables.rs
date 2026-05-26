@@ -147,6 +147,7 @@ pub fn mark_data_tables(dom: &mut Dom, root: &NodeRef) {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     //! Every expected value hand-derived by tracing `Readability.js:2271-2329`
     //! (NOT by running an oracle — anti-inversion, HLD §4).

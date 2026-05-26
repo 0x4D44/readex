@@ -911,6 +911,7 @@ pub fn post_process_content(article_content: &NodeRef) {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     //! Expected DOM shapes hand-derived by tracing `Readability.js` (NOT by
     //! running an oracle — inversion, HLD §4).

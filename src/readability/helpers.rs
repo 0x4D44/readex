@@ -354,6 +354,7 @@ pub fn next_sibling(node: &NodeRef) -> Option<NodeRef> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     //! Expected values hand-derived by tracing `Readability.js` (NOT by
     //! running an oracle — that would be inversion, HLD §4).
