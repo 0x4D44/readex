@@ -6330,4 +6330,257 @@ mod tests {
         let ps = get_elements_by_tag_name(&out, "p");
         assert!(!ps.is_empty(), "p preserved after table prune");
     }
+
+    // -------------------------------------------------------------------
+    // handle_table non-leaf cell TABLE_ALL branch (main_extractor.py:406-411)
+    // -------------------------------------------------------------------
+
+    /// `main_extractor.py:406-411` TABLE_ALL branch with a NESTED `<hi>`
+    /// formatting descendant inside a non-leaf cell. `hi` IS in
+    /// `TABLE_ALL` (`{'td','th','hi'}`) but is NOT in `TABLE_ELEMS`
+    /// (`{'td','th'}`), so Python skips the in-place rename-to-"cell" and
+    /// runs `handle_textnode(child, ...)` directly. The processed `<hi>` is
+    /// then appended onto the cell via `define_newelem`. Pins the True side
+    /// of `TABLE_ALL.contains(child_tag)` (1201) AND the False side of the
+    /// inner `TABLE_ELEMS.contains(child_tag)` rename gate (1218).
+    #[test]
+    fn handle_table_non_leaf_cell_with_nested_hi_routes_through_handle_textnode() {
+        // <table><tr><td>prefix<hi>bold</hi></td></tr></table>
+        let t = dom_create_element("table");
+        let tr = dom_create_element("tr");
+        let td = dom_create_element("td");
+        // Direct text on the cell makes it non-leaf once an element child
+        // is also present (element_child_count > 0 → the else branch).
+        dom_append_child(&td, &create_text_node("prefix"));
+        let hi = dom_create_element("hi");
+        dom_append_child(&hi, &create_text_node("bold"));
+        dom_append_child(&td, &hi);
+        dom_append_child(&tr, &td);
+        dom_append_child(&t, &tr);
+
+        let pot = potential_tags(&["table", "hi", "p"]);
+        let opts = Options::default();
+        let out = handle_table(&t, &pot, &opts).expect("non-empty → Some");
+        let cells = get_elements_by_tag_name(&out, "cell");
+        assert_eq!(cells.len(), 1, "one cell survives");
+        // Cell carries the source <td>'s direct text "prefix"
+        // (main_extractor.py:402 — text taken from subelement directly).
+        assert_eq!(
+            element_text(&cells[0]).as_deref(),
+            Some("prefix"),
+            "non-leaf cell text taken from source cell directly"
+        );
+        // The nested <hi> was routed through handle_textnode (TABLE_ALL,
+        // not TABLE_ELEMS) and appended via define_newelem.
+        let his = get_elements_by_tag_name(&cells[0], "hi");
+        assert_eq!(his.len(), 1, "nested <hi> appended to cell (TABLE_ALL branch)");
+        assert_eq!(
+            element_text(&his[0]).as_deref(),
+            Some("bold"),
+            "hi text preserved through handle_textnode"
+        );
+    }
+
+    /// `main_extractor.py:406-409` TABLE_ALL branch with a NESTED `<th>`
+    /// cell descendant inside a non-leaf cell. `th` IS in `TABLE_ELEMS`, so
+    /// Python in-place renames the nested cell tag to "cell" BEFORE running
+    /// `handle_textnode`. Pins the True side of the inner
+    /// `TABLE_ELEMS.contains(child_tag)` rename gate (1218) — the
+    /// `replace_element_tag(child, "cell")` path.
+    #[test]
+    fn handle_table_non_leaf_cell_with_nested_th_renames_to_cell() {
+        // <table><tr><td>outer<th>nestedhdr</th></td></tr></table>
+        // (manually-built malformed nesting; mirrors lxml accepting a
+        // td-inside-td after html5 fragment normalisation upstream.)
+        let t = dom_create_element("table");
+        let tr = dom_create_element("tr");
+        let td = dom_create_element("td");
+        dom_append_child(&td, &create_text_node("outer"));
+        let inner_th = dom_create_element("th");
+        dom_append_child(&inner_th, &create_text_node("nestedhdr"));
+        dom_append_child(&td, &inner_th);
+        dom_append_child(&tr, &td);
+        dom_append_child(&t, &tr);
+
+        let pot = potential_tags(&["table"]);
+        let opts = Options::default();
+        let out = handle_table(&t, &pot, &opts).expect("non-empty → Some");
+        // The outer cell survives with text "outer". The nested <th> was
+        // renamed to "cell" and routed through handle_textnode, then
+        // appended via define_newelem as a "cell"-tagged child.
+        let outer_cells = get_elements_by_tag_name(&out, "cell");
+        assert!(
+            !outer_cells.is_empty(),
+            "at least the outer cell survives the rename-to-cell branch"
+        );
+        // No <th> tag should remain anywhere — the nested one was renamed
+        // to "cell" (1218 True).
+        let remaining_th = get_elements_by_tag_name(&out, "th");
+        assert!(
+            remaining_th.is_empty(),
+            "nested <th> renamed away (TABLE_ELEMS rename-to-cell branch)"
+        );
+    }
+
+    /// `main_extractor.py:422-423 (M5 Stage 6d)` — non-WHITESPACE tail
+    /// recovery on a mid-cell `<code>` child. Mirrors the f76ec833 fixture
+    /// `<td><code>.rs</code>, <code>.rlib</code></td>`: lxml stores `.tail`
+    /// intrinsically, so the `, ` separator between the two inline `<code>`
+    /// elements survives onto the first cell-child. Pins the `!trimmed.is_empty()`
+    /// TRUE side of the `keep` disjunction (1291) — distinct from the
+    /// whitespace-only-tail path already pinned by
+    /// `handle_table_preserves_last_cell_child_trailing_whitespace_tail`.
+    #[test]
+    fn handle_table_recovers_non_whitespace_mid_cell_code_tail() {
+        let t = dom_create_element("table");
+        let tr = dom_create_element("tr");
+        let td = dom_create_element("td");
+        let code1 = dom_create_element("code");
+        dom_append_child(&code1, &create_text_node(".rs"));
+        let code2 = dom_create_element("code");
+        dom_append_child(&code2, &create_text_node(".rlib"));
+        dom_append_child(&td, &code1);
+        dom_append_child(&td, &code2);
+        // The `, ` separator is the tail of the FIRST <code> — a
+        // non-whitespace tail mid-cell (next sibling is code2). The Stage
+        // 6d gate keeps it because `!trimmed.is_empty()` (NOT because it is
+        // the last child — code1 is mid-position).
+        set_tail(&code1, Some(", "));
+        dom_append_child(&tr, &td);
+        dom_append_child(&t, &tr);
+
+        let pot = potential_tags(&["table"]);
+        let opts = Options::default();
+        let out = handle_table(&t, &pot, &opts).expect("non-empty → Some");
+        let cells = get_elements_by_tag_name(&out, "cell");
+        assert_eq!(cells.len(), 1, "one cell survives");
+        let codes = element_children(&cells[0]);
+        assert_eq!(codes.len(), 2, "both <code> children present");
+        assert_eq!(local_name(&codes[0]).as_deref(), Some("code"));
+        assert_eq!(
+            tail(&codes[0]).as_deref(),
+            Some(", "),
+            "non-whitespace `, ` tail recovered onto first code child (Stage 6d, f76ec833)"
+        );
+    }
+
+    /// `main_extractor.py:388 (seen_header_row |= seen_header)` LEFT-operand
+    /// TRUE short-circuit. A 3-row table whose FIRST row carries a `<th>`
+    /// sets `seen_header` on row 1; the tr2 boundary toggles
+    /// `seen_header_row = false || true = true`; the tr3 boundary then
+    /// re-evaluates `seen_header_row || seen_header` with the LEFT operand
+    /// ALREADY true (the `||` short-circuits without reading `seen_header`).
+    /// Pins the True side of the disjunction at line 1120.
+    #[test]
+    fn handle_table_three_rows_header_row_flag_short_circuits_on_left() {
+        let t = dom_create_element("table");
+        // Row 1: a <th> header cell (sets seen_header during cell handling).
+        let tr1 = dom_create_element("tr");
+        let th1 = dom_create_element("th");
+        dom_append_child(&th1, &create_text_node("H"));
+        dom_append_child(&tr1, &th1);
+        dom_append_child(&t, &tr1);
+        // Rows 2 and 3: plain data cells. The tr3 boundary fires line 1120
+        // with seen_header_row already true (set at the tr2 boundary).
+        for txt in ["r2", "r3"] {
+            let tr = dom_create_element("tr");
+            let td = dom_create_element("td");
+            dom_append_child(&td, &create_text_node(txt));
+            dom_append_child(&tr, &td);
+            dom_append_child(&t, &tr);
+        }
+        let pot = potential_tags(&["table"]);
+        let opts = Options::default();
+        let out = handle_table(&t, &pot, &opts).expect("non-empty → Some");
+        let rows = get_elements_by_tag_name(&out, "row");
+        assert_eq!(rows.len(), 3, "three rows survive");
+        // Only the first row's <th> is a header; the |= short-circuit on
+        // the tr3 boundary did not reset or mis-mark later rows.
+        let cells = get_elements_by_tag_name(&out, "cell");
+        assert_eq!(
+            get_attribute(&cells[0], "role").as_deref(),
+            Some("head"),
+            "row-1 th is header"
+        );
+        assert!(
+            get_attribute(&cells[1], "role").is_none()
+                && get_attribute(&cells[2], "role").is_none(),
+            "later-row cells are not headers (seen_header_row gate held across the |= short-circuit)"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // _extract + recover_wild_text same-tag tail survival
+    // (main_extractor.py:608 / 528-529)
+    // -------------------------------------------------------------------
+
+    /// `main_extractor.py:608 (M5 Stage 6a/6i)` — a `<p>` element whose
+    /// `.tail` text must survive the move into `result_body` when
+    /// `handle_paragraphs` returns a same-tag `<p>`. In lxml the tail is
+    /// intrinsic to the element so `result_body.append(el)` carries it
+    /// along; readex models tail as a following sibling Text node, so the
+    /// port must explicitly clear-then-re-attach. Pins the
+    /// `saved_tail.is_some()` TRUE arms — the pre-move clear (1916) and the
+    /// post-move re-attach (1920).
+    #[test]
+    fn _extract_reattaches_same_tag_p_tail() {
+        // Two adjacent paragraphs with text BETWEEN them: the first <p>'s
+        // tail is "between-tail". Both paragraphs are long enough to keep
+        // result_body populated; the >1-child exit gate fires after both.
+        let (_d, body) = parse_body(
+            "<html><body><article>\
+             <p>The first article paragraph carries substantial content for extraction so the body clears the minimum-size threshold during the primary BODY_XPATH match without bailing.</p>\
+             between-tail\
+             <p>The second article paragraph adds further weight to the body, providing enough words to keep the extractor on its main path through the same-tag tail survival logic.</p>\
+             </article></body></html>",
+        );
+        let opts = Options::default();
+        let (rb, _text, _pot) = _extract(&body, &opts);
+        let ps = get_elements_by_tag_name(&rb, "p");
+        assert!(ps.len() >= 2, "both paragraphs kept in result_body");
+        // The FIRST paragraph's tail "between-tail" must survive the move.
+        let first_tail = tail(&ps[0]).unwrap_or_default();
+        assert!(
+            first_tail.contains("between-tail"),
+            "same-tag <p> tail re-attached after the move into result_body: {first_tail:?}"
+        );
+    }
+
+    /// `main_extractor.py:528-529 (M5 Stage 6j-a)` — the same same-tag
+    /// tail-survival logic inside `recover_wild_text`. A `<p>` (which IS in
+    /// the recover search expression) whose `.tail` survives the move into
+    /// `result_body` when `handle_paragraphs` returns a same-tag `<p>`.
+    /// Pins the `saved_tail.is_some()` TRUE arms in recover_wild_text
+    /// (1690 pre-clear, 1694 re-attach).
+    #[test]
+    fn recover_wild_text_reattaches_same_tag_p_tail() {
+        let tree = dom_create_element("body");
+        let article = dom_create_element("article");
+        let p = dom_create_element("p");
+        dom_append_child(
+            &p,
+            &create_text_node("A recovered paragraph with enough content to survive processing."),
+        );
+        dom_append_child(&article, &p);
+        // The <p>'s tail — a following Text-node sibling.
+        dom_append_child(&article, &create_text_node("between-tail"));
+        // A trailing element so the first <p> is not the last child (keeps
+        // the shape realistic; not strictly required).
+        let p2 = dom_create_element("p");
+        dom_append_child(&p2, &create_text_node("Second recovered paragraph body."));
+        dom_append_child(&article, &p2);
+        dom_append_child(&tree, &article);
+
+        let result_body = dom_create_element("body");
+        let pot = potential_tags(&["p"]);
+        let opts = Options::default();
+        let rb = recover_wild_text(&tree, &result_body, &opts, &pot);
+        let ps = get_elements_by_tag_name(&rb, "p");
+        assert!(!ps.is_empty(), "paragraph recovered into result_body");
+        let first_tail = tail(&ps[0]).unwrap_or_default();
+        assert!(
+            first_tail.contains("between-tail"),
+            "same-tag <p> tail re-attached in recover_wild_text: {first_tail:?}"
+        );
+    }
 }

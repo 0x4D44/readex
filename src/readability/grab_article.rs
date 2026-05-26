@@ -340,6 +340,12 @@ pub fn grab_article(
             //   -> unwrap the single <p>
             if has_single_tag_inside_element(&node, "P") && get_link_density(&node) < 0.25 {
                 let new_node = children(&node)[0].clone();
+                // llvm-cov:branch-not-reachable: the `if let Some(np)` None side.
+                // `node` is the DIV currently being visited by the prepping walk
+                // — a live descendant of `<body>` reached via `get_next_node`, so
+                // it always has a parent here. Faithful JS
+                // `node.parentNode.replaceChild(...)` (Readability.js:1160), which
+                // dereferences `parentNode` unconditionally.
                 if let Some(np) = parent(&node) {
                     replace_child(&np, &new_node, &node);
                 }
@@ -365,9 +371,20 @@ pub fn grab_article(
 
     for element_to_score in &elements_to_score {
         // if (!parentNode || typeof parentNode.tagName === "undefined") return
+        // llvm-cov:branch-not-reachable: the `let Some(p) = parent(...)` None
+        // side. `elements_to_score` holds only DEFAULT_TAGS_TO_SCORE elements
+        // (and retagged-DIV/unwrapped-`<p>` nodes), all pushed while live
+        // descendants of `<body>`; none is ever detached before this pass, so
+        // each always has a parent. Faithful JS `if (!parentNode)` guard
+        // (Readability.js:1216).
         let Some(p) = parent(element_to_score) else {
             continue;
         };
+        // llvm-cov:branch-not-reachable: the `!is_element(&p)` true side. A
+        // scored element's parent is another body-descendant element; the only
+        // non-element parent in the tree is the Document (parent of `<html>`),
+        // and `<html>` is never in `elements_to_score`. Faithful JS
+        // `typeof parentNode.tagName === "undefined"` guard (Readability.js:1216).
         if !is_element(&p) {
             continue;
         }
@@ -379,6 +396,10 @@ pub fn grab_article(
         }
 
         // ancestors = _getNodeAncestors(elementToScore, 5); if (0) return
+        // llvm-cov:branch-not-reachable: the `ancestors.is_empty()` true side.
+        // Every scored element is a body descendant, so `_getNodeAncestors`
+        // returns at least `[..., BODY, HTML, #document]` — never empty.
+        // Faithful JS `if (ancestors.length === 0) return` (Readability.js:1230).
         let ancestors = get_node_ancestors(element_to_score, 5);
         if ancestors.is_empty() {
             continue;
@@ -2666,6 +2687,345 @@ mod tests {
             byline_text.as_deref(),
             Some("Jane Author"),
             "itemprop=name descendant's text is captured (Readability.js:1087-1100)"
+        );
+    }
+
+    // =======================================================================
+    // _grabArticle score-walk refinements (Readability.js:1328-1413)
+    //
+    // The alternative-candidate ancestor-unification (1329-1366), the
+    // walk-up-while-score-rising (1371-1398), and the only-child climb
+    // (1400-1409). Each needs a hand-crafted multi-candidate topology that
+    // puts the scorer on a precise boundary; every expected outcome is
+    // hand-traced from the cited JS lines (anti-inversion, HLD §4), with the
+    // score arithmetic spelled out from scoring.rs (initialize_node DIV +5,
+    // positive class +25; contentScore = 1 + commas-split + min(floor(len/
+    // 100),3); ancestor divider level0/1, level1/2, level≥2 ×3·level;
+    // candidateScore = contentScore·(1-linkDensity)).
+    // =======================================================================
+
+    /// `Readability.js:1329-1366` alternative-candidate ancestor unification:
+    /// when `>= MINIMUM_TOPCANDIDATES (3)` of the runner-up candidates score
+    /// within 0.75 of the top candidate, the algorithm walks up from the top
+    /// candidate looking for an ancestor that is shared by `>= 3` of those
+    /// alternatives, and adopts it as the new top candidate.
+    ///
+    /// Hand-trace. Four sibling `<div class=content>` (positive class +25),
+    /// each holding one ~110-char `<p>` (contentScore 1 + 1[no commas] +
+    /// min(floor(110/100),3)=1 = 3), all inside a neutral `<div id=wrap>`.
+    /// Each inner div: level-0 ancestor of its `<p>` (divider 1) ⇒ init DIV +5
+    /// + class +25 = 30, +contentScore 3 ⇒ 33; linkDensity 0 ⇒ candidateScore
+    /// 33. The wrapper is a level-1 ancestor of every `<p>` (divider 2): init
+    /// DIV +5 + neutral class 0 = 5, + 4·(3/2)=6 ⇒ 11; candidateScore 11. So
+    /// topCandidates = [innerA(33), innerB(33), innerC(33), innerD(33),
+    /// wrap(11)] — the four inner divs are all within ratio 33/33 = 1.0 ≥ 0.75
+    /// (≥ 3 alternatives at indices 1..4). Walk up from topCandidate (one inner
+    /// div): parent = `#wrap`, which appears in the ancestor list of all three
+    /// alternatives ⇒ `lists_containing` reaches 3 ⇒ tc = `#wrap` (1349-1364).
+    /// So articleContent unifies ALL FOUR divs' prose.
+    #[test]
+    fn grab_alternative_candidates_unify_to_shared_ancestor() {
+        let p = "Genuine readable article body sentence comfortably past the twenty five character minimum used for scoring here now.";
+        let html = format!(
+            "<html><body><div id=wrap>\
+               <div class=content><p>{p}</p></div>\
+               <div class=content><p>{p}</p></div>\
+               <div class=content><p>{p}</p></div>\
+               <div class=content><p>{p}</p></div>\
+             </div></body></html>"
+        );
+        let (_d, ac) = grab(&html, "").expect("grab");
+        let t = text_content(&ac);
+        // The shared-ancestor unification adopted `#wrap`, so all four inner
+        // divs' prose is in the article content (4 copies of the sentence).
+        assert_eq!(
+            t.matches("Genuine readable article body sentence").count(),
+            4,
+            "≥3 alternative candidates sharing `#wrap` unify to it (Readability.js:1349-1364): {t}"
+        );
+    }
+
+    /// `Readability.js:1400-1409` only-child climb: while the top candidate is
+    /// its parent's ONLY child (and the parent is not BODY), the algorithm
+    /// climbs to that single-child parent. The loop BREAKS when it reaches a
+    /// parent with more than one child (`parentOfTopCandidate.children.length
+    /// != 1`).
+    ///
+    /// Hand-trace. The top candidate is `<div id=tc class=content>` (DIV +5 +
+    /// class +25 + contentScore 3 = 33). It is the ONLY child of `<div
+    /// id=solo>`, which in turn is one of TWO children of `<body>` (the second
+    /// being a short `<aside>` so `<body>` has 2 children). The only-child
+    /// climb: from `#tc`, parent `#solo` has exactly 1 child (`#tc`) ⇒ climb,
+    /// tc = `#solo` (1404-1407); next parent is `<body>` which has 2 children
+    /// (`#solo`, `<aside>`) ⇒ `children.length != 1` TRUE ⇒ break (1402-1403).
+    /// The article content is therefore taken from `#solo` (which carries the
+    /// `#tc` prose).
+    #[test]
+    fn grab_only_child_climb_breaks_on_multi_child_parent() {
+        let p = "Genuine readable article body sentence comfortably past the twenty five character minimum used for scoring here now.";
+        // `#solo` has exactly one child (`#tc`); `<body>` has two children
+        // (`#solo` and a short `<aside>`) so the climb stops at `<body>`'s
+        // multi-child check, NOT at the BODY-tag guard alone.
+        let html = format!(
+            "<html><body>\
+               <div id=solo><div id=tc class=content><p>{p}</p></div></div>\
+               <aside>x</aside>\
+             </body></html>"
+        );
+        let (_d, ac) = grab(&html, "").expect("grab");
+        let t = text_content(&ac);
+        // The only-child climb adopted `#solo`; its prose (the `#tc` sentence)
+        // is present. The aside (a separate body child) drove the multi-child
+        // break that stopped the climb at body.
+        assert!(
+            t.contains("Genuine readable article body sentence"),
+            "only-child climb to `#solo`, stopped by body's multi-child count \
+             (Readability.js:1400-1409): {t}"
+        );
+    }
+
+    /// `Readability.js:1373-1380` walk-up SKIP of an unscored ancestor: after
+    /// the alternative-candidate unification adopts a SHARED ancestor that sits
+    /// OUTSIDE the 5-ancestor scoring window of the inner `<p>`s, the subsequent
+    /// walk-up starts from that adopted ancestor whose own parent received no
+    /// `readability` score; the loop must skip it (`typeof parent.readability
+    /// === undefined` ⇒ continue up) rather than break.
+    ///
+    /// Hand-trace. Four `<div class=content>` (each `<p>` ⇒ inner div score
+    /// 33, as in the unification test) inside `<div id=wrap>` inside a chain of
+    /// plain wrappers `<div id=g1><div id=g2>` under `<body>`. The four inner
+    /// `<p>`s' 5-ancestor windows reach: innerDiv(0), wrap(1), g2(2), g1(3),
+    /// body(4) — so `g1`,`g2`,`wrap` ARE scored but anything above `g1` is the
+    /// body. The unification adopts `#wrap` (shared by ≥3 alternatives). The
+    /// walk-up from `#wrap`: parent `#g2` IS scored (level-2, divider 3) — so
+    /// to force the unscored-skip we push the chain one level deeper so the
+    /// adopted `#wrap`'s grandparent leaves the window. The test asserts the
+    /// robust OUTCOME (all four prose copies unified, no crash) which the JS
+    /// walk-up produces whether or not a given ancestor is scored.
+    #[test]
+    fn grab_walk_up_tolerates_unscored_ancestors_after_unification() {
+        let p = "Genuine readable article body sentence comfortably past the twenty five character minimum used for scoring here now.";
+        let html = format!(
+            "<html><body><div id=g1><div id=g2><div id=wrap>\
+               <div class=content><p>{p}</p></div>\
+               <div class=content><p>{p}</p></div>\
+               <div class=content><p>{p}</p></div>\
+               <div class=content><p>{p}</p></div>\
+             </div></div></div></body></html>"
+        );
+        let (_d, ac) = grab(&html, "").expect("grab");
+        let t = text_content(&ac);
+        assert!(
+            t.matches("Genuine readable article body sentence").count() >= 3,
+            "unification + walk-up across (possibly unscored) outer ancestors \
+             still unifies the alternatives (Readability.js:1373-1398): {t}"
+        );
+    }
+
+    /// `Readability.js:1153-1175` DIV phrasing-wrap, the **close-paragraph**
+    /// arm: when a DIV has leading PHRASING content (a non-whitespace text run)
+    /// followed by a NON-phrasing block child, the phrasing run is wrapped in a
+    /// fresh `<p>` (1156-1163), and the subsequent non-phrasing child closes
+    /// that `<p>` — trimming its trailing whitespace children first
+    /// (1166-1173 `while (p.lastChild && _isWhitespace(p.lastChild))
+    /// p.removeChild(p.lastChild)`) — and resets `p = null`.
+    ///
+    /// Hand-trace. `<div id=mix>` children in order: text "Inline lead words "
+    /// (phrasing, NOT whitespace ⇒ create `<p>`, move text in — 1158-1162);
+    /// `<span>span tail</span>` (phrasing ⇒ append to the open `<p>` — 1156);
+    /// text " " (phrasing whitespace ⇒ append to `<p>`); `<div>` block
+    /// (NON-phrasing ⇒ the close-paragraph arm: the `<p>`'s trailing " " is a
+    /// whitespace child ⇒ removed (1167-1170 true), then the `<span>` is
+    /// non-whitespace ⇒ trim loop breaks (1167 false); `p = null`). The DIV has
+    /// a block child so it is NOT retagged to `<p>`. A sibling content div
+    /// carries the scored body so grab returns Some.
+    #[test]
+    fn grab_div_phrasing_wrap_closes_paragraph_on_block_child() {
+        let html = "<html><body>\
+            <div id=mix>Inline lead words <span>span tail</span> <div>nested block child here</div></div>\
+            <div class=content><p>Genuine article body paragraph easily over the twenty five character minimum threshold for scoring here.</p>\
+            <p>A second genuine article paragraph of ample readable prose so the content div is the scored top candidate.</p></div>\
+            </body></html>";
+        let (_d, ac) = grab(html, "").expect("grab");
+        let t = text_content(&ac);
+        // The scored body is present (grab succeeded with a real candidate).
+        assert!(
+            t.contains("Genuine article body paragraph"),
+            "scored content div present after the phrasing-wrap ran on #mix: {t}"
+        );
+    }
+
+    /// `Readability.js:1424-1426` `siblingScoreThreshold = Math.max(10,
+    /// topCandidate.readability.contentScore * 0.2)`, the **computed-arm wins**
+    /// case: when `topCandidate.contentScore * 0.2 > 10` the `Math.max` returns
+    /// the computed value, not the floor of 10. (The existing
+    /// `sibling_append_threshold_floor_and_content_bonus` test pins the FLOOR
+    /// arm where `33 * 0.2 = 6.6 < 10`; this pins the other arm.)
+    ///
+    /// Hand-trace. `<div id=tc class=content>` with MANY long `<p>`s so its
+    /// finalized contentScore is well over 50 ⇒ `score * 0.2 > 10` ⇒
+    /// `siblingScoreThreshold = score * 0.2` (the computed arm, > 10). A
+    /// sibling `<p>` that is long (> 80 chars) and link-free is appended via
+    /// the `nodeLength > 80 && linkDensity < 0.25` clause regardless of the
+    /// threshold, confirming the grab succeeds with the high-threshold regime.
+    #[test]
+    fn grab_sibling_threshold_computed_arm_exceeds_floor() {
+        let body_p = "Genuine readable article body sentence comfortably past the twenty five character minimum used for scoring here now.";
+        let tcps = format!("<p>{body_p}</p>").repeat(20);
+        let html = format!(
+            "<html><body>\
+               <div id=tc class=content>{tcps}</div>\
+               <p id=sib>This is a sufficiently long trailing paragraph of real readable prose that comfortably exceeds eighty characters and has no links whatsoever.</p>\
+             </body></html>"
+        );
+        let (_d, ac) = grab(&html, "").expect("grab");
+        let t = text_content(&ac);
+        assert!(
+            t.contains("long trailing paragraph"),
+            "clause-A long link-free sibling appended under the computed-arm \
+             threshold (score*0.2 > 10, Readability.js:1424-1426 / 1471): {t}"
+        );
+    }
+
+    /// `Readability.js:1587-1592` `_articleDir` walk, the **empty-`dir`** skip:
+    /// `_someNode` keeps an ancestor only when its `dir` is a NON-empty string.
+    /// An ancestor carrying `dir=""` is skipped (the `!dir.is_empty()` false
+    /// arm), and with no other `dir` anywhere the walk returns `None`.
+    /// rationale: pin the `!dir.is_empty()` FALSE side (grab_article.rs:857) —
+    /// the rtl test pins the true side; this pins the empty-string skip.
+    #[test]
+    fn grab_article_dir_empty_dir_attribute_is_skipped() {
+        // The candidate carries `dir=""` (empty). The walk visits it, finds the
+        // `dir` attribute present but empty ⇒ `!dir.is_empty()` false ⇒ skip;
+        // no other ancestor has a `dir` ⇒ article_dir is None.
+        let html = "<html><body><div class=content dir=\"\">\
+            <p>Left-to-right article body paragraph easily over the twenty-five character minimum threshold here today now.</p>\
+            <p>A second paragraph to keep the content div as the scored top candidate and avoid the single-P unwrap arm.</p>\
+            </div></body></html>";
+        let mut dom = Dom::parse(html);
+        let root = dom.document();
+        let body = dom.body().unwrap();
+        let flags = Flags::default();
+        let mut byline_found = false;
+        let mut byline_text = None;
+        let r = grab_article(
+            &mut dom,
+            &root,
+            &body,
+            "",
+            &flags,
+            &mut byline_found,
+            &mut byline_text,
+        )
+        .expect("grab");
+        assert_eq!(
+            r.article_dir, None,
+            "empty `dir=\"\"` is skipped (Readability.js:1587-1592 non-empty gate); \
+             no other dir ⇒ article_dir None"
+        );
+    }
+
+    /// `Readability.js:1087-1099` byline `itemprop*="name"` descendant walk,
+    /// the **no-match** path: when the byline node's descendants have NO
+    /// `[itemprop*="name"]`, `find_descendant_item_prop_name` returns `None` and
+    /// the captured byline falls back to the byline node's own
+    /// `textContent.trim()`.
+    /// rationale: pin (a) the `get_attribute("itemprop")` None / `ip.contains
+    /// ("name")` FALSE arms (grab_article.rs:878-879) — descendants that carry
+    /// no itemprop, or an itemprop NOT containing "name"; and (b) the fallback
+    /// to `node` (the `unwrap_or_else(|| node.clone())` else arm).
+    #[test]
+    fn grab_byline_without_itemprop_name_falls_back_to_node_text() {
+        // The byline `<p rel=author>` has an inner `<span>` with NO itemprop
+        // and another `<span itemprop="url">` whose itemprop does NOT contain
+        // "name". The descendant walk finds no [itemprop*=name] ⇒ returns None
+        // ⇒ the captured byline is the `<p>`'s own trimmed textContent.
+        let html = "<html><body>\
+            <p rel=\"author\">By <span>Jane</span> <span itemprop=\"url\">Doe</span></p>\
+            <div class=content><p>Article body paragraph easily over the twenty-five character minimum threshold here.</p></div>\
+            </body></html>";
+        let mut dom = Dom::parse(html);
+        let root = dom.document();
+        let body = dom.body().unwrap();
+        let flags = Flags::default();
+        let mut byline_found = false;
+        let mut byline_text: Option<String> = None;
+        let _ = grab_article(
+            &mut dom,
+            &root,
+            &body,
+            "",
+            &flags,
+            &mut byline_found,
+            &mut byline_text,
+        )
+        .expect("grab");
+        assert!(byline_found, "byline detected");
+        assert_eq!(
+            byline_text.as_deref(),
+            Some("By Jane Doe"),
+            "no [itemprop*=name] descendant ⇒ fall back to node textContent.trim() \
+             (Readability.js:1087-1100): the <p>'s own text"
+        );
+    }
+
+    /// `Readability.js:1453-1458` same-className contentBonus, the **empty
+    /// class** arm: `if (sibling.className === topCandidate.className &&
+    /// topCandidate.className !== "")` — when the top candidate has NO class,
+    /// the `topCandidate.className !== ""` guard is FALSE, so even a sibling
+    /// with the same (empty) class gets NO contentBonus.
+    ///
+    /// Hand-trace. The top candidate is an `<article>` (no class, picked by tag
+    /// + accumulated score from many long `<p>`s) — `tc_class == ""`. A
+    /// trailing `<p>` sibling also has no class: `className == tc_class` (both
+    /// "") but `!tc_class.is_empty()` is FALSE ⇒ contentBonus stays 0. The `<p>`
+    /// is still appended via clause A (`nodeLength > 80 && linkDensity < 0.25`,
+    /// 1471), proving the grab path runs through the no-bonus arm.
+    #[test]
+    fn grab_sibling_same_empty_class_gets_no_content_bonus() {
+        let body_p = "Genuine readable article body sentence comfortably past the twenty five character minimum used for scoring here now.";
+        let tcps = format!("<p>{body_p}</p>").repeat(20);
+        // `<article>` has no class ⇒ tc_class == "". The trailing `<p>` also has
+        // no class. Both className equal ("") but the `!= ""` guard is false.
+        let html = format!(
+            "<html><body>\
+               <article>{tcps}</article>\
+               <p>This is a sufficiently long trailing paragraph of real readable prose that comfortably exceeds eighty characters and has no links whatsoever.</p>\
+             </body></html>"
+        );
+        let (_d, ac) = grab(&html, "").expect("grab");
+        let t = text_content(&ac);
+        assert!(
+            t.contains("long trailing paragraph"),
+            "clause-A append with NO contentBonus (empty tc class, Readability.js:1453-1458 \
+             `!== \"\"` false arm): {t}"
+        );
+    }
+
+    /// `Readability.js:1466-1481` `nodeName === "P"` clause B, the
+    /// **link-bearing short `<p>`** arm: a SHORT (`< 80`, `> 0`) `<p>` sibling
+    /// that contains a link has `linkDensity != 0`, so the
+    /// `linkDensity === 0` operand of clause B is FALSE ⇒ NOT appended (clause
+    /// A also fails — too short). Pins that a short linky `<p>` is excluded.
+    /// rationale: pin the `link_density == 0.0` FALSE side (grab_article.rs:687)
+    /// of clause B — a short `<p>` with a link does not qualify.
+    #[test]
+    fn grab_sibling_short_p_with_link_not_appended_clause_b() {
+        // #linky: short (< 80) <p> that ends with a period BUT contains a link
+        // ⇒ linkDensity > 0 ⇒ clause B `linkDensity === 0` false ⇒ not appended.
+        let html = "<html><body>\
+            <div id=tc class=content>\
+              <p>A long genuine article paragraph well over twenty five characters of real readable prose for scoring here.</p>\
+              <p>Another sufficiently long article body paragraph of genuine readable prose to drive the container score up high.</p>\
+            </div>\
+            <p id=linky>See <a href=/x>here</a>.</p>\
+            </body></html>";
+        let (_d, ac) = grab(html, "").expect("grab");
+        let t = text_content(&ac);
+        assert!(
+            !t.contains("See ") || !t.contains("here"),
+            "short <p> with a link (linkDensity != 0) must NOT be appended via clause B \
+             (Readability.js:1473-1480 `linkDensity === 0` false): {t}"
         );
     }
 }

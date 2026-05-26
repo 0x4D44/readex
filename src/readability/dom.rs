@@ -224,6 +224,13 @@ fn preprocess_html(html: &str) -> Cow<'_, str> {
         || contains_ci(bytes, b"<tr")
         || contains_ci(bytes, b"<tbody")
         || contains_ci(bytes, b"<tfoot")
+        // llvm-cov:branch-not-reachable: the `<thead` operand's TRUE side.
+        // Any input containing the byte sequence `<thead` necessarily contains
+        // its prefix `<th`, so the earlier `contains_ci(b"<th")` operand always
+        // short-circuits this disjunction TRUE first. The `<thead` operand is
+        // therefore only ever EVALUATED (its FALSE side) when no cell tag is
+        // present at all; its TRUE side is structurally unreachable. It is kept
+        // verbatim for symmetry with the per-tag rewrite list in CELL_TAGS.
         || contains_ci(bytes, b"<thead");
 
     if !has_br_end && !has_xmp && !has_stray_cell {
@@ -3449,6 +3456,19 @@ mod tests {
     fn preprocess_stray_tfoot_only_triggers_cell_rewrite() {
         let result = preprocess_html("<tfoot>x</tfoot>");
         assert!(matches!(result, Cow::Owned(_)), "stray <tfoot> triggers rewrite");
+    }
+
+    /// The `<th` limb of the `has_stray_cell` `||` chain (dom.rs:223) is
+    /// reached and TRUE only when `<td` is absent. An isolated `<th>` (no
+    /// preceding `<td`) makes the `contains_ci(b"<td")` operand false, so the
+    /// `<th` operand is the one that short-circuits the disjunction TRUE.
+    /// rationale: pin the `contains_ci(b"<th")` true side (dom.rs:223), which
+    /// every fixture that also contains a `<td` short-circuits before reaching.
+    #[test]
+    fn preprocess_stray_th_only_triggers_cell_rewrite() {
+        let result = preprocess_html("<th>head cell</th>");
+        assert!(matches!(result, Cow::Owned(_)), "stray <th> triggers rewrite");
+        assert_eq!(&*result, "<div>head cell</div>", "stray <th> rewritten to <div>");
     }
 
     /// `set_element_text` (`dom.rs:726-749`): the three negative arms.

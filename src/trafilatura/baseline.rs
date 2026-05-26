@@ -283,6 +283,14 @@ pub fn baseline(filecontent: &str) -> BaselineOutput {
             let inner_dom = Dom::parse(&json_body);
             match inner_dom.root_element() {
                 Some(r) => trim(&text_content(&r)),
+                // llvm-cov:branch-not-reachable: `json_body` is guaranteed
+                // non-empty here (the `if json_body.is_empty() { continue }`
+                // at baseline.py:49 already ran) and contains "<p>", so
+                // html5ever ALWAYS synthesises an <html> root and
+                // `root_element()` returns `Some(_)`. This `None` arm mirrors
+                // Python's defensive `if parsed is not None else ""`
+                // (baseline.py:51) and is unreachable through any caller input
+                // — same html5ever invariant as `html2txt`'s root guard above.
                 None => String::new(),
             }
         } else {
@@ -411,6 +419,14 @@ pub fn baseline(filecontent: &str) -> BaselineOutput {
         .unwrap_or_default()
         .into_iter()
         .next();
+    // llvm-cov:branch-not-reachable: the `None` side of this `if let` (and the
+    // path-5 `html2txt` fallback below at baseline.py:98-101) cannot fire — at
+    // this point `tree_root` is a fully-parsed html5ever document, which ALWAYS
+    // synthesises a `<body>` child of `<html>`, so `.//body` always yields at
+    // least one match. Python's lxml CAN produce a body-less HtmlElement (hence
+    // the upstream fallback), but html5ever cannot, so path 4 always returns
+    // here. (See the matching test note in `html2txt_fallback_when_body_missing`
+    // and the identical invariant annotated on `html2txt_from_tree` below.)
     if let Some(body_elem) = body_elem {
         // baseline.py:92 — p_elem = SubElement(postbody, 'p')
         let p_elem = create_element("p");

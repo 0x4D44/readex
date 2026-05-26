@@ -971,10 +971,24 @@ impl Document {
             let score = score_paragraph_text(&elem_text);
 
             // readability_lxml.py:249 — full score to parent.
+            // llvm-cov:branch-not-reachable: the `None` side of this
+            // `if let` cannot fire — `ensure_candidate(&mut candidates,
+            // &parent_node)` ran unconditionally above (line 965), so the
+            // entry for `parent_node` is guaranteed present. Python's
+            // `candidates[node]["content_score"] += ...` has no None path
+            // at all (the dict key was just created at :241-243); the Rust
+            // `find_candidate_mut` Option is a facade artifact of the Vec
+            // representation, not a real algorithmic branch.
             if let Some(c) = find_candidate_mut(&mut candidates, &parent_node) {
                 c.score += score;
             }
             // readability_lxml.py:250-251 — half score to grandparent.
+            // llvm-cov:branch-not-reachable: same invariant as above for
+            // the inner `find_candidate_mut(gp)` — when `grand_parent_node`
+            // is `Some(gp)`, `ensure_candidate(gp)` ran at line 967, so the
+            // map entry exists and the inner Option is always `Some`. The
+            // OUTER `Some(gp)` side is exercised by normal nested DOMs; only
+            // the inner facade-Option's `None` arm is unreachable.
             if let Some(gp) = &grand_parent_node
                 && let Some(c) = find_candidate_mut(&mut candidates, gp)
             {
@@ -2003,6 +2017,13 @@ pub fn compare_extraction(
         false
     } else if len_text == 0 && algo_len > 0 {
         // external.py:68-69 — Branch 2: own empty, algo non-empty → algo.
+        // llvm-cov:branch-not-reachable: the `algo_len > 0` conjunct's
+        // FALSE side cannot fire here — Branch 1 (`algo_len == 0 || ...`)
+        // already returned for `algo_len == 0`, so reaching Branch 2
+        // guarantees `algo_len != 0`, i.e. `algo_len > 0` (a `usize`). The
+        // conjunct is preserved verbatim from the Python source
+        // (`not len_text and algo_len`), where it is likewise always-true
+        // once Branch 1 is past.
         true
     } else if len_text > 2 * algo_len {
         // external.py:70-71 — Branch 3: own > 2× algo → keep own.
@@ -5331,5 +5352,200 @@ mod tests {
             );
         }
         // None is also valid (winning_len == 0 short-circuits).
+    }
+
+    // -----------------------------------------------------------------------
+    // get_article <p>-sibling rescue (readability_lxml.py:187-201)
+    // -----------------------------------------------------------------------
+
+    /// `readability_lxml.py:188-191` cond_a — a sibling of the best
+    /// candidate that is a `<p>` (NOT itself a high-scoring candidate) with
+    /// leading text longer than 80 chars AND link density below 0.25 is
+    /// rescued into the output. Pins the True sides of the `<p>` tag gate
+    /// (1071), the `node_length > 80 && link_density < 0.25` conjunction
+    /// (1079 — cond_a), and the `cond_a || cond_b` disjunction (1083).
+    ///
+    /// Driven directly (not through `summary()`) so the candidate set and
+    /// best candidate are deterministic: the scorer's pick is incidental to
+    /// the rescue logic under test.
+    #[test]
+    fn get_article_rescues_long_low_link_p_sibling() {
+        // <div id="parent"><div id="best">..</div><p>STANDALONE..</p></div>
+        let parent_div = create_element("div");
+        let best_div = create_element("div");
+        crate::readability::dom::append_child(
+            &best_div,
+            &crate::readability::dom::create_text_node("best candidate body content here"),
+        );
+        let sibling_p = create_element("p");
+        // Leading-text run > 80 chars, NO <a> children → link_density 0.0
+        // (< 0.25). The cond_a arm fires.
+        set_element_text(
+            &sibling_p,
+            Some(
+                "STANDALONE_RESCUE_MARKER a standalone paragraph of plain prose well over eighty characters long with no links whatsoever",
+            ),
+        );
+        append_child(&parent_div, &best_div);
+        append_child(&parent_div, &sibling_p);
+
+        let best_candidate = Candidate::new(10.0, best_div.clone());
+        let candidates: Vec<(NodeRef, Candidate)> = vec![(best_div.clone(), best_candidate.clone())];
+
+        let doc = Document::new("<html><body></body></html>");
+        let output = doc.get_article(&candidates, &best_candidate);
+
+        // The best candidate AND the rescued <p> are both appended.
+        let out_text = text_content(&output);
+        assert!(
+            out_text.contains("best candidate body content"),
+            "best candidate appended: {out_text:?}"
+        );
+        assert!(
+            out_text.contains("STANDALONE_RESCUE_MARKER"),
+            "long low-link <p> sibling rescued via cond_a: {out_text:?}"
+        );
+    }
+
+    /// `readability_lxml.py:188-191` cond_b — a SHORT (`node_length <= 80`)
+    /// `<p>` sibling with link density exactly 0.0 whose text contains a
+    /// sentence boundary (`. ` or trailing `.`) is rescued. Pins the True
+    /// side of cond_b: `node_length <= 80 && link_density == 0.0 &&
+    /// DOT_SPACE.is_match(text)` (1080) and the cond_a-FALSE / cond_b-TRUE
+    /// path through the disjunction at 1083.
+    #[test]
+    fn get_article_rescues_short_dotspace_p_sibling_via_cond_b() {
+        let parent_div = create_element("div");
+        let best_div = create_element("div");
+        crate::readability::dom::append_child(
+            &best_div,
+            &crate::readability::dom::create_text_node("primary best candidate content"),
+        );
+        let sibling_p = create_element("p");
+        // <= 80 chars, no links (density 0.0), contains a trailing "." so
+        // DOT_SPACE (`\.( |$)`) matches. cond_a is FALSE (length <= 80), so
+        // ONLY cond_b can rescue it.
+        set_element_text(&sibling_p, Some("SHORT_DOTSPACE_MARKER short note ends."));
+        append_child(&parent_div, &best_div);
+        append_child(&parent_div, &sibling_p);
+
+        let best_candidate = Candidate::new(10.0, best_div.clone());
+        let candidates: Vec<(NodeRef, Candidate)> = vec![(best_div.clone(), best_candidate.clone())];
+
+        let doc = Document::new("<html><body></body></html>");
+        let output = doc.get_article(&candidates, &best_candidate);
+
+        let out_text = text_content(&output);
+        assert!(
+            out_text.contains("SHORT_DOTSPACE_MARKER"),
+            "short dot-space <p> sibling rescued via cond_b: {out_text:?}"
+        );
+    }
+
+    /// `readability_lxml.py:183-186` — a sibling that IS itself a scored
+    /// candidate with `score >= sibling_score_threshold` is appended via
+    /// the candidate-score arm (NOT the `<p>` rescue). Pins the True side of
+    /// the `find_candidate(..).is_some() && c.score >= threshold`
+    /// conjunction (1063 / 1064) — distinct from the best-candidate-identity
+    /// arm already exercised by the summary tests.
+    #[test]
+    fn get_article_appends_high_scoring_candidate_sibling() {
+        let parent_div = create_element("div");
+        let best_div = create_element("div");
+        crate::readability::dom::append_child(
+            &best_div,
+            &crate::readability::dom::create_text_node("the winning best candidate body"),
+        );
+        // A sibling DIV that is itself a candidate scoring above the
+        // threshold (max(10, best.score*0.2) = 10 here → use 12.0).
+        let scored_sibling = create_element("div");
+        crate::readability::dom::append_child(
+            &scored_sibling,
+            &crate::readability::dom::create_text_node("HIGH_SCORE_SIBLING_MARKER companion block"),
+        );
+        append_child(&parent_div, &best_div);
+        append_child(&parent_div, &scored_sibling);
+
+        let best_candidate = Candidate::new(10.0, best_div.clone());
+        let candidates: Vec<(NodeRef, Candidate)> = vec![
+            (best_div.clone(), best_candidate.clone()),
+            (scored_sibling.clone(), Candidate::new(12.0, scored_sibling.clone())),
+        ];
+
+        let doc = Document::new("<html><body></body></html>");
+        let output = doc.get_article(&candidates, &best_candidate);
+
+        let out_text = text_content(&output);
+        assert!(
+            out_text.contains("HIGH_SCORE_SIBLING_MARKER"),
+            "high-scoring candidate sibling appended via the score-threshold arm: {out_text:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // remove_unlikely_candidates frame-guard + ok_maybe override
+    // (readability_lxml.py:289-293)
+    // -----------------------------------------------------------------------
+
+    /// `readability_lxml.py:291` — the FRAME_TAGS guard. A `<body>` whose
+    /// `class` matches `unlikelyCandidatesRe` ("sidebar") must NOT be
+    /// dropped, because `body`/`html` are top-level frame tags
+    /// (`FRAME_TAGS`) and are skipped BEFORE the regex check. Pins the True
+    /// side of `FRAME_TAGS.contains(&tag)` (line 752) — distinct from the
+    /// ordinary `<div>` strip already covered by
+    /// `remove_unlikely_candidates_strips_comment_div`.
+    #[test]
+    fn remove_unlikely_candidates_skips_frame_tag_body_with_unlikely_class() {
+        // <body class="sidebar"> — "sidebar" matches unlikelyCandidatesRe,
+        // but body is a FRAME_TAG so the guard at line 752 short-circuits
+        // the loop iteration with `continue`, sparing the body.
+        let html = r#"<html><body class="sidebar">
+            <div class="article-body">keep me</div>
+        </body></html>"#;
+        let mut doc = Document::new(html);
+        doc.remove_unlikely_candidates();
+        // The body itself must survive (the frame guard skipped it).
+        let body = doc.dom.body().expect("body survives the frame guard");
+        assert_eq!(
+            class_name(&body),
+            "sidebar",
+            "frame-tag <body> with an unlikely class must NOT be dropped (FRAME_TAGS guard)"
+        );
+        // And its article child is still reachable.
+        let kids = children(&body);
+        assert!(
+            kids.iter().any(|k| class_name(k) == "article-body"),
+            "article child survives under the spared body"
+        );
+    }
+
+    /// `readability_lxml.py:292-293` — the `okMaybeItsACandidateRe`
+    /// override. A `<div>` whose attributes match `unlikelyCandidatesRe`
+    /// ("comment") BUT ALSO match `okMaybeItsACandidateRe` ("main") is
+    /// KEPT — the `&& !ok_maybe_re().is_match(attrs)` conjunction's second
+    /// operand is false, so the deletion does not fire. Pins the False side
+    /// of the `!ok_maybe_re()` conjunct at line 756.
+    #[test]
+    fn remove_unlikely_candidates_keeps_ok_maybe_override_div() {
+        // class="comment-main": "comment" hits unlikelyCandidatesRe, "main"
+        // hits okMaybeItsACandidateRe → the override keeps the div.
+        let html = r#"<html><body>
+            <div class="comment-main">overridden keep</div>
+            <div class="comments">plain drop</div>
+        </body></html>"#;
+        let mut doc = Document::new(html);
+        doc.remove_unlikely_candidates();
+        let body = doc.dom.body().expect("body");
+        let classes: Vec<String> = children(&body).iter().map(class_name).collect();
+        assert!(
+            classes.iter().any(|c| c == "comment-main"),
+            "unlikely+ok_maybe div kept via the override, classes left: {classes:?}"
+        );
+        // Sanity: a plain unlikely div (no ok_maybe token) IS dropped, so
+        // the override is what spared the first div, not a no-op pass.
+        assert!(
+            !classes.iter().any(|c| c == "comments"),
+            "plain unlikely div still dropped, classes left: {classes:?}"
+        );
     }
 }

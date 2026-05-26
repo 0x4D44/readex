@@ -2264,4 +2264,39 @@ mod tests {
         assert_eq!(ps.len(), 2, "two <p> elements from two separate br chains");
         assert_eq!(text_content(&div), "foobarbaz");
     }
+
+    /// `_replaceBrs` trailing-whitespace trim (`Readability.js:735-737`):
+    /// `while (p.lastChild && _isWhitespace(p.lastChild)) p.lastChild.remove()`.
+    /// After the move loop absorbs phrasing siblings, a TRAILING whitespace-only
+    /// text node that became `p.lastChild` is stripped, then the loop breaks on
+    /// the first non-whitespace child.
+    /// rationale: pin the `is_whitespace(&lc)` TRUE arm (prep.rs:368) — every
+    /// other replace_brs test ends the new `<p>` on a non-whitespace child, so
+    /// the trim loop breaks immediately (false arm only). Here the new `<p>`
+    /// ends on a standalone " " text node that must be removed.
+    #[test]
+    fn replace_brs_trims_trailing_whitespace_child_of_new_p() {
+        // a<br><br>b<span>c</span><SPACE> : the <br><br> collapses to a <p>; the
+        // move loop absorbs the "b" text, the phrasing <span>c</span>, then the
+        // standalone trailing " " text node. p.lastChild is now that " " →
+        // _isWhitespace true → removed (prep.rs:368 true); next lastChild is the
+        // <span> (not whitespace) → loop breaks. So the <p> ends "...c" with NO
+        // trailing space, and the div text has no trailing space either.
+        let mut dom = Dom::parse("<div>a<br><br>b<span>c</span> </div>");
+        let body = dom.body().unwrap();
+        let div = get_elements_by_tag_name(&body, "div")[0].clone();
+        replace_brs(&mut dom, &body);
+        let ps = get_elements_by_tag_name(&div, "p");
+        assert_eq!(ps.len(), 1, "one <p> from the br-chain collapse");
+        assert_eq!(
+            text_content(&ps[0]),
+            "bc",
+            "trailing whitespace child trimmed off the new <p> (Readability.js:735-737)"
+        );
+        // The trailing " " was removed, not left dangling inside the <p>.
+        assert!(
+            !text_content(&ps[0]).ends_with(' '),
+            "no trailing space survives the trim loop"
+        );
+    }
 }

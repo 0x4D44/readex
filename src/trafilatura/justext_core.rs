@@ -707,6 +707,11 @@ fn walk_dom(node: &NodeRef, maker: &mut ParagraphMaker) {
 /// which emits no events for Comment / PI / Doctype).
 fn walk_child(node: &NodeRef, maker: &mut ParagraphMaker) {
     if is_text(node) {
+        // llvm-cov:branch-not-reachable: the implicit `else` of this `if let`
+        // cannot fire — `is_text(node)` is `matches!(node.data, NodeData::Text
+        // { .. })` (readability::dom::is_text), so once it returns `true` the
+        // `NodeData::Text` destructure is guaranteed to match. The arm is the
+        // idiomatic "match the variant we just tested for" shape.
         if let NodeData::Text { contents } = &node.data {
             let data = contents.borrow().to_string();
             maker.on_characters(&data);
@@ -943,6 +948,15 @@ fn get_neighbour(
         // `class_type` is set by phase-0 of `revise_paragraph_classification`
         // (the cf_class -> class_type copy at `core.py:316`) and updated
         // by later phases via `new_classes`. Read whatever's there.
+        // llvm-cov:branch-not-reachable: the `unwrap_or(CF_BAD)` fallback (the
+        // `class_type == None` side) cannot fire in the pipeline — `get_neighbour`
+        // is only reached from `revise_paragraph_classification_with`, whose
+        // phase-0 loop (`core.py:316`) copies the always-`Some` `cf_class`
+        // (set for EVERY paragraph at `classify_paragraphs_with`/`core.py:256-275`)
+        // into `class_type` before any neighbour walk. So `class_type` is
+        // `Some(_)` for every index by the time this read runs; the `None`
+        // fallback mirrors Python reading an attribute that is likewise always
+        // populated at this point.
         let c = paragraphs[idx as usize]
             .class_type
             .as_deref()
@@ -1221,6 +1235,14 @@ fn resolve_stoplist(target_language: Option<&str>) -> &'static [String] {
         for (code, name) in JUSTEXT_LANGUAGES {
             if *code == lang {
                 let list = get_stoplist(name);
+                // llvm-cov:branch-not-reachable: the `!list.is_empty()` FALSE
+                // side (and the `break` below) cannot fire — every `name` in
+                // `JUSTEXT_LANGUAGES` maps to an `include_str!`-embedded, non-
+                // empty vendored stoplist in `justext_stoplists::get_stoplist`,
+                // so a matched code always yields a populated list and returns
+                // here. The empty-list fall-through mirrors Python's
+                // missing-vendored-stoplist defensiveness (external.py:135-137)
+                // for a state the embedded slots cannot reach.
                 if !list.is_empty() {
                     return list;
                 }
@@ -1559,6 +1581,23 @@ mod tests {
             false,
         );
         assert!(para.is_blank());
+    }
+
+    /// rationale: pin the TRUE side of the LEFT `||` operand at
+    /// `justext_core.rs:203` — the free `is_blank` helper ports
+    /// `justext/utils.py:29-34` (`not string or string.isspace()`). The
+    /// `not string` (empty-string) clause is exercised here directly; the
+    /// `Paragraph::is_blank` method tested above goes through a different code
+    /// path (the cached `text`), so the free helper's empty-input short-circuit
+    /// is otherwise unobserved.
+    #[test]
+    fn is_blank_free_helper_true_for_empty_and_whitespace() {
+        // LEFT operand TRUE — empty string short-circuits (the `not string`).
+        assert!(is_blank(""));
+        // RIGHT operand TRUE — non-empty all-whitespace (the `.isspace()`).
+        assert!(is_blank("   \t\n"));
+        // Both FALSE — substantive text is not blank.
+        assert!(!is_blank("x"));
     }
 
     /// Test 8b (brief): `is_blank()` returns false for substantive text.
@@ -1931,6 +1970,33 @@ mod tests {
             !survivors.is_empty(),
             "unknown language should fall back to default stoplist, got 0 survivors"
         );
+    }
+
+    /// rationale: pin the `None` side of `resolve_stoplist`'s
+    /// `if let Some(lang) = target_language` at `justext_core.rs:1234`. Python
+    /// dispatches `if target_language in JUSTEXT_LANGUAGES` (external.py:134);
+    /// a `None` `target_language` is not in that map, so it takes the
+    /// `JT_STOPLIST or jt_stoplist_init()` fallback (external.py:137) —
+    /// the Rust port's English default. The existing tests always pass
+    /// `Some(_)` (`"en"` / `"zz"`), leaving the `None` arm unobserved.
+    #[test]
+    fn try_justext_none_language_falls_back_to_english() {
+        let html = r#"<html><body>
+            <p>The quick brown fox jumps over the lazy dog and this is a substantive
+            article paragraph about animals and forests with many common words like
+            the and a and of and to and the dog runs fast in the forest with the fox
+            and the cat as the sun sets behind the trees and the moon rises in the
+            east over the meadow with the river flowing gently through the valley.</p>
+        </body></html>"#;
+        let (_dom, body) = parse_body(html);
+        // target_language == None drives the `if let Some(lang)` None side.
+        let survivors = try_justext(&body, None, None);
+        assert!(
+            !survivors.is_empty(),
+            "None language must fall back to the English stoplist, got 0 survivors"
+        );
+        let joined = survivors.iter().map(|p| p.text.as_str()).collect::<Vec<_>>().join(" ");
+        assert!(joined.contains("substantive"), "article text must survive, got {joined:?}");
     }
 
     /// Brief test 3 (Stage 5d): `justext_rescue` builds a `<body>` NodeRef
@@ -2515,6 +2581,25 @@ mod tests {
         assert!(h9.is_heading);
     }
 
+    /// rationale: pin the FALSE side of the `&&` second operand at
+    /// `justext_core.rs:183` — the Python `HEADINGS_PATTERN = r"\bh\d\b"`
+    /// (`justext/paragraph.py:11`) requires the char after `h` to be a DIGIT.
+    /// A path component that is `h` + a single NON-digit char (e.g. `"ha"`,
+    /// `"hx"`) satisfies `rest.len() == 1` but fails `is_ascii_digit()`, so the
+    /// component is not a heading. The h1/h9 tests pin the TRUE side; the h10
+    /// test pins the `rest.len() == 1` FALSE side; this pins the `&&`
+    /// second-operand FALSE side (single char, non-digit).
+    #[test]
+    fn is_heading_path_single_non_digit_after_h_is_not_heading() {
+        // "ha" strips to rest="a" (len 1, not a digit) -> NOT a heading.
+        assert!(!is_heading_path("html.body.ha.p"));
+        // Mixed in a real-ish path: a `header`-like single-char-after-h trap.
+        assert!(!is_heading_path("html.hx.span"));
+        // Sanity: a genuine h3 in the same shape DOES register, proving the
+        // walk reaches the digit case and only the non-digit char is rejected.
+        assert!(is_heading_path("html.body.h3.span"));
+    }
+
     /// SAX walker: `<a>` start increments `in_link` (`core.py:175`),
     /// `</a>` clears it (`core.py:186`). A paragraph whose ENTIRE
     /// content is a link counts every char as a link char.
@@ -2530,6 +2615,30 @@ mod tests {
         assert_eq!(paras[0].chars_count_in_links, paras[0].text.chars().count());
         // link_density = 1.0.
         assert!((paras[0].link_density() - 1.0).abs() < 1e-9);
+    }
+
+    /// rationale: pin the `None` (skip) side of `walk_child`'s
+    /// `else if let Some(_tag) = local_name(node)` at `justext_core.rs:714`.
+    /// `lxml.sax.saxify` (`justext/core.py:143`) fires NO event for comment /
+    /// PI / doctype nodes; the Rust walker mirrors that by skipping any child
+    /// that is neither text (`is_text`) nor an element (`local_name` returns
+    /// `None` for non-Element nodes — see `readability::dom::local_name`).
+    /// A comment node as a direct child of `<p>` must therefore contribute no
+    /// text and produce no extra paragraph.
+    #[test]
+    fn make_paragraphs_skips_comment_child_no_sax_event() {
+        let (_dom, body) = parse_body(
+            "<html><body><p>before<!-- ignored comment -->after</p></body></html>",
+        );
+        let paras = make_paragraphs(&body);
+        assert_eq!(paras.len(), 1, "the comment must not split or add a paragraph");
+        // The comment text never enters the paragraph (no `characters` event).
+        assert_eq!(paras[0].text, "beforeafter");
+        assert!(
+            !paras[0].text.contains("ignored"),
+            "comment content must be skipped, got {:?}",
+            paras[0].text
+        );
     }
 
     /// `core.py:174` (lone `<br>` appends a space). A paragraph with
