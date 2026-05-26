@@ -653,6 +653,58 @@ mod tests {
         assert_eq!(text_content(&n), "hello");
     }
 
+    /// `_isPhrasingContent` (`Readability.js:2031-2040`): `<DEL>` with
+    /// all-phrasing children is phrasing.
+    /// rationale: pin the JS list `A|DEL|INS` (not just `A`).
+    #[test]
+    fn is_phrasing_content_del_with_phrasing_kids_is_phrasing() {
+        let dom = Dom::parse("<div><del><span>x</span></del><del><p>blk</p></del></div>");
+        let div = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let kids = children(&div);
+        assert!(
+            is_phrasing_content(&kids[0]),
+            "DEL with phrasing-only children is phrasing (Readability.js:2034)"
+        );
+        assert!(
+            !is_phrasing_content(&kids[1]),
+            "DEL containing a <p> (non-phrasing) is NOT phrasing"
+        );
+    }
+
+    /// `<INS>` mirror of the DEL case.
+    /// rationale: the alternation `A|DEL|INS` is all three.
+    #[test]
+    fn is_phrasing_content_ins_with_phrasing_kids_is_phrasing() {
+        let dom = Dom::parse("<div><ins><b>x</b></ins><ins><div>blk</div></ins></div>");
+        let div = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let kids = children(&div);
+        assert!(is_phrasing_content(&kids[0]));
+        assert!(!is_phrasing_content(&kids[1]));
+    }
+
+    /// `_isProbablyVisible` (`Readability.js:2694-2707`): `aria-hidden` with
+    /// a value OTHER than `"true"` (e.g. `"false"`) does NOT hide the node.
+    /// rationale: only `aria-hidden="true"` is the trigger; any other value
+    /// leaves the node visible.
+    #[test]
+    fn is_probably_visible_aria_hidden_false_is_visible() {
+        let (_d, n) = el(r#"<div aria-hidden="false">x</div>"#, "div");
+        assert!(
+            is_probably_visible(&n),
+            "aria-hidden=\"false\" is visible (Readability.js:2700-2703)"
+        );
+    }
+
+    /// `_isProbablyVisible`: `aria-hidden` present but empty string is NOT
+    /// `"true"` ⇒ visible.
+    /// rationale: pin the equality check at `:2702` — only the exact
+    /// string `"true"` triggers the hidden branch.
+    #[test]
+    fn is_probably_visible_aria_hidden_empty_string_is_visible() {
+        let (_d, n) = el(r#"<div aria-hidden="">x</div>"#, "div");
+        assert!(is_probably_visible(&n));
+    }
+
     #[test]
     fn next_sibling_all_node_types() {
         // M5 Stage 6e-a: Comments are stripped at parse time

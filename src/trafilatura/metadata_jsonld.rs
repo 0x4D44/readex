@@ -1279,4 +1279,1368 @@ mod tests {
         let m = run(html);
         assert_eq!(m.author.as_deref(), Some("Robust Reporter"));
     }
+
+    // ─── Stage 2: JSON-LD shape catalog (M5/coverage push) ─────────────────
+    //
+    // Tests in this block drive the missed branches inside `walk_article`,
+    // `extract_json`, `process_parent`, `extract_author_names`,
+    // `extract_json_parse_error`, `is_plausible_sitename`, `merge_author`,
+    // `normalize_json_string`, `strip_simple_html_tags`, `matches_schema_org`,
+    // and `is_liveblog_with_updates`. Each names the contract it pins.
+    //
+    // Oracle: `trafilatura@v2.0.0/json_metadata.py:67-223` and the dispatch
+    // in `metadata.py:182-195`.
+
+    // ── extract_json top-level dispatch shapes ────────────────────────────
+
+    /// `extract_json` (`json_metadata.py:143-144`): a root that is neither
+    /// object nor array (here: bare string) must produce no metadata.
+    /// rationale: faithful early-return on non-container roots, not a panic.
+    #[test]
+    fn jsonld_root_bare_string_yields_no_metadata() {
+        let html = r#"<html><head><script type="application/ld+json">
+        "just a string"
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.title.is_none());
+        assert!(m.author.is_none());
+        assert!(m.site_name.is_none());
+    }
+
+    /// `extract_json` root = `null` triggers the `_ => return` arm.
+    /// rationale: JSON null is a valid JSON value but not a schema.org
+    /// container — must not surface anything (`json_metadata.py:143-144`).
+    #[test]
+    fn jsonld_root_null_yields_no_metadata() {
+        let html = r#"<html><head><script type="application/ld+json">null</script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.title.is_none());
+    }
+
+    /// `extract_json` root = number triggers the `_ => return` arm.
+    /// rationale: same as null — defensive guard on non-object roots.
+    #[test]
+    fn jsonld_root_number_yields_no_metadata() {
+        let html = r#"<html><head><script type="application/ld+json">42</script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.title.is_none());
+    }
+
+    /// `extract_json` `@context` is non-schema.org URL → the explicit
+    /// non-schema.org gate (`json_metadata.py:150` `if context and ...`)
+    /// skips this entry. Rust port: `else { if context.is_none() ... }`.
+    /// rationale: an explicit non-schema-org @context disables walking.
+    #[test]
+    fn jsonld_non_schema_org_explicit_context_skipped() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "http://example.org/ns",
+         "@type": "Article", "headline": "Should Be Ignored",
+         "author": "Should Also Be Ignored"}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        // Non-schema.org context blocks the walker. Title/author stay None.
+        assert!(m.title.is_none());
+        assert!(m.author.is_none());
+    }
+
+    /// `extract_json` no `@context` present → faithful-tolerance widening
+    /// processes the entry as a fallback.
+    /// rationale: pins the documented widening (no @context still walks).
+    #[test]
+    fn jsonld_missing_context_still_walked_via_widening() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@type": "NewsArticle", "headline": "No Ctx Article",
+         "author": "Jane Doe"}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.title.as_deref(), Some("No Ctx Article"));
+        assert_eq!(m.author.as_deref(), Some("Jane Doe"));
+    }
+
+    /// `@graph` is a single object (not an array) under schema.org context.
+    /// rationale: `json_metadata.py:151-152`'s `Object` branch of the
+    /// `@graph` carrier — must walk it as a singleton.
+    #[test]
+    fn jsonld_graph_as_single_object() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org",
+         "@graph": {"@type": "NewsArticle",
+                    "headline": "Single-Obj Graph",
+                    "author": "Graph Solo"}}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.title.as_deref(), Some("Single-Obj Graph"));
+        assert_eq!(m.author.as_deref(), Some("Graph Solo"));
+    }
+
+    /// `@graph` carrier is a non-container type (string) → ignored, parent
+    /// not re-processed (falls through to no effective entries).
+    /// rationale: defensive — schema.org @graph must be array/object.
+    #[test]
+    fn jsonld_graph_as_string_is_ignored() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org",
+         "@graph": "not a graph"}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.title.is_none());
+    }
+
+    /// `@graph` resolution with multi-entity (Article + Organization +
+    /// Person + WebPage) cascade — covers `process_parent`'s per-entity
+    /// dispatch in one shot.
+    /// rationale: pins the multi-entity dispatch ordering.
+    #[test]
+    fn jsonld_graph_multi_entity_article_org_person_webpage() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org",
+         "@graph": [
+            {"@type": "WebPage", "name": "Page"},
+            {"@type": "Organization", "name": "Pub Co"},
+            {"@type": "Person", "name": "Top-Level Person"},
+            {"@type": "NewsArticle", "headline": "The Headline",
+             "author": "Article Author"}
+         ]}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.title.as_deref(), Some("The Headline"));
+        // `Pub Co` is longer than `Page` (the WebPage entry), so it overrides
+        // per `is_plausible_sitename`.
+        assert_eq!(m.site_name.as_deref(), Some("Pub Co"));
+        // Both top-level Person and Article author merge via `merge_author`.
+        let a = m.author.as_deref().unwrap();
+        assert!(a.contains("Top-Level Person"), "got {a:?}");
+        assert!(a.contains("Article Author"), "got {a:?}");
+    }
+
+    // ── liveblog carve-out (json_metadata.py:153-154) ──────────────────────
+
+    /// liveblogposting carve-out: `liveBlogUpdate` as ARRAY of update entries
+    /// is the effective parent list (`json_metadata.py:153-154`).
+    /// rationale: pins the array branch of the liveblog `liveBlogUpdate`
+    /// carrier shape.
+    #[test]
+    fn jsonld_liveblog_updates_as_array() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org",
+         "@type": "LiveBlogPosting",
+         "liveBlogUpdate": [
+            {"@type": "BlogPosting", "headline": "Latest Update",
+             "author": "Live Author"}
+         ]}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.title.as_deref(), Some("Latest Update"));
+        assert_eq!(m.author.as_deref(), Some("Live Author"));
+    }
+
+    /// liveblogposting carve-out: `liveBlogUpdate` as a single Object.
+    /// rationale: pins the Object branch of the carrier shape match.
+    #[test]
+    fn jsonld_liveblog_updates_as_single_object() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org",
+         "@type": "LiveBlogPosting",
+         "liveBlogUpdate": {"@type": "BlogPosting",
+                            "headline": "Solo Update"}}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.title.as_deref(), Some("Solo Update"));
+    }
+
+    /// `@type` contains "liveblogposting" substring but no `liveBlogUpdate`
+    /// key → `is_liveblog_with_updates` returns false; entry falls through
+    /// to the standard parent processing path.
+    /// rationale: pins `is_liveblog_with_updates`'s `&&` gate (both
+    /// halves required) at `json_metadata.py:153`.
+    #[test]
+    fn jsonld_liveblog_no_updates_key_falls_back_to_default_walker() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org",
+         "@type": "LiveBlogPosting",
+         "headline": "LB With No Updates",
+         "author": "LB Writer"}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        // Without liveBlogUpdate present, the default path walks the parent
+        // as Article-like (LiveBlogPosting is in JSON_ARTICLE_SCHEMA).
+        assert_eq!(m.title.as_deref(), Some("LB With No Updates"));
+        assert_eq!(m.author.as_deref(), Some("LB Writer"));
+    }
+
+    // ── process_parent edge shapes ─────────────────────────────────────────
+
+    /// `process_parent`: an entry whose `@type` is an Object (not str/array)
+    /// is skipped (`json_metadata.py:74-79` Python `isinstance(..., (str,
+    /// list))` filter). Rust port: `_ => continue`.
+    /// rationale: defensive type filter.
+    #[test]
+    fn jsonld_at_type_as_object_is_skipped() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org",
+         "@type": {"weird": "shape"},
+         "headline": "Should Not Surface"}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.title.is_none());
+    }
+
+    /// `process_parent`: a missing `@type` key is silently skipped — the
+    /// `continue` arm of the `Option::None` match.
+    /// rationale: `json_metadata.py:74` `if "@type" in content` gate.
+    #[test]
+    fn jsonld_missing_at_type_is_skipped() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org",
+         "headline": "Should Not Be Title"}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.title.is_none());
+    }
+
+    /// `process_parent`: an entry whose `@type` is an empty array → coerces
+    /// to no first element and is skipped (the inner `None => continue`).
+    /// rationale: `json_metadata.py:76` `parent.get("@type")[0]` first-elem
+    /// access on an empty list raises IndexError in Python; we faithfully
+    /// skip it instead of panicking.
+    #[test]
+    fn jsonld_at_type_empty_array_is_skipped() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org",
+         "@type": [],
+         "headline": "Empty-Type Array"}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.title.is_none());
+    }
+
+    /// `process_parent`: an entry whose `@type` is `[non-string-value]`
+    /// → also skipped (the inner `None` after `arr.first().and_then(as_str)`).
+    /// rationale: hardens the @type-array→first-string coercion.
+    #[test]
+    fn jsonld_at_type_array_first_non_string_is_skipped() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org",
+         "@type": [42],
+         "headline": "Wonky Type Array"}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.title.is_none());
+    }
+
+    /// `process_parent`: `@type` as a LIST of strings — uses the first
+    /// (`json_metadata.py:76-77`).
+    /// rationale: pins the `Array` arm of `@type` coercion when the first
+    /// item IS a string (the happy half).
+    #[test]
+    fn jsonld_at_type_as_list_of_strings_uses_first() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org",
+         "@type": ["NewsArticle", "BlogPosting"],
+         "headline": "Multi-Type Article"}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.title.as_deref(), Some("Multi-Type Article"));
+        // pagetype derived from first element of the @type list.
+        assert_eq!(m.pagetype.as_deref(), Some("newsarticle"));
+    }
+
+    /// `process_parent`: publisher present but `name` is NOT a string
+    /// (e.g. nested object). The early `and_then(Value::as_str)` returns
+    /// None → no site_name updated.
+    /// rationale: defensive against `publisher.name` of unexpected shape.
+    #[test]
+    fn jsonld_publisher_name_non_string_ignored() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "headline": "X",
+         "publisher": {"name": {"nested": "shape"}}}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.site_name.is_none());
+    }
+
+    /// `process_parent`: publisher with name = empty string → cleaned is
+    /// empty → the `!cleaned.is_empty()` gate stops the assignment.
+    /// rationale: pins the empty-name early-return.
+    #[test]
+    fn jsonld_publisher_empty_name_does_not_overwrite() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "headline": "X",
+         "publisher": {"name": ""}}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.site_name.is_none());
+    }
+
+    /// Publisher schema lookup: `name` absent, `legalName` present → uses
+    /// legalName (`json_metadata.py:85-88`).
+    /// rationale: pins the legalName fallback.
+    #[test]
+    fn jsonld_publisher_legalname_fallback() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org",
+         "@type": "Organization",
+         "legalName": "Big Media Co Ltd"}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.site_name.as_deref(), Some("Big Media Co Ltd"));
+    }
+
+    /// Publisher schema lookup: `name` and `legalName` both absent,
+    /// `alternateName` present → uses alternateName.
+    /// rationale: pins the final fallback in the OR chain.
+    #[test]
+    fn jsonld_publisher_alternatename_final_fallback() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org",
+         "@type": "Organization",
+         "alternateName": "Alt Co"}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.site_name.as_deref(), Some("Alt Co"));
+    }
+
+    /// Person at top level with `name` starting with "http" → skipped
+    /// (`json_metadata.py:90-92` `if not name.startswith("http")`).
+    /// rationale: pins the URL-as-name reject in the Person branch.
+    #[test]
+    fn jsonld_person_top_level_with_url_name_skipped() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org",
+         "@type": "Person",
+         "name": "https://example.com/profile/jane"}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.author.is_none());
+    }
+
+    /// Person at top level with regular `name` → populates author.
+    /// rationale: pins the happy path of the Person branch
+    /// (`json_metadata.py:90-92`).
+    #[test]
+    fn jsonld_person_top_level_writes_author() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org",
+         "@type": "Person", "name": "Top Person"}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.author.as_deref(), Some("Top Person"));
+    }
+
+    /// `process_parent`: non-object entry inside an array (here a string)
+    /// is silently skipped.
+    /// rationale: pins the `None => continue` of `content.as_object()`.
+    #[test]
+    fn jsonld_non_object_array_entries_skipped() {
+        let html = r#"<html><head><script type="application/ld+json">
+        ["just a string",
+         {"@context": "https://schema.org",
+          "@type": "Article", "headline": "Real One"}]
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.title.as_deref(), Some("Real One"));
+    }
+
+    // ── walk_article shape catalog ─────────────────────────────────────────
+
+    /// `walk_article` — `articleSection` as an ARRAY of strings appends each
+    /// entry to `categories` (`json_metadata.py:128-130`).
+    /// rationale: pins the `Value::Array` arm of articleSection.
+    #[test]
+    fn jsonld_article_section_as_array_of_strings() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "articleSection": ["Tech", "Science", "Policy"]}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.categories, vec!["Tech", "Science", "Policy"]);
+    }
+
+    /// `walk_article` — `articleSection` array entries that aren't strings
+    /// are silently filtered (no panic).
+    /// rationale: pins the `as_str()` filter inside the Array arm.
+    #[test]
+    fn jsonld_article_section_array_skips_non_strings() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "articleSection": ["Real", 42, null, "Also Real"]}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.categories, vec!["Real", "Also Real"]);
+    }
+
+    /// `walk_article` — `articleSection` of `Value::Number` falls through
+    /// the `_ => {}` arm; categories stay empty.
+    /// rationale: defensive — non-string/list shapes are no-ops.
+    #[test]
+    fn jsonld_article_section_number_is_noop() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "articleSection": 42}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.categories.is_empty());
+    }
+
+    /// `walk_article` — `articleSection` is processed ONLY if categories is
+    /// still empty (the `if metadata.categories.is_empty()` gate). Two
+    /// JSON-LD blocks with sections: the second is ignored.
+    /// rationale: pins the categories-empty gate ordering at
+    /// `json_metadata.py:126`.
+    #[test]
+    fn jsonld_article_section_skipped_when_already_set() {
+        let html = r#"<html><head>
+        <script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "articleSection": "First Cat"}
+        </script>
+        <script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "articleSection": "Second Cat"}
+        </script>
+        </head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.categories, vec!["First Cat"]);
+    }
+
+    /// `walk_article` — `keywords` as ARRAY appends each entry to `tags`.
+    /// rationale: pins the Array arm of the keywords carrier (additive
+    /// faithful extension noted in the module header).
+    #[test]
+    fn jsonld_keywords_as_array() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "keywords": ["rust", "json", "ld"]}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.tags, vec!["rust", "json", "ld"]);
+    }
+
+    /// `walk_article` — keywords with empty entries in comma-string get
+    /// filtered out by `!cleaned.is_empty()` after `trim`.
+    /// rationale: pins the empty-trim filter inside the comma-split branch.
+    #[test]
+    fn jsonld_keywords_comma_string_skips_blank_parts() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "keywords": "rust, , json,  "}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.tags, vec!["rust", "json"]);
+    }
+
+    /// `walk_article` — keywords as non-string/non-array (Number) is a no-op.
+    /// rationale: pins the `_ => {}` keywords arm.
+    #[test]
+    fn jsonld_keywords_non_supported_carrier_is_noop() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "keywords": 12345}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.tags.is_empty());
+    }
+
+    /// `walk_article` — `name` is used as title only when `headline` is
+    /// absent (`json_metadata.py:135-137`).
+    /// rationale: pins the `else if` cascade in title resolution.
+    #[test]
+    fn jsonld_title_falls_back_to_name_when_no_headline() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "name": "Name-Only Title"}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.title.as_deref(), Some("Name-Only Title"));
+    }
+
+    /// `walk_article` — `headline` precedence over `name` when both
+    /// present (`json_metadata.py:132-137`).
+    /// rationale: pins the `if let Some(headline)` first arm.
+    #[test]
+    fn jsonld_headline_beats_name_in_title_resolution() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "headline": "Headline Wins",
+         "name": "Name Loses"}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.title.as_deref(), Some("Headline Wins"));
+    }
+
+    /// `walk_article` — title not overwritten when already set.
+    /// rationale: pins the `if metadata.title.is_none()` gate.
+    #[test]
+    fn jsonld_walk_article_does_not_overwrite_existing_title() {
+        let html = r#"<html><head>
+        <script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "headline": "First Title"}
+        </script>
+        <script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "headline": "Second Title"}
+        </script>
+        </head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.title.as_deref(), Some("First Title"));
+    }
+
+    /// `walk_article` — `dateModified` is used only when `datePublished` is
+    /// absent.
+    /// rationale: pins the `else if` date fallback path.
+    #[test]
+    fn jsonld_date_modified_used_when_no_published() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "headline": "x", "dateModified": "2024-12-31"}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.date.as_deref(), Some("2024-12-31"));
+    }
+
+    /// `walk_article` — `datePublished` beats `dateModified` when both
+    /// present.
+    /// rationale: pins the `if let` order: published first, modified
+    /// second.
+    #[test]
+    fn jsonld_date_published_beats_date_modified() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "headline": "x",
+         "datePublished": "2024-01-01",
+         "dateModified": "2024-12-31"}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.date.as_deref(), Some("2024-01-01"));
+    }
+
+    /// `walk_article` — date already set by a prior block is not
+    /// overwritten.
+    /// rationale: pins `if metadata.date.is_none()` gate.
+    #[test]
+    fn jsonld_walk_article_does_not_overwrite_existing_date() {
+        let html = r#"<html><head>
+        <script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "headline": "First", "datePublished": "2024-01-01"}
+        </script>
+        <script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "headline": "Second", "datePublished": "2024-06-15"}
+        </script>
+        </head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.date.as_deref(), Some("2024-01-01"));
+    }
+
+    /// `walk_article` — `image` as a bare string (not an ImageObject) is
+    /// accepted.
+    /// rationale: pins the `Value::String` arm of the image carrier.
+    #[test]
+    fn jsonld_image_as_bare_string() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "headline": "x", "image": "https://example.com/img.jpg"}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.image.as_deref(), Some("https://example.com/img.jpg"));
+    }
+
+    /// `walk_article` — `image` as an array whose FIRST element is a bare
+    /// string.
+    /// rationale: pins the array→first→Value::String inner arm.
+    #[test]
+    fn jsonld_image_as_array_first_string() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "headline": "x",
+         "image": ["https://example.com/a.jpg",
+                   "https://example.com/b.jpg"]}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.image.as_deref(), Some("https://example.com/a.jpg"));
+    }
+
+    /// `walk_article` — `image` array first elem is an ImageObject with
+    /// `url`.
+    /// rationale: pins the array→first→Object→url inner arm.
+    #[test]
+    fn jsonld_image_as_array_first_object_with_url() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "headline": "x",
+         "image": [{"@type": "ImageObject", "url": "https://x/y.jpg"}]}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.image.as_deref(), Some("https://x/y.jpg"));
+    }
+
+    /// `walk_article` — `image` as ImageObject without `url` → None
+    /// candidate, image stays unset.
+    /// rationale: pins the `Object` branch returning None when url missing.
+    #[test]
+    fn jsonld_image_object_without_url_yields_no_image() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "headline": "x",
+         "image": {"@type": "ImageObject", "caption": "no url here"}}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.image.is_none());
+    }
+
+    /// `walk_article` — `image` as empty array → `arr.first()` is None →
+    /// no image.
+    /// rationale: pins the empty-array branch of the Array image arm.
+    #[test]
+    fn jsonld_image_empty_array_yields_no_image() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "headline": "x", "image": []}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.image.is_none());
+    }
+
+    /// `walk_article` — `image` as a Number → `_ => None` outer arm.
+    /// rationale: defensive type guard on the image carrier.
+    #[test]
+    fn jsonld_image_as_number_is_noop() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "headline": "x", "image": 42}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.image.is_none());
+    }
+
+    /// `walk_article` — image already set is not overwritten.
+    /// rationale: pins the `if metadata.image.is_none()` gate.
+    #[test]
+    fn jsonld_walk_article_does_not_overwrite_existing_image() {
+        let html = r#"<html><head>
+        <script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "headline": "x", "image": "https://first/a.jpg"}
+        </script>
+        <script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "headline": "y", "image": "https://second/b.jpg"}
+        </script>
+        </head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.image.as_deref(), Some("https://first/a.jpg"));
+    }
+
+    /// `walk_article` — `image` array first elem is non-string/non-object
+    /// (here a Number) → inner `_ => None`.
+    /// rationale: pins the inner `_ => None` arm of the array element
+    /// dispatch.
+    #[test]
+    fn jsonld_image_array_first_non_supported_is_noop() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "headline": "x", "image": [42]}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.image.is_none());
+    }
+
+    // ── extract_author_names shape catalog ────────────────────────────────
+
+    /// `extract_author_names` — string-valued author whose VALUE happens to
+    /// be JSON-parseable as an object → recurse into it
+    /// (`json_metadata.py:98-104`).
+    /// rationale: pins the `json.loads(s)` Python rescue path.
+    #[test]
+    fn jsonld_author_string_is_recursively_parsed_as_object() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "headline": "x",
+         "author": "{\"@type\": \"Person\", \"name\": \"Embedded Author\"}"}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.author.as_deref(), Some("Embedded Author"));
+    }
+
+    /// `extract_author_names` — string-valued author that parses to an
+    /// ARRAY (`json.loads("[{...}]")` rescue) recurses on the array.
+    /// rationale: pins the `is_array()` branch of the inner parse rescue.
+    #[test]
+    fn jsonld_author_string_is_recursively_parsed_as_array() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "headline": "x",
+         "author": "[{\"name\":\"A One\"},{\"name\":\"B Two\"}]"}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.author.as_deref(), Some("A One; B Two"));
+    }
+
+    /// `extract_author_names` — string-valued author that parses to a
+    /// primitive (e.g. a number) is treated as a plain name string,
+    /// reaching `normalize_json_string("42")` → `"42"`.
+    /// rationale: pins the fallback from "inner parse succeeded but not
+    /// container" through to the literal-string path.
+    #[test]
+    fn jsonld_author_string_parses_to_primitive_then_treated_as_name() {
+        // The string "42" parses to JSON number 42 (not object/array).
+        // The rescue branch then falls through to the literal-string
+        // handler, which yields "42" as a name.
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "headline": "x", "author": "42"}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.author.as_deref(), Some("42"));
+    }
+
+    /// `extract_author_names` — string-valued author that is empty after
+    /// `normalize_json_string` (here: only HTML tags) yields no name.
+    /// rationale: pins the `!cleaned.is_empty()` filter on string-author.
+    #[test]
+    fn jsonld_author_empty_after_tag_strip_yields_no_author() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "headline": "x", "author": "<span></span>"}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.author.is_none());
+    }
+
+    /// `extract_author_names` — author value is a Number → `_ => return
+    /// out` arm with `out` empty.
+    /// rationale: pins the catch-all in the carrier match.
+    #[test]
+    fn jsonld_author_as_number_is_skipped() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "headline": "x", "author": 12345}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.author.is_none());
+    }
+
+    /// `extract_author_names` — list-of-strings as author shape: each
+    /// non-object entry is skipped by `author.as_object()` → `None =>
+    /// continue`.
+    /// rationale: pins the per-item object-only filter (a list of bare
+    /// strings is faithfully ignored — Python iterates dicts; bare strings
+    /// have no `.get("name")`).
+    #[test]
+    fn jsonld_author_list_of_strings_is_filtered() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "headline": "x", "author": ["Loose A", "Loose B"]}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        // Bare strings inside the author list have no .name key; the
+        // per-item dispatch skips them.
+        assert!(m.author.is_none());
+    }
+
+    /// `extract_author_names` — list of MIXED objects + strings: strings
+    /// are skipped, objects with name are accepted.
+    /// rationale: pins the per-item filter when ONE side is valid.
+    #[test]
+    fn jsonld_author_list_of_mixed_keeps_valid_objects() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "headline": "x",
+         "author": ["Loose String", {"name": "Valid Author"}]}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.author.as_deref(), Some("Valid Author"));
+    }
+
+    /// `extract_author_names` — author object with `@type` that is NEITHER
+    /// "Person" nor missing (e.g. "Organization") is filtered out by the
+    /// `type_ok` gate (`json_metadata.py:110`).
+    /// rationale: pins the `Some(Value::String(s)) => s == "Person"` arm
+    /// when s != "Person".
+    #[test]
+    fn jsonld_author_object_with_non_person_type_filtered() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "headline": "x",
+         "author": {"@type": "Organization", "name": "Org Author"}}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.author.is_none());
+    }
+
+    /// `extract_author_names` — author object with `@type` of non-string
+    /// value (e.g. array) is filtered out.
+    /// rationale: pins the `_ => false` arm of the @type filter.
+    #[test]
+    fn jsonld_author_object_with_array_type_filtered() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "headline": "x",
+         "author": {"@type": ["Person", "Author"], "name": "Multi-Type"}}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        // @type as array fails type_ok (only String "Person" passes).
+        assert!(m.author.is_none());
+    }
+
+    /// `extract_author_names` — author object with `name` as ARRAY of
+    /// strings is joined with "; " (`json_metadata.py:113-118`).
+    /// rationale: pins the Array arm of the name carrier.
+    #[test]
+    fn jsonld_author_name_as_array_joined_with_semicolons() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "headline": "x",
+         "author": {"@type": "Person",
+                    "name": ["Jane Doe", "Jr."]}}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.author.as_deref(), Some("Jane Doe; Jr."));
+    }
+
+    /// `extract_author_names` — author object with `name` as EMPTY array
+    /// (`json_metadata.py:118`) → `None` → skipped.
+    /// rationale: pins the joined-list empty path.
+    #[test]
+    fn jsonld_author_name_as_empty_array_yields_no_author() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "headline": "x",
+         "author": {"@type": "Person", "name": []}}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.author.is_none());
+    }
+
+    /// `extract_author_names` — author object with `name` as a NESTED dict
+    /// reaches the `o.get("name")` branch (`json_metadata.py:115-118`).
+    /// rationale: pins the `Object` arm of the name carrier.
+    #[test]
+    fn jsonld_author_name_as_nested_object_with_name_field() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "headline": "x",
+         "author": {"@type": "Person",
+                    "name": {"name": "Inner Name"}}}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.author.as_deref(), Some("Inner Name"));
+    }
+
+    /// `extract_author_names` — author object with `name` of Number type
+    /// falls to `_ => None`.
+    /// rationale: pins the catch-all of the name carrier shape.
+    #[test]
+    fn jsonld_author_name_as_number_is_none() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "headline": "x",
+         "author": {"@type": "Person", "name": 42}}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.author.is_none());
+    }
+
+    /// `extract_author_names` — author with `givenName` only (no
+    /// familyName) → the dual-key gate fails and yields no name.
+    /// rationale: pins the `&&` gate in the givenName/familyName fallback.
+    #[test]
+    fn jsonld_author_given_name_only_yields_no_author() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "headline": "x",
+         "author": {"@type": "Person", "givenName": "Solo"}}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.author.is_none());
+    }
+
+    /// `extract_author_names` — givenName + additionalName + familyName
+    /// joined with spaces (`json_metadata.py:119-120`).
+    /// rationale: pins the AUTHOR_ATTRS triplet join (with middle name).
+    #[test]
+    fn jsonld_author_given_additional_family_joined_with_spaces() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "headline": "x",
+         "author": {"@type": "Person",
+                    "givenName": "Jane",
+                    "additionalName": "Q",
+                    "familyName": "Doe"}}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.author.as_deref(), Some("Jane Q Doe"));
+    }
+
+    /// `extract_author_names` — author object with neither `name` nor
+    /// givenName/familyName → final `else => None`.
+    /// rationale: pins the all-keys-absent fallthrough.
+    #[test]
+    fn jsonld_author_object_with_no_recognised_keys_skipped() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "headline": "x",
+         "author": {"@type": "Person", "url": "https://x"}}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.author.is_none());
+    }
+
+    /// `extract_author_names` — multiple Person entries in a list whose
+    /// names are dedup'd by `merge_author`.
+    /// rationale: pins the dedup arm of `merge_author` reached via the
+    /// author-walker.
+    #[test]
+    fn jsonld_author_list_with_duplicates_is_deduped() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "headline": "x",
+         "author": [{"name": "Jane Doe"}, {"name": "Jane Doe"},
+                    {"name": "Joe Bloggs"}]}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.author.as_deref(), Some("Jane Doe; Joe Bloggs"));
+    }
+
+    /// `merge_author` — candidate that is itself a URL is rejected.
+    /// rationale: pins the `starts_with("http")` reject in merge_author,
+    /// reached via a Person object's name field.
+    #[test]
+    fn jsonld_author_string_url_is_rejected_by_merge() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "headline": "x",
+         "author": {"name": "https://example.com/jane"}}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.author.is_none());
+    }
+
+    /// `merge_author` — candidate containing `@` (email) is rejected.
+    /// rationale: pins the `'@'` reject in merge_author.
+    #[test]
+    fn jsonld_author_email_address_is_rejected_by_merge() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "headline": "x", "author": "jane@example.com"}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.author.is_none());
+    }
+
+    // ── Direct unit tests on the small helpers ────────────────────────────
+
+    /// `matches_schema_org` — None returns false (`json_metadata.py:27`).
+    /// rationale: pins the None arm.
+    #[test]
+    fn matches_schema_org_none_is_false() {
+        assert!(!matches_schema_org(None));
+    }
+
+    /// `matches_schema_org` — http and https variants both accepted, with
+    /// or without trailing slash; non-schema-org rejected.
+    /// rationale: pins both halves of the `||` predicate.
+    #[test]
+    fn matches_schema_org_http_and_https_accepted() {
+        assert!(matches_schema_org(Some("http://schema.org")));
+        assert!(matches_schema_org(Some("https://schema.org/")));
+        // Case insensitive.
+        assert!(matches_schema_org(Some("HTTP://Schema.org")));
+        // Not schema.org.
+        assert!(!matches_schema_org(Some("http://example.com")));
+        // schema.org without scheme also rejected.
+        assert!(!matches_schema_org(Some("schema.org")));
+    }
+
+    /// `is_plausible_sitename` — empty candidate always rejected.
+    /// rationale: pins the `candidate.is_empty()` guard.
+    #[test]
+    fn is_plausible_sitename_empty_candidate_rejected() {
+        assert!(!is_plausible_sitename(Some("Existing"), "", "organization"));
+        assert!(!is_plausible_sitename(None, "", "organization"));
+    }
+
+    /// `is_plausible_sitename` — None / empty current always accepts.
+    /// rationale: pins the `None`/`Some("")` accept arms.
+    #[test]
+    fn is_plausible_sitename_no_or_empty_current_accepts() {
+        assert!(is_plausible_sitename(None, "New", "organization"));
+        assert!(is_plausible_sitename(Some(""), "New", "organization"));
+    }
+
+    /// `is_plausible_sitename` — current is http://… and candidate is not
+    /// http-prefixed → accept the candidate (preferred over a URL).
+    /// rationale: pins the `current.starts_with("http") && !candidate
+    /// .starts_with("http")` arm.
+    #[test]
+    fn is_plausible_sitename_url_current_replaced_by_name_candidate() {
+        assert!(is_plausible_sitename(
+            Some("https://example.com/site"),
+            "Better Name",
+            "organization"
+        ));
+    }
+
+    /// `is_plausible_sitename` — content_type "webpage" never overrides a
+    /// non-empty current (`json_metadata.py:63-64`).
+    /// rationale: pins the `content_type != "webpage"` arm of the length
+    /// compare.
+    #[test]
+    fn is_plausible_sitename_webpage_type_does_not_overwrite() {
+        assert!(!is_plausible_sitename(
+            Some("Short"),
+            "A Much Longer Candidate Name",
+            "webpage"
+        ));
+    }
+
+    /// `is_plausible_sitename` — current is longer than candidate → reject
+    /// (length rule).
+    /// rationale: pins the negative branch of `c.chars().count()
+    /// < candidate.chars().count()`.
+    #[test]
+    fn is_plausible_sitename_shorter_candidate_rejected() {
+        assert!(!is_plausible_sitename(
+            Some("An Already Long Name"),
+            "Short",
+            "organization"
+        ));
+    }
+
+    /// `is_plausible_sitename` — current is shorter than candidate AND
+    /// content_type != webpage → accept.
+    /// rationale: pins the positive branch of the length compare.
+    #[test]
+    fn is_plausible_sitename_longer_candidate_accepted() {
+        assert!(is_plausible_sitename(
+            Some("Short"),
+            "A Longer Name",
+            "organization"
+        ));
+    }
+
+    /// `merge_author` — None current + valid candidate → init.
+    /// rationale: pins the `_ => Some(trimmed)` arm.
+    #[test]
+    fn merge_author_initializes_from_none() {
+        let r = merge_author(None, "Jane Doe");
+        assert_eq!(r.as_deref(), Some("Jane Doe"));
+    }
+
+    /// `merge_author` — empty-string current + new candidate → init.
+    /// rationale: pins the `current.is_empty()` branch of the match guard.
+    #[test]
+    fn merge_author_initializes_from_empty_string() {
+        let r = merge_author(Some(""), "Jane Doe");
+        assert_eq!(r.as_deref(), Some("Jane Doe"));
+    }
+
+    /// `merge_author` — candidate trimmed to empty → keep current.
+    /// rationale: pins the `trimmed.is_empty()` reject.
+    #[test]
+    fn merge_author_blank_candidate_preserves_current() {
+        let r = merge_author(Some("Jane Doe"), "   ");
+        assert_eq!(r.as_deref(), Some("Jane Doe"));
+    }
+
+    /// `merge_author` — URL-candidate preserves current None.
+    /// rationale: pins the URL-reject path returning the existing None.
+    #[test]
+    fn merge_author_url_candidate_with_none_current_returns_none() {
+        assert!(merge_author(None, "http://example.com").is_none());
+    }
+
+    /// `merge_author` — same name twice → dedup; current returned
+    /// unchanged.
+    /// rationale: pins the dedup `already.iter().any(...)` arm.
+    #[test]
+    fn merge_author_dedupes_exact_match() {
+        let r = merge_author(Some("Jane Doe"), "Jane Doe");
+        assert_eq!(r.as_deref(), Some("Jane Doe"));
+    }
+
+    /// `merge_author` — append distinct candidates with "; ".
+    /// rationale: pins the format!("{c}; {trimmed}") branch.
+    #[test]
+    fn merge_author_appends_distinct_with_semicolon() {
+        let r = merge_author(Some("Jane Doe"), "Joe Smith");
+        assert_eq!(r.as_deref(), Some("Jane Doe; Joe Smith"));
+    }
+
+    /// `strip_simple_html_tags` — basic tag strip.
+    /// rationale: pins the standard `<...>` → `""` consumption.
+    #[test]
+    fn strip_simple_html_tags_removes_basic_tags() {
+        assert_eq!(strip_simple_html_tags("hello <b>bold</b> world"), "hello bold world");
+    }
+
+    /// `strip_simple_html_tags` — unclosed tag (no `>`) is preserved
+    /// verbatim.
+    /// rationale: pins the `!closed` branch where `out.push_str(&buf)`.
+    #[test]
+    fn strip_simple_html_tags_unclosed_tag_preserved() {
+        assert_eq!(strip_simple_html_tags("hello <unfinished"), "hello <unfinished");
+    }
+
+    /// `strip_simple_html_tags` — nested `<` resets the inner buffer (the
+    /// `<` inside an opening "tag" terminates the consumption loop).
+    /// rationale: pins the `if next == '<' { break; }` branch.
+    #[test]
+    fn strip_simple_html_tags_nested_lt_does_not_swallow_text() {
+        // Inner `<` triggers `break` on the inner loop; outer loop catches
+        // the `<` again as a new tag start. With "abc<x<y>z": first `<x`
+        // is preserved (because the inner `<` aborted, no closing `>`),
+        // then `<y>` is consumed as a tag.
+        let r = strip_simple_html_tags("a<x<y>b");
+        assert_eq!(r, "a<xb");
+    }
+
+    /// `is_liveblog_with_updates` — @type missing → false.
+    /// rationale: pins the `unwrap_or(false)` arm.
+    #[test]
+    fn is_liveblog_with_updates_no_type_false() {
+        let v = serde_json::json!({"liveBlogUpdate": []});
+        assert!(!is_liveblog_with_updates(&v));
+    }
+
+    /// `is_liveblog_with_updates` — @type missing the substring → false.
+    /// rationale: pins the `.contains("liveblogposting")` negative half.
+    #[test]
+    fn is_liveblog_with_updates_wrong_type_false() {
+        let v = serde_json::json!({"@type": "NewsArticle",
+                                    "liveBlogUpdate": []});
+        assert!(!is_liveblog_with_updates(&v));
+    }
+
+    /// `is_liveblog_with_updates` — @type matches but liveBlogUpdate key
+    /// missing → false (the `&&` second half fails).
+    /// rationale: pins the `parent.get("liveBlogUpdate").is_some()` guard.
+    #[test]
+    fn is_liveblog_with_updates_no_updates_key_false() {
+        let v = serde_json::json!({"@type": "LiveBlogPosting"});
+        assert!(!is_liveblog_with_updates(&v));
+    }
+
+    /// `is_liveblog_with_updates` — both halves true → true.
+    /// rationale: pins the happy path of the `&&` predicate.
+    #[test]
+    fn is_liveblog_with_updates_both_halves_true() {
+        let v = serde_json::json!({"@type": "LiveBlogPosting",
+                                    "liveBlogUpdate": []});
+        assert!(is_liveblog_with_updates(&v));
+    }
+
+    /// `normalize_json_string` — combines tag-strip + trim.
+    /// rationale: pins the cleaned-output of the helper used throughout
+    /// the walker.
+    #[test]
+    fn normalize_json_string_strips_tags_and_trims() {
+        assert_eq!(normalize_json_string("  <b>Hi</b> there  "), "Hi there");
+    }
+
+    // ── extract_json_parse_error: additional shape coverage ───────────────
+
+    /// `extract_json_parse_error` — malformed JSON containing
+    /// `"articleSection"` recovers a category.
+    /// rationale: pins the `elem.contains("\"articleSection\"")` →
+    /// `json_category_re` capture arm.
+    #[test]
+    fn parse_error_recovers_article_section_as_category() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context":"https://schema.org","@type":"NewsArticle",
+         "articleSection": "Politics" OOPS
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.categories, vec!["Politics"]);
+    }
+
+    /// `extract_json_parse_error` — pagetype is set ONLY when @type matches
+    /// the OGType list (`json_metadata.py:183-189`). A `@type` that is NOT
+    /// in JSON_OGTYPE_SCHEMA (here: "Recipe") is silently dropped.
+    /// rationale: pins the `.contains(&candidate.as_str())` negative half.
+    #[test]
+    fn parse_error_pagetype_non_ogtype_not_assigned() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context":"https://schema.org","@type":"Recipe" OOPS
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.pagetype.is_none());
+    }
+
+    /// `extract_json_parse_error` — pagetype matches OGType list (here:
+    /// "NewsArticle" → lowered → "newsarticle") → assigned.
+    /// rationale: pins the positive half of the pagetype branch.
+    #[test]
+    fn parse_error_pagetype_ogtype_match_assigned() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context":"https://schema.org","@type":"NewsArticle",
+         "author": {"@type":"Person","name":"Some Author"} OOPS
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.pagetype.as_deref(), Some("newsarticle"));
+    }
+
+    /// `extract_json_parse_error` — publisher group containing a comma is
+    /// rejected (`json_metadata.py:194` `if "," not in ...`).
+    /// rationale: pins the `!group.as_str().contains(',')` guard.
+    #[test]
+    fn parse_error_publisher_with_comma_rejected() {
+        // The regex captures up to the next `"`, so a `,` lurking
+        // before the next quote (the regex `[^"\\]+` accepts commas inside
+        // the name) gets caught by the `!contains(',')` guard.
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context":"https://schema.org","@type":"NewsArticle",
+         "publisher": {"name":"Acme, News, Inc"} OOPS
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.site_name.is_none());
+    }
+
+    /// `extract_json_parse_error` — title already set is not overwritten.
+    /// rationale: pins the `metadata.title.is_none()` gate on the
+    /// title-rescue loop.
+    #[test]
+    fn parse_error_does_not_overwrite_existing_title() {
+        // First block: valid JSON sets title. Second block: malformed JSON
+        // with a different headline. The second must NOT overwrite.
+        let html = r#"<html><head>
+        <script type="application/ld+json">
+        {"@context":"https://schema.org","@type":"Article",
+         "headline":"First Set"}
+        </script>
+        <script type="application/ld+json">
+        {"@context":"https://schema.org","@type":"Article",
+         "headline":"Second Should Not Win" OOPS
+        </script>
+        </head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.title.as_deref(), Some("First Set"));
+    }
+
+    /// `extract_json_parse_error` — input contains neither `"name"` nor
+    /// `"headline"` substrings → both inner `contains` gates short-circuit;
+    /// no title recovered.
+    /// rationale: pins the substring-gate short-circuits in the title
+    /// rescue loop.
+    #[test]
+    fn parse_error_no_name_or_headline_keys_leaves_title_none() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context":"https://schema.org","@type":"Article",
+         "datePublished":"2024-01-15" OOPS
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.title.is_none());
+    }
+
+    /// `extract_json_parse_error` — JSON with single quotes (JS-style)
+    /// fails serde_json and falls through to the regex rescue.
+    /// rationale: pins the dispatch from `extract_meta_json`'s `Err`
+    /// branch into `extract_json_parse_error`, with single-quote JSON.
+    #[test]
+    fn parse_error_handles_single_quoted_json() {
+        // serde_json rejects single quotes outright. But our regexes
+        // require double-quoted keys, so this resulting text recovers
+        // nothing — confirms that the path is exercised and does NOT
+        // panic.
+        let html = r#"<html><head><script type="application/ld+json">
+        {'@type':'Article','headline':'wont match'}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        // No double-quoted "headline" → no recovery; metadata unchanged.
+        assert!(m.title.is_none());
+    }
+
+    /// `extract_json_parse_error` — unterminated string still allows the
+    /// regex rescue to surface a publisher when present earlier.
+    /// rationale: pins the resilience-to-truncation contract.
+    #[test]
+    fn parse_error_unterminated_string_still_surfaces_publisher() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context":"https://schema.org","@type":"NewsArticle",
+         "publisher": {"name":"Solid Pub"}, "headline": "trunc
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.site_name.as_deref(), Some("Solid Pub"));
+    }
+
+    /// `extract_json_parse_error` — JS-style comments inside JSON break
+    /// serde and route to rescue; an `authorSection` capture survives.
+    /// rationale: pins comment-tolerant rescue (no panic).
+    #[test]
+    fn parse_error_with_js_comments_still_recovers_section() {
+        let html = r#"<html><head><script type="application/ld+json">
+        // JS comments invalid in JSON
+        {"@context":"https://schema.org","@type":"NewsArticle",
+         "articleSection": "Sports"}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.categories, vec!["Sports"]);
+    }
+
+    // ── Aggregate / cross-cutting tests ───────────────────────────────────
+
+    /// `walk_article` end-to-end with every recognised polymorphic field
+    /// shape, asserting all slots populate.
+    /// rationale: regression pin against silent loss of any single field
+    /// in `walk_article`.
+    #[test]
+    fn jsonld_full_article_populates_every_slot() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org",
+         "@type": "NewsArticle",
+         "headline": "Full Article",
+         "author": [{"@type":"Person","name":"Jane Doe"},
+                    {"@type":"Person","name":"Joe Smith"}],
+         "articleSection": ["Tech", "Policy"],
+         "keywords": ["a", "b", "c"],
+         "datePublished": "2024-03-04",
+         "image": {"@type": "ImageObject",
+                   "url": "https://example.com/hero.jpg"},
+         "publisher": {"@type": "Organization",
+                       "name": "Daily News"}}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.title.as_deref(), Some("Full Article"));
+        assert_eq!(m.author.as_deref(), Some("Jane Doe; Joe Smith"));
+        assert_eq!(m.categories, vec!["Tech", "Policy"]);
+        assert_eq!(m.tags, vec!["a", "b", "c"]);
+        assert_eq!(m.date.as_deref(), Some("2024-03-04"));
+        assert_eq!(m.image.as_deref(), Some("https://example.com/hero.jpg"));
+        assert_eq!(m.site_name.as_deref(), Some("Daily News"));
+        assert_eq!(m.pagetype.as_deref(), Some("newsarticle"));
+    }
+
+    /// `extract_json` (`json_metadata.py:151-152`) — `@graph` is NOT
+    /// present and `@context` matches → falls through to the
+    /// `else { effective.push(parent); }` fallback (process the parent as
+    /// a single article).
+    /// rationale: pins the no-@graph-no-liveblog fallback at
+    /// `json_metadata.py:155-156`.
+    #[test]
+    fn jsonld_schema_org_context_without_graph_walks_parent_directly() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "headline": "Direct Parent",
+         "author": "Single Person"}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.title.as_deref(), Some("Direct Parent"));
+        assert_eq!(m.author.as_deref(), Some("Single Person"));
+    }
+
+    /// `extract_json` — `@graph` value is a `Value::Null` (neither array
+    /// nor object) → effective stays empty, process_parent runs with [].
+    /// rationale: pins the third arm `_ => {}` of the @graph dispatch.
+    #[test]
+    fn jsonld_graph_as_null_yields_nothing() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@graph": null}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.title.is_none());
+    }
 }

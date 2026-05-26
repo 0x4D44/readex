@@ -1139,4 +1139,362 @@ mod tests {
             .any(|d| dom::class_name(d) == "empty");
         assert!(!any_empty, "no useful content ⇒ remove");
     }
+
+    // ---- should_remove_conditionally per-clause coverage (Readability.js:2440-2628) ----
+    //
+    // The shadiness ladder. Each test pins ONE branch of the long list at
+    // `Readability.js:2440-2628`. Existing tests above already cover:
+    //   - 2461 KEEP "table && data table" (clean_conditionally_keeps_marked_data_table)
+    //   - 2470 KEEP "<code> ancestor" (clean_conditionally_keeps_inside_code_ancestor)
+    //   - 2493 KEEP "10+ commas" (clean_conditionally_many_commas_keeps_div)
+    //   - 2560 REMOVE "li > p outside list" (clean_conditionally_li_gt_p_outside_list)
+    //   - 2566 REMOVE "suspiciously short" (clean_conditionally_suspiciously_short)
+    //   - 2587 REMOVE "weight + link density" (clean_conditionally_high_weight_mostly_links)
+    //   - 2597 REMOVE "no useful content" (clean_conditionally_no_useful_content)
+    //   - 2613 KEEP "image gallery <ul>" (clean_conditionally_image_gallery_ul_is_kept)
+    //
+    // The tests below cover the remaining branches.
+
+    /// `Readability.js:2466-2468` KEEP: inside any `<table>` ancestor whose
+    /// `_readabilityDataTable` flag is set. Unbounded depth (maxDepth = -1).
+    /// rationale: a marked data table protects its descendants from
+    /// `_cleanConditionally` removal regardless of class weight.
+    #[test]
+    fn clean_conditionally_keeps_descendants_inside_data_table_ancestor() {
+        let mut dom = Dom::parse(
+            "<div id=root>\
+             <table><thead><tr><th>a</th><th>b</th></tr></thead>\
+             <tbody><tr><td>1</td><td><div class=\"sidebar\"><p>x</p></div></td></tr></tbody>\
+             </table>\
+             </div>",
+        );
+        let root = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        super::super::mark_data_tables::mark_data_tables(&mut dom, &root);
+        let flags = Flags::default();
+        clean_conditionally(&dom, &flags, &root, "div");
+        // The negative-weight `<div class=sidebar>` inside the data table
+        // ancestor MUST survive (Readability.js:2466 KEEP).
+        let any_sidebar = get_elements_by_tag_name(&root, "div")
+            .iter()
+            .any(|d| dom::class_name(d) == "sidebar");
+        assert!(
+            any_sidebar,
+            "data-table ancestor protects descendants (Readability.js:2466-2468)"
+        );
+    }
+
+    /// `Readability.js:2474-2481` KEEP: a descendant `<table>` that is a data
+    /// table protects the candidate node from removal.
+    /// rationale: a div wrapping a data table is not stripped even if its
+    /// other shadiness checks would fail.
+    #[test]
+    fn clean_conditionally_keeps_node_with_data_table_descendant() {
+        let mut dom = Dom::parse(
+            "<div id=root>\
+             <div class=\"neutralwrap\"><table><thead><tr><th>x</th><th>y</th></tr></thead>\
+             <tbody><tr><td>1</td><td>2</td></tr></tbody></table></div>\
+             </div>",
+        );
+        let root = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        super::super::mark_data_tables::mark_data_tables(&mut dom, &root);
+        let flags = Flags::default();
+        clean_conditionally(&dom, &flags, &root, "div");
+        // The wrap div must survive: it has a data-table descendant.
+        let any_neutral = get_elements_by_tag_name(&root, "div")
+            .iter()
+            .any(|d| dom::class_name(d) == "neutralwrap");
+        assert!(
+            any_neutral,
+            "descendant data table protects ancestor (Readability.js:2474-2481)"
+        );
+    }
+
+    /// `Readability.js:2489-2491` REMOVE: `weight + contentScore < 0`. Negative
+    /// class weight short-circuits BEFORE the comma gate is consulted.
+    /// rationale: a `sidebar`-class div (-25 per regexps::negative) gets
+    /// stripped without consulting the rest of the shadiness checks even with
+    /// many commas (which would otherwise KEEP a neutral-weight div).
+    #[test]
+    fn clean_conditionally_negative_weight_removes_before_comma_gate() {
+        // class "sidebar" → -25 weight (regexps::negative). Add many commas to
+        // prove the weight short-circuit fires FIRST: with weight = 0 the
+        // 10+ commas branch would KEEP this div.
+        let dom = Dom::parse(
+            r#"<div id=root><div class="sidebar"><p>a,b,c,d,e,f,g,h,i,j,k,l,m</p></div></div>"#,
+        );
+        let root = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let flags = Flags::default();
+        clean_conditionally(&dom, &flags, &root, "div");
+        let any_sidebar = get_elements_by_tag_name(&root, "div")
+            .iter()
+            .any(|d| dom::class_name(d) == "sidebar");
+        assert!(
+            !any_sidebar,
+            "weight<0 short-circuits even with many commas (Readability.js:2489-2491)"
+        );
+    }
+
+    /// `Readability.js:2519-2523` KEEP: an `<object>`/`<embed>`/`<iframe>`
+    /// whose ANY attribute matches `REGEXPS.videos` (e.g. a YouTube src) is a
+    /// video embed and the candidate is KEPT regardless of other shadiness.
+    /// rationale: an iframe whose src is youtube.com keeps the containing div
+    /// even when no other content is present.
+    #[test]
+    fn clean_conditionally_video_embed_attribute_keeps_node() {
+        // No commas, no images, only an iframe with a YouTube src — without
+        // the video-keep the div would otherwise be removed (no useful content
+        // / suspicious embed). The KEEP path returns false immediately.
+        let dom = Dom::parse(
+            r#"<div id=root><div class="vidwrap"><iframe src="https://www.youtube.com/embed/abcDEF"></iframe></div></div>"#,
+        );
+        let root = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let flags = Flags::default();
+        clean_conditionally(&dom, &flags, &root, "div");
+        let any_wrap = get_elements_by_tag_name(&root, "div")
+            .iter()
+            .any(|d| dom::class_name(d) == "vidwrap");
+        assert!(
+            any_wrap,
+            "video-attribute embed KEEPs candidate (Readability.js:2519-2523)"
+        );
+    }
+
+    /// `Readability.js:2538-2544` REMOVE: `REGEXPS.adWords` match on innerText.
+    /// rationale: a div whose ONLY text is exactly the ad-words alternation
+    /// (`Advertisement`, `Werbung`, `Реклама`, `广告`, etc.) is stripped.
+    #[test]
+    fn clean_conditionally_ad_words_inner_text_removes() {
+        // The regex is `^(ad(vertising|vertisement)?|pub(licité)?|werb(ung)?|广告|Реклама|Anuncio)$`
+        // anchored — so the inner text must be EXACTLY one of those words.
+        let dom = Dom::parse(r#"<div id=root><div class="x">Advertisement</div></div>"#);
+        let root = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let flags = Flags::default();
+        clean_conditionally(&dom, &flags, &root, "div");
+        let any_x = get_elements_by_tag_name(&root, "div")
+            .iter()
+            .any(|d| dom::class_name(d) == "x");
+        assert!(
+            !any_x,
+            "adWords inner text ⇒ remove (Readability.js:2540)"
+        );
+    }
+
+    /// `Readability.js:2538-2544` REMOVE: `REGEXPS.loadingWords` match.
+    /// rationale: a div whose inner text is exactly a loading-label
+    /// (`Loading`, `Cargando…`, `Загрузка…`, etc.) is stripped.
+    #[test]
+    fn clean_conditionally_loading_words_inner_text_removes() {
+        let dom = Dom::parse(r#"<div id=root><div class="y">Loading...</div></div>"#);
+        let root = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let flags = Flags::default();
+        clean_conditionally(&dom, &flags, &root, "div");
+        let any_y = get_elements_by_tag_name(&root, "div")
+            .iter()
+            .any(|d| dom::class_name(d) == "y");
+        assert!(
+            !any_y,
+            "loadingWords inner text ⇒ remove (Readability.js:2541)"
+        );
+    }
+
+    /// `Readability.js:2557-2559` REMOVE: not figure-child AND img > 1 AND
+    /// p/img < 0.5. With 0 paragraphs and 2 images the ratio 0/2 = 0 < 0.5.
+    /// rationale: an image-heavy div outside a `<figure>` is treated as a
+    /// gallery wrapper and stripped when it lacks paragraphs.
+    #[test]
+    fn clean_conditionally_bad_p_to_img_ratio() {
+        // class=x → weight 0. No <p>. Two <img>. No commas. p/img = 0 < 0.5.
+        // Not a figure descendant. errs = true ⇒ remove.
+        let dom = Dom::parse(
+            r#"<div id=root><div class="x"><img src="a.jpg"><img src="b.jpg"></div></div>"#,
+        );
+        let root = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let flags = Flags::default();
+        clean_conditionally(&dom, &flags, &root, "div");
+        let any_x = get_elements_by_tag_name(&root, "div")
+            .iter()
+            .any(|d| dom::class_name(d) == "x");
+        assert!(
+            !any_x,
+            "p/img < 0.5 outside figure ⇒ remove (Readability.js:2557-2559)"
+        );
+    }
+
+    /// `Readability.js:2557-2559` KEEP path: the same shape but as a descendant
+    /// of `<figure>` — the `isFigureChild` guard suppresses the ratio check.
+    /// rationale: figure descendants are exempt from the image-density rule.
+    #[test]
+    fn clean_conditionally_figure_child_bypasses_p_to_img_ratio() {
+        // Same shape as above but wrapped in <figure>. The ratio check is
+        // disabled by isFigureChild=true. Other branches (suspiciously short
+        // — disabled too by isFigureChild; no useful content — disabled by
+        // img > 0) leave errs=false ⇒ keep.
+        let dom = Dom::parse(
+            r#"<div id=root><figure><div class="x"><img src="a.jpg"><img src="b.jpg"></div></figure></div>"#,
+        );
+        let root = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let flags = Flags::default();
+        clean_conditionally(&dom, &flags, &root, "div");
+        let any_x = get_elements_by_tag_name(&root, "div")
+            .iter()
+            .any(|d| dom::class_name(d) == "x");
+        assert!(
+            any_x,
+            "isFigureChild bypasses p/img ratio (Readability.js:2557 guard)"
+        );
+    }
+
+    /// `Readability.js:2563-2565` REMOVE: `input > Math.floor(p / 3)`. With
+    /// 0 paragraphs the gate is `input > 0`, so a single `<input>` triggers.
+    /// rationale: a form-like container with no paragraphs gets stripped.
+    #[test]
+    fn clean_conditionally_too_many_inputs_per_p() {
+        let dom = Dom::parse(
+            r#"<div id=root><div class="x"><input type="text"></div></div>"#,
+        );
+        let root = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let flags = Flags::default();
+        clean_conditionally(&dom, &flags, &root, "div");
+        let any_x = get_elements_by_tag_name(&root, "div")
+            .iter()
+            .any(|d| dom::class_name(d) == "x");
+        assert!(
+            !any_x,
+            "input > floor(p/3) ⇒ remove (Readability.js:2563-2565)"
+        );
+    }
+
+    /// `Readability.js:2578-2586` REMOVE: `!isList && weight<25 &&
+    /// linkDensity > 0.2`. Class "x" → weight 0. A short prose with a long
+    /// link drives linkDensity > 0.2.
+    /// rationale: a low-weight div whose text is mostly links is stripped.
+    #[test]
+    fn clean_conditionally_low_weight_linky() {
+        // Inner text: "ab " + "long anchor text here for density" =
+        // about 36 chars; "long anchor text here for density" ≈ 33 in <a>,
+        // so linkDensity ≈ 0.92 > 0.2. weight = 0 < 25.
+        let dom = Dom::parse(
+            r#"<div id=root><div class="x">ab <a href="/p">long anchor text here for density</a></div></div>"#,
+        );
+        let root = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let flags = Flags::default();
+        clean_conditionally(&dom, &flags, &root, "div");
+        let any_x = get_elements_by_tag_name(&root, "div")
+            .iter()
+            .any(|d| dom::class_name(d) == "x");
+        assert!(
+            !any_x,
+            "weight<25 && linkDensity>0.2 ⇒ remove (Readability.js:2578-2586)"
+        );
+    }
+
+    /// `Readability.js:2592-2596` REMOVE: `embedCount == 1 && contentLength
+    /// < 75`. A short-text candidate with one non-video iframe is stripped.
+    /// rationale: a single suspicious embed is enough to strip a short div.
+    #[test]
+    fn clean_conditionally_single_embed_short_content() {
+        // class="x" → weight 0. Inner text < 75 chars. One <iframe> with a
+        // non-video src (it would otherwise be a video-keep).
+        let dom = Dom::parse(
+            r#"<div id=root><div class="x">short text alongside an embed here<iframe src="https://example.com/x"></iframe></div></div>"#,
+        );
+        let root = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let flags = Flags::default();
+        clean_conditionally(&dom, &flags, &root, "div");
+        let any_x = get_elements_by_tag_name(&root, "div")
+            .iter()
+            .any(|d| dom::class_name(d) == "x");
+        assert!(
+            !any_x,
+            "embedCount==1 && contentLength<75 ⇒ remove (Readability.js:2592-2594)"
+        );
+    }
+
+    /// `Readability.js:2592-2596` REMOVE: `embedCount > 1` always triggers
+    /// regardless of content length.
+    /// rationale: multiple non-video embeds within a div get it stripped.
+    #[test]
+    fn clean_conditionally_multiple_embeds_removes() {
+        // Two non-video iframes ⇒ embedCount = 2 > 1 ⇒ remove. Content >= 75
+        // chars to prove the "embedCount > 1" half of the OR, not the
+        // "embedCount == 1 && contentLength < 75" half.
+        let dom = Dom::parse(
+            r#"<div id=root><div class="x">some content text long enough to be over the seventy-five character minimum but it still has too many embeds inside it now today<iframe src="https://example.com/a"></iframe><iframe src="https://example.com/b"></iframe></div></div>"#,
+        );
+        let root = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let flags = Flags::default();
+        clean_conditionally(&dom, &flags, &root, "div");
+        let any_x = get_elements_by_tag_name(&root, "div")
+            .iter()
+            .any(|d| dom::class_name(d) == "x");
+        assert!(
+            !any_x,
+            "embedCount>1 ⇒ remove (Readability.js:2595)"
+        );
+    }
+
+    /// `Readability.js:2451-2459` "list density" branch: when `tag` is NOT a
+    /// list, the JS computes `listLength / inner_text_len > 0.9` and treats
+    /// the candidate as if it were a list (suppressing the
+    /// li/p and low-weight-linky checks). With a div whose entire text is
+    /// inside one `<ul>`, the ratio = 1.0 > 0.9.
+    /// rationale: a div dominated by a list is treated as a list for the
+    /// shadiness checks.
+    #[test]
+    fn clean_conditionally_list_density_treats_div_as_list() {
+        // Build a candidate that would FAIL the suspiciously-short check
+        // (img==0, contentLength=4 chars, linkDensity=1.0) IF isList were
+        // false. With the list-density override (1.0 > 0.9 ⇒ is_list=true),
+        // suspiciously-short is suppressed. To still get a kept outcome we
+        // also need img>0 OR text_density>0 to defang the no-useful-content
+        // arm. The <ul>'s text density > 0 (it has a text descendant), so
+        // text_density>0 ⇒ no-useful-content arm does not fire.
+        let dom = Dom::parse(
+            r#"<div id=root><div class="x"><ul><li><a href="/p">a longer link text here for stable density numbers in this list density test</a></li></ul></div></div>"#,
+        );
+        let root = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let flags = Flags::default();
+        clean_conditionally(&dom, &flags, &root, "div");
+        let any_x = get_elements_by_tag_name(&root, "div")
+            .iter()
+            .any(|d| dom::class_name(d) == "x");
+        assert!(
+            any_x,
+            "list-density override (Readability.js:2451-2459) treats div as list ⇒ \
+             li/p, suspicious-short and low-weight-linky arms suppressed"
+        );
+    }
+
+    /// `Readability.js:2614-2621` image-gallery exception, early-return when a
+    /// child has MORE than one own child. The exception walks `<li>` children;
+    /// if any `<li>` has > 1 child the exception is abandoned and the original
+    /// haveToRemove verdict stands.
+    /// rationale: an `<ul>` whose `<li>` items have text alongside `<img>`
+    /// (i.e. multiple children per li) does not get the gallery exemption.
+    #[test]
+    fn clean_conditionally_gallery_exception_aborts_on_multi_child_li() {
+        // class="x" — neutral; tag = "ul". The shadiness ladder for a UL with
+        // a single img per li *would* return false via the gallery KEEP
+        // (img == liCount). But here each li has TWO children (img + text
+        // span), so the early-return at 2618-2620 fires returning
+        // haveToRemove (which is true: img==2>1 AND p==0 ⇒ ratio 0<0.5
+        // forces errs ... but wait, isList is true since tag=="ul", so
+        // 2557 is is_figure_child false AND img>1 AND p/img<0.5 — p/img
+        // check fires regardless of isList. Actually 2557-2559 fires when
+        // !isFigureChild && img>1 && p/img<0.5. That's independent of
+        // isList. So haveToRemove = true. The gallery early-return at
+        // 2618-2620 returns true.
+        let dom = Dom::parse(
+            r#"<div id=root><ul class="x"><li><img src="a.jpg"><span>caption a</span></li><li><img src="b.jpg"><span>caption b</span></li></ul></div>"#,
+        );
+        let root = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let flags = Flags::default();
+        clean_conditionally(&dom, &flags, &root, "ul");
+        // The UL is gone — gallery exception aborted by multi-child li
+        // (Readability.js:2618-2620).
+        assert!(
+            get_elements_by_tag_name(&root, "ul").is_empty(),
+            "multi-child <li> aborts gallery exception (Readability.js:2618-2620)"
+        );
+    }
 }

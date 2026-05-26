@@ -3290,4 +3290,119 @@ mod tests {
         assert_eq!(&*result, "</table><div>stray</div>");
         assert!(matches!(result, Cow::Owned(_)));
     }
+
+    // -----------------------------------------------------------------
+    // M11 Phase A — preprocess_html negative-shape branch coverage
+    // -----------------------------------------------------------------
+
+    /// rationale: `tag_matches` end-of-input arm — when a `<` is the last byte
+    /// of the input, the function must not panic and must accept it as a
+    /// no-match (no closing `>` follows). Pin the behaviour: a bare trailing
+    /// `<` is copied through unchanged.
+    #[test]
+    fn preprocess_p_bare_trailing_lt_does_not_panic() {
+        let result = preprocess_html("hello<");
+        // No trigger matched the `<`; the byte is copied as-is.
+        // The output may be either Borrowed or Owned depending on whether
+        // any quick-scan trigger fired. With no triggers, returns Borrowed.
+        assert_eq!(&*result, "hello<");
+    }
+
+    /// rationale: `</br` at end-of-input with no `>` — strip everything
+    /// from the `<` to end (find_closing_angle returns bytes.len()).
+    #[test]
+    fn preprocess_q_br_close_without_closing_angle() {
+        let result = preprocess_html("text</br");
+        // </br with no `>` — strip to end.
+        assert_eq!(&*result, "text");
+        assert!(matches!(result, Cow::Owned(_)));
+    }
+
+    /// rationale: `<` not followed by any trigger tag (no br-end, no xmp,
+    /// no cell tag). In a non-quick-scan-triggered input the function
+    /// returns Borrowed; this test makes the trigger fire (via `<td`) but
+    /// the OTHER `<` in the document falls into the "no match" tail.
+    #[test]
+    fn preprocess_r_other_lt_falls_through_when_triggers_present() {
+        // `<p>` is NOT a trigger — it falls through the trigger ladder and
+        // gets copied as `<` + advance pos. The `<td>` triggers the
+        // quick-scan and is rewritten.
+        let result = preprocess_html("<p>x</p><td>y</td>");
+        assert_eq!(&*result, "<p>x</p><div>y</div>");
+        assert!(matches!(result, Cow::Owned(_)));
+    }
+
+    /// rationale: `<table>` opening AFTER a stray `<td>` — depth tracking
+    /// proves the stray-cell rewrite is order-dependent. Stray `<td>` BEFORE
+    /// the `<table>` is rewritten; `<td>` INSIDE survives unchanged.
+    #[test]
+    fn preprocess_s_stray_td_then_table_with_cells() {
+        let input = "<td>stray</td><table><tr><td>cell</td></tr></table>";
+        let expected = "<div>stray</div><table><tr><td>cell</td></tr></table>";
+        let result = preprocess_html(input);
+        assert_eq!(&*result, expected);
+        assert!(matches!(result, Cow::Owned(_)));
+    }
+
+    /// rationale: cover the close-cell branch (`</td`, `</tr`, etc.) outside
+    /// a table — gets rewritten to `</div`. The open-cell version is already
+    /// tested; the close-cell rewrite is a parallel branch.
+    #[test]
+    fn preprocess_t_close_cell_outside_table_rewritten() {
+        // `<th>` opens and `</th>` closes — both should become div outside a
+        // table context.
+        let result = preprocess_html("<th>x</th>");
+        assert_eq!(&*result, "<div>x</div>");
+        assert!(matches!(result, Cow::Owned(_)));
+    }
+
+    /// rationale: close-cell INSIDE a table is preserved. Pinned to prove
+    /// the depth-aware branch keeps the table syntax intact.
+    #[test]
+    fn preprocess_u_close_cell_inside_table_preserved() {
+        let input = "<table><tr><td>x</td></tr></table>";
+        let result = preprocess_html(input);
+        assert_eq!(&*result, input);
+    }
+
+    /// rationale: input with NO quick-scan triggers and NO `<` at all — the
+    /// most-common no-op path. Returns Borrowed (zero allocation) regardless
+    /// of length.
+    #[test]
+    fn preprocess_v_no_lt_at_all_is_borrowed() {
+        let result = preprocess_html("just plain text content with no markup");
+        assert_eq!(&*result, "just plain text content with no markup");
+        assert!(matches!(result, Cow::Borrowed(_)));
+    }
+
+    // -----------------------------------------------------------------
+    // helpers small-branch coverage (the per-byte utilities)
+    // -----------------------------------------------------------------
+
+    /// `tag_matches` must REJECT prefix matches. `<thread>` must not match
+    /// `<thead>` (5 chars vs 6, but the prefix is the same up to position 5).
+    /// rationale: the tag-boundary guard at byte position `pos + tag.len()`
+    /// requires `is_tag_boundary` or EOF.
+    #[test]
+    fn tag_matches_rejects_prefix_collision() {
+        // Quick-scan triggers on `<th` (any of thead/th/tr/tbody/tfoot are
+        // searched). With `<thread>` the open-cell-tag pass should NOT match
+        // any of {thead,tfoot,tbody,tr,th,td} because `<thread>` followed by
+        // `e` after `<th` violates the boundary guard.
+        let result = preprocess_html("<thread>x</thread>");
+        // No rewrite (no real tag-name match — `<thread>` is its own thing).
+        assert_eq!(&*result, "<thread>x</thread>");
+    }
+
+    /// `is_tag_boundary` accepts form-feed (0x0C) as boundary.
+    /// rationale: the boundary classifier must match HTML5's space set
+    /// including the form-feed for parser-faithful behaviour.
+    #[test]
+    fn preprocess_w_form_feed_after_tag_name_accepted_as_boundary() {
+        // `<td\x0Cclass=...>` — form-feed after the tag name. The cell tag
+        // is matched (boundary satisfied), so a stray `<td>` is rewritten.
+        let input = "<td\x0Cclass=\"x\">cell</td>";
+        let result = preprocess_html(input);
+        assert_eq!(&*result, "<div\x0Cclass=\"x\">cell</div>");
+    }
 }

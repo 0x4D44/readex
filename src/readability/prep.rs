@@ -1547,6 +1547,444 @@ mod tests {
         assert_eq!(text_content(&divs[0]), "x");
     }
 
+    // ---- fix_lazy_images additional branch coverage (Readability.js:2332-2412) ----
+    //
+    // Existing tests already cover: figure-creates-img, inner-img short-circuit,
+    // data-src→src, data-srcset→srcset, tiny b64 placeholder cull, svg+xml
+    // carve-out, has-image short-circuit, lazy-class bypass. The tests below
+    // hit the remaining branches.
+
+    /// `Readability.js:2391` `image_src_value`: any attribute name with a
+    /// plain image URL value is promoted to `src`. Cover `data-original`
+    /// (the WordPress/lazysizes pattern).
+    /// rationale: any non-{src,srcset,alt} attribute whose value matches
+    /// `^.+\.(jpg|jpeg|png|webp)\S*$` is copied to `src`.
+    #[test]
+    fn fix_lazy_images_data_original_attr_promotes_to_src() {
+        let dom = Dom::parse(r#"<body><img data-original="hero.jpg"></body>"#);
+        let body = dom.body().unwrap();
+        fix_lazy_images(&body);
+        let img = get_elements_by_tag_name(&body, "img")[0].clone();
+        assert_eq!(
+            get_attribute(&img, "src").as_deref(),
+            Some("hero.jpg"),
+            "data-original value matches image_src_value ⇒ copied to src"
+        );
+    }
+
+    /// Same shape as above, different attribute name (`data-defer-src`).
+    /// rationale: the promotion is value-driven, not attribute-name-driven.
+    #[test]
+    fn fix_lazy_images_data_defer_src_promotes_to_src() {
+        let dom = Dom::parse(r#"<body><img data-defer-src="hero.webp"></body>"#);
+        let body = dom.body().unwrap();
+        fix_lazy_images(&body);
+        let img = get_elements_by_tag_name(&body, "img")[0].clone();
+        assert_eq!(
+            get_attribute(&img, "src").as_deref(),
+            Some("hero.webp"),
+            ".webp extension matches the image_src_value alternation"
+        );
+    }
+
+    /// Same shape again with `data-flickity-lazyload` (a real-world lazy-load
+    /// library attribute).
+    /// rationale: arbitrary library prefixes — the function is generic.
+    #[test]
+    fn fix_lazy_images_data_flickity_lazyload_promotes_to_src() {
+        let dom = Dom::parse(r#"<body><img data-flickity-lazyload="hero.png"></body>"#);
+        let body = dom.body().unwrap();
+        fix_lazy_images(&body);
+        let img = get_elements_by_tag_name(&body, "img")[0].clone();
+        assert_eq!(get_attribute(&img, "src").as_deref(), Some("hero.png"));
+    }
+
+    /// `Readability.js:2381` skip `src` attribute when iterating: a plain
+    /// image-URL value at `src` must NOT be promoted to itself (and we must
+    /// not loop forever).
+    /// rationale: the iteration explicitly skips `src` / `srcset` / `alt`.
+    #[test]
+    fn fix_lazy_images_src_attr_is_skipped_in_iteration() {
+        // src already set, no `lazy` class. The has-image short-circuit at
+        // :2371-2377 returns BEFORE the iteration. We pin the outcome: no
+        // duplicate write, src is identical.
+        let dom = Dom::parse(r#"<body><img src="real.jpg"></body>"#);
+        let body = dom.body().unwrap();
+        fix_lazy_images(&body);
+        let img = get_elements_by_tag_name(&body, "img")[0].clone();
+        assert_eq!(get_attribute(&img, "src").as_deref(), Some("real.jpg"));
+    }
+
+    /// `Readability.js:2381` skip `alt` attribute when iterating. An `alt`
+    /// whose value happens to look like an image URL must NOT be promoted.
+    /// rationale: the JS skips alt to avoid hijacking accessibility text.
+    #[test]
+    fn fix_lazy_images_alt_attr_is_skipped() {
+        // No src/srcset, has class "lazy" so short-circuit DOES NOT fire ⇒
+        // the iteration runs. alt="photo.jpg" must NOT become src.
+        let dom = Dom::parse(r#"<body><img class="lazy" alt="photo.jpg"></body>"#);
+        let body = dom.body().unwrap();
+        fix_lazy_images(&body);
+        let img = get_elements_by_tag_name(&body, "img")[0].clone();
+        assert!(
+            get_attribute(&img, "src").is_none(),
+            "alt value MUST be skipped (Readability.js:2381): src stays unset"
+        );
+    }
+
+    /// `Readability.js:2371-2377` srcset=="null" string special case: a
+    /// literal `"null"` srcset is treated as absent, so the has-image
+    /// short-circuit does NOT fire ⇒ attribute promotion runs.
+    /// rationale: pages emit `srcset="null"` for placeholder lazy loaders.
+    #[test]
+    fn fix_lazy_images_srcset_null_string_treated_as_absent() {
+        let dom = Dom::parse(
+            r#"<body><img srcset="null" data-src="real.jpg"></body>"#,
+        );
+        let body = dom.body().unwrap();
+        fix_lazy_images(&body);
+        let img = get_elements_by_tag_name(&body, "img")[0].clone();
+        // The has-image short-circuit was bypassed (srcset == "null"),
+        // attribute promotion ran, data-src landed in src.
+        assert_eq!(
+            get_attribute(&img, "src").as_deref(),
+            Some("real.jpg"),
+            "srcset=\"null\" must NOT count as an image (Readability.js:2374-2375)"
+        );
+    }
+
+    /// `Readability.js:2386` srcset-shape value: extension + whitespace +
+    /// digit (e.g. `foo.jpg 2x`) ⇒ promoted to `srcset`, not `src`.
+    /// rationale: a srcset-pattern value is recognised by the regex and
+    /// routed to the srcset slot.
+    #[test]
+    fn fix_lazy_images_data_src_with_srcset_shape_value_goes_to_srcset() {
+        // Value `"hero.jpg 2x"` matches image_srcset_value (.jpg + ws + digit)
+        // BEFORE image_src_value is checked (the JS `if/else` order).
+        let dom = Dom::parse(r#"<body><img data-src="hero.jpg 2x"></body>"#);
+        let body = dom.body().unwrap();
+        fix_lazy_images(&body);
+        let img = get_elements_by_tag_name(&body, "img")[0].clone();
+        assert_eq!(
+            get_attribute(&img, "srcset").as_deref(),
+            Some("hero.jpg 2x"),
+            "srcset-shape value routed to srcset slot (Readability.js:2386)"
+        );
+        assert!(
+            get_attribute(&img, "src").is_none(),
+            "src must remain unset — the value matched the srcset regex first"
+        );
+    }
+
+    /// `Readability.js:2391` else-branch: non-image-shaped value is ignored.
+    /// rationale: a `data-foo="some-other-thing"` value that matches neither
+    /// regex leaves no trace on src/srcset.
+    #[test]
+    fn fix_lazy_images_non_image_attr_value_ignored() {
+        let dom = Dom::parse(
+            r#"<body><img class="lazy" data-foo="bar-not-an-image"></body>"#,
+        );
+        let body = dom.body().unwrap();
+        fix_lazy_images(&body);
+        let img = get_elements_by_tag_name(&body, "img")[0].clone();
+        assert!(get_attribute(&img, "src").is_none());
+        assert!(get_attribute(&img, "srcset").is_none());
+    }
+
+    /// `Readability.js:2336-2369` tiny-b64 NEGATIVE case: NO other attribute
+    /// has an image-extension value ⇒ `src_could_be_removed=false` ⇒ the
+    /// tiny base64 src is KEPT (not removed). The has-image short-circuit
+    /// then fires (the src remains) and no promotion runs.
+    /// rationale: the cull only triggers when a real image exists elsewhere
+    /// (otherwise removing src would leave the page with no image).
+    #[test]
+    fn fix_lazy_images_b64_kept_when_no_other_image_attr() {
+        let dom = Dom::parse(
+            r#"<body><img src="data:image/png;base64,iVBOR" data-some="not-an-image-text"></body>"#,
+        );
+        let body = dom.body().unwrap();
+        fix_lazy_images(&body);
+        let img = get_elements_by_tag_name(&body, "img")[0].clone();
+        assert_eq!(
+            get_attribute(&img, "src").as_deref(),
+            Some("data:image/png;base64,iVBOR"),
+            "no other image-ext attr ⇒ src_could_be_removed=false ⇒ b64 src kept"
+        );
+    }
+
+    /// `Readability.js:2367` b64length >= 133 boundary: a LARGE base64 src
+    /// (≥133 chars payload) is NOT removed even if another attr has an
+    /// image-ext value — only tiny placeholders qualify.
+    /// rationale: a real base64-encoded image survives the cull.
+    #[test]
+    fn fix_lazy_images_b64_kept_when_payload_large_enough() {
+        // Build a base64 src with payload >= 133 chars (any chars suffice as
+        // the function counts character length, not validates base64).
+        let large_payload = "A".repeat(140);
+        let html = format!(
+            r#"<body><img src="data:image/png;base64,{large_payload}" data-real-src="real.jpg"></body>"#
+        );
+        let dom = Dom::parse(&html);
+        let body = dom.body().unwrap();
+        fix_lazy_images(&body);
+        let img = get_elements_by_tag_name(&body, "img")[0].clone();
+        // src is unchanged (b64length>=133 ⇒ no cull). has-image short-circuit
+        // then keeps everything as-is — data-real-src is NOT promoted.
+        let src = get_attribute(&img, "src").unwrap();
+        assert!(
+            src.starts_with("data:image/png;base64,"),
+            "large b64 src kept (Readability.js:2366): {src}"
+        );
+    }
+
+    /// `Readability.js:2398-2407` figure with srcset-shape value: a `<figure>`
+    /// with NO inner `<img>`/`<picture>` and a `data-srcset` is given a NEW
+    /// `<img>` child carrying that srcset.
+    /// rationale: the score-affecting branch covers both src AND srcset shapes.
+    #[test]
+    fn fix_lazy_images_empty_figure_with_srcset_creates_img_with_srcset() {
+        // value "hero.jpg 2x" matches image_srcset_value ⇒ figure-creates-img
+        // assigns it to the new img's `srcset` attribute.
+        let dom = Dom::parse(
+            r#"<body><div id=a><figure data-srcset="hero.jpg 2x"></figure></div></body>"#,
+        );
+        let art = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        fix_lazy_images(&art);
+        let imgs = get_elements_by_tag_name(&art, "img");
+        assert_eq!(imgs.len(), 1, "figure branch creates a new <img>");
+        assert_eq!(
+            get_attribute(&imgs[0], "srcset").as_deref(),
+            Some("hero.jpg 2x"),
+            "srcset-shape value lands in srcset (Readability.js:2398-2407)"
+        );
+    }
+
+    /// `Readability.js:2382-2384`: `srcset` attribute when iterating is SKIPPED.
+    /// rationale: an existing `srcset` whose value is non-empty and not "null"
+    /// makes the has-image short-circuit fire, so we never see iteration. Pin
+    /// the outcome: srcset is preserved exactly.
+    #[test]
+    fn fix_lazy_images_srcset_attr_is_skipped_in_iteration() {
+        // `srcset="real.jpg 2x"` ⇒ has-image short-circuit fires (srcset
+        // is present and != "null"). data-src is NOT promoted.
+        let dom = Dom::parse(
+            r#"<body><img srcset="real.jpg 2x" data-src="other.jpg"></body>"#,
+        );
+        let body = dom.body().unwrap();
+        fix_lazy_images(&body);
+        let img = get_elements_by_tag_name(&body, "img")[0].clone();
+        assert_eq!(
+            get_attribute(&img, "srcset").as_deref(),
+            Some("real.jpg 2x"),
+            "existing srcset preserved (short-circuit at :2371-2377)"
+        );
+        assert!(
+            get_attribute(&img, "src").is_none(),
+            "no promotion ran (short-circuit), src unset"
+        );
+    }
+
+    /// `Readability.js:2371-2377` empty-string `src` is treated as ABSENT.
+    /// rationale: `src=""` does NOT count as having an image, so the
+    /// short-circuit does NOT fire and attribute promotion runs.
+    #[test]
+    fn fix_lazy_images_empty_src_string_does_not_short_circuit() {
+        // src="" ⇒ has_image=false. data-src="real.jpg" promotes to src.
+        let dom = Dom::parse(r#"<body><img src="" data-src="real.jpg"></body>"#);
+        let body = dom.body().unwrap();
+        fix_lazy_images(&body);
+        let img = get_elements_by_tag_name(&body, "img")[0].clone();
+        assert_eq!(
+            get_attribute(&img, "src").as_deref(),
+            Some("real.jpg"),
+            "empty src does NOT short-circuit; promotion runs"
+        );
+    }
+
+    // ---- unwrap_noscript_images additional branch coverage (Readability.js:1892-1968) ----
+
+    /// `Readability.js:1934` `prevElement` is `null` (no prior sibling): the
+    /// noscript-img unwrap skips this noscript.
+    /// rationale: a noscript that is the FIRST child has no previous sibling
+    /// to replace, so the pass-2 guard silently continues.
+    #[test]
+    fn unwrap_noscript_images_no_prev_sibling_skips_unwrap() {
+        // No prev sibling — noscript is the only child.
+        let dom = Dom::parse(
+            r#"<html><body><div><noscript><img src="real.jpg"></noscript></div></body></html>"#,
+        );
+        unwrap_noscript_images(&dom.document());
+        let body = dom.body().unwrap();
+        let div = get_elements_by_tag_name(&body, "div")[0].clone();
+        // No replacement happened: the <noscript> is still there and its
+        // <img> still inside it (it survives pass 1 via its src attribute).
+        let nosc = get_elements_by_tag_name(&div, "noscript");
+        assert_eq!(nosc.len(), 1, "noscript preserved when prev sibling absent");
+        let img_in_nos = get_elements_by_tag_name(&nosc[0], "img");
+        assert_eq!(img_in_nos.len(), 1, "noscript's img stays inside");
+    }
+
+    /// `Readability.js:1919-1921` noscript that does NOT pass `_isSingleImage`
+    /// (empty noscript) is skipped.
+    /// rationale: an empty `<noscript>` is not an unwrap target.
+    #[test]
+    fn unwrap_noscript_images_empty_noscript_skipped() {
+        let dom = Dom::parse(
+            r#"<html><body><div><img src="placeholder.png"><noscript></noscript></div></body></html>"#,
+        );
+        unwrap_noscript_images(&dom.document());
+        let body = dom.body().unwrap();
+        let div = get_elements_by_tag_name(&body, "div")[0].clone();
+        // The prev img is kept, the empty noscript is left in place
+        // (it would be removed later by _removeScripts).
+        assert_eq!(
+            get_elements_by_tag_name(&div, "img").len(),
+            1,
+            "empty noscript skipped, placeholder img stays"
+        );
+    }
+
+    /// `Readability.js:1935-1938` prev-img-via-descendant branch: prev element
+    /// is NOT an `<img>` itself (it's e.g. an `<a>` wrapping an `<img>`), so
+    /// the JS uses `prev.getElementsByTagName("img")[0]`.
+    /// rationale: cover the descendant lookup arm of the prevImg resolution.
+    #[test]
+    fn unwrap_noscript_images_prev_with_img_descendant() {
+        // Prev: <a><img data-src="lazy.png"></a> — single-image (a has 1
+        // child, no text); its descendant img survives pass 1 (data-src).
+        // Noscript: <img src="real.jpg">.
+        let dom = Dom::parse(
+            r#"<html><body><div><a><img data-src="lazy.png"></a><noscript><img src="real.jpg"></noscript></div></body></html>"#,
+        );
+        unwrap_noscript_images(&dom.document());
+        let body = dom.body().unwrap();
+        let div = get_elements_by_tag_name(&body, "div")[0].clone();
+        // The <a> wrapper is the prevElement; it was replaced by newImg
+        // (`replaceChild` at :1965). The div now contains:
+        //  - the newImg (moved out of noscript) where <a> was
+        //  - the noscript element (still present, empty after move)
+        // Pin the survivor:
+        let div_imgs = get_elements_by_tag_name(&div, "img");
+        // The new img is directly under div (it took the <a>'s slot, then
+        // replaceChild moves it without re-parenting into <a>). At least one
+        // img with src="real.jpg" + data-src="lazy.png" copied across.
+        let new_img_under_div = div_imgs
+            .iter()
+            .find(|i| get_attribute(i, "src").as_deref() == Some("real.jpg"));
+        assert!(
+            new_img_under_div.is_some(),
+            "noscript img promoted into the div (prev had img descendant)"
+        );
+        let new_img = new_img_under_div.unwrap();
+        assert_eq!(
+            get_attribute(new_img, "data-src").as_deref(),
+            Some("lazy.png"),
+            "data-src from prev's descendant img copied onto newImg"
+        );
+    }
+
+    /// `Readability.js:1943-1945` attribute copy skips empty values.
+    /// rationale: an attribute on prevImg whose value is "" is silently
+    /// skipped during the attribute-copy pass.
+    #[test]
+    fn unwrap_noscript_images_skips_empty_attribute_values_during_copy() {
+        // Prev img: src=placeholder.png (survives pass 1 by name) + an
+        // empty-string custom attr. Noscript img: src=real.jpg.
+        //
+        // The empty-string attr would otherwise be copied if it matched the
+        // value-regex, but the :1944 `if (!value) continue;` short-circuits.
+        // We pin by asserting the new img has NO `data-empty` attribute.
+        let dom = Dom::parse(
+            r#"<html><body><div><img src="placeholder.png" data-empty=""><noscript><img src="real.jpg"></noscript></div></body></html>"#,
+        );
+        unwrap_noscript_images(&dom.document());
+        let body = dom.body().unwrap();
+        let div = get_elements_by_tag_name(&body, "div")[0].clone();
+        let imgs = get_elements_by_tag_name(&div, "img");
+        assert_eq!(imgs.len(), 1);
+        let img = &imgs[0];
+        // The empty-valued attribute MUST NOT have been copied. (Whether
+        // present-with-empty-value or absent, the contract is "no useful
+        // value got carried over".)
+        assert!(
+            get_attribute(img, "data-empty").is_none()
+                || get_attribute(img, "data-empty").as_deref() == Some(""),
+            "empty-value attr was skipped (Readability.js:1944)"
+        );
+    }
+
+    /// `Readability.js:1947-1951` attribute copy skips non-source attributes
+    /// (name not in {src,srcset} AND value doesn't match image-extension).
+    /// rationale: a `class` attribute on prevImg is NOT copied to newImg.
+    #[test]
+    fn unwrap_noscript_images_does_not_copy_non_source_attributes() {
+        // Prev img: src=placeholder.png + class=placeholder-class. Noscript
+        // img: src=real.jpg. The class attribute is name="class" (not src/
+        // srcset) AND value="placeholder-class" (no image extension), so
+        // :1947-1951 SKIPS it.
+        let dom = Dom::parse(
+            r#"<html><body><div><img src="placeholder.png" class="placeholder-class"><noscript><img src="real.jpg"></noscript></div></body></html>"#,
+        );
+        unwrap_noscript_images(&dom.document());
+        let body = dom.body().unwrap();
+        let div = get_elements_by_tag_name(&body, "div")[0].clone();
+        let imgs = get_elements_by_tag_name(&div, "img");
+        assert_eq!(imgs.len(), 1);
+        let img = &imgs[0];
+        // class was NOT copied (faithful: only source-ish attrs cross the
+        // boundary).
+        let cls = get_attribute(img, "class");
+        assert!(
+            cls.is_none() || cls.as_deref() == Some(""),
+            "non-source class attribute NOT copied (Readability.js:1947-1951): {cls:?}"
+        );
+    }
+
+    /// `Readability.js:1952-1954` skip when newImg already has the SAME
+    /// value: the copy is a no-op.
+    /// rationale: when prev and noscript img both carry the same src, no
+    /// `data-old-src` is created.
+    #[test]
+    fn unwrap_noscript_images_skips_when_same_value_already_present() {
+        // Both prev and noscript img have src="same.jpg". The :1952-1954
+        // guard `if (newImg.getAttribute(name) === value) continue;` skips
+        // — no data-old-src created.
+        let dom = Dom::parse(
+            r#"<html><body><div><img src="same.jpg"><noscript><img src="same.jpg"></noscript></div></body></html>"#,
+        );
+        unwrap_noscript_images(&dom.document());
+        let body = dom.body().unwrap();
+        let div = get_elements_by_tag_name(&body, "div")[0].clone();
+        let imgs = get_elements_by_tag_name(&div, "img");
+        assert_eq!(imgs.len(), 1);
+        let img = &imgs[0];
+        assert_eq!(get_attribute(img, "src").as_deref(), Some("same.jpg"));
+        assert!(
+            get_attribute(img, "data-old-src").is_none(),
+            "no data-old-src when values identical (Readability.js:1952-1954)"
+        );
+    }
+
+    /// `Readability.js:1899-1909` Pass 1 — keep when no attributes at all
+    /// but ANY attribute *value* matches image extension regex. Cover a
+    /// non-source-named attribute whose value carries `.jpg`.
+    /// rationale: the value-regex KEEP arm at :1907.
+    #[test]
+    fn unwrap_noscript_images_keeps_img_by_value_regex_only() {
+        // `id="myimage.jpg"` — name is not in the src-name set, but the
+        // value matches `.(jpg|jpeg|png|webp)`. :1907-1909 KEEPS the img.
+        let dom = Dom::parse(
+            r#"<html><body><div><img id="myimage.jpg"></div></body></html>"#,
+        );
+        unwrap_noscript_images(&dom.document());
+        let imgs = get_elements_by_tag_name(&dom.document(), "img");
+        assert_eq!(
+            imgs.len(),
+            1,
+            "id value matches image-extension regex ⇒ img kept (Readability.js:1907)"
+        );
+    }
+
     // (Existing test below — keep.)
 
     #[test]

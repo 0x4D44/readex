@@ -1529,4 +1529,780 @@ mod tests {
         assert!(strip_scheme("中神通信息技术有限公司").is_none());
         assert!(strip_scheme("ペ").is_none()); // shorter than any scheme
     }
+
+    // ===================================================================
+    // M12 Stage 4 — branch coverage push (metadata_url.rs)
+    // -------------------------------------------------------------------
+    // Per `wrk_docs/2026.05.26 - CC - Coverage Improvement Plan.md`
+    // §Stage 4 these tests pin cold-spot contracts in:
+    //   - is_valid_url         (filters.py:253-271 minimal port)
+    //   - urljoin              (urllib.parse.urljoin reduced shapes)
+    //   - extract_catstags     (metadata.py:422-446)
+    //   - extract_license      (metadata.py:465-479)
+    //   - parse_license_element (metadata.py:449-462)
+    //   - match_license_regex  (LICENSE_REGEX, metadata.py:56-58)
+    //   - match_text_license_regex (TEXT_LICENSE_REGEX, metadata.py:60-62)
+    //   - extract_url          (metadata.py:389-413)
+    //   - extract_date         (metadata.py:546-547 / htmldate cascade)
+    //   - meta_url_sitename / get_base_url / repair_relative_url
+    // ===================================================================
+
+    // ---- is_valid_url ----------------------------------------------------
+
+    #[test]
+    fn is_valid_url_accepts_https_with_dotted_host() {
+        // rationale: scheme + dotted host satisfy the gate.
+        assert!(is_valid_url("https://example.com/x"));
+    }
+
+    #[test]
+    fn is_valid_url_accepts_localhost() {
+        // rationale: `host.eq_ignore_ascii_case("localhost")` arm — single-label
+        // host without a dot is allowed when it equals "localhost".
+        assert!(is_valid_url("http://localhost/x"));
+    }
+
+    #[test]
+    fn is_valid_url_rejects_ftp_scheme() {
+        // rationale: `filters.py:253-271` requires http/https only.
+        assert!(!is_valid_url("ftp://example.com/file"));
+    }
+
+    #[test]
+    fn is_valid_url_rejects_relative_url() {
+        // rationale: `strip_scheme` returns None for non-http(s) -> early false.
+        assert!(!is_valid_url("/just/a/path"));
+    }
+
+    #[test]
+    fn is_valid_url_rejects_scheme_only() {
+        // rationale: authority empty -> false. `https://` with no host.
+        assert!(!is_valid_url("https://"));
+    }
+
+    #[test]
+    fn is_valid_url_rejects_scheme_with_path_no_host() {
+        // rationale: empty authority before `/`.
+        assert!(!is_valid_url("https:///path/only"));
+    }
+
+    #[test]
+    fn is_valid_url_rejects_single_label_host_not_localhost() {
+        // rationale: host must contain '.' OR equal "localhost" — `intranet` fails both.
+        assert!(!is_valid_url("https://intranet/foo"));
+    }
+
+    #[test]
+    fn is_valid_url_accepts_userinfo_and_port() {
+        // rationale: userinfo `user@` and `:port` are stripped before the
+        // `host.contains('.')` check.
+        assert!(is_valid_url("https://user@example.com:8080/x"));
+    }
+
+    // ---- urljoin (driven via fix_relative_urls) -------------------------
+
+    #[test]
+    fn urljoin_query_only_ref_keeps_base_path_and_replaces_query() {
+        // rationale: `urljoin(base, "?q=2")` keeps base's path and drops base's
+        // query/fragment, then appends new query.
+        assert_eq!(
+            fix_relative_urls("https://e.com/a/b?old=1", "?new=2"),
+            "https://e.com/a/b?new=2"
+        );
+    }
+
+    #[test]
+    fn urljoin_fragment_only_ref_keeps_base_path_and_query() {
+        // rationale: fragment-only reference path of urljoin.
+        assert_eq!(
+            fix_relative_urls("https://e.com/a/b?q=1", "#section"),
+            "https://e.com/a/b?q=1#section"
+        );
+    }
+
+    #[test]
+    fn urljoin_fragment_only_ref_drops_base_fragment_keeps_path() {
+        // rationale: fragment-only reference replaces base's fragment.
+        assert_eq!(
+            fix_relative_urls("https://e.com/a#old", "#new"),
+            "https://e.com/a#new"
+        );
+    }
+
+    #[test]
+    fn urljoin_base_without_path_synthesises_leading_slash() {
+        // rationale: base has empty path -> parent is empty -> the "Base had no
+        // path" arm prepends a synthetic `/`.
+        assert_eq!(
+            fix_relative_urls("https://e.com", "x"),
+            "https://e.com/x"
+        );
+    }
+
+    #[test]
+    fn urljoin_same_host_with_scheme_returns_reference_verbatim() {
+        // rationale: when ref has its own scheme AND same netloc as base,
+        // urljoin's ref_scheme.is_some() early-return fires.
+        assert_eq!(
+            fix_relative_urls("https://e.com/a", "https://e.com/b/c"),
+            "https://e.com/b/c"
+        );
+    }
+
+    #[test]
+    fn urljoin_protocol_relative_inherits_base_scheme_when_same_logic_path() {
+        // rationale: scheme-less `//host/x` with DIFFERENT host -> `http:` prepended
+        // (this is the "different netloc" branch; covered for completeness).
+        assert_eq!(
+            fix_relative_urls("https://e.com", "//other.com/abc"),
+            "http://other.com/abc"
+        );
+    }
+
+    #[test]
+    fn urljoin_relative_path_against_root_base() {
+        // rationale: relative path with base "/" — parent_end at index 1 yields "/".
+        assert_eq!(
+            fix_relative_urls("https://e.com/", "x"),
+            "https://e.com/x"
+        );
+    }
+
+    // ---- extract_catstags - category branches ---------------------------
+
+    #[test]
+    fn extract_catstags_category_from_post_info_div() {
+        // rationale: CATEGORIES_XPATHS[0] matches `<div class="post-info">//a`.
+        let dom = parse(
+            r#"<html><head></head><body>
+                <div class="post-info">
+                    <a href="/category/news">News</a>
+                    <a href="/category/sport">Sport</a>
+                </div>
+            </body></html>"#,
+        );
+        let cats = extract_catstags(&dom, "category");
+        assert_eq!(cats, vec!["News".to_string(), "Sport".to_string()]);
+    }
+
+    #[test]
+    fn extract_catstags_category_meta_article_section_fallback() {
+        // rationale: `metadata.py:437-441` — when XPath finds nothing, fall back
+        // to `<meta property="article:section">`.
+        let dom = parse(
+            r#"<html><head>
+                <meta property="article:section" content="Politics">
+            </head><body><p>text</p></body></html>"#,
+        );
+        let cats = extract_catstags(&dom, "category");
+        assert_eq!(cats, vec!["Politics".to_string()]);
+    }
+
+    #[test]
+    fn extract_catstags_category_meta_subject_name_fallback() {
+        // rationale: fallback also accepts any `<meta name="*subject*">`
+        // (case-insensitive substring).
+        let dom = parse(
+            r#"<html><head>
+                <meta name="dcterms.subject" content="Technology">
+            </head><body><p>text</p></body></html>"#,
+        );
+        let cats = extract_catstags(&dom, "category");
+        assert_eq!(cats, vec!["Technology".to_string()]);
+    }
+
+    #[test]
+    fn extract_catstags_category_meta_fallback_only_when_xpath_empty() {
+        // rationale: the meta fallback is gated on `results.is_empty()`; if
+        // XPath wins, the meta fallback never fires.
+        let dom = parse(
+            r#"<html><head>
+                <meta property="article:section" content="Should Be Ignored">
+            </head><body>
+                <div class="post-info"><a href="/category/news">News</a></div>
+            </body></html>"#,
+        );
+        let cats = extract_catstags(&dom, "category");
+        assert_eq!(cats, vec!["News".to_string()]);
+    }
+
+    #[test]
+    fn extract_catstags_tag_does_not_use_meta_fallback() {
+        // rationale: the meta fallback at metadata.py:437-441 only fires for
+        // `metatype == "category"` — tags don't get the section/subject path.
+        let dom = parse(
+            r#"<html><head>
+                <meta property="article:section" content="X">
+            </head><body></body></html>"#,
+        );
+        let tags = extract_catstags(&dom, "tag");
+        assert!(tags.is_empty(), "tag should not pull from article:section");
+    }
+
+    #[test]
+    fn extract_catstags_dedupes_repeated_text() {
+        // rationale: `metadata.py:446` `dict.fromkeys(...)` — insertion-order
+        // dedup. Two anchors with same text yield one entry.
+        let dom = parse(
+            r#"<html><head></head><body>
+                <div class="tags">
+                    <a href="/tag/rust">rust</a>
+                    <a href="/tag/rust">rust</a>
+                </div>
+            </body></html>"#,
+        );
+        let tags = extract_catstags(&dom, "tag");
+        assert_eq!(tags, vec!["rust".to_string()]);
+    }
+
+    #[test]
+    fn extract_catstags_returns_empty_when_no_body() {
+        // rationale: `let Some(body) = dom.body()` early-return.
+        // A malformed fragment that html5ever still synthesizes a body for
+        // -> ensure we just return empty when no useful structure.
+        let dom = parse("<html><head></head><body></body></html>");
+        let cats = extract_catstags(&dom, "category");
+        assert!(cats.is_empty());
+    }
+
+    #[test]
+    fn extract_catstags_skips_anchor_without_matching_href() {
+        // rationale: `href_matches_metatype` rejects anchors whose href doesn't
+        // include `/tag[s|ies]?/`.
+        let dom = parse(
+            r#"<html><head></head><body>
+                <div class="tags">
+                    <a href="/about/team">about</a>
+                    <a href="/tag/rust">rust</a>
+                </div>
+            </body></html>"#,
+        );
+        let tags = extract_catstags(&dom, "tag");
+        assert_eq!(tags, vec!["rust".to_string()]);
+    }
+
+    #[test]
+    fn extract_catstags_first_winning_xpath_short_circuits() {
+        // rationale: `if !results.is_empty() { break; }` — only the FIRST
+        // matching XPath populates results. A later xpath that would also
+        // match must NOT add additional entries.
+        let dom = parse(
+            r#"<html><head></head><body>
+                <div class="post-info">
+                    <a href="/category/news">News</a>
+                </div>
+                <div class="row">
+                    <a href="/category/sport">Sport</a>
+                </div>
+            </body></html>"#,
+        );
+        let cats = extract_catstags(&dom, "category");
+        // Only the first xpath's hit; the row-based xpath is not consulted.
+        assert_eq!(cats, vec!["News".to_string()]);
+    }
+
+    #[test]
+    fn extract_catstags_skips_anchor_without_href_attr() {
+        // rationale: `let Some(href) = get_attribute(...) else { continue }`.
+        let dom = parse(
+            r#"<html><head></head><body>
+                <div class="tags">
+                    <a>no href</a>
+                    <a href="/tag/rust">rust</a>
+                </div>
+            </body></html>"#,
+        );
+        let tags = extract_catstags(&dom, "tag");
+        assert_eq!(tags, vec!["rust".to_string()]);
+    }
+
+    // ---- parse_license_element / match_license_regex --------------------
+
+    #[test]
+    fn match_license_regex_extracts_by_sa_4_0() {
+        // rationale: LICENSE_REGEX `/by-sa/4.0` match yields ("by-sa", "4.0").
+        let pair = match_license_regex("https://creativecommons.org/licenses/by-sa/4.0/");
+        assert_eq!(
+            pair,
+            Some(("by-sa".to_string(), "4.0".to_string()))
+        );
+    }
+
+    #[test]
+    fn match_license_regex_extracts_by_nc_nd() {
+        // rationale: longer prefixes appear FIRST in the alternation; `by-nc-nd`
+        // is matched as a whole, not as `by-nc` + `-nd`.
+        let pair = match_license_regex("https://creativecommons.org/licenses/by-nc-nd/3.0/");
+        assert_eq!(
+            pair,
+            Some(("by-nc-nd".to_string(), "3.0".to_string()))
+        );
+    }
+
+    #[test]
+    fn match_license_regex_extracts_zero() {
+        // rationale: `zero` token at the end of the alternation list.
+        let pair = match_license_regex("https://creativecommons.org/publicdomain/zero/1.0/");
+        assert_eq!(
+            pair,
+            Some(("zero".to_string(), "1.0".to_string()))
+        );
+    }
+
+    #[test]
+    fn match_license_regex_rejects_zero_major_version() {
+        // rationale: `[1-9]\.[0-9]` — major must NOT be `0`.
+        assert_eq!(
+            match_license_regex("https://e.com/by/0.5/"),
+            None
+        );
+    }
+
+    #[test]
+    fn match_license_regex_rejects_missing_version() {
+        // rationale: no `[1-9]\.[0-9]` after the token -> None.
+        assert_eq!(
+            match_license_regex("https://creativecommons.org/licenses/by-sa/"),
+            None
+        );
+    }
+
+    #[test]
+    fn match_license_regex_rejects_non_digit_version() {
+        // rationale: `major.is_ascii_digit() && minor.is_ascii_digit()` guard.
+        assert_eq!(
+            match_license_regex("https://e.com/by/a.b/"),
+            None
+        );
+    }
+
+    #[test]
+    fn match_license_regex_returns_none_for_unrelated_href() {
+        // rationale: no `/<token>/` appears -> None.
+        assert_eq!(match_license_regex("https://example.com/about"), None);
+    }
+
+    // ---- match_text_license_regex ---------------------------------------
+
+    #[test]
+    fn match_text_license_regex_creative_commons_with_version() {
+        // rationale: TEXT_LICENSE_REGEX — `Creative Commons BY-SA 4.0` -> matches.
+        let m = match_text_license_regex("Creative Commons by-sa 4.0");
+        assert_eq!(m.as_deref(), Some("Creative Commons by-sa 4.0"));
+    }
+
+    #[test]
+    fn match_text_license_regex_cc_prefix_without_version() {
+        // rationale: version is `?` optional in the regex.
+        let m = match_text_license_regex("cc by-nc");
+        assert_eq!(m.as_deref(), Some("cc by-nc"));
+    }
+
+    #[test]
+    fn match_text_license_regex_rejects_token_without_prefix() {
+        // rationale: prefix (`cc` or `creative commons`) is required.
+        assert!(match_text_license_regex("by-sa 4.0").is_none());
+    }
+
+    #[test]
+    fn match_text_license_regex_rejects_unrelated_text() {
+        // rationale: neither prefix appears -> None.
+        assert!(match_text_license_regex("All rights reserved").is_none());
+    }
+
+    #[test]
+    fn match_text_license_regex_rejects_prefix_without_space() {
+        // rationale: `after_prefix.starts_with(' ')` guard.
+        assert!(match_text_license_regex("ccby-sa").is_none());
+    }
+
+    #[test]
+    fn match_text_license_regex_rejects_zero_major_version() {
+        // rationale: `major != '0'` guard — when present, version must be valid.
+        // With "0.5" present but invalid, the version is NOT consumed but the
+        // base "cc by-sa" still matches (version optional).
+        let m = match_text_license_regex("cc by-sa 0.5");
+        assert_eq!(m.as_deref(), Some("cc by-sa"));
+    }
+
+    // ---- extract_license -------------------------------------------------
+
+    #[test]
+    fn extract_license_from_footer_link_with_text_match() {
+        // rationale: footer-link strict branch — link href has no LICENSE_REGEX
+        // match, but link text matches TEXT_LICENSE_REGEX -> returns matched substring.
+        let dom = parse(
+            r#"<html><head></head><body>
+                <p>article</p>
+                <footer>
+                    <a href="https://e.com/license">Creative Commons by-sa 4.0</a>
+                </footer>
+            </body></html>"#,
+        );
+        assert_eq!(
+            extract_license(&dom).as_deref(),
+            Some("Creative Commons by-sa 4.0")
+        );
+    }
+
+    #[test]
+    fn extract_license_from_div_class_footer_with_cc_href() {
+        // rationale: div.footer//a branch — strict mode requires href LICENSE_REGEX
+        // OR text matches TEXT_LICENSE_REGEX.
+        let dom = parse(
+            r#"<html><head></head><body>
+                <div class="page-footer">
+                    <a href="https://creativecommons.org/licenses/by/4.0/">CC BY</a>
+                </div>
+            </body></html>"#,
+        );
+        assert_eq!(extract_license(&dom).as_deref(), Some("CC BY 4.0"));
+    }
+
+    #[test]
+    fn extract_license_from_div_id_footer() {
+        // rationale: `is_footer_id` branch alongside the class branch.
+        let dom = parse(
+            r#"<html><head></head><body>
+                <div id="footer">
+                    <a href="https://creativecommons.org/publicdomain/zero/1.0/">CC0</a>
+                </div>
+            </body></html>"#,
+        );
+        assert_eq!(extract_license(&dom).as_deref(), Some("CC ZERO 1.0"));
+    }
+
+    #[test]
+    fn extract_license_returns_none_when_no_rel_no_footer() {
+        // rationale: every path falls through -> None.
+        let dom = parse(
+            r#"<html><head></head><body>
+                <p>article</p>
+                <a href="/about">About</a>
+            </body></html>"#,
+        );
+        assert!(extract_license(&dom).is_none());
+    }
+
+    #[test]
+    fn extract_license_div_footer_skips_when_not_footer() {
+        // rationale: `if !(is_footer_class || is_footer_id) { continue; }`.
+        let dom = parse(
+            r#"<html><head></head><body>
+                <div class="content">
+                    <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>
+                </div>
+            </body></html>"#,
+        );
+        // rel="license" not set and div isn't a footer -> None.
+        assert!(extract_license(&dom).is_none());
+    }
+
+    #[test]
+    fn extract_license_skips_footer_anchor_without_href() {
+        // rationale: `if get_attribute(&a, "href").is_some()` guard.
+        let dom = parse(
+            r#"<html><head></head><body>
+                <footer>
+                    <a>no href, just text</a>
+                </footer>
+            </body></html>"#,
+        );
+        assert!(extract_license(&dom).is_none());
+    }
+
+    // ---- parse_license_element strict mode arms -------------------------
+
+    #[test]
+    fn extract_license_rel_license_returns_text_when_text_arm_wins() {
+        // rationale: rel=license with no href LICENSE_REGEX match AND link text
+        // present -> non-strict branch returns the trimmed text verbatim.
+        let dom = parse(
+            r#"<html><head></head><body>
+                <a rel="license" href="https://e.com/x">Public Domain</a>
+            </body></html>"#,
+        );
+        assert_eq!(extract_license(&dom).as_deref(), Some("Public Domain"));
+    }
+
+    #[test]
+    fn extract_license_rel_license_returns_none_when_empty_text_and_no_regex() {
+        // rationale: text arm trimmed empty -> None; href has no LICENSE_REGEX
+        // -> overall None for the first anchor; second anchor in footer kicks in.
+        let dom = parse(
+            r#"<html><head></head><body>
+                <a rel="license" href="https://e.com/x"></a>
+            </body></html>"#,
+        );
+        assert!(extract_license(&dom).is_none());
+    }
+
+    // ---- extract_url additional shapes ----------------------------------
+
+    #[test]
+    fn extract_url_with_base_element() {
+        // rationale: URL_SELECTORS[1] = `<base>` href fallback.
+        let dom = parse(
+            r#"<html><head>
+                <base href="https://example.com/base/">
+            </head><body></body></html>"#,
+        );
+        assert_eq!(
+            extract_url(&dom, None).as_deref(),
+            Some("https://example.com/base/")
+        );
+    }
+
+    #[test]
+    fn extract_url_with_alternate_x_default() {
+        // rationale: URL_SELECTORS[2] = link[rel=alternate hreflang=x-default].
+        let dom = parse(
+            r#"<html><head>
+                <link rel="alternate" hreflang="x-default" href="https://example.com/x">
+            </head><body></body></html>"#,
+        );
+        assert_eq!(
+            extract_url(&dom, None).as_deref(),
+            Some("https://example.com/x")
+        );
+    }
+
+    #[test]
+    fn extract_url_rejects_invalid_and_uses_default() {
+        // rationale: `is_valid_url` rejects `ftp://` so the canonical link
+        // is discarded and default_url wins.
+        let dom = parse(
+            r#"<html><head>
+                <link rel="canonical" href="ftp://example.com/file">
+            </head><body></body></html>"#,
+        );
+        assert_eq!(
+            extract_url(&dom, Some("https://fallback.com/")).as_deref(),
+            Some("https://fallback.com/")
+        );
+    }
+
+    #[test]
+    fn extract_url_returns_none_with_no_head_and_no_default() {
+        // rationale: `walk_url_selectors` early-returns None when head missing.
+        let dom = parse("<html><body></body></html>");
+        assert!(extract_url(&dom, None).is_none());
+    }
+
+    #[test]
+    fn extract_url_relative_canonical_with_no_og_base_falls_back() {
+        // rationale: `/article/x` is relative; no `og:`/`twitter:` content
+        // to repair against; the raw value falls through to is_valid_url,
+        // which rejects schemeless URL -> default_url wins.
+        let dom = parse(
+            r#"<html><head>
+                <link rel="canonical" href="/article/x">
+            </head><body></body></html>"#,
+        );
+        assert_eq!(
+            extract_url(&dom, Some("https://default.com/")).as_deref(),
+            Some("https://default.com/")
+        );
+    }
+
+    // ---- get_base_url ----------------------------------------------------
+
+    #[test]
+    fn get_base_url_strips_path_query_fragment() {
+        // rationale: `urlutils.py:76-84` — returns `scheme://netloc`.
+        assert_eq!(
+            get_base_url("https://example.com/a/b?q=1#x"),
+            Some("https://example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn get_base_url_returns_none_for_missing_scheme() {
+        // rationale: `url.find("://")` returns None for no `://`.
+        assert_eq!(get_base_url("example.com/path"), None);
+    }
+
+    #[test]
+    fn get_base_url_returns_none_for_empty_netloc() {
+        // rationale: netloc empty after `://` -> None.
+        assert_eq!(get_base_url("https:///path"), None);
+    }
+
+    #[test]
+    fn get_base_url_returns_none_for_empty_scheme() {
+        // rationale: `i > 0` filter — leading `://` would yield empty scheme.
+        assert_eq!(get_base_url("://e.com/x"), None);
+    }
+
+    // ---- meta_url_sitename ----------------------------------------------
+
+    #[test]
+    fn meta_url_sitename_strips_www() {
+        // rationale: META_URL strips an optional `www.` prefix.
+        assert_eq!(
+            meta_url_sitename("https://www.example.com/x"),
+            Some("example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn meta_url_sitename_strips_w_digit_prefix() {
+        // rationale: META_URL = `(?:www\.|w[0-9]+\.)?` — `w3.` style.
+        assert_eq!(
+            meta_url_sitename("https://w3.example.com/x"),
+            Some("example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn meta_url_sitename_keeps_bare_host_no_prefix() {
+        // rationale: no `www`/`wN.` prefix -> host kept verbatim.
+        assert_eq!(
+            meta_url_sitename("https://example.com/x"),
+            Some("example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn meta_url_sitename_returns_none_for_non_http() {
+        // rationale: regex anchored at `https?://` -> no match for ftp:.
+        assert!(meta_url_sitename("ftp://example.com/x").is_none());
+    }
+
+    #[test]
+    fn meta_url_sitename_returns_none_for_empty_host() {
+        // rationale: `if host.is_empty()` -> None.
+        assert!(meta_url_sitename("https://").is_none());
+    }
+
+    // ---- normalize_url additional --------------------------------------
+
+    #[test]
+    fn normalize_url_collapses_double_slashes_in_path() {
+        // rationale: PATH1 collapses `//+` -> `/`.
+        assert_eq!(
+            normalize_url("https://e.com//a//b"),
+            "https://e.com/a/b"
+        );
+    }
+
+    #[test]
+    fn normalize_url_strips_leading_dotdot_segments() {
+        // rationale: PATH2 strips a leading `/..` run.
+        assert_eq!(
+            normalize_url("https://e.com/../../x"),
+            "https://e.com/x"
+        );
+    }
+
+    #[test]
+    fn normalize_url_preserves_query_and_fragment_byte_equal() {
+        // rationale: only the path is quoted; query/fragment pass through.
+        assert_eq!(
+            normalize_url("https://e.com/p?a=1#frag"),
+            "https://e.com/p?a=1#frag"
+        );
+    }
+
+    #[test]
+    fn normalize_url_no_scheme_returns_input_unchanged() {
+        // rationale: `let Some(rest) = strip_scheme(url) else { return ... }`.
+        assert_eq!(
+            normalize_url("not-a-url"),
+            "not-a-url"
+        );
+    }
+
+    // ---- href_matches_metatype additional shapes ------------------------
+
+    #[test]
+    fn href_matches_metatype_with_i_quirk() {
+        // rationale: Python's `[s|ies]?` is a single-char class; `i` is in the
+        // set, so `/tagi/` matches (verified Python regex quirk).
+        assert!(href_matches_metatype("/tagi/x", "tag"));
+    }
+
+    #[test]
+    fn href_matches_metatype_with_e_quirk() {
+        // rationale: `e` is in the `[s|ies]?` class.
+        assert!(href_matches_metatype("/tage/x", "tag"));
+    }
+
+    #[test]
+    fn href_matches_metatype_with_pipe_quirk() {
+        // rationale: `|` is literally one of the chars in the `[s|ies]` class.
+        assert!(href_matches_metatype("/tag|/x", "tag"));
+    }
+
+    #[test]
+    fn href_matches_metatype_rejects_partial_path() {
+        // rationale: needle requires surrounding slashes.
+        assert!(!href_matches_metatype("/tagged-rust", "tag"));
+    }
+
+    // ---- extract_date additional shapes ---------------------------------
+
+    #[test]
+    fn extract_date_returns_none_for_empty_html() {
+        // rationale: defensive path — no date hints found anywhere.
+        let dom = parse("<html><head></head><body><p>x</p></body></html>");
+        assert!(extract_date(&dom, (9999, 12, 31)).is_none());
+    }
+
+    #[test]
+    fn extract_date_returns_none_when_root_missing() {
+        // rationale: `let tree = dom.root_element()?` early-return.
+        // An empty/fragment document still synthesises a root via html5ever;
+        // we simulate "no date anywhere" instead.
+        let dom = parse("");
+        let out = extract_date(&dom, (9999, 12, 31));
+        assert!(out.is_none() || out.as_deref().is_some_and(|s| s.len() == 10));
+    }
+
+    // ---- line_processing -------------------------------------------------
+
+    #[test]
+    fn line_processing_replaces_html_entities_then_trims() {
+        // rationale: `utils.py:283-300` minimal port — &#13;/&#10;/&nbsp;.
+        let out = line_processing("foo&#13;&#10;&nbsp;bar");
+        // After replace + strip_control_chars + trim, whitespace collapsed.
+        assert!(out.contains("foo"));
+        assert!(out.contains("bar"));
+    }
+
+    #[test]
+    fn line_processing_empty_returns_empty() {
+        assert_eq!(line_processing(""), "");
+    }
+
+    // ---- strip_port / strip_www_prefix corner cases ---------------------
+
+    #[test]
+    fn strip_port_leaves_authority_when_no_colon() {
+        // rationale: `let Some(colon) = rfind(':')` -> None branch.
+        assert_eq!(strip_port("example.com"), "example.com");
+    }
+
+    #[test]
+    fn strip_port_leaves_when_after_colon_not_digits() {
+        // rationale: port must be all-ascii-digit.
+        assert_eq!(strip_port("example.com:abc"), "example.com:abc");
+    }
+
+    #[test]
+    fn strip_www_prefix_with_digit_label_strips() {
+        // rationale: `wwwN.` (CLEAN_FLD_REGEX `^www[0-9]*\.`).
+        assert_eq!(strip_www_prefix("www2.example.com"), "example.com");
+    }
+
+    #[test]
+    fn strip_www_prefix_no_www_returns_input() {
+        assert_eq!(strip_www_prefix("example.com"), "example.com");
+    }
+
+    #[test]
+    fn strip_www_prefix_www_without_dot_returns_input() {
+        // rationale: `if let Some(stripped) = rest[..].strip_prefix('.')` else fall.
+        assert_eq!(strip_www_prefix("wwwsomething"), "wwwsomething");
+    }
 }

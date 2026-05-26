@@ -1464,4 +1464,466 @@ mod tests {
         let dom = Dom::parse("<html><head></head><body></body></html>");
         assert!(html_lang(&dom.document()).is_none());
     }
+
+    // ====== Stage 2: JSON-LD shape catalog for `get_json_ld` ===============
+    //
+    // Tests below drive the missed branches inside `get_json_ld`
+    // (`Readability.js:1632-1747`). Each pins the JS-source-line contract
+    // it covers.
+
+    /// `get_json_ld` — a script element with `type != application/ld+json`
+    /// is skipped (`Readability.js:1639-1641`).
+    /// rationale: pins the `continue` arm on the type-attribute filter.
+    #[test]
+    fn jsonld_skips_script_with_wrong_type() {
+        let html = r#"<html><head>
+            <script type="text/javascript">
+            {"@context":"https://schema.org","@type":"Article","name":"Ignored"}
+            </script>
+        </head><body></body></html>"#;
+        let (_d, r) = doc(html);
+        let ld = get_json_ld(&r);
+        assert!(ld.title.is_none(), "got {:?}", ld.title);
+    }
+
+    /// `get_json_ld` — a script with no `type` attribute is also skipped.
+    /// rationale: pins the `None` comparison of `get_attribute("type")`.
+    #[test]
+    fn jsonld_skips_script_with_no_type_attribute() {
+        let html = r#"<html><head>
+            <script>
+            {"@context":"https://schema.org","@type":"Article","name":"Ignored"}
+            </script>
+        </head><body></body></html>"#;
+        let (_d, r) = doc(html);
+        let ld = get_json_ld(&r);
+        assert!(ld.title.is_none());
+    }
+
+    /// `get_json_ld` — top-level array with NO Article-type entry → the
+    /// `find` returns None, we continue to the next script
+    /// (`Readability.js:1650-1660`).
+    /// rationale: pins the `None => continue` arm of the array find.
+    #[test]
+    fn jsonld_array_with_no_article_entry_falls_through() {
+        let html = r#"<html><head>
+            <script type="application/ld+json">
+            [{"@type":"WebSite","name":"Just a site"},
+             {"@type":"Organization","name":"Just an org"}]
+            </script>
+        </head><body></body></html>"#;
+        let (_d, r) = doc(html);
+        let ld = get_json_ld(&r);
+        assert!(ld.title.is_none());
+        assert!(ld.byline.is_none());
+    }
+
+    /// `get_json_ld` — array entry's `@type` is NOT a string (e.g. an
+    /// array of strings) — `as_str()` returns None, `unwrap_or(false)`
+    /// short-circuits → entry skipped.
+    /// rationale: pins the `as_str().is_some_and(...)` shape on array
+    /// entries.
+    #[test]
+    fn jsonld_array_entry_with_non_string_type_skipped() {
+        let html = r#"<html><head>
+            <script type="application/ld+json">
+            [{"@type":["NewsArticle","BlogPosting"],"name":"Multi-Type"}]
+            </script>
+        </head><body></body></html>"#;
+        let (_d, r) = doc(html);
+        let ld = get_json_ld(&r);
+        // JS would have `Array.prototype.match` undefined → no match.
+        // Faithful: no qualifying article in the array → continue to next
+        // script (none here) → empty JsonLd.
+        assert!(ld.title.is_none());
+    }
+
+    /// `get_json_ld` — `@context` is an Object WITHOUT a `@vocab` key →
+    /// fails the inner `obj.get("@vocab")` lookup → context_matches false.
+    /// rationale: pins the `unwrap_or(false)` half of the Object match.
+    #[test]
+    fn jsonld_context_object_no_vocab_rejected() {
+        let html = r#"<html><head>
+            <script type="application/ld+json">
+            {"@context":{"locale":"en-US"},
+             "@type":"Article","name":"Should Skip"}
+            </script>
+        </head><body></body></html>"#;
+        let (_d, r) = doc(html);
+        let ld = get_json_ld(&r);
+        assert!(ld.title.is_none());
+    }
+
+    /// `get_json_ld` — `@context` object with `@vocab` that is NOT
+    /// schema.org → also rejected.
+    /// rationale: pins the negative side of `schema_dot_org_matches` on
+    /// the vocab path.
+    #[test]
+    fn jsonld_context_object_vocab_non_schema_org_rejected() {
+        let html = r#"<html><head>
+            <script type="application/ld+json">
+            {"@context":{"@vocab":"https://example.com/ns"},
+             "@type":"Article","name":"Should Skip"}
+            </script>
+        </head><body></body></html>"#;
+        let (_d, r) = doc(html);
+        let ld = get_json_ld(&r);
+        assert!(ld.title.is_none());
+    }
+
+    /// `get_json_ld` — `@context` object whose `@vocab` is non-string
+    /// (number) → `as_str()` returns None → unwrap_or(false).
+    /// rationale: pins the `and_then(as_str)` failure path.
+    #[test]
+    fn jsonld_context_object_vocab_non_string_rejected() {
+        let html = r#"<html><head>
+            <script type="application/ld+json">
+            {"@context":{"@vocab":42},
+             "@type":"Article","name":"Should Skip"}
+            </script>
+        </head><body></body></html>"#;
+        let (_d, r) = doc(html);
+        let ld = get_json_ld(&r);
+        assert!(ld.title.is_none());
+    }
+
+    /// `get_json_ld` — `@context` of unsupported type (Number) → outer
+    /// `_ => false` arm.
+    /// rationale: pins the catch-all of the context match.
+    #[test]
+    fn jsonld_context_as_number_rejected() {
+        let html = r#"<html><head>
+            <script type="application/ld+json">
+            {"@context":42,"@type":"Article","name":"Should Skip"}
+            </script>
+        </head><body></body></html>"#;
+        let (_d, r) = doc(html);
+        let ld = get_json_ld(&r);
+        assert!(ld.title.is_none());
+    }
+
+    /// `get_json_ld` — `@context` absent → outer `_ => false` arm.
+    /// rationale: pins the no-@context guard.
+    #[test]
+    fn jsonld_missing_context_rejected() {
+        let html = r#"<html><head>
+            <script type="application/ld+json">
+            {"@type":"Article","name":"Should Skip"}
+            </script>
+        </head><body></body></html>"#;
+        let (_d, r) = doc(html);
+        let ld = get_json_ld(&r);
+        assert!(ld.title.is_none());
+    }
+
+    /// `get_json_ld` — `@type` present at top-level but NOT an article
+    /// type → `at_type_ok` false → continue (`Readability.js:1680-1686`).
+    /// rationale: pins the type-mismatch reject.
+    #[test]
+    fn jsonld_non_article_top_type_rejected() {
+        let html = r#"<html><head>
+            <script type="application/ld+json">
+            {"@context":"https://schema.org","@type":"WebSite","name":"Site"}
+            </script>
+        </head><body></body></html>"#;
+        let (_d, r) = doc(html);
+        let ld = get_json_ld(&r);
+        assert!(ld.title.is_none());
+    }
+
+    /// `get_json_ld` — top-level `@type` is non-string (e.g. array) → the
+    /// `as_str()` returns None → continue.
+    /// rationale: pins the post-@graph `at_type_ok` guard.
+    #[test]
+    fn jsonld_top_type_as_array_rejected() {
+        let html = r#"<html><head>
+            <script type="application/ld+json">
+            {"@context":"https://schema.org",
+             "@type":["NewsArticle","BlogPosting"],
+             "name":"Should Skip"}
+            </script>
+        </head><body></body></html>"#;
+        let (_d, r) = doc(html);
+        let ld = get_json_ld(&r);
+        assert!(ld.title.is_none());
+    }
+
+    /// `get_json_ld` — `name` only (no `headline`) populates title via the
+    /// `(Some(n), _)` arm (`Readability.js:1709-1710`).
+    /// rationale: pins the name-only path.
+    #[test]
+    fn jsonld_title_from_name_only() {
+        let html = r#"<html><head>
+            <script type="application/ld+json">
+            {"@context":"https://schema.org","@type":"Article",
+             "name":"Name Only"}
+            </script>
+        </head><body></body></html>"#;
+        let (_d, r) = doc(html);
+        let ld = get_json_ld(&r);
+        assert_eq!(ld.title.as_deref(), Some("Name Only"));
+    }
+
+    /// `get_json_ld` — `headline` only (no `name`) populates title via the
+    /// `(_, Some(h))` arm.
+    /// rationale: pins the headline-only path.
+    #[test]
+    fn jsonld_title_from_headline_only() {
+        let html = r#"<html><head>
+            <script type="application/ld+json">
+            {"@context":"https://schema.org","@type":"Article",
+             "headline":"Headline Only"}
+            </script>
+        </head><body></body></html>"#;
+        let (_d, r) = doc(html);
+        let ld = get_json_ld(&r);
+        assert_eq!(ld.title.as_deref(), Some("Headline Only"));
+    }
+
+    /// `get_json_ld` — `name` and `headline` identical → falls through to
+    /// the `(Some(n), _)` arm (the `n != h` guard fails)
+    /// (`Readability.js:1690`).
+    /// rationale: pins the `if n != h` short-circuit.
+    #[test]
+    fn jsonld_title_when_name_equals_headline_uses_name_arm() {
+        let html = r#"<html><head>
+            <script type="application/ld+json">
+            {"@context":"https://schema.org","@type":"Article",
+             "name":"Same Title", "headline":"Same Title"}
+            </script>
+        </head><body></body></html>"#;
+        let (_d, r) = doc(html);
+        let ld = get_json_ld(&r);
+        assert_eq!(ld.title.as_deref(), Some("Same Title"));
+    }
+
+    /// `get_json_ld` — name & headline differ, but neither matches doc
+    /// title (similarity ≤ 0.75) → the `else` arm chooses `name`
+    /// (`Readability.js:1707-1708`).
+    /// rationale: pins the `name` fallback when similarity rule doesn't
+    /// elect `headline`.
+    #[test]
+    fn jsonld_title_diff_neither_matches_falls_back_to_name() {
+        let html = r#"<html><head>
+            <title>Completely Unrelated Document Heading</title>
+            <script type="application/ld+json">
+            {"@context":"https://schema.org","@type":"Article",
+             "name":"Brand Site Header XYZ",
+             "headline":"Something Else Entirely Yes"}
+            </script>
+        </head><body></body></html>"#;
+        let (_d, r) = doc(html);
+        let ld = get_json_ld(&r);
+        // Neither name nor headline is similar enough to the doc title;
+        // headlineMatches && !nameMatches = false; else → name wins.
+        assert_eq!(ld.title.as_deref(), Some("Brand Site Header XYZ"));
+    }
+
+    /// `get_json_ld` — neither `name` nor `headline` present → title
+    /// remains None.
+    /// rationale: pins the `_ => {}` arm of the title resolution match.
+    #[test]
+    fn jsonld_title_missing_when_neither_name_nor_headline() {
+        let html = r#"<html><head>
+            <script type="application/ld+json">
+            {"@context":"https://schema.org","@type":"Article",
+             "description":"Has only description"}
+            </script>
+        </head><body></body></html>"#;
+        let (_d, r) = doc(html);
+        let ld = get_json_ld(&r);
+        assert!(ld.title.is_none());
+        assert_eq!(ld.excerpt.as_deref(), Some("Has only description"));
+    }
+
+    /// `get_json_ld` — `author` is an object with no `name` field, also
+    /// not an array → the entire byline assignment is skipped.
+    /// rationale: pins the `if let Some(name)` failure with non-array
+    /// author.
+    #[test]
+    fn jsonld_author_object_no_name_field_yields_no_byline() {
+        let html = r#"<html><head>
+            <script type="application/ld+json">
+            {"@context":"https://schema.org","@type":"Article",
+             "name":"x", "author":{"url":"https://x"}}
+            </script>
+        </head><body></body></html>"#;
+        let (_d, r) = doc(html);
+        let ld = get_json_ld(&r);
+        assert!(ld.byline.is_none());
+    }
+
+    /// `get_json_ld` — `author` as array where first element has no
+    /// `name` → the `first.get("name").as_str().is_some()` guard fails →
+    /// no byline.
+    /// rationale: pins the `first has no name` short-circuit.
+    #[test]
+    fn jsonld_author_array_first_has_no_name_yields_no_byline() {
+        let html = r#"<html><head>
+            <script type="application/ld+json">
+            {"@context":"https://schema.org","@type":"Article",
+             "name":"x",
+             "author":[{"url":"https://x"},{"name":"Late Arrival"}]}
+            </script>
+        </head><body></body></html>"#;
+        let (_d, r) = doc(html);
+        let ld = get_json_ld(&r);
+        // First-element guard fails → entire array path is skipped.
+        assert!(ld.byline.is_none());
+    }
+
+    /// `get_json_ld` — empty author array → `arr.first()` is None → no
+    /// byline.
+    /// rationale: pins the empty-array guard.
+    #[test]
+    fn jsonld_author_empty_array_yields_no_byline() {
+        let html = r#"<html><head>
+            <script type="application/ld+json">
+            {"@context":"https://schema.org","@type":"Article",
+             "name":"x", "author":[]}
+            </script>
+        </head><body></body></html>"#;
+        let (_d, r) = doc(html);
+        let ld = get_json_ld(&r);
+        assert!(ld.byline.is_none());
+    }
+
+    /// `get_json_ld` — `author.name` present as STRING → byline set.
+    /// rationale: pins the happy path of the byline.name arm.
+    #[test]
+    fn jsonld_author_object_with_name_string() {
+        let html = r#"<html><head>
+            <script type="application/ld+json">
+            {"@context":"https://schema.org","@type":"Article",
+             "name":"x", "author":{"name":"Solo Writer"}}
+            </script>
+        </head><body></body></html>"#;
+        let (_d, r) = doc(html);
+        let ld = get_json_ld(&r);
+        assert_eq!(ld.byline.as_deref(), Some("Solo Writer"));
+    }
+
+    /// `get_json_ld` — `publisher` without `.name` → no site_name.
+    /// rationale: pins the `and_then(p.get("name"))` failure path.
+    #[test]
+    fn jsonld_publisher_without_name_yields_no_site_name() {
+        let html = r#"<html><head>
+            <script type="application/ld+json">
+            {"@context":"https://schema.org","@type":"Article",
+             "name":"x", "publisher":{"url":"https://x"}}
+            </script>
+        </head><body></body></html>"#;
+        let (_d, r) = doc(html);
+        let ld = get_json_ld(&r);
+        assert!(ld.site_name.is_none());
+    }
+
+    /// `get_json_ld` — `datePublished` populates the slot.
+    /// rationale: pins the date_published assignment.
+    #[test]
+    fn jsonld_date_published_populates_slot() {
+        let html = r#"<html><head>
+            <script type="application/ld+json">
+            {"@context":"https://schema.org","@type":"Article",
+             "name":"x", "datePublished":"2024-12-01"}
+            </script>
+        </head><body></body></html>"#;
+        let (_d, r) = doc(html);
+        let ld = get_json_ld(&r);
+        assert_eq!(ld.date_published.as_deref(), Some("2024-12-01"));
+    }
+
+    /// `get_json_ld` — `description` populates the excerpt slot.
+    /// rationale: pins the excerpt assignment branch.
+    #[test]
+    fn jsonld_description_populates_excerpt() {
+        let html = r#"<html><head>
+            <script type="application/ld+json">
+            {"@context":"https://schema.org","@type":"Article",
+             "name":"x", "description":"A short blurb."}
+            </script>
+        </head><body></body></html>"#;
+        let (_d, r) = doc(html);
+        let ld = get_json_ld(&r);
+        assert_eq!(ld.excerpt.as_deref(), Some("A short blurb."));
+    }
+
+    /// `get_json_ld` — `@graph` field present but is NOT an array (here:
+    /// an Object) AND top-level `@type` is missing → JS faithful path:
+    /// `parsed.get("@graph").and_then(|g| g.as_array())` returns None →
+    /// the `else { parsed }` branch keeps `parsed` (which lacks @type), so
+    /// the subsequent `at_type_ok` check fails → continue.
+    /// rationale: pins the `@graph` non-array shape.
+    #[test]
+    fn jsonld_graph_as_non_array_with_no_at_type_skipped() {
+        let html = r#"<html><head>
+            <script type="application/ld+json">
+            {"@context":"https://schema.org",
+             "@graph":{"@type":"Article","name":"In Object Graph"}}
+            </script>
+        </head><body></body></html>"#;
+        let (_d, r) = doc(html);
+        let ld = get_json_ld(&r);
+        // @graph as object is not unwrapped (JS coerces only arrays); the
+        // top-level has no @type → at_type_ok false → skip.
+        assert!(ld.title.is_none());
+    }
+
+    /// `get_json_ld` — `@graph` array entries with no Article-type
+    /// → continues to next script (covers the `None => continue` arm of
+    /// the @graph find).
+    /// rationale: complementary to existing
+    /// `jsonld_at_graph_no_article_skips_to_next_script` — additionally
+    /// pins the "no second script" → empty JsonLd path.
+    #[test]
+    fn jsonld_graph_no_article_and_no_next_script_returns_empty() {
+        let html = r#"<html><head>
+            <script type="application/ld+json">
+            {"@context":"https://schema.org",
+             "@graph":[{"@type":"WebSite","name":"S"},
+                       {"@type":"Organization","name":"O"}]}
+            </script>
+        </head><body></body></html>"#;
+        let (_d, r) = doc(html);
+        let ld = get_json_ld(&r);
+        assert!(ld.title.is_none());
+        assert!(ld.byline.is_none());
+        assert!(ld.site_name.is_none());
+    }
+
+    /// `get_json_ld` — no scripts in document → empty JsonLd.
+    /// rationale: pins the outer "no qualifying JSON-LD" return at
+    /// `Readability.js:1746`.
+    #[test]
+    fn jsonld_no_scripts_returns_default() {
+        let (_d, r) = doc("<html><body><p>no scripts here</p></body></html>");
+        let ld = get_json_ld(&r);
+        assert!(ld.title.is_none());
+        assert!(ld.byline.is_none());
+        assert!(ld.excerpt.is_none());
+        assert!(ld.site_name.is_none());
+        assert!(ld.date_published.is_none());
+    }
+
+    /// `get_json_ld` — top-level array find succeeds on FIRST entry but
+    /// that first entry's @context fails the schema.org check → continue
+    /// to next script.
+    /// rationale: pins the array-find-then-context-fail interaction
+    /// (covers the path where the array's chosen entry STILL fails the
+    /// context filter at `:1662-1672`).
+    #[test]
+    fn jsonld_array_find_first_then_context_fail_continues() {
+        let html = r#"<html><head>
+            <script type="application/ld+json">
+            [{"@context":"http://example.org/ns","@type":"Article",
+              "name":"Wrong Context"}]
+            </script>
+            <script type="application/ld+json">
+            {"@context":"https://schema.org","@type":"Article","name":"Right"}
+            </script>
+        </head><body></body></html>"#;
+        let (_d, r) = doc(html);
+        let ld = get_json_ld(&r);
+        assert_eq!(ld.title.as_deref(), Some("Right"));
+    }
 }

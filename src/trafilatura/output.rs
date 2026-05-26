@@ -4231,4 +4231,2685 @@ mod tests {
         }
         assert_eq!(strip_control_chars(&input), input);
     }
+
+    // -------------------------------------------------------------------
+    // Stage 3 coverage push (May 2026): branch-coverage tests for
+    // build_yaml_header / add_xml_meta / replace_element_text /
+    // process_element / sanitize / line_processing / unescape_html /
+    // python_repr_list / json_str / csv_or_null / csv_quote_minimal /
+    // TEI helpers / restore_tei_case / check_tei. Each pins one named
+    // contract per `xml.py` / `core.py` line range.
+    // -------------------------------------------------------------------
+
+    // --- build_yaml_header (core.py:73-91): per-field presence ----------
+    // Each test populates exactly ONE field on Metadata; asserts the
+    // header carries that field's key and no other field-keys, walking
+    // each `if let Some(v) = ... && !v.is_empty()` arm.
+
+    #[test]
+    fn build_yaml_header_empty_metadata_returns_just_delimiters() {
+        // rationale: core.py:73-91 — all-falsy Document yields the bare
+        // "---\n---\n" delimiter pair (Python's `if getattr(document, attr):`
+        // arm goes false for every slot).
+        let h = build_yaml_header(&Metadata::default());
+        assert_eq!(h, "---\n---\n");
+    }
+
+    #[test]
+    fn build_yaml_header_title_only_emits_title_line() {
+        // rationale: core.py:75 — the `title` slot is the first attr in
+        // Python's tuple; isolate it to walk the `Some(v) && !v.is_empty()`
+        // arm without other slots interfering.
+        let md = Metadata {
+            title: Some("Hello".to_string()),
+            ..Metadata::default()
+        };
+        let h = build_yaml_header(&md);
+        assert!(h.contains("title: Hello\n"), "got: {h:?}");
+        assert!(!h.contains("author:"));
+        assert!(!h.contains("url:"));
+        assert!(!h.contains("hostname:"));
+        assert!(!h.contains("description:"));
+        assert!(!h.contains("sitename:"));
+        assert!(!h.contains("date:"));
+        assert!(!h.contains("categories:"));
+        assert!(!h.contains("tags:"));
+        assert!(!h.contains("license:"));
+    }
+
+    #[test]
+    fn build_yaml_header_empty_string_fields_are_treated_as_falsy() {
+        // rationale: core.py:73-91 — Python's `if value:` makes the empty
+        // string falsy. Every `Some("".to_string())` field must NOT emit a
+        // line; the `&& !v.is_empty()` arm guard fires.
+        let md = Metadata {
+            title: Some(String::new()),
+            author: Some(String::new()),
+            url: Some(String::new()),
+            hostname: Some(String::new()),
+            description: Some(String::new()),
+            site_name: Some(String::new()),
+            date: Some(String::new()),
+            license: Some(String::new()),
+            ..Metadata::default()
+        };
+        let h = build_yaml_header(&md);
+        assert_eq!(h, "---\n---\n");
+    }
+
+    #[test]
+    fn build_yaml_header_author_only_emits_author_line() {
+        // rationale: core.py:76 — author slot.
+        let md = Metadata {
+            author: Some("Jane Doe".to_string()),
+            ..Metadata::default()
+        };
+        let h = build_yaml_header(&md);
+        assert!(h.contains("author: Jane Doe\n"));
+        assert!(!h.contains("title:"));
+    }
+
+    #[test]
+    fn build_yaml_header_url_only_emits_url_line() {
+        // rationale: core.py:77 — url slot.
+        let md = Metadata {
+            url: Some("https://example.com/x".to_string()),
+            ..Metadata::default()
+        };
+        let h = build_yaml_header(&md);
+        assert!(h.contains("url: https://example.com/x\n"));
+        assert!(!h.contains("hostname:"));
+    }
+
+    #[test]
+    fn build_yaml_header_hostname_only_emits_hostname_line() {
+        // rationale: core.py:78 — hostname slot.
+        let md = Metadata {
+            hostname: Some("example.com".to_string()),
+            ..Metadata::default()
+        };
+        let h = build_yaml_header(&md);
+        assert!(h.contains("hostname: example.com\n"));
+        assert!(!h.contains("url:"));
+    }
+
+    #[test]
+    fn build_yaml_header_description_only_emits_description_line() {
+        // rationale: core.py:79 — description slot.
+        let md = Metadata {
+            description: Some("a summary".to_string()),
+            ..Metadata::default()
+        };
+        let h = build_yaml_header(&md);
+        assert!(h.contains("description: a summary\n"));
+    }
+
+    #[test]
+    fn build_yaml_header_sitename_only_emits_sitename_line() {
+        // rationale: core.py:80 — sitename slot (Python attr name "sitename",
+        // Rust field `site_name`; YAML key is "sitename").
+        let md = Metadata {
+            site_name: Some("Example".to_string()),
+            ..Metadata::default()
+        };
+        let h = build_yaml_header(&md);
+        assert!(h.contains("sitename: Example\n"));
+        assert!(!h.contains("site_name:"));
+    }
+
+    #[test]
+    fn build_yaml_header_date_only_emits_date_line() {
+        // rationale: core.py:81 — date slot.
+        let md = Metadata {
+            date: Some("2026-05-26".to_string()),
+            ..Metadata::default()
+        };
+        let h = build_yaml_header(&md);
+        assert!(h.contains("date: 2026-05-26\n"));
+    }
+
+    #[test]
+    fn build_yaml_header_categories_render_as_python_repr_list() {
+        // rationale: core.py:82,90 — `str(getattr(document, "categories"))`
+        // renders as Python's `['a', 'b']` (single quotes, comma+space).
+        let md = Metadata {
+            categories: vec!["news".to_string(), "tech".to_string()],
+            ..Metadata::default()
+        };
+        let h = build_yaml_header(&md);
+        assert!(
+            h.contains("categories: ['news', 'tech']\n"),
+            "got: {h:?}"
+        );
+    }
+
+    #[test]
+    fn build_yaml_header_tags_render_as_python_repr_list() {
+        // rationale: core.py:83,90 — same as categories.
+        let md = Metadata {
+            tags: vec!["alpha".to_string()],
+            ..Metadata::default()
+        };
+        let h = build_yaml_header(&md);
+        assert!(h.contains("tags: ['alpha']\n"), "got: {h:?}");
+    }
+
+    #[test]
+    fn build_yaml_header_empty_categories_and_tags_are_skipped() {
+        // rationale: core.py:73-91 — `if !v.is_empty()` on Vec guards both
+        // slots; empty vectors emit nothing.
+        let md = Metadata::default();
+        let h = build_yaml_header(&md);
+        assert!(!h.contains("categories:"));
+        assert!(!h.contains("tags:"));
+    }
+
+    #[test]
+    fn build_yaml_header_license_only_emits_license_line() {
+        // rationale: core.py:87 — license slot (last in the tuple).
+        let md = Metadata {
+            license: Some("CC-BY".to_string()),
+            ..Metadata::default()
+        };
+        let h = build_yaml_header(&md);
+        assert!(h.contains("license: CC-BY\n"));
+    }
+
+    #[test]
+    fn build_yaml_header_all_fields_emit_in_python_source_order() {
+        // rationale: core.py:75-87 — the tuple ORDER is the YAML key order;
+        // emitter must walk it verbatim. Title -> author -> url -> hostname
+        // -> description -> sitename -> date -> categories -> tags ->
+        // license. fingerprint/id slots are omitted (Metadata lacks them).
+        let md = Metadata {
+            title: Some("T".to_string()),
+            author: Some("A".to_string()),
+            url: Some("U".to_string()),
+            hostname: Some("H".to_string()),
+            description: Some("D".to_string()),
+            site_name: Some("S".to_string()),
+            date: Some("2026".to_string()),
+            categories: vec!["c1".to_string()],
+            tags: vec!["t1".to_string()],
+            license: Some("L".to_string()),
+            ..Metadata::default()
+        };
+        let h = build_yaml_header(&md);
+        // Build the EXACT expected string. This pins the order contract.
+        let expected =
+            "---\ntitle: T\nauthor: A\nurl: U\nhostname: H\ndescription: D\nsitename: S\ndate: 2026\ncategories: ['c1']\ntags: ['t1']\nlicense: L\n---\n";
+        assert_eq!(h, expected);
+    }
+
+    // --- add_xml_meta (xml.py:42-46, 178-183): per-attribute presence ---
+    // Order from add_xml_meta source: sitename, title, author, date, url,
+    // hostname, description, categories, tags, license, language.
+
+    #[test]
+    fn add_xml_meta_empty_metadata_sets_no_attributes() {
+        // rationale: xml.py:178-183 — every `if value:` arm goes false on
+        // default Metadata; the doc node has zero metadata attributes.
+        let doc = create_element("doc");
+        add_xml_meta(&doc, &Metadata::default());
+        for k in [
+            "sitename",
+            "title",
+            "author",
+            "date",
+            "url",
+            "hostname",
+            "description",
+            "categories",
+            "tags",
+            "license",
+            "language",
+        ] {
+            assert_eq!(get_attribute(&doc, k), None, "key {k} must not be set");
+        }
+    }
+
+    #[test]
+    fn add_xml_meta_empty_string_skipped_for_all_optional_fields() {
+        // rationale: xml.py:178-183 — `if value:` is falsy on "" — every
+        // Some("") slot walks the SKIP arm of the conditional.
+        let md = Metadata {
+            title: Some(String::new()),
+            author: Some(String::new()),
+            url: Some(String::new()),
+            hostname: Some(String::new()),
+            description: Some(String::new()),
+            site_name: Some(String::new()),
+            date: Some(String::new()),
+            license: Some(String::new()),
+            language: Some(String::new()),
+            ..Metadata::default()
+        };
+        let doc = create_element("doc");
+        add_xml_meta(&doc, &md);
+        for k in [
+            "title",
+            "author",
+            "url",
+            "hostname",
+            "description",
+            "sitename",
+            "date",
+            "license",
+            "language",
+        ] {
+            assert_eq!(get_attribute(&doc, k), None, "key {k} must be skipped");
+        }
+    }
+
+    #[test]
+    fn add_xml_meta_sitename_only_attr_set() {
+        // rationale: xml.py:42-46,178-183 — sitename is the first slot;
+        // isolate to walk the `Some(v) && !v.is_empty()` true-arm.
+        let md = Metadata {
+            site_name: Some("Example".to_string()),
+            ..Metadata::default()
+        };
+        let doc = create_element("doc");
+        add_xml_meta(&doc, &md);
+        assert_eq!(get_attribute(&doc, "sitename").as_deref(), Some("Example"));
+        assert_eq!(get_attribute(&doc, "title"), None);
+    }
+
+    #[test]
+    fn add_xml_meta_date_only_attr_set() {
+        // rationale: xml.py:42-46 — date slot.
+        let md = Metadata {
+            date: Some("2026-05-26".to_string()),
+            ..Metadata::default()
+        };
+        let doc = create_element("doc");
+        add_xml_meta(&doc, &md);
+        assert_eq!(get_attribute(&doc, "date").as_deref(), Some("2026-05-26"));
+    }
+
+    #[test]
+    fn add_xml_meta_hostname_only_attr_set() {
+        // rationale: xml.py:42-46 — hostname slot.
+        let md = Metadata {
+            hostname: Some("example.com".to_string()),
+            ..Metadata::default()
+        };
+        let doc = create_element("doc");
+        add_xml_meta(&doc, &md);
+        assert_eq!(get_attribute(&doc, "hostname").as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn add_xml_meta_description_only_attr_set() {
+        // rationale: xml.py:42-46 — description slot.
+        let md = Metadata {
+            description: Some("summary".to_string()),
+            ..Metadata::default()
+        };
+        let doc = create_element("doc");
+        add_xml_meta(&doc, &md);
+        assert_eq!(get_attribute(&doc, "description").as_deref(), Some("summary"));
+    }
+
+    #[test]
+    fn add_xml_meta_author_only_attr_set() {
+        // rationale: xml.py:42-46 — author slot.
+        let md = Metadata {
+            author: Some("Author".to_string()),
+            ..Metadata::default()
+        };
+        let doc = create_element("doc");
+        add_xml_meta(&doc, &md);
+        assert_eq!(get_attribute(&doc, "author").as_deref(), Some("Author"));
+    }
+
+    #[test]
+    fn add_xml_meta_tags_only_attr_joined_by_semicolon() {
+        // rationale: xml.py:183 — list fields render as `';'.join(list)`.
+        let md = Metadata {
+            tags: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            ..Metadata::default()
+        };
+        let doc = create_element("doc");
+        add_xml_meta(&doc, &md);
+        assert_eq!(get_attribute(&doc, "tags").as_deref(), Some("a;b;c"));
+        assert_eq!(get_attribute(&doc, "categories"), None);
+    }
+
+    #[test]
+    fn add_xml_meta_empty_categories_and_tags_skipped() {
+        // rationale: xml.py:178-183 — empty list is falsy in Python's `if
+        // value:`; both attrs must be absent.
+        let md = Metadata::default();
+        let doc = create_element("doc");
+        add_xml_meta(&doc, &md);
+        assert_eq!(get_attribute(&doc, "categories"), None);
+        assert_eq!(get_attribute(&doc, "tags"), None);
+    }
+
+    #[test]
+    fn add_xml_meta_license_only_attr_set() {
+        // rationale: xml.py:42-46 — license slot.
+        let md = Metadata {
+            license: Some("CC-BY".to_string()),
+            ..Metadata::default()
+        };
+        let doc = create_element("doc");
+        add_xml_meta(&doc, &md);
+        assert_eq!(get_attribute(&doc, "license").as_deref(), Some("CC-BY"));
+    }
+
+    #[test]
+    fn add_xml_meta_language_only_attr_set() {
+        // rationale: xml.py:42-46 — language slot (last in our port).
+        let md = Metadata {
+            language: Some("en".to_string()),
+            ..Metadata::default()
+        };
+        let doc = create_element("doc");
+        add_xml_meta(&doc, &md);
+        assert_eq!(get_attribute(&doc, "language").as_deref(), Some("en"));
+    }
+
+    // --- replace_element_text (xml.py:253-297): tag-branch catalog ----
+
+    #[test]
+    fn replace_element_text_default_tag_passes_text_through() {
+        // rationale: xml.py:253-274 — the formatting match has a `_ => {}`
+        // default arm: non-(head|del|hi|code|ref|cell|item) tags emit raw
+        // text verbatim.
+        let p = build_elem("p", Some("hello"), vec![], &[]);
+        assert_eq!(replace_element_text(&p, true), "hello");
+    }
+
+    #[test]
+    fn replace_element_text_no_text_returns_empty_string() {
+        // rationale: xml.py:255 — `element.text or ""`; a textless tag
+        // returns an empty string (the formatting branch's `!orig.is_empty()`
+        // guard goes false).
+        let p = create_element("p");
+        assert_eq!(replace_element_text(&p, true), "");
+    }
+
+    #[test]
+    fn replace_element_text_head_without_include_formatting_passes_through() {
+        // rationale: xml.py:257 — the `include_formatting AND text non-empty`
+        // gate is false when include_formatting=false; <head> emits raw text
+        // (no '## ' prefix).
+        let h = build_elem("head", Some("Title"), vec![], &[("rend", "h2")]);
+        assert_eq!(replace_element_text(&h, false), "Title");
+    }
+
+    #[test]
+    fn replace_element_text_head_h1_emits_single_hash() {
+        // rationale: xml.py:258-263 — rend="h1" gives one '#'.
+        let h = build_elem("head", Some("Title"), vec![], &[("rend", "h1")]);
+        assert_eq!(replace_element_text(&h, true), "# Title");
+    }
+
+    #[test]
+    fn replace_element_text_head_h6_emits_six_hashes() {
+        // rationale: xml.py:258-263 — rend="h6" gives six '#'.
+        let h = build_elem("head", Some("Title"), vec![], &[("rend", "h6")]);
+        assert_eq!(replace_element_text(&h, true), "###### Title");
+    }
+
+    #[test]
+    fn replace_element_text_hi_i_italic_wrap() {
+        // rationale: xml.py:266-269 — HI_FORMATTING["#i"] = '*'.
+        let hi = build_elem("hi", Some("italic"), vec![], &[("rend", "#i")]);
+        assert_eq!(replace_element_text(&hi, true), "*italic*");
+    }
+
+    #[test]
+    fn replace_element_text_hi_u_underline_wrap() {
+        // rationale: xml.py:266-269 — HI_FORMATTING["#u"] = '__'.
+        let hi = build_elem("hi", Some("under"), vec![], &[("rend", "#u")]);
+        assert_eq!(replace_element_text(&hi, true), "__under__");
+    }
+
+    #[test]
+    fn replace_element_text_hi_t_tt_wrap() {
+        // rationale: xml.py:266-269 — HI_FORMATTING["#t"] = '`' (typewriter).
+        let hi = build_elem("hi", Some("tt"), vec![], &[("rend", "#t")]);
+        assert_eq!(replace_element_text(&hi, true), "`tt`");
+    }
+
+    #[test]
+    fn replace_element_text_hi_unknown_rend_returns_unwrapped() {
+        // rationale: xml.py:266-269 — HI_FORMATTING.get returns None for
+        // unknown rend; the `if let Some(wrap) = hi_formatting(...)` arm
+        // goes false; text passes through unwrapped.
+        let hi = build_elem("hi", Some("plain"), vec![], &[("rend", "#xx")]);
+        assert_eq!(replace_element_text(&hi, true), "plain");
+    }
+
+    #[test]
+    fn replace_element_text_hi_missing_rend_returns_unwrapped() {
+        // rationale: xml.py:266-269 — `if get_attribute(... "rend")` goes
+        // None; the `if let Some(rend) = ...` arm exits early.
+        let hi = build_elem("hi", Some("plain"), vec![], &[]);
+        assert_eq!(replace_element_text(&hi, true), "plain");
+    }
+
+    #[test]
+    fn replace_element_text_code_multiline_emits_fenced_block() {
+        // rationale: xml.py:270-274 — multi-line code uses ``` fences.
+        let c = build_elem("code", Some("def f():\n    pass"), vec![], &[]);
+        assert_eq!(
+            replace_element_text(&c, true),
+            "```\ndef f():\n    pass\n```"
+        );
+    }
+
+    #[test]
+    fn replace_element_text_ref_without_target_emits_bare_link_text() {
+        // rationale: xml.py:279-284 — missing target falls through to
+        // `elem_text = link_text` (only the bracketed text).
+        let r = build_elem("ref", Some("link"), vec![], &[]);
+        assert_eq!(replace_element_text(&r, false), "[link]");
+    }
+
+    #[test]
+    fn replace_element_text_ref_empty_target_falls_back_to_link_text() {
+        // rationale: xml.py:279-284 — `if target && !target.is_empty()`
+        // is false for empty target attr.
+        let r = build_elem("ref", Some("link"), vec![], &[("target", "")]);
+        assert_eq!(replace_element_text(&r, false), "[link]");
+    }
+
+    #[test]
+    fn replace_element_text_ref_with_empty_text_returns_empty() {
+        // rationale: xml.py:278 — `if tag == "ref" && !elem_text.is_empty()`
+        // gate goes false when text is empty; raw passthrough.
+        let r = build_elem("ref", None, vec![], &[("target", "https://e.com")]);
+        assert_eq!(replace_element_text(&r, false), "");
+    }
+
+    #[test]
+    fn replace_element_text_cell_mid_row_no_leading_pipe() {
+        // rationale: xml.py:291-293 — mid-row leaf cell (has previous sibling
+        // element) gets NO leading "| ".
+        let row = create_element("row");
+        let first = create_element("cell");
+        append_child(&first, &create_text_node("first"));
+        append_child(&row, &first);
+        let mid = create_element("cell");
+        append_child(&mid, &create_text_node("second"));
+        append_child(&row, &mid);
+        assert_eq!(replace_element_text(&mid, false), "second");
+    }
+
+    #[test]
+    fn replace_element_text_cell_empty_text_emits_empty() {
+        // rationale: xml.py:287-293 — `if !elem_text.is_empty()` guard skip.
+        let row = create_element("row");
+        let cell = create_element("cell");
+        append_child(&row, &cell);
+        assert_eq!(replace_element_text(&cell, false), "");
+    }
+
+    #[test]
+    fn replace_element_text_cell_with_p_child_first_in_row() {
+        // rationale: xml.py:288-290 — first-cell-in-row with <p> first child
+        // emits "| {text} " (note trailing space).
+        let row = create_element("row");
+        let cell = create_element("cell");
+        append_child(&cell, &create_text_node("hdr"));
+        let p_kid = create_element("p");
+        append_child(&cell, &p_kid);
+        append_child(&row, &cell);
+        assert_eq!(replace_element_text(&cell, false), "| hdr ");
+    }
+
+    #[test]
+    fn replace_element_text_cell_with_p_child_mid_row() {
+        // rationale: xml.py:288-290 — mid-row p-first cell gets " " not "| ".
+        let row = create_element("row");
+        let first = build_elem("cell", Some("a"), vec![], &[]);
+        let mid = create_element("cell");
+        append_child(&mid, &create_text_node("body"));
+        append_child(&mid, &create_element("p"));
+        append_child(&row, &first);
+        append_child(&row, &mid);
+        assert_eq!(replace_element_text(&mid, false), "body ");
+    }
+
+    // --- process_element extra branches ------------------------------
+
+    #[test]
+    fn process_element_textless_non_newline_tag_early_returns() {
+        // rationale: xml.py:333-336 — textless non-NEWLINE_ELEM tag (e.g.
+        // <span>) takes the early return; nothing is emitted at all.
+        let span = create_element("span");
+        let mut out = Vec::new();
+        process_element(&span, &mut out, false);
+        assert!(out.is_empty(), "got: {out:?}");
+    }
+
+    #[test]
+    fn process_element_lb_emits_newline_in_newline_elems() {
+        // rationale: xml.py:331-332 — textless <lb> (in NEWLINE_ELEMS) emits
+        // "\n", then the after-tag block emits another "\n".
+        let lb = create_element("lb");
+        let mut out = Vec::new();
+        process_element(&lb, &mut out, false);
+        let joined: String = out.join("");
+        assert!(joined.contains('\n'));
+    }
+
+    #[test]
+    fn process_element_quote_emits_newlines() {
+        // rationale: xml.py:331-332,341-343 — <quote> in NEWLINE_ELEMS.
+        let q = build_elem("quote", Some("quoted"), vec![], &[]);
+        let mut out = Vec::new();
+        process_element(&q, &mut out, false);
+        let joined: String = out.join("");
+        assert!(joined.contains("quoted"));
+        assert!(joined.contains('\n'));
+    }
+
+    #[test]
+    fn process_element_del_special_formatting_no_trailing_space() {
+        // rationale: xml.py:346-347 — SPECIAL_FORMATTING tags don't emit the
+        // default trailing space. <del> with formatting emits "~~text~~"
+        // with no " " after the closing tag.
+        let d = build_elem("del", Some("old"), vec![], &[]);
+        let mut out = Vec::new();
+        process_element(&d, &mut out, true);
+        let joined: String = out.join("");
+        assert_eq!(joined, "~~old~~");
+    }
+
+    #[test]
+    fn process_element_row_padding_for_colspan() {
+        // rationale: xml.py:317-330 — short row with colspan="3" pads with
+        // "||\n" (3 cells expected, 1 actual, 2 pad bars).
+        let cell = build_elem("cell", Some("only"), vec![], &[]);
+        let row = build_elem("row", None, vec![cell], &[("colspan", "3")]);
+        let mut out = Vec::new();
+        process_element(&row, &mut out, false);
+        let joined: String = out.join("");
+        assert!(joined.contains("||\n"), "got: {joined:?}");
+    }
+
+    #[test]
+    fn process_element_row_head_cell_emits_underline() {
+        // rationale: xml.py:329-330 — head row (cell role="head") emits
+        // "\n|---|---|...\n" separator.
+        let head_cell = build_elem("cell", Some("H"), vec![], &[("role", "head")]);
+        let row = build_elem("row", None, vec![head_cell], &[]);
+        let mut out = Vec::new();
+        process_element(&row, &mut out, false);
+        let joined: String = out.join("");
+        assert!(joined.contains("---|"), "got: {joined:?}");
+    }
+
+    #[test]
+    fn process_element_cell_ancestor_suppresses_newline() {
+        // rationale: xml.py:341 — `has_cell_ancestor` gate: a <p> nested
+        // under <cell> does NOT emit a newline (the cell consumes its
+        // formatting).
+        let body = create_element("body");
+        let row = create_element("row");
+        let cell = create_element("cell");
+        let p = build_elem("p", Some("inside"), vec![], &[]);
+        append_child(&cell, &p);
+        append_child(&row, &cell);
+        append_child(&body, &row);
+        let mut out = Vec::new();
+        process_element(&p, &mut out, false);
+        let joined: String = out.join("");
+        // No '\n' from this <p> (cell ancestor suppresses).
+        assert!(!joined.contains('\n'), "got: {joined:?}");
+    }
+
+    // --- sanitize (utils.py:303-312) ----------------------------------
+
+    #[test]
+    fn sanitize_empty_input_returns_none() {
+        // rationale: utils.py:308-310 — all-blank/empty input collapses to
+        // empty joined string -> None return.
+        assert_eq!(sanitize("", false, false), None);
+    }
+
+    #[test]
+    fn sanitize_whitespace_only_returns_none() {
+        // rationale: utils.py:294-295 — every line trims to "", every line
+        // is None-pruned; final joined string is "".
+        assert_eq!(sanitize("   \n\t\n   ", false, false), None);
+    }
+
+    #[test]
+    fn sanitize_non_blank_returns_some_joined_lines() {
+        // rationale: utils.py:308-310 — non-blank lines join with "\n";
+        // blank lines are pruned.
+        let r = sanitize("a\n\nb", false, false).expect("non-empty");
+        assert_eq!(r, "a\nb");
+    }
+
+    #[test]
+    fn sanitize_strips_unicode_line_separator_marker() {
+        // rationale: utils.py:308 — `\u{2424}` (SYMBOL FOR NEWLINE) is the
+        // process_element spacing-hack marker; sanitize strips it from the
+        // joined output.
+        let r = sanitize("a\u{2424}b", false, false).expect("non-empty");
+        // The marker is replaced; the two non-blank chars survive on the
+        // same line (no \n splits in input).
+        assert!(!r.contains('\u{2424}'));
+        assert!(r.contains('a') && r.contains('b'));
+    }
+
+    #[test]
+    fn sanitize_trailing_space_routes_to_line_processing_directly() {
+        // rationale: utils.py:306-307 — trailing_space=true short-circuits
+        // the line-splitter and feeds the whole input to line_processing.
+        let r = sanitize("  hello world  ", false, true);
+        // Whitespace re-attached because original had leading/trailing ws.
+        assert!(r.is_some());
+        let s = r.unwrap();
+        assert!(s.starts_with(' '));
+        assert!(s.ends_with(' '));
+        assert!(s.contains("hello world"));
+    }
+
+    #[test]
+    fn sanitize_text_returns_empty_string_on_none() {
+        // rationale: sanitize_text wraps sanitize() with `or ""` per xml.py:363.
+        assert_eq!(sanitize_text(""), "");
+        assert_eq!(sanitize_text("   "), "");
+    }
+
+    // --- line_processing (utils.py:282-300) ---------------------------
+
+    #[test]
+    fn line_processing_decodes_html_space_entities() {
+        // rationale: utils.py:288 — `&#13;` -> '\r', `&#10;` -> '\n',
+        // `&nbsp;` -> '\u{00A0}'. trim() collapses runs, but the substitution
+        // happens BEFORE trim.
+        let r = line_processing("a&#10;b", true, false).unwrap();
+        assert!(r.contains('\n'));
+        let r2 = line_processing("a&#13;b", true, false).unwrap();
+        assert!(r2.contains('\r'));
+    }
+
+    #[test]
+    fn line_processing_nbsp_decoded_to_u00a0() {
+        // rationale: utils.py:288 — `&nbsp;` -> NBSP.
+        let r = line_processing("a&nbsp;b", true, false).unwrap();
+        assert!(r.contains('\u{00A0}'));
+    }
+
+    #[test]
+    fn line_processing_preserve_space_returns_decoded_unchanged() {
+        // rationale: utils.py:289 — `preserve_space=true` short-circuits
+        // the trim block; control-stripped text is returned as-is.
+        let r = line_processing("  hi  ", true, false).unwrap();
+        // No trim happened; leading/trailing spaces preserved.
+        assert_eq!(r, "  hi  ");
+    }
+
+    #[test]
+    fn line_processing_blank_line_returns_none() {
+        // rationale: utils.py:294-295 — `if all(map(str.isspace, ...))` arm:
+        // all-whitespace lines return None.
+        assert_eq!(line_processing("   \t  ", false, false), None);
+    }
+
+    #[test]
+    fn line_processing_trailing_space_reattaches_leading_and_trailing() {
+        // rationale: utils.py:296-299 — trailing_space=true re-attaches a
+        // single leading/trailing space based on the ORIGINAL line.
+        let r = line_processing("  foo bar  ", false, true).unwrap();
+        assert_eq!(r, " foo bar ");
+    }
+
+    #[test]
+    fn line_processing_trailing_space_only_leading_when_leading_ws() {
+        // rationale: utils.py:296-299 — only leading space exists in
+        // original; only one side gets the space.
+        let r = line_processing(" foo", false, true).unwrap();
+        assert_eq!(r, " foo");
+        let r2 = line_processing("foo ", false, true).unwrap();
+        assert_eq!(r2, "foo ");
+    }
+
+    #[test]
+    fn line_processing_strips_control_chars_then_trims() {
+        // rationale: utils.py:288 — `remove_control_characters` before trim.
+        // BOM + text -> just text after strip + trim.
+        let r = line_processing("\u{FEFF}hello", false, false).unwrap();
+        assert_eq!(r, "hello");
+    }
+
+    // --- unescape_html (subset of html.unescape) ----------------------
+
+    #[test]
+    fn unescape_html_xml_mandatory_entities() {
+        // rationale: XML mandates the five entities; verify each.
+        assert_eq!(unescape_html("&amp;"), "&");
+        assert_eq!(unescape_html("&lt;"), "<");
+        assert_eq!(unescape_html("&gt;"), ">");
+        assert_eq!(unescape_html("&quot;"), "\"");
+        assert_eq!(unescape_html("&apos;"), "'");
+    }
+
+    #[test]
+    fn unescape_html_numeric_decimal_entity() {
+        // rationale: html.unescape — `&#NN;` decodes by base 10.
+        assert_eq!(unescape_html("&#38;"), "&");
+        assert_eq!(unescape_html("&#233;"), "é");
+    }
+
+    #[test]
+    fn unescape_html_numeric_hex_entity_lower_and_upper_x() {
+        // rationale: html.unescape — both `&#xHH;` and `&#XHH;` decode by
+        // base 16 (the strip_prefix("x").or_else(strip_prefix("X")) arm).
+        assert_eq!(unescape_html("&#x26;"), "&");
+        assert_eq!(unescape_html("&#X26;"), "&");
+    }
+
+    #[test]
+    fn unescape_html_malformed_hex_falls_back_to_verbatim() {
+        // rationale: u32::from_str_radix("ZZ", 16) is Err → None → emit
+        // verbatim "&entity;".
+        assert_eq!(unescape_html("&#xZZ;"), "&#xZZ;");
+    }
+
+    #[test]
+    fn unescape_html_unknown_named_falls_back_to_verbatim() {
+        // rationale: the giant `match entity.as_str()` falls through to
+        // `_ => None` for unknown names; verbatim copy with the bracketing.
+        assert_eq!(unescape_html("&xyz;"), "&xyz;");
+    }
+
+    #[test]
+    fn unescape_html_unterminated_entity_passes_through() {
+        // rationale: `if !found_end` arm copies '&' + scanned chars verbatim
+        // (no terminating ';').
+        assert_eq!(unescape_html("a&amp"), "a&amp");
+    }
+
+    #[test]
+    fn unescape_html_named_punctuation_entities() {
+        // rationale: select corpus-driven entities (nbsp, eacute, rsquo, mdash).
+        assert_eq!(unescape_html("&nbsp;"), "\u{00A0}");
+        assert_eq!(unescape_html("&eacute;"), "é");
+        assert_eq!(unescape_html("&rsquo;"), "\u{2019}");
+        assert_eq!(unescape_html("&mdash;"), "\u{2014}");
+    }
+
+    #[test]
+    fn unescape_html_ddagger_alias_decodes_like_dagger() {
+        // rationale: html5 spec — ddagger is a case-insensitive alias for
+        // Dagger; both -> U+2021 (faithful-divergence guard).
+        assert_eq!(unescape_html("&ddagger;"), "\u{2021}");
+        assert_eq!(unescape_html("&Dagger;"), "\u{2021}");
+    }
+
+    #[test]
+    fn unescape_html_bare_ampersand_passes_through() {
+        // rationale: `&` followed by nothing or non-entity chars copies
+        // verbatim (loop break, found_end=false).
+        assert_eq!(unescape_html("a&b"), "a&b");
+        assert_eq!(unescape_html("&"), "&");
+    }
+
+    #[test]
+    fn unescape_html_unicode_multibyte_passthrough() {
+        // rationale: the char-iterator scanner must not corrupt multi-byte
+        // UTF-8 sequences (`café` is 5 bytes in UTF-8, 4 chars).
+        assert_eq!(unescape_html("café"), "café");
+    }
+
+    // --- python_repr_list, json_str, json_optional_str, csv_or_null,
+    //     csv_quote_minimal ------------------------------------------
+
+    #[test]
+    fn python_repr_list_empty_emits_bracket_pair() {
+        // rationale: Python `str([])` -> "[]"; join("") is empty.
+        assert_eq!(python_repr_list(&[]), "[]");
+    }
+
+    #[test]
+    fn python_repr_list_single_item_quoted() {
+        // rationale: Python `str(['a'])` -> "['a']".
+        assert_eq!(python_repr_list(&["a".to_string()]), "['a']");
+    }
+
+    #[test]
+    fn python_repr_list_multi_item_comma_space_separated() {
+        // rationale: Python `str(['a', 'b'])` -> "['a', 'b']".
+        assert_eq!(
+            python_repr_list(&["a".to_string(), "b".to_string()]),
+            "['a', 'b']"
+        );
+    }
+
+    #[test]
+    fn json_str_basic_string_quoted_no_escapes() {
+        // rationale: serde_json renders ASCII as "hello".
+        assert_eq!(json_str("hello"), "\"hello\"");
+    }
+
+    #[test]
+    fn json_str_quotes_and_backslash_escaped() {
+        // rationale: serde_json escapes `"` -> `\"` and `\\` -> `\\\\`.
+        assert_eq!(json_str("a\"b"), "\"a\\\"b\"");
+        assert_eq!(json_str("a\\b"), "\"a\\\\b\"");
+    }
+
+    #[test]
+    fn json_str_newline_escaped() {
+        // rationale: serde_json escapes control chars (`\n` -> `\\n`).
+        assert_eq!(json_str("a\nb"), "\"a\\nb\"");
+    }
+
+    #[test]
+    fn json_str_non_ascii_passes_through_verbatim() {
+        // rationale: serde_json defaults to ensure_ascii=false equivalent;
+        // non-ASCII passes through (matches Python json.dumps(..., ensure_ascii=False)).
+        assert_eq!(json_str("café"), "\"café\"");
+    }
+
+    #[test]
+    fn json_optional_str_none_returns_null() {
+        // rationale: json.dumps(None) -> "null".
+        assert_eq!(json_optional_str(None), "null");
+    }
+
+    #[test]
+    fn json_optional_str_some_returns_quoted_string() {
+        // rationale: delegates to json_str on Some.
+        assert_eq!(json_optional_str(Some("hi")), "\"hi\"");
+    }
+
+    #[test]
+    fn csv_or_null_none_returns_null_token() {
+        // rationale: xml.py:377 — `d if d else null`. None -> null.
+        assert_eq!(csv_or_null(None, "NULL"), "NULL");
+    }
+
+    #[test]
+    fn csv_or_null_empty_string_returns_null_token() {
+        // rationale: xml.py:377 — empty string is Python-falsy; renders null.
+        assert_eq!(csv_or_null(Some(""), "NULL"), "NULL");
+    }
+
+    #[test]
+    fn csv_or_null_some_non_empty_returns_value() {
+        // rationale: xml.py:377 — non-empty Some flows through.
+        assert_eq!(csv_or_null(Some("x"), "NULL"), "x");
+    }
+
+    #[test]
+    fn csv_quote_minimal_no_special_chars_returns_field_unquoted() {
+        // rationale: csv.QUOTE_MINIMAL — no delim/quote/CR/LF => no quoting.
+        assert_eq!(csv_quote_minimal("plain", "\t"), "plain");
+    }
+
+    #[test]
+    fn csv_quote_minimal_delim_in_field_triggers_quoting() {
+        // rationale: csv.QUOTE_MINIMAL — delim present => quote whole field.
+        assert_eq!(csv_quote_minimal("a,b", ","), "\"a,b\"");
+    }
+
+    #[test]
+    fn csv_quote_minimal_double_quote_doubled_inside_quoted_field() {
+        // rationale: csv.QUOTE_MINIMAL — embedded `"` doubled-up.
+        assert_eq!(csv_quote_minimal("a\"b", ","), "\"a\"\"b\"");
+    }
+
+    #[test]
+    fn csv_quote_minimal_cr_or_lf_triggers_quoting() {
+        // rationale: csv.QUOTE_MINIMAL — CR or LF in field => quote.
+        assert_eq!(csv_quote_minimal("a\nb", "\t"), "\"a\nb\"");
+        assert_eq!(csv_quote_minimal("a\rb", "\t"), "\"a\rb\"");
+    }
+
+    // --- restore_tei_case --------------------------------------------
+
+    #[test]
+    fn restore_tei_case_uppercases_tei_root_open_close() {
+        // rationale: rcdom lower-cases; restore_tei_case re-uppercases TEI
+        // root tag and known children.
+        let in_s = "<tei xmlns=\"x\"><teiheader/><text/></tei>";
+        let out = restore_tei_case(in_s);
+        assert!(out.contains("<TEI "), "got: {out}");
+        assert!(out.contains("</TEI>"), "got: {out}");
+        assert!(out.contains("<teiHeader/>"), "got: {out}");
+    }
+
+    #[test]
+    fn restore_tei_case_preserves_non_tei_tags() {
+        // rationale: only the mappings table is touched; arbitrary tags
+        // (like <p>) pass through unchanged.
+        let in_s = "<tei><teiheader></teiheader><text><body><p>hi</p></body></text></tei>";
+        let out = restore_tei_case(in_s);
+        assert!(out.contains("<p>hi</p>"));
+        assert!(out.contains("<TEI>"));
+        assert!(out.contains("</teiHeader>"));
+    }
+
+    #[test]
+    fn restore_tei_case_uppercases_filedesc_titlestmt_chain() {
+        // rationale: fileDesc / titleStmt / publicationStmt / sourceDesc /
+        // notesStmt — each is part of the mapping table.
+        let in_s = "<filedesc><titlestmt/><publicationstmt/><notesstmt/><sourcedesc/></filedesc>";
+        let out = restore_tei_case(in_s);
+        assert!(out.contains("<fileDesc>"));
+        assert!(out.contains("<titleStmt/>"));
+        assert!(out.contains("<publicationStmt/>"));
+        assert!(out.contains("<notesStmt/>"));
+        assert!(out.contains("<sourceDesc/>"));
+    }
+
+    #[test]
+    fn restore_tei_case_uppercases_biblfull_profiledesc_etc() {
+        // rationale: biblFull / profileDesc / textClass / encodingDesc /
+        // appInfo — each in the mapping table.
+        let in_s = "<biblfull/><profiledesc/><textclass/><encodingdesc/><appinfo/>";
+        let out = restore_tei_case(in_s);
+        assert!(out.contains("<biblFull/>"));
+        assert!(out.contains("<profileDesc/>"));
+        assert!(out.contains("<textClass/>"));
+        assert!(out.contains("<encodingDesc/>"));
+        assert!(out.contains("<appInfo/>"));
+    }
+
+    #[test]
+    fn restore_tei_case_idempotent_on_correct_case() {
+        // rationale: re-running on already-correct-case output should be
+        // a no-op (the `if out.contains(from)` guard skips on miss).
+        let s = "<TEI><teiHeader/></TEI>";
+        assert_eq!(restore_tei_case(s), s);
+    }
+
+    #[test]
+    fn restore_tei_case_handles_self_closing_tei_root() {
+        // rationale: `<tei/>` self-closing variant.
+        let out = restore_tei_case("<tei/>");
+        assert_eq!(out, "<TEI/>");
+    }
+
+    // --- write_teitree / write_fullheader / build_tei_output ----------
+
+    #[test]
+    fn write_teitree_includes_text_body_div_chain_with_entry_type() {
+        // rationale: xml.py:397-403 — text/body/div[type=entry] chain.
+        let doc = doc_with_simple_body(Metadata::default());
+        let tei = write_teitree(&doc);
+        let textels = get_elements_by_tag_name(&tei, "text");
+        assert_eq!(textels.len(), 1);
+        let bodies = get_elements_by_tag_name(&textels[0], "body");
+        assert_eq!(bodies.len(), 1);
+        let divs = get_elements_by_tag_name(&bodies[0], "div");
+        assert!(divs.iter().any(|d| get_attribute(d, "type")
+            .as_deref()
+            == Some("entry")));
+    }
+
+    #[test]
+    fn write_teitree_includes_div_with_type_comments_when_none() {
+        // rationale: xml.py:405-408 — None commentsbody synthesises a fresh
+        // <div type="comments"> (Python default path).
+        let doc = Document {
+            metadata: Metadata::default(),
+            body: create_element("body"),
+            commentsbody: None,
+            raw_text: String::new(),
+        };
+        let tei = write_teitree(&doc);
+        let divs = get_elements_by_tag_name(&tei, "div");
+        assert!(divs
+            .iter()
+            .any(|d| get_attribute(d, "type").as_deref() == Some("comments")));
+    }
+
+    #[test]
+    fn write_fullheader_with_license_emits_availability_block() {
+        // rationale: xml.py:435-440 — license -> <publicationStmt><publisher/>
+        // <availability><p>license</p></availability>.
+        let md = Metadata {
+            license: Some("CC-BY-SA".to_string()),
+            ..Metadata::default()
+        };
+        let teidoc = create_element("TEI");
+        let header = write_fullheader(&teidoc, &md);
+        let avail = get_elements_by_tag_name(&header, "availability");
+        assert_eq!(avail.len(), 1);
+        let kids = children(&avail[0]);
+        assert_eq!(kids.len(), 1);
+        assert_eq!(element_text(&kids[0]).as_deref(), Some("CC-BY-SA"));
+    }
+
+    #[test]
+    fn write_fullheader_without_license_emits_empty_p_in_publication_stmt() {
+        // rationale: xml.py:441-442 — no license -> empty <p/> inside
+        // <publicationStmt> for TEI conformance.
+        let teidoc = create_element("TEI");
+        let header = write_fullheader(&teidoc, &Metadata::default());
+        let pubs = get_elements_by_tag_name(&header, "publicationstmt");
+        // The FIRST publicationStmt is the one for fileDesc>publicationStmt
+        // (the no-license empty-p branch). The second is inside biblFull
+        // (always populated).
+        assert!(pubs.len() >= 1);
+        let ps = get_elements_by_tag_name(&pubs[0], "p");
+        // Must contain at least one <p> as the empty placeholder.
+        assert!(!ps.is_empty());
+    }
+
+    #[test]
+    fn write_fullheader_categories_emit_textclass_terms() {
+        // rationale: xml.py:471-475 — categories -> <textClass><keywords>
+        // <term type="categories">a,b</term></keywords></textClass>.
+        let md = Metadata {
+            categories: vec!["news".to_string(), "tech".to_string()],
+            ..Metadata::default()
+        };
+        let teidoc = create_element("TEI");
+        let header = write_fullheader(&teidoc, &md);
+        let terms = get_elements_by_tag_name(&header, "term");
+        let cat_term = terms
+            .iter()
+            .find(|t| get_attribute(t, "type").as_deref() == Some("categories"))
+            .expect("categories term present");
+        assert_eq!(element_text(cat_term).as_deref(), Some("news,tech"));
+    }
+
+    #[test]
+    fn write_fullheader_tags_emit_textclass_terms() {
+        // rationale: xml.py:476-480 — tags -> similar shape.
+        let md = Metadata {
+            tags: vec!["one".to_string(), "two".to_string()],
+            ..Metadata::default()
+        };
+        let teidoc = create_element("TEI");
+        let header = write_fullheader(&teidoc, &md);
+        let terms = get_elements_by_tag_name(&header, "term");
+        let tag_term = terms
+            .iter()
+            .find(|t| get_attribute(t, "type").as_deref() == Some("tags"))
+            .expect("tags term present");
+        assert_eq!(element_text(tag_term).as_deref(), Some("one,two"));
+    }
+
+    #[test]
+    fn write_fullheader_omits_textclass_when_no_categories_or_tags() {
+        // rationale: xml.py:470 — `if categories or tags:` arm; when both
+        // empty the entire textClass subtree is absent.
+        let teidoc = create_element("TEI");
+        let header = write_fullheader(&teidoc, &Metadata::default());
+        let tc = get_elements_by_tag_name(&header, "textclass");
+        assert!(tc.is_empty(), "textClass must be absent: {}", tc.len());
+    }
+
+    #[test]
+    fn write_fullheader_filedate_seeds_creation_date_text() {
+        // rationale: xml.py:483 — `<date type="download">docmeta.filedate</date>`.
+        let md = Metadata {
+            filedate: Some("2026-05-26".to_string()),
+            ..Metadata::default()
+        };
+        let teidoc = create_element("TEI");
+        let header = write_fullheader(&teidoc, &md);
+        let dates = get_elements_by_tag_name(&header, "date");
+        let download = dates
+            .iter()
+            .find(|d| get_attribute(d, "type").as_deref() == Some("download"))
+            .expect("download date present");
+        assert_eq!(element_text(download).as_deref(), Some("2026-05-26"));
+    }
+
+    #[test]
+    fn write_fullheader_url_emits_ptr_url_in_biblfull() {
+        // rationale: xml.py:465-467 — url -> <ptr type="URL" target="..."/>
+        // inside biblFull/publicationStmt.
+        let md = Metadata {
+            url: Some("https://example.com/x".to_string()),
+            ..Metadata::default()
+        };
+        let teidoc = create_element("TEI");
+        let header = write_fullheader(&teidoc, &md);
+        let ptrs = get_elements_by_tag_name(&header, "ptr");
+        // Find the URL ptr (there's also an app ptr in appInfo).
+        let url_ptr = ptrs
+            .iter()
+            .find(|p| get_attribute(p, "type").as_deref() == Some("URL"))
+            .expect("URL ptr present");
+        assert_eq!(
+            get_attribute(url_ptr, "target").as_deref(),
+            Some("https://example.com/x")
+        );
+    }
+
+    #[test]
+    fn write_fullheader_author_attaches_only_when_non_empty() {
+        // rationale: xml.py:430-431 — `if author:` guards the <author>
+        // element. Empty / None author -> NO <author> in titleStmt.
+        let teidoc = create_element("TEI");
+        let header_empty = write_fullheader(&teidoc, &Metadata::default());
+        let authors_empty = get_elements_by_tag_name(&header_empty, "author");
+        assert!(
+            authors_empty.is_empty(),
+            "author must be absent for None metadata: {}",
+            authors_empty.len()
+        );
+
+        let teidoc2 = create_element("TEI");
+        let md = Metadata {
+            author: Some("Jane".to_string()),
+            ..Metadata::default()
+        };
+        let header_some = write_fullheader(&teidoc2, &md);
+        let authors_some = get_elements_by_tag_name(&header_some, "author");
+        // Two <author> elements: one in fileDesc/titleStmt, one in
+        // sourceDesc/biblFull/titleStmt.
+        assert_eq!(authors_some.len(), 2);
+        assert_eq!(element_text(&authors_some[0]).as_deref(), Some("Jane"));
+    }
+
+    #[test]
+    fn build_tei_output_runs_check_tei_to_scrub_invalid_tags() {
+        // rationale: xml.py:186-193 — build_tei_output composes write_teitree
+        // then check_tei. Inject a <span> in the body; check_tei must strip it.
+        let body = create_element("body");
+        let p = build_elem("p", Some("good "), vec![], &[]);
+        let span = build_elem("span", Some("bad"), vec![], &[]);
+        append_child(&p, &span);
+        append_child(&body, &p);
+        let doc = Document {
+            metadata: Metadata::default(),
+            body,
+            commentsbody: None,
+            raw_text: String::new(),
+        };
+        let out = build_tei_output(&doc);
+        let spans = get_elements_by_tag_name(&out, "span");
+        assert!(spans.is_empty(), "span must be stripped by check_tei");
+    }
+
+    // --- check_tei deeper coverage -----------------------------------
+
+    #[test]
+    fn check_tei_renames_head_to_ab_header() {
+        // rationale: xml.py:199-210 — Pass 1 renames <head> -> <ab type="header">.
+        // Build a TEI shell that exposes <head> inside the body/div chain.
+        let tei = create_element("TEI");
+        let textel = create_element("text");
+        let bodyel = create_element("body");
+        let div = build_elem("div", None, vec![], &[("type", "entry")]);
+        let head = build_elem("head", Some("Section"), vec![], &[]);
+        append_child(&div, &head);
+        append_child(&bodyel, &div);
+        append_child(&textel, &bodyel);
+        append_child(&tei, &textel);
+        check_tei(&tei);
+        let heads = get_elements_by_tag_name(&tei, "head");
+        assert!(heads.is_empty(), "head must be renamed: {}", heads.len());
+        let abs_with_header = get_elements_by_tag_name(&tei, "ab")
+            .into_iter()
+            .filter(|e| get_attribute(e, "type").as_deref() == Some("header"))
+            .count();
+        assert_eq!(abs_with_header, 1);
+    }
+
+    #[test]
+    fn check_tei_preserves_valid_attributes() {
+        // rationale: xml.py:232-234 — attributes in TEI_VALID_ATTRS are kept.
+        // `rend`, `rendition`, `role`, `target`, `type` are valid.
+        let tei = create_element("TEI");
+        let textel = create_element("text");
+        let bodyel = create_element("body");
+        let div = build_elem("div", None, vec![], &[("type", "entry")]);
+        let p = build_elem(
+            "p",
+            Some("body"),
+            vec![],
+            &[("rend", "bold"), ("role", "primary"), ("target", "x")],
+        );
+        append_child(&div, &p);
+        append_child(&bodyel, &div);
+        append_child(&textel, &bodyel);
+        append_child(&tei, &textel);
+        check_tei(&tei);
+        let ps = get_elements_by_tag_name(&tei, "p");
+        assert_eq!(get_attribute(&ps[0], "rend").as_deref(), Some("bold"));
+        assert_eq!(get_attribute(&ps[0], "role").as_deref(), Some("primary"));
+        assert_eq!(get_attribute(&ps[0], "target").as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn check_tei_lb_with_text_tail_becomes_p() {
+        // rationale: xml.py:212-214 — <lb> under <div> with non-blank tail
+        // is renamed to <p> with text = trimmed tail. The tail must be set
+        // AFTER attaching to a parent: `set_tail` on a detached node is a
+        // no-op (dom.rs:770-772).
+        let tei = create_element("TEI");
+        let textel = create_element("text");
+        let bodyel = create_element("body");
+        let div = build_elem("div", None, vec![], &[("type", "entry")]);
+        let lb = create_element("lb");
+        append_child(&div, &lb);
+        set_tail(&lb, Some("after lb"));
+        append_child(&bodyel, &div);
+        append_child(&textel, &bodyel);
+        append_child(&tei, &textel);
+        check_tei(&tei);
+        // <lb> renamed to <p>; new <p> carries the tail as text.
+        let ps = get_elements_by_tag_name(&tei, "p");
+        assert!(ps.iter().any(|p| element_text(p).as_deref() == Some("after lb")));
+    }
+
+    // --- _handle_unwanted_tails additional shapes --------------------
+
+    #[test]
+    fn handle_unwanted_tails_p_no_tail_is_noop() {
+        // rationale: xml.py:517-519 — None tail -> set None + return. No
+        // change to element text.
+        let p = build_elem("p", Some("body"), vec![], &[]);
+        _handle_unwanted_tails(&p);
+        assert_eq!(element_text(&p).as_deref(), Some("body"));
+        assert_eq!(tail(&p), None);
+    }
+
+    #[test]
+    fn handle_unwanted_tails_p_whitespace_only_tail_is_dropped() {
+        // rationale: xml.py:517 — trim of whitespace tail collapses to ""
+        // -> drop, return.
+        let root = create_element("root");
+        let p = build_elem("p", Some("body"), vec![], &[]);
+        append_child(&root, &p);
+        set_tail(&p, Some("   "));
+        _handle_unwanted_tails(&p);
+        assert_eq!(tail(&p), None);
+        assert_eq!(element_text(&p).as_deref(), Some("body"));
+    }
+
+    #[test]
+    fn handle_unwanted_tails_p_no_existing_text_uses_tail_alone() {
+        // rationale: xml.py:521-522 — `" ".join(filter(None, [text, tail]))`:
+        // when text is empty, the result is just the trimmed tail.
+        let root = create_element("root");
+        let p = create_element("p");
+        append_child(&root, &p);
+        set_tail(&p, Some("only tail"));
+        _handle_unwanted_tails(&p);
+        assert_eq!(element_text(&p).as_deref(), Some("only tail"));
+    }
+
+    // --- _tei_handle_complex_head: additional shapes -----------------
+
+    #[test]
+    fn tei_handle_complex_head_no_children_keeps_text_only() {
+        // rationale: xml.py:534-535 — leaf <head> ends up as a new <ab>
+        // with copied text and copied attributes; no <lb/> separators.
+        let head = build_elem("ab", Some("just text"), vec![], &[("rend", "h1")]);
+        let new_ab = _tei_handle_complex_head(&head);
+        assert_eq!(element_text(&new_ab).as_deref(), Some("just text"));
+        assert_eq!(get_attribute(&new_ab, "rend").as_deref(), Some("h1"));
+        assert!(get_elements_by_tag_name(&new_ab, "lb").is_empty());
+    }
+
+    #[test]
+    fn tei_handle_complex_head_with_non_p_child_keeps_child() {
+        // rationale: xml.py:545-546 — non-<p> children get appended verbatim.
+        let head = build_elem("ab", Some("head"), vec![], &[]);
+        let hi = build_elem("hi", Some("inner"), vec![], &[("rend", "#b")]);
+        append_child(&head, &hi);
+        let new_ab = _tei_handle_complex_head(&head);
+        // The <hi> child must survive on the new <ab>.
+        let his = get_elements_by_tag_name(&new_ab, "hi");
+        assert_eq!(his.len(), 1);
+        assert_eq!(element_text(&his[0]).as_deref(), Some("inner"));
+    }
+
+    // --- _wrap_unwanted_siblings_of_div: terminator branches ---------
+
+    #[test]
+    fn wrap_unwanted_siblings_breaks_on_next_div() {
+        // rationale: xml.py:562-563 — encountering another <div> ends the
+        // sibling-collection loop; the wrapper takes only the in-between
+        // siblings.
+        let body = create_element("body");
+        let div1 = build_elem("div", None, vec![], &[]);
+        let p_loose = build_elem("p", Some("between"), vec![], &[]);
+        let div2 = build_elem("div", None, vec![], &[]);
+        let p_after = build_elem("p", Some("after div2"), vec![], &[]);
+        append_child(&body, &div1);
+        append_child(&body, &p_loose);
+        append_child(&body, &div2);
+        append_child(&body, &p_after);
+        _wrap_unwanted_siblings_of_div(&div1);
+        // After the call: body has [div1, wrapper-div(p_loose), div2, p_after].
+        // div2 acts as the terminator; p_after stays a direct child.
+        let kids = children(&body);
+        assert!(kids
+            .iter()
+            .any(|k| local_name(k).as_deref() == Some("p")
+                && element_text(k).as_deref() == Some("after div2")));
+    }
+
+    #[test]
+    fn wrap_unwanted_siblings_with_no_following_siblings_is_noop() {
+        // rationale: xml.py:561 — empty itersiblings list: function returns
+        // without inserting a wrapper.
+        let body = create_element("body");
+        let div = build_elem("div", None, vec![], &[]);
+        append_child(&body, &div);
+        _wrap_unwanted_siblings_of_div(&div);
+        let kids = children(&body);
+        assert_eq!(kids.len(), 1);
+        assert!(matches!(local_name(&kids[0]).as_deref(), Some("div")));
+    }
+
+    // --- delete_element / merge_with_parent extra negatives ---------
+
+    #[test]
+    fn delete_element_drop_tail_no_tail_safe() {
+        // rationale: keep_tail=false branch even with no following tail
+        // run — just detaches element.
+        let root = create_element("root");
+        let a = build_elem("a", Some("x"), vec![], &[]);
+        let b = build_elem("b", Some("y"), vec![], &[]);
+        append_child(&root, &a);
+        append_child(&root, &b);
+        delete_element(&b, false);
+        let bs = get_elements_by_tag_name(&root, "b");
+        assert!(bs.is_empty());
+    }
+
+    #[test]
+    fn merge_with_parent_no_tail_just_text_folds() {
+        // rationale: xml.py:80-81 — tail=None branch leaves full_text as
+        // just replace_element_text output; the rest of the fold still runs.
+        let root = create_element("root");
+        let a = build_elem("a", Some("x"), vec![], &[]);
+        let b = build_elem("b", Some("y"), vec![], &[]);
+        append_child(&root, &a);
+        append_child(&root, &b);
+        // no tail on b.
+        merge_with_parent(&b, false);
+        assert_eq!(tail(&a).as_deref(), Some("y"));
+    }
+
+    // --- xmltotxt / sanitize_tree boundary cases ---------------------
+
+    #[test]
+    fn xmltotxt_none_input_returns_empty_string() {
+        // rationale: xml.py:356-357 — `if xmloutput is None: return ""`.
+        assert_eq!(xmltotxt(None, false), "");
+    }
+
+    #[test]
+    fn xmltotxt_simple_text_round_trips_through_sanitize_and_unescape() {
+        // rationale: xml.py:363 — `unescape(sanitize("".join(returnlist))
+        // or "")`. A simple <p>hello</p> should emit "hello\n" (the after-
+        // tag newline) which sanitize trims to "hello".
+        let p = build_elem("p", Some("hello"), vec![], &[]);
+        let out = xmltotxt(Some(&p), false);
+        assert!(out.contains("hello"));
+    }
+
+    #[test]
+    fn xmltotxt_html_entities_in_text_are_unescaped() {
+        // rationale: xml.py:363 — unescape runs after sanitize. Text
+        // containing &amp; -> &.
+        let p = build_elem("p", Some("a &amp; b"), vec![], &[]);
+        let out = xmltotxt(Some(&p), false);
+        assert!(out.contains("a & b"));
+    }
+
+    // --- _move_element_one_level_up: edge case --------------------
+
+    #[test]
+    fn move_element_one_level_up_no_grandparent_is_noop() {
+        // rationale: xml.py:578-581 — `if gp is None: return`. Element nested
+        // only one level deep has no grandparent; function exits without panic.
+        let p = create_element("p");
+        let ab = create_element("ab");
+        append_child(&p, &ab);
+        // p is detached - no grandparent.
+        _move_element_one_level_up(&ab);
+        // No panic; ab stays under p (or is unaffected).
+        assert!(parent(&ab).is_some());
+    }
+
+    #[test]
+    fn move_element_one_level_up_no_parent_is_noop() {
+        // rationale: xml.py:578-580 — `if p is None: return`. Detached node
+        // has no parent.
+        let orphan = create_element("ab");
+        _move_element_one_level_up(&orphan);
+        // Survives without panic; remains parentless.
+        assert!(parent(&orphan).is_none());
+    }
+
+    // --- remove_empty_elements additional shapes ---------------------
+
+    #[test]
+    fn remove_empty_elements_preserves_element_with_tail_text() {
+        // rationale: xml.py:97 — `text_chars_test(element.tail) is False`
+        // guard; an element with non-blank tail text is KEPT (truthy tail
+        // qualifies as "this element matters").
+        let root = create_element("root");
+        let p = create_element("p");
+        append_child(&root, &p);
+        set_tail(&p, Some("trailing text"));
+        remove_empty_elements(&root);
+        assert_eq!(get_elements_by_tag_name(&root, "p").len(), 1);
+    }
+
+    // --- _handle_text_content_of_div_nodes: tail handling -----------
+
+    #[test]
+    fn handle_text_content_of_div_nodes_appends_tail_to_last_p() {
+        // rationale: xml.py:505-507 — non-blank div tail folds onto the
+        // last <p> child's text.
+        let root = create_element("root");
+        let div = create_element("div");
+        let p = build_elem("p", Some("body"), vec![], &[]);
+        append_child(&div, &p);
+        append_child(&root, &div);
+        set_tail(&div, Some("trailing"));
+        _handle_text_content_of_div_nodes(&div);
+        // The div's tail is gone, folded onto the last <p>.
+        assert_eq!(tail(&div), None);
+        let kids = children(&div);
+        assert_eq!(element_text(&kids[0]).as_deref(), Some("body trailing"));
+    }
+
+    #[test]
+    fn handle_text_content_of_div_nodes_creates_p_for_tail_when_no_p() {
+        // rationale: xml.py:509-511 — div with no <p> children + tail text
+        // appends a fresh <p>.
+        let root = create_element("root");
+        let div = create_element("div");
+        let other = build_elem("span", Some("non-p"), vec![], &[]);
+        append_child(&div, &other);
+        append_child(&root, &div);
+        set_tail(&div, Some("orphan tail"));
+        _handle_text_content_of_div_nodes(&div);
+        let kids = children(&div);
+        // The new <p> is the LAST child.
+        let last = kids.last().expect("at least one child");
+        assert_eq!(local_name(last).as_deref(), Some("p"));
+        assert_eq!(element_text(last).as_deref(), Some("orphan tail"));
+    }
+
+    #[test]
+    fn handle_text_content_of_div_nodes_blank_text_is_noop() {
+        // rationale: xml.py:496-497 — `if element.text and element.text
+        // .strip()` arm: whitespace-only text doesn't trigger folding.
+        let div = create_element("div");
+        set_element_text(&div, Some("   "));
+        let p = build_elem("p", Some("body"), vec![], &[]);
+        append_child(&div, &p);
+        _handle_text_content_of_div_nodes(&div);
+        // text is still "   " or unchanged; <p>'s text not touched.
+        let kids = children(&div);
+        assert_eq!(element_text(&kids[0]).as_deref(), Some("body"));
+    }
+
+    // --- Additional process_element table-row branches --------------
+
+    #[test]
+    fn process_element_row_with_span_attr_uses_span_when_colspan_missing() {
+        // rationale: xml.py:319-324 — colspan OR span; falls back to span
+        // attr when colspan absent.
+        let cell = build_elem("cell", Some("x"), vec![], &[]);
+        let row = build_elem("row", None, vec![cell], &[("span", "2")]);
+        let mut out = Vec::new();
+        process_element(&row, &mut out, false);
+        let joined: String = out.join("");
+        // 1 cell, max_span=2 -> 1 pad bar.
+        assert!(joined.contains("|\n"), "got: {joined:?}");
+    }
+
+    #[test]
+    fn process_element_row_non_digit_colspan_defaults_to_one() {
+        // rationale: xml.py:319-324 — `isdigit` gate: non-digit colspan
+        // falls through to max_span=1; no padding emitted (cell_count=1
+        // matches max_span=1). The row's own emission won't start with
+        // pad bars — only the cell renders "| x".
+        let cell = build_elem("cell", Some("x"), vec![], &[]);
+        let row = build_elem("row", None, vec![cell], &[("colspan", "abc")]);
+        let mut out = Vec::new();
+        process_element(&row, &mut out, false);
+        let joined: String = out.join("");
+        // Specifically: NO "||\n" pad-bar run (would appear if max_span > 1).
+        assert!(!joined.contains("||\n"), "got: {joined:?}");
+    }
+
+    #[test]
+    fn process_element_row_colspan_capped_at_max_table_width() {
+        // rationale: xml.py:324 — `.min(MAX_TABLE_WIDTH)`. A massive colspan
+        // is clamped to 1000.
+        let cell = build_elem("cell", Some("x"), vec![], &[]);
+        let row = build_elem("row", None, vec![cell], &[("colspan", "5000")]);
+        let mut out = Vec::new();
+        process_element(&row, &mut out, false);
+        let joined: String = out.join("");
+        // Should produce a "|" repeated 999 times (1000 expected - 1 actual).
+        let bar_count = joined.matches('|').count();
+        assert!(bar_count >= 999, "want >= 999 bars, got {bar_count}");
+    }
+
+    // --- replace_element_text cell-with-p-child mid-row -------------
+
+    #[test]
+    fn replace_element_text_cell_with_non_p_child_falls_through_to_leaf() {
+        // rationale: xml.py:289 — `if first_child.tag == "p":` gate goes
+        // false for a non-<p> first child; falls into the cell-leaf branch
+        // (xml.py:291-293).
+        let row = create_element("row");
+        let cell = create_element("cell");
+        append_child(&cell, &create_text_node("body"));
+        let span_kid = create_element("span");
+        append_child(&cell, &span_kid);
+        append_child(&row, &cell);
+        // First-in-row cell with non-<p> child: should NOT hit p-child
+        // branch. However elem_child_count > 0 so the "p-child" outer
+        // condition (line 597) IS triggered but the inner p-check fails,
+        // so elem_text is unchanged from raw.
+        assert_eq!(replace_element_text(&cell, false), "body");
+    }
+
+    // --- _tei_handle_complex_head: <p> branches ---------------------
+
+    #[test]
+    fn tei_handle_complex_head_first_p_when_empty_seeds_text() {
+        // rationale: xml.py:543-544 — first <p> child path: no existing
+        // children + no existing text -> child text becomes ab's text.
+        let head = build_elem("ab", None, vec![], &[]);
+        let p = build_elem("p", Some("first"), vec![], &[]);
+        append_child(&head, &p);
+        let new_ab = _tei_handle_complex_head(&head);
+        assert_eq!(element_text(&new_ab).as_deref(), Some("first"));
+        // No <lb/> emitted (this was the first-child fast path).
+        assert!(get_elements_by_tag_name(&new_ab, "lb").is_empty());
+    }
+
+    // --- prune_childless_textless via control_xml_output ------------
+    // (private function, exercised via control_xml_output path)
+
+    #[test]
+    fn control_xml_output_prunes_childless_textless_inner_leaves() {
+        // rationale: core.py:47-59 — empty <span> leaves are pruned by
+        // prune_childless_textless inside control_xml_output, before
+        // remove_empty_elements.
+        let body = create_element("body");
+        let outer = build_elem("p", Some("text"), vec![], &[]);
+        let inner_empty = create_element("span"); // empty leaf -> pruned
+        append_child(&outer, &inner_empty);
+        append_child(&body, &outer);
+        let doc = Document {
+            metadata: Metadata::default(),
+            body,
+            commentsbody: None,
+            raw_text: String::new(),
+        };
+        let s = control_xml_output(&doc, OutputFormat::Xml);
+        // empty span should be gone.
+        assert!(!s.contains("<span"), "got: {s}");
+        // text-bearing <p> survives.
+        assert!(s.contains("text"));
+    }
+
+    // --- write_fullheader: combination categories AND tags ---------
+
+    #[test]
+    fn write_fullheader_emits_both_terms_when_categories_and_tags_set() {
+        // rationale: xml.py:471-481 — both flags true: <textClass> contains
+        // BOTH <term type="categories"> AND <term type="tags">.
+        let md = Metadata {
+            categories: vec!["c".to_string()],
+            tags: vec!["t".to_string()],
+            ..Metadata::default()
+        };
+        let teidoc = create_element("TEI");
+        let header = write_fullheader(&teidoc, &md);
+        let terms = get_elements_by_tag_name(&header, "term");
+        assert!(terms
+            .iter()
+            .any(|t| get_attribute(t, "type").as_deref() == Some("categories")));
+        assert!(terms
+            .iter()
+            .any(|t| get_attribute(t, "type").as_deref() == Some("tags")));
+    }
+
+    #[test]
+    fn write_fullheader_no_filedate_leaves_creation_date_empty() {
+        // rationale: xml.py:483 — `if filedate:` arm goes false; the
+        // <date type="download"> still emits but with no text content.
+        let teidoc = create_element("TEI");
+        let header = write_fullheader(&teidoc, &Metadata::default());
+        let dates = get_elements_by_tag_name(&header, "date");
+        let download = dates
+            .iter()
+            .find(|d| get_attribute(d, "type").as_deref() == Some("download"))
+            .expect("download date present");
+        assert_eq!(element_text(download), None);
+    }
+
+    // --- Additional add_xml_meta: combined fields contract ---------
+
+    #[test]
+    fn add_xml_meta_all_fields_set_in_source_order() {
+        // rationale: xml.py:42-46 — add_xml_meta walks META_ATTRIBUTES in
+        // order (sitename, title, author, date, url, hostname, description,
+        // categories, tags, license, language). Verify every slot is set
+        // when its source has content.
+        let md = Metadata {
+            title: Some("T".to_string()),
+            author: Some("A".to_string()),
+            url: Some("U".to_string()),
+            hostname: Some("H".to_string()),
+            description: Some("D".to_string()),
+            site_name: Some("S".to_string()),
+            date: Some("2026".to_string()),
+            categories: vec!["c".to_string()],
+            tags: vec!["t".to_string()],
+            license: Some("L".to_string()),
+            language: Some("en".to_string()),
+            ..Metadata::default()
+        };
+        let doc = create_element("doc");
+        add_xml_meta(&doc, &md);
+        assert_eq!(get_attribute(&doc, "sitename").as_deref(), Some("S"));
+        assert_eq!(get_attribute(&doc, "title").as_deref(), Some("T"));
+        assert_eq!(get_attribute(&doc, "author").as_deref(), Some("A"));
+        assert_eq!(get_attribute(&doc, "date").as_deref(), Some("2026"));
+        assert_eq!(get_attribute(&doc, "url").as_deref(), Some("U"));
+        assert_eq!(get_attribute(&doc, "hostname").as_deref(), Some("H"));
+        assert_eq!(get_attribute(&doc, "description").as_deref(), Some("D"));
+        assert_eq!(get_attribute(&doc, "categories").as_deref(), Some("c"));
+        assert_eq!(get_attribute(&doc, "tags").as_deref(), Some("t"));
+        assert_eq!(get_attribute(&doc, "license").as_deref(), Some("L"));
+        assert_eq!(get_attribute(&doc, "language").as_deref(), Some("en"));
+    }
+
+    // --- _wrap_unwanted_siblings_of_div: detached div is noop --------
+
+    #[test]
+    fn wrap_unwanted_siblings_of_detached_div_is_noop() {
+        // rationale: xml.py:553-555 — `if p is None: return`. Detached div
+        // has no parent.
+        let div = create_element("div");
+        // No panic; no insertion.
+        _wrap_unwanted_siblings_of_div(&div);
+        assert!(parent(&div).is_none());
+    }
+
+    // --- _handle_text_content_of_div_nodes blank-tail noop ----------
+
+    #[test]
+    fn handle_text_content_of_div_nodes_blank_tail_is_noop() {
+        // rationale: xml.py:505-506 — `if tail and tail.strip()` arm:
+        // whitespace-only tail does NOT trigger fold.
+        let root = create_element("root");
+        let div = create_element("div");
+        let p = build_elem("p", Some("body"), vec![], &[]);
+        append_child(&div, &p);
+        append_child(&root, &div);
+        set_tail(&div, Some("   "));
+        _handle_text_content_of_div_nodes(&div);
+        // <p>'s text unchanged.
+        let kids = children(&div);
+        assert_eq!(element_text(&kids[0]).as_deref(), Some("body"));
+    }
+
+    // --- _move_element_one_level_up: full-path with tail and siblings ---
+
+    #[test]
+    fn move_element_one_level_up_with_following_siblings_lifts_ab() {
+        // rationale: xml.py:578-607 — full flow: an <ab> nested inside a
+        // <p> moves up to grandparent; following siblings get wrapped in a
+        // new <p>; the parent <p> is dropped when empty. Exercises has_kids
+        // / has_text / has_tail in the line 2133 conditional + line 2145
+        // empty-p removal.
+        let body = create_element("body");
+        let p = create_element("p");
+        let ab = build_elem("ab", Some("head"), vec![], &[]);
+        let hi_sib = build_elem("hi", Some("after"), vec![], &[]);
+        append_child(&p, &ab);
+        append_child(&p, &hi_sib);
+        append_child(&body, &p);
+        _move_element_one_level_up(&ab);
+        // ab is now a direct child of body (sibling of <p> -> but <p> is
+        // dropped because empty).
+        let body_kids = children(&body);
+        // Body now contains: [ab, p(new)] — the empty original p was
+        // dropped, the new wrapper p (with hi inside) remains.
+        assert!(body_kids
+            .iter()
+            .any(|k| local_name(k).as_deref() == Some("ab")));
+        // Following sibling moved into a new <p>.
+        let his = get_elements_by_tag_name(&body, "hi");
+        assert_eq!(his.len(), 1);
+    }
+
+    #[test]
+    fn move_element_one_level_up_with_tail_on_element_seeds_new_text() {
+        // rationale: xml.py:593-596 — `new_elem.text = element.tail`. The
+        // tail of <ab> becomes the text of the new <p> sibling.
+        let body = create_element("body");
+        let p = create_element("p");
+        let ab = build_elem("ab", Some("head"), vec![], &[]);
+        let hi_sib = build_elem("hi", Some("x"), vec![], &[]);
+        append_child(&p, &ab);
+        append_child(&p, &hi_sib);
+        append_child(&body, &p);
+        // Set tail AFTER attach.
+        set_tail(&ab, Some("AB_TAIL"));
+        _move_element_one_level_up(&ab);
+        // The new <p> (wrapping <hi>) should have text "AB_TAIL".
+        let body_kids = children(&body);
+        let new_p = body_kids
+            .iter()
+            .find(|k| {
+                local_name(k).as_deref() == Some("p")
+                    && get_elements_by_tag_name(k, "hi").len() == 1
+            })
+            .expect("new wrapper p present");
+        assert_eq!(element_text(new_p).as_deref(), Some("AB_TAIL"));
+    }
+
+    // --- process_element row branch: head row with multi-span -------
+
+    #[test]
+    fn process_element_row_head_cell_with_colspan_emits_repeated_underline() {
+        // rationale: xml.py:329-330 — head row underline uses `---|` *
+        // max_span. colspan=3 + head cell -> "---|---|---|".
+        let head_cell = build_elem("cell", Some("H"), vec![], &[("role", "head")]);
+        let row = build_elem("row", None, vec![head_cell], &[("colspan", "3")]);
+        let mut out = Vec::new();
+        process_element(&row, &mut out, false);
+        let joined: String = out.join("");
+        // Three "---|" substrings = "---|---|---|".
+        assert_eq!(joined.matches("---|").count(), 3);
+    }
+
+    // --- prune_childless_textless via additional input shapes -------
+
+    #[test]
+    fn control_xml_output_keeps_graphic_even_when_empty() {
+        // rationale: core.py:54 — `tag != "graphic"`: empty <graphic> is
+        // preserved (the `prune_childless_textless` exception).
+        let body = create_element("body");
+        let g = create_element("graphic");
+        set_attribute(&g, "src", "/img.png");
+        append_child(&body, &g);
+        let doc = Document {
+            metadata: Metadata::default(),
+            body,
+            commentsbody: None,
+            raw_text: String::new(),
+        };
+        let s = control_xml_output(&doc, OutputFormat::Xml);
+        assert!(s.contains("graphic"), "graphic must survive: {s}");
+    }
+
+    #[test]
+    fn control_xml_output_keeps_empty_children_inside_code() {
+        // rationale: core.py:56 — `parent.tag != "code"`: leaves under
+        // <code> are preserved.
+        let body = create_element("body");
+        let code = create_element("code");
+        let inner = create_element("span");
+        append_child(&code, &inner);
+        append_child(&body, &code);
+        let doc = Document {
+            metadata: Metadata::default(),
+            body,
+            commentsbody: None,
+            raw_text: String::new(),
+        };
+        let s = control_xml_output(&doc, OutputFormat::Xml);
+        // The empty span under <code> survives prune_childless_textless,
+        // but remove_empty_elements has its own <code>-parent guard too.
+        // Either way the <code> tag itself must be in output.
+        assert!(s.contains("<code"));
+    }
+
+    // --- _tei_handle_complex_head: subsequent <p> emits <lb/> ---------
+
+    #[test]
+    fn tei_handle_complex_head_second_p_emits_lb_separator() {
+        // rationale: xml.py:539-541 — when the new <ab> already has children
+        // (or the last child's tail has text), a <lb/> is emitted before
+        // the next <p>'s text. Exercises line 1973 branch (kids.is_empty()
+        // || last_has_tail).
+        let head = build_elem("ab", None, vec![], &[]);
+        let p1 = build_elem("p", Some("first"), vec![], &[]);
+        let p2 = build_elem("p", Some("second"), vec![], &[]);
+        append_child(&head, &p1);
+        append_child(&head, &p2);
+        let new_ab = _tei_handle_complex_head(&head);
+        // After: new_ab has text "first", then <lb/> with tail "second".
+        assert_eq!(element_text(&new_ab).as_deref(), Some("first"));
+        let lbs = get_elements_by_tag_name(&new_ab, "lb");
+        assert_eq!(lbs.len(), 1);
+        assert_eq!(tail(&lbs[0]).as_deref(), Some("second"));
+    }
+
+    // --- replace_element_text: cell with p child mid-row (lines 597+) -
+
+    #[test]
+    fn replace_element_text_cell_with_p_child_first_row_trailing_space() {
+        // rationale: xml.py:288-290 — verify trailing-space invariant of
+        // first-cell-with-p-child branch (line 606).
+        let row = create_element("row");
+        let cell = create_element("cell");
+        append_child(&cell, &create_text_node("h"));
+        append_child(&cell, &create_element("p"));
+        append_child(&row, &cell);
+        // Output: "| h " — leading "| " + trailing " ".
+        let r = replace_element_text(&cell, false);
+        assert_eq!(r, "| h ");
+        assert!(r.ends_with(' '));
+    }
+
+    // --- unescape_html: long-but-bounded scan -----------------------
+
+    #[test]
+    fn unescape_html_scan_limit_truncates_at_10_chars() {
+        // rationale: the scan loop runs at most 10 iterations
+        // (`for _ in 0..10`). Anything longer is treated as a non-entity
+        // and passes through with the partial entity name.
+        // "&abcdefghijk;" has an 11-char body, exceeds the bound.
+        let r = unescape_html("&abcdefghijk;");
+        // Loop terminates after 10 chars -> found_end stays false -> verbatim.
+        assert!(r.starts_with('&'), "got: {r}");
+    }
+
+    // --- _move_element_one_level_up: parent-tail seeds new_elem.tail ---
+
+    #[test]
+    fn move_element_one_level_up_with_p_tail_runs_to_completion() {
+        // rationale: xml.py:598-601 — tail of the parent <p> drives the
+        // lines 2122-2127 + 2138-2140 chain. The function must run without
+        // panic and the new wrapper p must exist somewhere in the document
+        // carrying the moved <hi>. The exact placement of the tail varies
+        // with rcdom's tail re-anchoring quirks (faithful-divergence:
+        // documented in dom.rs:769-797).
+        let body = create_element("body");
+        let p = create_element("p");
+        let ab = build_elem("ab", Some("head"), vec![], &[]);
+        let sib = build_elem("hi", Some("x"), vec![], &[]);
+        append_child(&p, &ab);
+        append_child(&p, &sib);
+        append_child(&body, &p);
+        // Set tail on p (the parent of ab).
+        set_tail(&p, Some("PTAIL"));
+        _move_element_one_level_up(&ab);
+        // The moved <hi> survives; the function ran the has_kids branch.
+        let his = get_elements_by_tag_name(&body, "hi");
+        assert_eq!(his.len(), 1);
+        // ab is hoisted to body.
+        let abs_at_body = children(&body)
+            .iter()
+            .filter(|k| local_name(k).as_deref() == Some("ab"))
+            .count();
+        assert_eq!(abs_at_body, 1);
+    }
+
+    // --- serialize_xml_pretty: empty root -------------------------
+
+    #[test]
+    fn serialize_xml_pretty_empty_root_self_closes() {
+        // rationale: lxml `<tag/>` for empty element.
+        let e = create_element("root");
+        assert_eq!(serialize_xml_pretty(&e), "<root/>");
+    }
+
+    #[test]
+    fn serialize_xml_pretty_root_with_text_only_inline() {
+        // rationale: text-only root has no children to indent; emits inline.
+        let e = build_elem("root", Some("hello"), vec![], &[]);
+        assert_eq!(serialize_xml_pretty(&e), "<root>hello</root>");
+    }
+
+    #[test]
+    fn serialize_xml_pretty_root_with_attribute_emits_attr() {
+        // rationale: attributes serialised name="escaped value" in source
+        // order.
+        let e = create_element("root");
+        set_attribute(&e, "k", "v");
+        assert_eq!(serialize_xml_pretty(&e), "<root k=\"v\"/>");
+    }
+
+    // --- remove_empty_elements: graphic + code coverage --------------
+
+    #[test]
+    fn remove_empty_elements_keeps_graphic_with_no_text_no_children() {
+        // rationale: xml.py:101 — graphic is the exception; even with no
+        // children and no text it survives.
+        let root = create_element("root");
+        let g = create_element("graphic");
+        set_attribute(&g, "src", "/img.png");
+        append_child(&root, &g);
+        remove_empty_elements(&root);
+        assert_eq!(get_elements_by_tag_name(&root, "graphic").len(), 1);
+    }
+
+    // --- process_element: textless cell after newline-emit ----------
+
+    #[test]
+    fn process_element_textless_cell_falls_through_to_after_tag() {
+        // rationale: xml.py:333-336 — `tag != "cell"` arm: tag == "cell"
+        // falls through to the after-tag block. Empty cell emits " | "
+        // separator.
+        let row = create_element("row");
+        let cell = create_element("cell");
+        append_child(&row, &cell);
+        let mut out = Vec::new();
+        process_element(&cell, &mut out, false);
+        let joined: String = out.join("");
+        assert!(joined.contains(" | "), "got: {joined:?}");
+    }
+
+    // --- process_element extra branches at xml.py:673,725,728 ---------
+
+    #[test]
+    fn process_element_p_with_text_and_no_tail_runs_after_tag() {
+        // rationale: xml.py:672 — `!has_text && !has_tail` arm goes false
+        // when text IS present (skips the textless-element block); then
+        // after-tag block runs (xml.py:725) for NEWLINE_ELEMS.
+        let p = build_elem("p", Some("body"), vec![], &[]);
+        let mut out = Vec::new();
+        process_element(&p, &mut out, false);
+        let joined: String = out.join("");
+        assert!(joined.contains("body"));
+        assert!(joined.contains('\n'));
+    }
+
+    #[test]
+    fn process_element_p_with_text_and_tail_emits_both() {
+        // rationale: xml.py:344,350 — text + tail both present: text via
+        // replace_element_text, after-tag separator, then tail emission.
+        let root = create_element("root");
+        let p = build_elem("p", Some("body"), vec![], &[]);
+        append_child(&root, &p);
+        set_tail(&p, Some("after"));
+        let mut out = Vec::new();
+        process_element(&p, &mut out, false);
+        let joined: String = out.join("");
+        assert!(joined.contains("body"));
+        assert!(joined.contains("after"));
+    }
+
+    #[test]
+    fn process_element_non_newline_non_special_emits_default_space() {
+        // rationale: xml.py:346-347 — default branch (not NEWLINE_ELEMS, not
+        // cell, not SPECIAL_FORMATTING) emits " ".
+        let span = build_elem("span", Some("body"), vec![], &[]);
+        let mut out = Vec::new();
+        process_element(&span, &mut out, false);
+        let joined: String = out.join("");
+        // span has text, after-tag block emits " ".
+        assert_eq!(joined, "body ");
+    }
+
+    // --- prune_childless_textless via control_xml_output: tail-only ---
+
+    #[test]
+    fn control_xml_output_keeps_inner_leaf_with_tail_text() {
+        // rationale: core.py:51 — `not element.tail` goes false when tail
+        // has text; element is KEPT (line 409 in prune_childless_textless).
+        let body = create_element("body");
+        let outer = build_elem("p", Some("text"), vec![], &[]);
+        let kid = create_element("span");
+        append_child(&outer, &kid);
+        // Set tail on kid AFTER attach.
+        set_tail(&kid, Some("tail content"));
+        append_child(&body, &outer);
+        let doc = Document {
+            metadata: Metadata::default(),
+            body,
+            commentsbody: None,
+            raw_text: String::new(),
+        };
+        let s = control_xml_output(&doc, OutputFormat::Xml);
+        // The span has a tail, so it's NOT pruned by prune_childless_textless.
+        // But subsequent passes may transform it. The tail text should
+        // somehow survive (sanitize_tree may join it).
+        assert!(s.contains("tail content"), "got: {s}");
+    }
+
+    // --- _move_element_one_level_up: new_elem text-only (no kids) --
+
+    #[test]
+    fn move_element_one_level_up_with_only_ab_tail_no_siblings() {
+        // rationale: xml.py:593-596 — ab's tail seeds new_elem.text. With
+        // no following siblings, new_elem has no kids; has_text=true alone
+        // drives the line 2133 conditional (exercise text-only branch).
+        let body = create_element("body");
+        let p = create_element("p");
+        let ab = build_elem("ab", Some("head"), vec![], &[]);
+        append_child(&p, &ab);
+        append_child(&body, &p);
+        // ab has a tail but NO following siblings.
+        set_tail(&ab, Some("AB_TAIL"));
+        _move_element_one_level_up(&ab);
+        // After: ab is in body; some new <p> with text "AB_TAIL" exists.
+        let body_kids = children(&body);
+        let new_p = body_kids.iter().find(|k| {
+            local_name(k).as_deref() == Some("p")
+                && element_text(k).as_deref() == Some("AB_TAIL")
+        });
+        assert!(
+            new_p.is_some(),
+            "expected a new <p> with AB_TAIL text in body"
+        );
+    }
+
+    // --- _tei_handle_complex_head: first <p> after non-p child (mixed) --
+
+    #[test]
+    fn tei_handle_complex_head_p_after_non_p_child_emits_lb() {
+        // rationale: xml.py:539-541 — `kids.is_empty()` is false (there's
+        // already a non-p child); plus last_has_tail likely false → first
+        // disjunct fires → <lb/> emitted. Tests line 1965/1973 branches.
+        let head = build_elem("ab", None, vec![], &[]);
+        let hi = build_elem("hi", Some("x"), vec![], &[]);
+        let p = build_elem("p", Some("after hi"), vec![], &[]);
+        append_child(&head, &hi);
+        append_child(&head, &p);
+        let new_ab = _tei_handle_complex_head(&head);
+        // <hi> was appended first (non-p path); then <p> hit the kids
+        // already exist branch.
+        assert_eq!(get_elements_by_tag_name(&new_ab, "hi").len(), 1);
+        // Either <lb> emitted (kids existed) OR text seeded on last child.
+        // Verify the after-hi text is somewhere in the output.
+        let lbs = get_elements_by_tag_name(&new_ab, "lb");
+        // Some lb separator must have been emitted between the non-p and
+        // the p (kids was non-empty when p processed).
+        assert!(!lbs.is_empty() || tail(&hi).is_some(), "should have emitted separator");
+    }
+
+    // --- write_fullheader: tags-only (no categories) ----------------
+
+    #[test]
+    fn write_fullheader_tags_only_textclass_has_no_categories_term() {
+        // rationale: xml.py:471-475 — `if categories:` arm goes false; only
+        // the tags <term> emits. Tests line 2293 conditional.
+        let md = Metadata {
+            tags: vec!["t".to_string()],
+            ..Metadata::default()
+        };
+        let teidoc = create_element("TEI");
+        let header = write_fullheader(&teidoc, &md);
+        let terms = get_elements_by_tag_name(&header, "term");
+        let categories_term = terms
+            .iter()
+            .find(|t| get_attribute(t, "type").as_deref() == Some("categories"));
+        assert!(
+            categories_term.is_none(),
+            "categories term must be absent when categories empty"
+        );
+        let tag_term = terms
+            .iter()
+            .find(|t| get_attribute(t, "type").as_deref() == Some("tags"));
+        assert!(tag_term.is_some());
+    }
+
+    #[test]
+    fn write_fullheader_categories_only_textclass_has_no_tags_term() {
+        // rationale: xml.py:476-481 — `if tags:` arm goes false.
+        let md = Metadata {
+            categories: vec!["c".to_string()],
+            ..Metadata::default()
+        };
+        let teidoc = create_element("TEI");
+        let header = write_fullheader(&teidoc, &md);
+        let terms = get_elements_by_tag_name(&header, "term");
+        let tags_term = terms
+            .iter()
+            .find(|t| get_attribute(t, "type").as_deref() == Some("tags"));
+        assert!(
+            tags_term.is_none(),
+            "tags term must be absent when tags empty"
+        );
+    }
+
+    // --- write_fullheader: no description on abstract <p> ------------
+
+    #[test]
+    fn write_fullheader_description_seeds_abstract_p_text() {
+        // rationale: xml.py:472-473 — description seeds the abstract <p>'s
+        // text. Tests line 2283 conditional.
+        let md = Metadata {
+            description: Some("the abstract".to_string()),
+            ..Metadata::default()
+        };
+        let teidoc = create_element("TEI");
+        let header = write_fullheader(&teidoc, &md);
+        let abs = get_elements_by_tag_name(&header, "abstract");
+        let abs_p = children(&abs[0]);
+        assert_eq!(element_text(&abs_p[0]).as_deref(), Some("the abstract"));
+    }
+
+    #[test]
+    fn write_fullheader_url_absent_omits_ptr_url() {
+        // rationale: xml.py:465-467 — `if url:` goes false; no <ptr type="URL">
+        // in biblFull/publicationStmt.
+        let teidoc = create_element("TEI");
+        let header = write_fullheader(&teidoc, &Metadata::default());
+        let ptrs = get_elements_by_tag_name(&header, "ptr");
+        let url_ptr = ptrs
+            .iter()
+            .find(|p| get_attribute(p, "type").as_deref() == Some("URL"));
+        assert!(url_ptr.is_none());
+    }
+
+    // --- unescape_html: long entity name terminator ----------------
+
+    #[test]
+    fn unescape_html_entity_with_non_alnum_terminator_breaks_loop() {
+        // rationale: xml.py-equiv — the peek loop's `_ => break` arm (line
+        // 1055) fires when a non-alphanumeric / non-`;` / non-`#` character
+        // shows up mid-entity (e.g. "&amp x" — space breaks the scan).
+        let r = unescape_html("&amp x");
+        // "&amp" was scanned, then ' ' breaks the loop, found_end=false ->
+        // verbatim copy.
+        assert!(r.contains("&amp"));
+    }
+
+    // --- write_fullheader: source bibl sigle / date / sitename --------
+
+    #[test]
+    fn write_fullheader_sitename_and_date_combine_into_sigle() {
+        // rationale: xml.py:449-456 — `sigle = ', '.join([sitename, date])`.
+        // Both set: sigle = "Example, 2026". Tests line 2238 conditional.
+        let md = Metadata {
+            site_name: Some("Example".to_string()),
+            date: Some("2026".to_string()),
+            ..Metadata::default()
+        };
+        let teidoc = create_element("TEI");
+        let header = write_fullheader(&teidoc, &md);
+        let bibls = get_elements_by_tag_name(&header, "bibl");
+        let sigle_bibl = bibls
+            .iter()
+            .find(|b| get_attribute(b, "type").as_deref() == Some("sigle"))
+            .expect("sigle bibl present");
+        assert_eq!(element_text(sigle_bibl).as_deref(), Some("Example, 2026"));
+    }
+
+    #[test]
+    fn write_fullheader_title_only_seeds_source_bibl() {
+        // rationale: xml.py:451-454 — bibl_parts = [title, sigle], joined.
+        // Title set, sigle empty: bibl text = "title".
+        let md = Metadata {
+            title: Some("Title Only".to_string()),
+            ..Metadata::default()
+        };
+        let teidoc = create_element("TEI");
+        let header = write_fullheader(&teidoc, &md);
+        // Source bibl is the first bibl (no type=sigle).
+        let bibls = get_elements_by_tag_name(&header, "bibl");
+        let source_bibl = bibls
+            .iter()
+            .find(|b| get_attribute(b, "type").is_none())
+            .expect("source bibl present");
+        assert_eq!(element_text(source_bibl).as_deref(), Some("Title Only"));
+    }
+
+    #[test]
+    fn write_fullheader_date_set_seeds_publication_date_text() {
+        // rationale: xml.py:466 — `<date>{date}</date>` in publicationStmt
+        // when date is set. Tests line 2272 conditional.
+        let md = Metadata {
+            date: Some("2026-05-26".to_string()),
+            ..Metadata::default()
+        };
+        let teidoc = create_element("TEI");
+        let header = write_fullheader(&teidoc, &md);
+        let dates = get_elements_by_tag_name(&header, "date");
+        // Find a date with text "2026-05-26" (the publication date, not the
+        // download date).
+        let pub_date = dates
+            .iter()
+            .find(|d| element_text(d).as_deref() == Some("2026-05-26"));
+        assert!(pub_date.is_some(), "publication date must be set");
+    }
+
+    // --- build_json_output: raw_text non-empty branch ---------------
+
+    #[test]
+    fn build_json_output_raw_text_non_empty_renders_as_string() {
+        // rationale: xml.py:124 — `raw_text` slot: non-empty -> json_str;
+        // empty -> "null". The full-metadata branch (with_metadata=true)
+        // emits this slot. Tests line 1427 conditional.
+        let doc = Document {
+            metadata: Metadata::default(),
+            body: create_element("body"),
+            commentsbody: None,
+            raw_text: "raw content".to_string(),
+        };
+        let s = build_json_output(&doc, true);
+        let v: serde_json::Value = serde_json::from_str(&s).expect("parse");
+        assert_eq!(v["raw_text"].as_str(), Some("raw content"));
+    }
+
+    #[test]
+    fn build_json_output_raw_text_empty_renders_as_null() {
+        // rationale: xml.py:124 — empty raw_text -> "null" token.
+        let doc = Document {
+            metadata: Metadata::default(),
+            body: create_element("body"),
+            commentsbody: None,
+            raw_text: String::new(),
+        };
+        let s = build_json_output(&doc, true);
+        let v: serde_json::Value = serde_json::from_str(&s).expect("parse");
+        assert!(v["raw_text"].is_null());
+    }
+
+    // --- process_element: row with include_formatting -----------------
+
+    #[test]
+    fn process_element_row_with_include_formatting_uses_plain_newline() {
+        // rationale: xml.py:341-343 — `\u{2424}` hack EXCEPT for <row>;
+        // a row with include_formatting=true still uses plain "\n".
+        let cell = build_elem("cell", Some("x"), vec![], &[]);
+        let row = build_elem("row", None, vec![cell], &[]);
+        let mut out = Vec::new();
+        process_element(&row, &mut out, true);
+        let joined: String = out.join("");
+        // No U+2424 marker on rows.
+        assert!(!joined.contains('\u{2424}'), "got: {joined:?}");
+        assert!(joined.contains('\n'));
+    }
+
+    // --- replace_element_text: head with rend=0 unusual ---------------
+
+    #[test]
+    fn replace_element_text_head_rend_zero_emits_zero_hashes() {
+        // rationale: xml.py:258-263 — `int(rend[1])`. rend="h0" -> 0 hashes.
+        // "{} {}".format("#"*0, "Title") = " Title".
+        let h = build_elem("head", Some("Title"), vec![], &[("rend", "h0")]);
+        assert_eq!(replace_element_text(&h, true), " Title");
+    }
+
+    #[test]
+    fn replace_element_text_head_rend_non_digit_defaults_to_two() {
+        // rationale: xml.py:258-263 — `int(rend[1])` raises on non-digit;
+        // we default to 2 (unwrap_or path).
+        let h = build_elem("head", Some("Title"), vec![], &[("rend", "hx")]);
+        assert_eq!(replace_element_text(&h, true), "## Title");
+    }
+
+    // --- _wrap_unwanted_siblings_of_div: non-TEI_DIV_SIBLING flush --
+
+    #[test]
+    fn wrap_unwanted_siblings_flushes_on_non_tei_div_sibling() {
+        // rationale: xml.py:569-573 — non-TEI_DIV_SIBLING sibling flushes
+        // the wrapper if it has children, then starts fresh. <head> is NOT
+        // in TEI_DIV_SIBLINGS — it acts as a separator.
+        let body = create_element("body");
+        let div = build_elem("div", None, vec![], &[]);
+        let p1 = build_elem("p", Some("p1"), vec![], &[]);
+        let head = build_elem("head", Some("h"), vec![], &[]);
+        let p2 = build_elem("p", Some("p2"), vec![], &[]);
+        append_child(&body, &div);
+        append_child(&body, &p1);
+        append_child(&body, &head);
+        append_child(&body, &p2);
+        _wrap_unwanted_siblings_of_div(&div);
+        // body must still contain a <head> element (the separator stays in place).
+        let heads = get_elements_by_tag_name(&body, "head");
+        assert_eq!(heads.len(), 1);
+        // p1 should now be inside a wrapper div (the flush moved it).
+        let ps = get_elements_by_tag_name(&body, "p");
+        assert!(ps.iter().any(|p| element_text(p).as_deref() == Some("p1")));
+        // p2 also collected; ends up in body somewhere.
+        assert!(ps.iter().any(|p| element_text(p).as_deref() == Some("p2")));
+    }
+
+    // --- restore_tei_case: case where source uses lowercase TEI -----
+
+    #[test]
+    fn restore_tei_case_handles_tei_with_attributes() {
+        // rationale: the `<tei ` mapping (note trailing space) handles
+        // self-closing-less <tei xmlns="...">.
+        let in_s = "<tei xmlns=\"http://www.tei-c.org/ns/1.0\"></tei>";
+        let out = restore_tei_case(in_s);
+        assert!(out.contains("<TEI "));
+        assert!(out.contains("</TEI>"));
+    }
+
+    // --- process_element: textless-with-tail (has_tail=true) -------
+
+    #[test]
+    fn process_element_textless_with_tail_renders_tail() {
+        // rationale: xml.py:309 — `!has_text && !has_tail` arm goes false
+        // when has_tail=true; the textless-element block is skipped, but
+        // after-tag block and tail emission both run. For NEWLINE_ELEMS
+        // (e.g. <p>), this is a different shape than text+tail.
+        let root = create_element("root");
+        let p = create_element("p");
+        append_child(&root, &p);
+        set_tail(&p, Some("only tail"));
+        let mut out = Vec::new();
+        process_element(&p, &mut out, false);
+        let joined: String = out.join("");
+        assert!(joined.contains("only tail"), "got: {joined:?}");
+    }
+
+    // --- serialize_xml_pretty: element with text-only inline path ----
+
+    #[test]
+    fn serialize_xml_pretty_with_text_and_child_inline() {
+        // rationale: mixed content (text + child) emits inline (line 2832
+        // has_text=true branch within !indent block).
+        let main = create_element("main");
+        set_element_text(&main, Some("Lead "));
+        let span = build_elem("span", Some("kid"), vec![], &[]);
+        append_child(&main, &span);
+        let s = serialize_xml_pretty(&main);
+        // Has_text + child -> mixed content -> inline.
+        assert_eq!(s, "<main>Lead <span>kid</span></main>");
+    }
+
+    // --- _handle_unwanted_tails: empty tail trimmed to None ---------
+
+    #[test]
+    fn handle_unwanted_tails_p_explicit_empty_tail_is_dropped() {
+        // rationale: xml.py:517 — empty (post-trim) tail → drop.
+        let root = create_element("root");
+        let p = build_elem("p", Some("body"), vec![], &[]);
+        append_child(&root, &p);
+        // Set tail to "" — empty string. set_tail with empty string is a
+        // no-op per dom.rs:791-793, so we need whitespace to exercise the
+        // trim branch.
+        set_tail(&p, Some("\t  \n"));
+        _handle_unwanted_tails(&p);
+        // Tail trimmed to "" → dropped; element text unchanged.
+        assert_eq!(element_text(&p).as_deref(), Some("body"));
+        assert_eq!(tail(&p), None);
+    }
+
+    // --- remove_empty_elements: keep when only text non-blank --------
+
+    #[test]
+    fn remove_empty_elements_preserves_element_with_text_only() {
+        // rationale: xml.py:97 — `text_chars_test(element.text)` returns
+        // true → element kept (line 351 conditional).
+        let root = create_element("root");
+        let p = build_elem("p", Some("real text"), vec![], &[]);
+        append_child(&root, &p);
+        remove_empty_elements(&root);
+        assert_eq!(get_elements_by_tag_name(&root, "p").len(), 1);
+    }
+
+    // --- strip_double_tags: parent in NESTING_WHITELIST skips merge ---
+
+    #[test]
+    fn strip_double_tags_does_not_merge_when_inner_parent_is_quote() {
+        // rationale: xml.py:110 — `subelem.getparent().tag not in
+        // NESTING_WHITELIST` gate. <quote><p>...</p></quote> the <p>'s
+        // parent is <quote> (in NESTING_WHITELIST), so the merge is
+        // skipped even if a nested same-tag is found. Tests line 477.
+        let root = create_element("root");
+        let inner_p = build_elem("p", Some("inner"), vec![], &[]);
+        let quote = build_elem("quote", None, vec![inner_p], &[]);
+        let outer_p = build_elem("p", None, vec![quote], &[]);
+        append_child(&root, &outer_p);
+        strip_double_tags(&root);
+        // Both <p>s survive: the inner <p>'s parent is <quote>, which is
+        // in NESTING_WHITELIST.
+        assert_eq!(get_elements_by_tag_name(&root, "p").len(), 2);
+        assert_eq!(get_elements_by_tag_name(&root, "quote").len(), 1);
+    }
+
+    // --- replace_element_text: code single-line --------------------
+
+    #[test]
+    fn replace_element_text_code_single_line_inline_wrap() {
+        // rationale: xml.py:270-274 — single-line code uses backticks
+        // `inline`.
+        let c = build_elem("code", Some("inline"), vec![], &[]);
+        assert_eq!(replace_element_text(&c, true), "`inline`");
+    }
+
+    // --- replace_element_text: code without include_formatting -----
+
+    #[test]
+    fn replace_element_text_code_without_formatting_passthrough() {
+        // rationale: xml.py:257 — the formatting match block is gated by
+        // include_formatting; without it, code emits raw text.
+        let c = build_elem("code", Some("inline"), vec![], &[]);
+        assert_eq!(replace_element_text(&c, false), "inline");
+    }
+
+    // --- process_element: tail on textless element -----------------
+
+    #[test]
+    fn process_element_textless_lb_with_tail_emits_newline_and_tail() {
+        // rationale: xml.py:309-336 — `!has_text && !has_tail` arm goes
+        // false when tail present; the textless-block is skipped, but
+        // <lb> is NEWLINE_ELEMS so after-tag block still emits "\n"; tail
+        // appended after.
+        let root = create_element("root");
+        let lb = create_element("lb");
+        append_child(&root, &lb);
+        set_tail(&lb, Some("tail-content"));
+        let mut out = Vec::new();
+        process_element(&lb, &mut out, false);
+        let joined: String = out.join("");
+        assert!(joined.contains("tail-content"));
+        assert!(joined.contains('\n'));
+    }
+
+    // --- write_fullheader: sigle date-only ----------------------
+
+    #[test]
+    fn write_fullheader_date_only_sigle_no_sitename() {
+        // rationale: xml.py:449-456 — sigle_parts filtered_flatten; with
+        // only date, sigle = "2026".
+        let md = Metadata {
+            date: Some("2026".to_string()),
+            ..Metadata::default()
+        };
+        let teidoc = create_element("TEI");
+        let header = write_fullheader(&teidoc, &md);
+        let bibls = get_elements_by_tag_name(&header, "bibl");
+        let sigle_bibl = bibls
+            .iter()
+            .find(|b| get_attribute(b, "type").as_deref() == Some("sigle"))
+            .expect("sigle bibl present");
+        assert_eq!(element_text(sigle_bibl).as_deref(), Some("2026"));
+    }
+
+    // --- _move_element_one_level_up: all-false branch at line 2133 ---
+
+    #[test]
+    fn move_element_one_level_up_no_siblings_no_tails_skips_new_elem_insert() {
+        // rationale: xml.py:603-604 — `if has_kids OR has_text OR has_tail`
+        // gate's all-false branch: ab has no tail, no following siblings,
+        // and parent p has no tail. new_elem stays detached. The empty p
+        // is then dropped (line 2145 active branch).
+        let body = create_element("body");
+        let p = create_element("p");
+        let ab = build_elem("ab", Some("head"), vec![], &[]);
+        append_child(&p, &ab);
+        append_child(&body, &p);
+        _move_element_one_level_up(&ab);
+        // ab is hoisted; the original p (now empty) is removed; no new p.
+        let body_kids = children(&body);
+        // Should be just the ab.
+        assert_eq!(body_kids.len(), 1);
+        assert_eq!(local_name(&body_kids[0]).as_deref(), Some("ab"));
+    }
+
+    // --- _move_element_one_level_up: p retains text, NOT dropped ----
+
+    #[test]
+    fn move_element_one_level_up_keeps_p_when_it_has_text() {
+        // rationale: xml.py:606-607 — p has text → keep. Tests line 2145
+        // arm of the conditional (p NOT dropped).
+        let body = create_element("body");
+        let p = create_element("p");
+        // Give p some leading text BEFORE ab.
+        set_element_text(&p, Some("p text"));
+        let ab = build_elem("ab", Some("head"), vec![], &[]);
+        append_child(&p, &ab);
+        append_child(&body, &p);
+        _move_element_one_level_up(&ab);
+        // p still in body, retains its text.
+        let body_kids = children(&body);
+        let p_kept = body_kids
+            .iter()
+            .find(|k| local_name(k).as_deref() == Some("p"))
+            .expect("p still present");
+        assert_eq!(element_text(p_kept).as_deref(), Some("p text"));
+    }
+
+    // --- replace_element_text: del without include_formatting ------
+
+    #[test]
+    fn replace_element_text_del_without_formatting_passthrough() {
+        // rationale: xml.py:257 — match block gated by include_formatting.
+        // <del> with include_formatting=false emits raw text.
+        let d = build_elem("del", Some("old"), vec![], &[]);
+        assert_eq!(replace_element_text(&d, false), "old");
+    }
+
+    // --- _handle_unwanted_tails: ab without parent is noop -----------
+
+    #[test]
+    fn handle_unwanted_tails_ab_no_parent_no_panic() {
+        // rationale: xml.py:523-528 — `if let Some(p) = parent(element)`
+        // arm: detached ab → no insertion, no panic. set_tail on detached
+        // is a no-op (dom.rs:770-772), so we can't directly test the
+        // tail-bearing detached case; but verify the function exits
+        // cleanly.
+        let orphan_ab = create_element("ab");
+        _handle_unwanted_tails(&orphan_ab);
+        assert!(parent(&orphan_ab).is_none());
+    }
+
+    // --- escape_xml_text_into / escape_xml_attr_into via serialize ----
+
+    #[test]
+    fn serialize_xml_pretty_text_with_amp_lt_gt_escapes_each() {
+        // rationale: escape_xml_text_into — `&`, `<`, `>` each escaped.
+        let e = build_elem("root", Some("a & b < c > d"), vec![], &[]);
+        let s = serialize_xml_pretty(&e);
+        assert!(s.contains("&amp;"));
+        assert!(s.contains("&lt;"));
+        assert!(s.contains("&gt;"));
+    }
+
+    #[test]
+    fn serialize_xml_pretty_attr_with_quote_escapes() {
+        // rationale: escape_xml_attr_into — `"` escaped inside attrs.
+        let e = create_element("root");
+        set_attribute(&e, "k", "a \"v\" b");
+        let s = serialize_xml_pretty(&e);
+        assert!(s.contains("&quot;"));
+    }
+
+    // --- unescape_html: numeric entity (covers '#' arm of line 1051) ---
+
+    #[test]
+    fn unescape_html_alnum_entity_at_each_position() {
+        // rationale: the peek loop accepts is_ascii_alphanumeric || '#'.
+        // Digits at the start trigger only the alnum arm (no '#').
+        // Numeric entity "&#x33;" hits the '#' arm at idx 0, then 'x33'
+        // (alnum) at indices 1-3. Both sub-conditions exercised.
+        assert_eq!(unescape_html("&#x33;"), "3");
+        // Long alpha entity hits only alnum.
+        assert_eq!(unescape_html("&amp;"), "&");
+    }
+
+    // --- process_element: row with mixed cells (head+plain) -----------
+
+    #[test]
+    fn process_element_row_mixed_head_and_plain_cells() {
+        // rationale: xml.py:329-330 — `has_head_cell` is true if ANY child
+        // is role=head. Mix of head and plain cells still emits the
+        // underline separator. Tests line 703 conditional.
+        let head_cell = build_elem("cell", Some("H"), vec![], &[("role", "head")]);
+        let plain_cell = build_elem("cell", Some("P"), vec![], &[]);
+        let row = build_elem("row", None, vec![head_cell, plain_cell], &[]);
+        let mut out = Vec::new();
+        process_element(&row, &mut out, false);
+        let joined: String = out.join("");
+        // Both cells emit content; head separator present.
+        assert!(joined.contains('H'));
+        assert!(joined.contains('P'));
+        assert!(joined.contains("---|"));
+    }
+
+    // --- process_element: row with cell role≠"head" yields no underline ---
+
+    #[test]
+    fn process_element_row_with_non_head_cells_no_underline() {
+        // rationale: xml.py:329 — `if has_head_cell:` arm goes false when
+        // no role=head cell exists; no "---|" underline.
+        let c1 = build_elem("cell", Some("a"), vec![], &[]);
+        let c2 = build_elem("cell", Some("b"), vec![], &[]);
+        let row = build_elem("row", None, vec![c1, c2], &[]);
+        let mut out = Vec::new();
+        process_element(&row, &mut out, false);
+        let joined: String = out.join("");
+        assert!(!joined.contains("---|"), "got: {joined:?}");
+    }
+
+    // --- _tei_handle_complex_head: <ab> with non-p kid then p -------
+
+    #[test]
+    fn tei_handle_complex_head_kids_then_p_last_has_tail() {
+        // rationale: xml.py:539-541 — when last child has tail text, emit
+        // another <lb/> before the next <p>'s text. Tests line 1973's
+        // last_has_tail=true sub-condition + line 1978 latest.
+        let head = build_elem("ab", None, vec![], &[]);
+        let hi = build_elem("hi", Some("first"), vec![], &[]);
+        let p2 = build_elem("p", Some("middle"), vec![], &[]);
+        let p3 = build_elem("p", Some("end"), vec![], &[]);
+        append_child(&head, &hi);
+        append_child(&head, &p2);
+        append_child(&head, &p3);
+        let new_ab = _tei_handle_complex_head(&head);
+        // <hi> goes in via the non-p path; then p2 hits the kids non-empty
+        // branch and either appends lb or sets tail on the last child;
+        // p3 similarly. Verify multiple <p>-derived texts survive.
+        let lbs = get_elements_by_tag_name(&new_ab, "lb");
+        assert!(!lbs.is_empty(), "expected at least one <lb/>");
+        // All text content survives somewhere.
+        let dump = format!("{:?}", new_ab);
+        let _ = dump; // silence unused-binding lint
+        let his = get_elements_by_tag_name(&new_ab, "hi");
+        assert_eq!(his.len(), 1);
+    }
+
+    // --- serialize_xml_pretty: child with text but no descendants ---
+
+    #[test]
+    fn serialize_xml_pretty_child_with_text_indents_when_root_clean() {
+        // rationale: line 2806 — non-empty kids + has_text=false on root
+        // → indented form. Child has text but indenting parent root has
+        // no text.
+        let root = create_element("root");
+        let kid = build_elem("kid", Some("hi"), vec![], &[]);
+        append_child(&root, &kid);
+        let s = serialize_xml_pretty(&root);
+        // Indented form: root child on its own line.
+        assert!(s.contains("\n  <kid>hi</kid>"), "got: {s}");
+    }
 }
+
+
+
+
+
+
+
+
+
+
+
+

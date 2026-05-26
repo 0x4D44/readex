@@ -428,6 +428,50 @@ mod tests {
         assert!(!a.text_content.contains("color:red"), "style text leaked");
     }
 
+    /// `Readability.js:2759-2763` — `metadata.excerpt = metadata.excerpt ||
+    /// firstParagraph`. When metadata supplied an excerpt, it WINS over the
+    /// first-`<p>` fallback. Pin the precedence.
+    /// rationale: the `Some.or(_)` short-circuit on the metadata side.
+    #[test]
+    fn parse_metadata_excerpt_wins_over_first_paragraph_fallback() {
+        let html = "<html><head><title>T Long Enough Title Here</title>\
+            <meta name=\"description\" content=\"Metadata-supplied excerpt wins\">\
+            </head><body><div class=content>\
+            <p>Different first paragraph text that is comfortably beyond the twenty-five character minimum so it scores as content.</p>\
+            <p>Second paragraph here.</p>\
+            </div></body></html>";
+        let a = parse(html).expect("article");
+        assert_eq!(
+            a.excerpt.as_deref(),
+            Some("Metadata-supplied excerpt wins"),
+            "metadata.excerpt precedence (Readability.js:2759-2763 `metadata.excerpt || first_paragraph`)"
+        );
+    }
+
+    /// `Readability.js:2759-2763` — fallback path: NO metadata excerpt ⇒ the
+    /// first-`<p>.textContent.trim()` of the scored article is used.
+    /// rationale: pin the None.or(Some(first_para)) arm of the precedence.
+    #[test]
+    fn parse_first_paragraph_excerpt_fallback_when_no_metadata_excerpt() {
+        // No <meta name="description"> ⇒ metadata_pre.excerpt = None ⇒
+        // None.or(first_paragraph_excerpt). Make the title long enough to
+        // avoid the title-dup remove of the body's first <h1>/<p>.
+        let html = "<html><head><title>T Long Enough Title Here</title></head>\
+            <body><div class=content>\
+            <p>First paragraph fallback excerpt prose comfortably over twenty-five characters of content.</p>\
+            <p>Second paragraph here for additional scoring weight on the content div.</p>\
+            </div></body></html>";
+        let a = parse(html).expect("article");
+        assert!(
+            a.excerpt
+                .as_deref()
+                .unwrap_or("")
+                .contains("First paragraph fallback excerpt"),
+            "first-paragraph fallback used (Readability.js:2759-2763): {:?}",
+            a.excerpt
+        );
+    }
+
     #[test]
     fn parse_empty_document_returns_none_faithful_stage1c_retry_exhaustion() {
         // FAITHFUL Stage-1c behaviour (changed from the Stage-1a/1b
