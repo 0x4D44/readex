@@ -694,6 +694,11 @@ pub fn simple_pattern_post_filter(haystack: &str, match_start: usize) -> bool {
     // `w3.org` case) byte-slicing is equivalent. Walk back to the nearest
     // char boundary that gives us at least the trailing 6 chars.
     let mut start = match_start.saturating_sub(6);
+    // llvm-cov:branch-not-reachable: the `start < match_start` FALSE side
+    // (loop running until start == match_start) cannot fire — match_start is
+    // always a char boundary and the longest UTF-8 codepoint is 4 bytes, so a
+    // boundary is always found within the 6-byte window first, exiting via the
+    // `is_char_boundary` condition while `start < match_start` still holds.
     while start < match_start && !haystack.is_char_boundary(start) {
         start += 1;
     }
@@ -1147,5 +1152,22 @@ mod tests {
         let second = simple_pattern_post_filter(haystack, m.start());
         assert_eq!(first, second);
         assert!(!first); // w3.org prefix → drop.
+    }
+
+    /// rationale: pin `simple_pattern_post_filter`'s UTF-8 boundary-skip
+    /// loop (regex_catalogues.rs:702 — the `!is_char_boundary` TRUE side).
+    /// When the 6-byte look-behind window opens inside a multi-byte
+    /// codepoint, the loop must walk `start` forward to the next char
+    /// boundary before slicing, so the function never panics on a
+    /// mid-codepoint slice (M9 Stage-0 UTF-8 safety contract) and the
+    /// non-w3.org context is kept.
+    #[test]
+    fn simple_pattern_post_filter_skips_into_multibyte_context() {
+        // "日本語" = 3 chars × 3 bytes = 9 bytes. Char boundaries at 0, 3, 6,
+        // 9. With match_start=10 (the 'B' in "日本語ABCD"), start_init =
+        // 10 - 6 = 4, which lands INSIDE "本" (bytes 3..6) — NOT a boundary.
+        // The loop advances start to 6 (next boundary) before slicing.
+        let haystack = "日本語ABCD";
+        assert!(simple_pattern_post_filter(haystack, 10));
     }
 }

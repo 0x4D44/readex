@@ -909,6 +909,11 @@ fn from_timestamp(t: i64) -> Option<DateTime> {
 /// Howard Hinnant algorithm.
 fn civil_from_days(z: i64) -> (i32, u32, u32) {
     let z = z + 719_468;
+    // llvm-cov:branch-not-reachable: the `z < 0` arm needs days < -719468
+    // (a date before ~year -200). The only caller `from_timestamp` is
+    // private and reached solely from `check_extracted_reference`, which
+    // gates on `reference > 0`; the smallest positive timestamp yields
+    // z ≈ 719468, so the negative-era branch cannot fire in practice.
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = (z - era * 146_097) as u64;
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
@@ -1971,5 +1976,280 @@ mod tests {
         let opts = Extractor::new(false, (2030, 12, 31), (1995, 1, 1), true, "%Y-%m-%d".into());
         let r = compare_values(0, "2024-06-15", &opts);
         assert_eq!(r, dt(2024, 6, 15).timestamp());
+    }
+
+    // -------------------------------------------------------------------
+    // valid_calendar fail arms (reached via is_valid_date / check_date_input)
+    // -------------------------------------------------------------------
+
+    /// rationale: pin `valid_calendar`'s month-out-of-range reject arm
+    /// (validators.rs:344) — month 13 makes `parse_iso_ymd_fast` return
+    /// None, so `is_valid_date` rejects (Python `datetime(...,13,...)`
+    /// raises ValueError caught at validators.py:47).
+    #[test]
+    fn is_valid_date_rejects_month_thirteen() {
+        let earliest = dt(1995, 1, 1);
+        let latest = dt(2030, 12, 31);
+        let di = DateInput::Str("2024-13-15");
+        assert!(!is_valid_date(Some(&di), "%Y-%m-%d", &earliest, &latest));
+    }
+
+    /// rationale: pin `valid_calendar`'s day-out-of-range reject arm
+    /// (validators.rs:348) — Feb 30 makes `parse_iso_ymd_fast` return None.
+    #[test]
+    fn is_valid_date_rejects_feb_thirty() {
+        let earliest = dt(1995, 1, 1);
+        let latest = dt(2030, 12, 31);
+        let di = DateInput::Str("2024-02-30");
+        assert!(!is_valid_date(Some(&di), "%Y-%m-%d", &earliest, &latest));
+    }
+
+    /// rationale: pin `valid_calendar`'s hour-out-of-range reject arm
+    /// (validators.rs:351) — a 19-char ISO datetime with hour 25 routes
+    /// through `from_isoformat`'s `valid_calendar` time-field check and is
+    /// rejected (Python `datetime.fromisoformat` raises ValueError on
+    /// hour > 23 at validators.py:200, falling back to the default).
+    #[test]
+    fn check_date_input_rejects_out_of_range_hour() {
+        let default = dt(2025, 1, 1);
+        let di = DateInput::Str("2024-06-15T25:00:00");
+        // from_isoformat returns None on hour 25 → default returned.
+        assert_eq!(check_date_input(Some(&di), &default), default);
+    }
+
+    /// rationale: pin `valid_calendar`'s minute-out-of-range reject arm
+    /// (validators.rs:351 middle disjunct `mi > 59`) via the
+    /// `from_isoformat` 19-char path.
+    #[test]
+    fn check_date_input_rejects_out_of_range_minute() {
+        let default = dt(2025, 1, 1);
+        let di = DateInput::Str("2024-06-15T12:99:00");
+        assert_eq!(check_date_input(Some(&di), &default), default);
+    }
+
+    /// rationale: pin `valid_calendar`'s second-out-of-range reject arm
+    /// (validators.rs:351 final disjunct `s > 59`) via the `from_isoformat`
+    /// 19-char path.
+    #[test]
+    fn check_date_input_rejects_out_of_range_second() {
+        let default = dt(2025, 1, 1);
+        let di = DateInput::Str("2024-06-15T12:30:99");
+        assert_eq!(check_date_input(Some(&di), &default), default);
+    }
+
+    /// rationale: pin `from_isoformat`'s date-separator mismatch reject
+    /// arms (validators.rs:980 — `b[4] != b'-'` and `b[7] != b'-'`). A
+    /// 19-char string with a wrong date separator at byte 4 returns None.
+    #[test]
+    fn check_date_input_rejects_bad_year_month_separator() {
+        let default = dt(2025, 1, 1);
+        let di = DateInput::Str("2024X06-15T12:30:00");
+        assert_eq!(check_date_input(Some(&di), &default), default);
+    }
+
+    /// rationale: pin `from_isoformat`'s `b[7] != b'-'` reject arm
+    /// (validators.rs:980) — bad separator at byte 7 (month/day).
+    #[test]
+    fn check_date_input_rejects_bad_month_day_separator() {
+        let default = dt(2025, 1, 1);
+        let di = DateInput::Str("2024-06X15T12:30:00");
+        assert_eq!(check_date_input(Some(&di), &default), default);
+    }
+
+    /// rationale: pin `from_isoformat`'s `b[16] != b':'` reject arm
+    /// (validators.rs:980 final disjunct) — bad separator between minute
+    /// and second.
+    #[test]
+    fn check_date_input_rejects_bad_minute_second_colon() {
+        let default = dt(2025, 1, 1);
+        let di = DateInput::Str("2024-06-15T12:30X00");
+        assert_eq!(check_date_input(Some(&di), &default), default);
+    }
+
+    /// rationale: pin `from_isoformat`'s separator-mismatch reject arm
+    /// (validators.rs:975) — a 19-char string with a bad time separator
+    /// (`X` where `:` is expected at index 13) returns None and falls back
+    /// to the default (Python's fromisoformat raises ValueError).
+    #[test]
+    fn check_date_input_rejects_bad_time_separator() {
+        let default = dt(2025, 1, 1);
+        let di = DateInput::Str("2024-06-15T12X34:56");
+        assert_eq!(check_date_input(Some(&di), &default), default);
+    }
+
+    /// rationale: pin `from_isoformat`'s happy 19-char datetime arm so the
+    /// separator/time checks at validators.rs:975-978 also exercise their
+    /// pass-through (FALSE) side — a valid `T`-separated datetime parses.
+    #[test]
+    fn check_date_input_parses_full_iso_datetime() {
+        let default = dt(2000, 1, 1);
+        let di = DateInput::Str("2024-06-15T12:34:56");
+        let r = check_date_input(Some(&di), &default);
+        assert_eq!((r.year, r.month, r.day), (2024, 6, 15));
+        assert_eq!((r.hour, r.minute, r.second), (12, 34, 56));
+    }
+
+    // -------------------------------------------------------------------
+    // is_leap_year / days_in_month February arms
+    // -------------------------------------------------------------------
+
+    /// rationale: pin `days_in_month`'s non-leap February arm
+    /// (validators.rs:362 FALSE → 28 days) — Feb 29 in a non-leap year
+    /// (2023) must be rejected by `parse_iso_ymd_fast`.
+    #[test]
+    fn is_valid_date_rejects_feb_29_in_non_leap_year() {
+        let earliest = dt(1995, 1, 1);
+        let latest = dt(2030, 12, 31);
+        let di = DateInput::Str("2023-02-29");
+        assert!(!is_valid_date(Some(&di), "%Y-%m-%d", &earliest, &latest));
+    }
+
+    /// rationale: pin `is_leap_year`'s century-non-leap arm
+    /// (validators.rs:373 — `y % 100 != 0` FALSE for 1900, then the
+    /// `y % 400 == 0` FALSE) — Feb 29 1900 is invalid (1900 is divisible
+    /// by 100 but not 400).
+    #[test]
+    fn is_valid_date_rejects_feb_29_in_century_non_leap_year() {
+        let earliest = dt(1800, 1, 1);
+        let latest = dt(2030, 12, 31);
+        let di = DateInput::Str("1900-02-29");
+        assert!(!is_valid_date(Some(&di), "%Y-%m-%d", &earliest, &latest));
+    }
+
+    /// rationale: pin `is_leap_year`'s 400-divisible-leap arm
+    /// (validators.rs:373 — `y % 400 == 0` TRUE) — Feb 29 2000 IS valid
+    /// (2000 divisible by 400).
+    #[test]
+    fn is_valid_date_accepts_feb_29_in_400_divisible_year() {
+        let earliest = dt(1995, 1, 1);
+        let latest = dt(2030, 12, 31);
+        let di = DateInput::Str("2000-02-29");
+        assert!(is_valid_date(Some(&di), "%Y-%m-%d", &earliest, &latest));
+    }
+
+    // -------------------------------------------------------------------
+    // expect_literal failure arm (reached via format_parse)
+    // -------------------------------------------------------------------
+
+    /// rationale: pin `expect_literal`'s mismatch reject arm
+    /// (validators.rs:334) — a non-ISO format parse that hits a literal
+    /// separator mismatch returns Err, so `is_valid_date` rejects.
+    #[test]
+    fn is_valid_date_rejects_literal_mismatch_in_custom_format() {
+        let earliest = dt(1995, 1, 1);
+        let latest = dt(2030, 12, 31);
+        // Format "%d.%m.%Y" expects '.' separators; the input uses '/' so
+        // expect_literal fails on the first separator.
+        let di = DateInput::Str("15/06/2024");
+        assert!(!is_valid_date(Some(&di), "%d.%m.%Y", &earliest, &latest));
+    }
+
+    /// rationale: pin `expect_literal`'s end-of-input reject arm
+    /// (validators.rs:334 first disjunct `*si >= s.len()`) — when the
+    /// input runs out before the format expects a literal char, parsing
+    /// fails (Python's strptime raises ValueError at validators.py:47).
+    #[test]
+    fn is_valid_date_rejects_format_longer_than_input() {
+        let earliest = dt(1995, 1, 1);
+        let latest = dt(2030, 12, 31);
+        // Input "2024" exhausts after %Y; format then expects literal '-'
+        // but si is already at end → `*si >= s.len()` TRUE.
+        let di = DateInput::Str("2024");
+        assert!(!is_valid_date(Some(&di), "%Y-", &earliest, &latest));
+    }
+
+    // -------------------------------------------------------------------
+    // days_from_civil negative-year arm (reached via DateTime::timestamp)
+    // -------------------------------------------------------------------
+
+    /// rationale: pin `days_from_civil`'s negative-year era arm
+    /// (validators.rs:137 FALSE — `y < 0`). A year-0 January date drives
+    /// `y - 1 = -1` into the era computation; the timestamp must be
+    /// strictly below a year-1 date's (monotonic-with-calendar contract
+    /// underpinning validators.py:53's timestamp comparison).
+    #[test]
+    fn timestamp_negative_year_is_monotonic() {
+        let year_zero = dt(0, 1, 1).timestamp();
+        let year_one = dt(1, 1, 1).timestamp();
+        assert!(year_zero < year_one);
+    }
+
+    // -------------------------------------------------------------------
+    // filter_ymd_candidate copyear pass-through arm
+    // -------------------------------------------------------------------
+
+    /// rationale: pin `filter_ymd_candidate`'s `yi >= copyear` pass-through
+    /// (validators.rs:804 FALSE) — when copyear is set AND the candidate
+    /// year is at or above it, the candidate survives (validators.py:154
+    /// `copyear == 0 or int(bestmatch[1]) >= copyear`).
+    #[test]
+    fn filter_ymd_candidate_keeps_year_at_or_above_copyear() {
+        let min_date = dt(1995, 1, 1);
+        let max_date = dt(2030, 12, 31);
+        // candidate 2024 with copyear 2020 → 2024 >= 2020 → kept.
+        let r = filter_ymd_candidate(
+            Some(("2024", "06", "15")),
+            "",
+            false,
+            2020,
+            "%Y-%m-%d",
+            &min_date,
+            &max_date,
+        );
+        assert_eq!(r.as_deref(), Some("2024-06-15"));
+    }
+
+    // -------------------------------------------------------------------
+    // plausible_year_filter — group-0 fallback when group 1 absent
+    // -------------------------------------------------------------------
+
+    /// rationale: pin `plausible_year_filter`'s `caps.get(1).or_else(get(0))`
+    /// fallback (validators.rs:647 — the `or_else` arm) — Python's
+    /// `re.findall` on a multi-group pattern returns a tuple; htmldate's
+    /// single-group call sites always populate group 1, but the defensive
+    /// fallback reads the whole match (group 0) when group 1 did NOT
+    /// participate in the match. An alternation whose first group is empty
+    /// drives that path.
+    #[test]
+    fn plausible_year_filter_falls_back_to_group_zero_when_group1_empty() {
+        // captures_len() == 3 (>1) so the has_groups branch is taken, but on
+        // input "2024" group 1 (the "x..." arm) does NOT match; group 2 does.
+        // get(1) is None → or_else(get(0)) returns the whole "2024" match.
+        let pattern = Regex::new(r"(x\d{4})|(\d{4})").unwrap();
+        let yearpat = Regex::new(r"([0-9]{4})").unwrap();
+        let earliest = dt(1995, 1, 1);
+        let latest = dt(2030, 12, 31);
+        let out = plausible_year_filter(
+            "year 2024 here",
+            &pattern,
+            &yearpat,
+            &earliest,
+            &latest,
+            false,
+        );
+        // The whole-match group-0 "2024" survives the year-window filter.
+        assert!(out.contains_key("2024"), "group-0 fallback should yield 2024");
+    }
+
+    /// rationale: pin `plausible_year_filter`'s no-explicit-groups branch
+    /// (validators.rs:647 FALSE side — `has_groups = captures_len() > 1`
+    /// is false for a group-less pattern). Mirrors Python's `re.findall`
+    /// returning the whole match for patterns with no parentheses.
+    #[test]
+    fn plausible_year_filter_handles_pattern_without_explicit_groups() {
+        // `\d{4}` has only group 0 → captures_len() == 1 → has_groups=false.
+        let pattern = Regex::new(r"\d{4}").unwrap();
+        let yearpat = Regex::new(r"([0-9]{4})").unwrap();
+        let earliest = dt(1995, 1, 1);
+        let latest = dt(2030, 12, 31);
+        let out = plausible_year_filter(
+            "year 2024 here",
+            &pattern,
+            &yearpat,
+            &earliest,
+            &latest,
+            false,
+        );
+        assert!(out.contains_key("2024"), "no-group pattern should still surface 2024");
     }
 }

@@ -1401,6 +1401,9 @@ pub fn find_date(tree: &NodeRef, options: &Extractor) -> Option<String> {
     // canonical link; then call extract_url_date.
     let canonical_url: Option<String> = find_canonical_url(tree);
     let url_result = extract_url_date(canonical_url.as_deref(), options);
+    // llvm-cov:branch-not-reachable: the `!deferred_url_extractor` FALSE side
+    // is dead — `deferred_url_extractor` is pinned `false` above, so the `&&`
+    // second operand always evaluates to `true` (we never skip a hit URL).
     if url_result.is_some() && !deferred_url_extractor {
         return url_result;
     }
@@ -1411,7 +1414,10 @@ pub fn find_date(tree: &NodeRef, options: &Extractor) -> Option<String> {
         return result;
     }
 
-    // core.py:900-901 — deferred URL fallback (no-op when deferred=false).
+    // llvm-cov:branch-not-reachable: `deferred_url_extractor` is pinned
+    // `false` (see L1398), so the entire deferred-URL fallback block is
+    // dead in every in-tree caller. Preserved verbatim from core.py:900-901
+    // for forward-compatibility if a deferred caller ever appears.
     if deferred_url_extractor && url_result.is_some() {
         return url_result;
     }
@@ -1732,6 +1738,68 @@ mod tests {
         let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
         let r = select_candidate(&m, ymd_pattern(), year_pattern(), &o);
         assert_eq!(r, None);
+    }
+
+    /// rationale: pin `select_candidate`'s "patterns[1] wins on >50%
+    /// ratio" arm (core.rs:633 — `years[1] != years[0] &&
+    /// counts[1]/counts[0] > 0.5` TRUE → bestmatch[1]). The second
+    /// candidate's count is at least half of the first's, so it wins
+    /// (core.py:395-398). With original=false (reverse sort, newer is
+    /// patterns[0]), this lets a slightly-more-popular OLDER year beat
+    /// the newer one.
+    #[test]
+    fn select_candidate_patterns_one_wins_on_majority_ratio() {
+        use super::super::regex_catalogues::{year_pattern, ymd_pattern};
+        let mut m = HashMap::new();
+        // original=false → reverse sort puts " 2024-06-15 " first.
+        // counts = [3 (newer), 4 (older)] → ratio 4/3 > 0.5 → patterns[1]
+        // (the older " 2020-06-15 ") wins.
+        m.insert(" 2020-06-15 ".to_string(), 4usize);
+        m.insert(" 2024-06-15 ".to_string(), 3usize);
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        let r = select_candidate(&m, ymd_pattern(), year_pattern(), &o);
+        // The older year wins because count[1]/count[0] = 4/3 > 0.5.
+        assert!(r.as_deref().unwrap().contains("2020"));
+    }
+
+    /// rationale: pin `select_candidate`'s "years.len() < 2" recovery
+    /// arm (core.rs:596 TRUE → fall through to single-year validation at
+    /// L599-L612) — when yearpat captures fewer than 2 years among the
+    /// top-2 patterns, the function attempts to salvage the first
+    /// captured year (faithful divergence from Python's `zip(*bestones)`
+    /// which would panic on a length mismatch).
+    #[test]
+    fn select_candidate_falls_back_when_only_one_year_captured() {
+        use super::super::regex_catalogues::{year_pattern, ymd_pattern};
+        let mut m = HashMap::new();
+        // One entry has a 4-digit year; the other doesn't. yearpat only
+        // captures from the first → years.len() == 1 < 2 → recovery arm.
+        // original=true → ascending sort → " 2024..." (lex smaller) sits at
+        // patterns[0], so the recovery's `catch.find(patterns[0])` succeeds.
+        m.insert(" 2024-06-15 ".to_string(), 2usize);
+        m.insert(" no-year-here ".to_string(), 1usize);
+        let o = opts_orig("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        let r = select_candidate(&m, ymd_pattern(), year_pattern(), &o);
+        // The recovery arm catches the lone year and returns the YMD match.
+        assert!(r.as_deref().unwrap().contains("2024"));
+    }
+
+    /// rationale: pin `select_candidate`'s "patterns[0] wins when ratio
+    /// <= 0.5" arm (core.rs:633 TRUE+ `>0.5` FALSE → bestmatch[0]).
+    /// With original=true (ascending sort, older is patterns[0]), the
+    /// older year wins when the newer's count is <= half (core.py:395-400).
+    #[test]
+    fn select_candidate_patterns_zero_wins_when_minority_ratio() {
+        use super::super::regex_catalogues::{year_pattern, ymd_pattern};
+        let mut m = HashMap::new();
+        // original=true → ascending sort → " 2020-06-15 " is patterns[0].
+        // counts = [10 (older), 1 (newer)] → ratio 1/10 = 0.1 <= 0.5 →
+        // falls through to else → patterns[0] (older) wins.
+        m.insert(" 2020-06-15 ".to_string(), 10usize);
+        m.insert(" 2024-06-15 ".to_string(), 1usize);
+        let o = opts_orig("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        let r = select_candidate(&m, ymd_pattern(), year_pattern(), &o);
+        assert!(r.as_deref().unwrap().contains("2020"));
     }
 
     // -----------------------------------------------------------------------
@@ -2208,6 +2276,120 @@ mod tests {
         assert_eq!(r.as_deref(), Some("2024-03-15"));
     }
 
+    /// rationale: pin `find_date`'s outputformat-validity gate
+    /// (core.rs:1389 — `format != "%Y-%m-%d" && !is_valid_format`).
+    /// A non-default, invalid format (no `%` directive) is rejected up
+    /// front returning None (core.py:866-867).
+    #[test]
+    fn find_date_rejects_invalid_outputformat() {
+        let html = r#"<html><head>
+            <meta property="article:published_time" content="2024-06-15">
+        </head><body></body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        // "nodirective" has no '%', so is_valid_format rejects it; combined
+        // with format != "%Y-%m-%d" the gate fires and find_date bails.
+        let o = opts_orig("nodirective", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(find_date(&root, &o), None);
+    }
+
+    /// rationale: pin `find_date`'s outputformat gate pass-through
+    /// (core.rs:1389 FALSE — a non-default but VALID format proceeds) so
+    /// the full pipeline emits in the requested format (core.py:866-867
+    /// then the normal walk).
+    #[test]
+    fn find_date_honours_valid_custom_outputformat() {
+        let html = r#"<html><head>
+            <meta property="article:published_time" content="2024-06-15">
+        </head><body></body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts_orig("%d.%m.%Y", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(find_date(&root, &o).as_deref(), Some("15.06.2024"));
+    }
+
+    /// rationale: pin `find_date`'s abbr-elements fallback arm
+    /// (core.rs:1420-1423) — when header/json miss but an `<abbr
+    /// class="published" title=...>` carries the date, the abbr walk
+    /// resolves it (core.py:904-909).
+    #[test]
+    fn find_date_from_abbr_element() {
+        let html = r#"<html><head></head><body>
+            <abbr class="published" title="2024-06-15">Jun 15</abbr>
+        </body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts_orig("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(find_date(&root, &o).as_deref(), Some("2024-06-15"));
+    }
+
+    /// rationale: pin `find_date`'s date-elements walk arm
+    /// (core.rs:1441 — `examine_date_elements(search_tree, date_expr)`)
+    /// where a date-bearing element in the body (not header/json/abbr/time)
+    /// resolves via the FAST_PREPEND + DATE_EXPRESSIONS xpath
+    /// (core.py:929-941).
+    #[test]
+    fn find_date_from_body_date_element() {
+        let html = r#"<html><head></head><body>
+            <span class="date">2024-06-15</span>
+        </body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(find_date(&root, &o).as_deref(), Some("2024-06-15"));
+    }
+
+    /// rationale: pin `find_date`'s `extensive=false` exit arm
+    /// (core.rs:1461 FALSE — the function returns None when every earlier
+    /// arm misses and extensive_search is off, mirroring Python's "no
+    /// fallback" terminal at core.py:983).
+    #[test]
+    fn find_date_returns_none_when_not_extensive_and_no_signals() {
+        let html = r#"<html><head><title>Hi</title></head><body>
+            <p>Just plain text with no date markers.</p>
+        </body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        // extensive=false → reaches L1461 with the FALSE side and returns None.
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(find_date(&root, &o), None);
+    }
+
+    /// rationale: pin `find_canonical_url`'s non-canonical `<link>` skip
+    /// arm (core.rs:1497 FALSE — `rel.eq_ignore_ascii_case("canonical")`
+    /// is false for stylesheets / icons). The function continues iterating
+    /// and returns None when no canonical link exists.
+    #[test]
+    fn find_date_ignores_non_canonical_link_elements() {
+        let html = r#"<html><head>
+            <link rel="stylesheet" href="https://example.com/css/2024/03/15/main.css">
+            <link rel="icon" href="https://example.com/icon/2024/03/15/fav.png">
+            <meta property="article:published_time" content="2024-06-15">
+        </head><body></body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts_orig("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        // The stylesheet/icon URLs are NOT consumed by find_canonical_url;
+        // the meta tag's date wins.
+        assert_eq!(find_date(&root, &o).as_deref(), Some("2024-06-15"));
+    }
+
+    /// rationale: pin `find_canonical_url`'s missing-`href` skip arm
+    /// (core.rs:1499 FALSE — `get_attribute(&link, "href")` is None). A
+    /// `rel="canonical"` link without an `href` attribute is skipped and
+    /// the function returns None.
+    #[test]
+    fn find_date_skips_canonical_link_without_href() {
+        let html = r#"<html><head>
+            <link rel="canonical">
+            <meta property="article:published_time" content="2024-06-15">
+        </head><body></body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts_orig("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(find_date(&root, &o).as_deref(), Some("2024-06-15"));
+    }
+
     // -----------------------------------------------------------------------
     // examine_header — additional arm coverage (core.py:235-352)
     // -----------------------------------------------------------------------
@@ -2535,6 +2717,39 @@ mod tests {
         let o = opts_orig("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
         // title parse fails, no text → returns None.
         assert_eq!(examine_abbr_elements(&root, &o), None);
+    }
+
+    /// rationale: pin `examine_abbr_elements`'s class+no-title+empty-text
+    /// arm (core.rs:772 `if let Some(t) = text` FALSE side) — an `<abbr
+    /// class="published">` with no title AND no text child means
+    /// `element_text` returns None, so the loop iteration is a no-op.
+    #[test]
+    fn examine_abbr_class_without_title_or_text_returns_none() {
+        let html = r#"<html><body>
+            <abbr class="published"></abbr>
+        </body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(examine_abbr_elements(&root, &o), None);
+    }
+
+    /// rationale: pin `examine_abbr_elements`'s class+title with
+    /// `original=false` + parse failure — compare_reference returns 0,
+    /// so the `if reference > 0 { break }` FALSE side (core.rs:761) is
+    /// taken (don't break, keep iterating).
+    #[test]
+    fn examine_abbr_class_title_unparseable_does_not_break() {
+        let html = r#"<html><body>
+            <abbr class="published" title="not parseable">Junk</abbr>
+            <abbr class="published" title="2024-06-15">Jun 15</abbr>
+        </body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        // First abbr's title fails to parse (reference stays 0, no break),
+        // second abbr provides the valid date.
+        assert_eq!(examine_abbr_elements(&root, &o).as_deref(), Some("2024-06-15"));
     }
 
     // -----------------------------------------------------------------------

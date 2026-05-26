@@ -148,6 +148,11 @@ pub fn discard_unwanted(tree: &NodeRef) -> Vec<NodeRef> {
     for subtree in matches {
         // `subtree.getparent().remove(subtree)` — drop the subtree from its
         // parent; the dom facade's `remove` does both halves in one call.
+        // llvm-cov:branch-not-reachable: `xpath_engine::evaluate(".//div[...]"
+        // , tree)` only returns descendant `<div>` elements, each of which
+        // has a parent by construction. The is_some() FALSE arm is a
+        // defensive guard mirroring Python's `subtree.getparent() is not
+        // None` check (which similarly never fires for matched descendants).
         if parent(&subtree).is_some() {
             dom::remove(&subtree);
             discarded.push(subtree);
@@ -479,6 +484,11 @@ fn strip_tz_suffix(s: &str) -> &str {
 }
 
 fn parse_ymd(s: &str) -> Option<DateTime> {
+    // llvm-cov:branch-not-reachable: the `len != 10` TRUE arm is dead — both
+    // callers in `try_fromisoformat` pass exactly 10 chars (the date-only
+    // branch is gated on `stripped.len() == 10`, the datetime branch slices
+    // `&stripped[..10]`). Kept as a defensive guard mirroring Python's
+    // fromisoformat length check.
     if s.len() != 10 {
         return None;
     }
@@ -624,6 +634,11 @@ pub fn try_date_expr(
     // dateparser fallback (Rust stub returns None).
     if extensive_search && text_date_pattern().is_match(&truncated) {
         let parsed = external_date_parser(&truncated, outputformat);
+        // llvm-cov:branch-not-reachable: `external_date_parser` is a faithful
+        // STUB (extractors.py:386-396 → returns None unconditionally; see
+        // module docs), so `parsed` is always None and this `if let Some`
+        // arm and its inner `is_valid_date` check are dead. Kept in source
+        // shape to mirror the Python control flow if dateparser ever lands.
         if let Some(ref p) = parsed {
             let di = DateInput::Str(p);
             if is_valid_date(Some(&di), outputformat, min_date, max_date) {
@@ -731,11 +746,21 @@ pub fn idiosyncrasies_search(htmlstring: &str, options: &Extractor) -> Option<St
     for i in 1..caps.len() {
         if let Some(m) = caps.get(i) {
             let s = m.as_str();
+            // llvm-cov:branch-not-reachable: every TEXT_PATTERNS group is
+            // a mandatory numeric capture `[0-9]{1,...}` — when `caps.get(i)`
+            // returns Some, the captured slice is always non-empty. The
+            // `is_empty()` TRUE arm mirrors Python's `filter(None, ...)`
+            // belt-and-braces defence (extractors.py:493) but cannot fire.
             if !s.is_empty() {
                 parts.push(s);
             }
         }
     }
+    // llvm-cov:branch-not-reachable: the `parts.len() < 3` TRUE arm is dead —
+    // every TEXT_PATTERNS alternative defines exactly three mandatory numeric
+    // groups (`[0-9]{...}`), so any successful match contributes precisely
+    // three non-empty groups. Kept as a defensive guard for the Python
+    // `filter(None, match.groups())` shape (extractors.py:493-495).
     if parts.len() < 3 {
         return None;
     }
@@ -1565,5 +1590,111 @@ mod tests {
         let root = dom.root_element().expect("html root");
         let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
         assert_eq!(img_search(&root, &o), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // try_fromisoformat — remaining out-of-range time-field arms
+    // -----------------------------------------------------------------------
+
+    /// rationale: pin `try_fromisoformat`'s `mi > 59` reject arm
+    /// (extractors.rs:445 middle disjunct) — a valid hour with an
+    /// out-of-range minute (60+) is rejected, mirroring Python's
+    /// `datetime.fromisoformat` ValueError on minute > 59.
+    #[test]
+    fn try_fromisoformat_rejects_out_of_range_minute() {
+        assert_eq!(try_fromisoformat("2024-06-15T12:99:00"), None);
+    }
+
+    /// rationale: pin `try_fromisoformat`'s `se > 59` reject arm
+    /// (extractors.rs:445 final disjunct) — a valid hour+minute with an
+    /// out-of-range second (60+, excluding leap seconds htmldate doesn't
+    /// model) is rejected.
+    #[test]
+    fn try_fromisoformat_rejects_out_of_range_second() {
+        assert_eq!(try_fromisoformat("2024-06-15T12:30:99"), None);
+    }
+
+    /// rationale: pin `parse_ymd`'s separator-mismatch reject arm at byte
+    /// 4 (extractors.rs:491 first disjunct `b[4] != b'-'`) — a 10-char
+    /// date-only string whose year-month separator is wrong returns None.
+    #[test]
+    fn try_fromisoformat_rejects_bad_date_separator() {
+        assert_eq!(try_fromisoformat("2024X06X15"), None);
+    }
+
+    /// rationale: pin `parse_ymd`'s separator-mismatch reject arm at byte
+    /// 7 (extractors.rs:491 second disjunct `b[7] != b'-'`) — b[4] is
+    /// valid but b[7] is not, drives the second half of the OR.
+    #[test]
+    fn try_fromisoformat_rejects_bad_month_day_separator() {
+        assert_eq!(try_fromisoformat("2024-06X15"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // days_in_month — 400-divisible leap year (Feb) arm
+    // -----------------------------------------------------------------------
+
+    /// rationale: pin `make_datetime`/`days_in_month`'s 400-divisible
+    /// leap-year arm (extractors.rs:547 `y % 400 == 0` TRUE) — Feb 29
+    /// 2000 is a valid calendar date (2000 is divisible by 400), so the
+    /// 8-digit `custom_parse` shortcut accepts it.
+    #[test]
+    fn custom_parse_accepts_feb_29_in_400_divisible_year() {
+        let min = dt(1995, 1, 1);
+        let max = dt(2030, 12, 31);
+        let r = custom_parse("20000229", "%Y-%m-%d", &min, &max);
+        assert_eq!(r.as_deref(), Some("2000-02-29"));
+    }
+
+    // -----------------------------------------------------------------------
+    // try_date_expr — empty-after-trim arm
+    // -----------------------------------------------------------------------
+
+    /// rationale: pin `try_date_expr`'s `truncated.is_empty()` reject arm
+    /// (extractors.rs:603) — a non-empty input that `trim_text` reduces to
+    /// the empty string short-circuits before the digit-count gate
+    /// (extractors.py:412-413).
+    #[test]
+    fn try_date_expr_returns_none_when_trim_empties_input() {
+        let min = dt(1995, 1, 1);
+        let max = dt(2030, 12, 31);
+        // Whitespace-only input passes the `raw.is_empty()` guard but
+        // trim_text() collapses it to "".
+        let r = try_date_expr(Some("    \t  "), "%Y-%m-%d", false, &min, &max);
+        assert_eq!(r, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // json_search — empty script-body arm
+    // -----------------------------------------------------------------------
+
+    /// rationale: pin `json_search`'s `raw.is_empty()` skip arm
+    /// (extractors.rs:704 first disjunct) — an empty ld+json script block
+    /// is skipped before the `"date` substring test (extractors.py:476).
+    #[test]
+    fn json_search_skips_empty_script_body() {
+        let html = r#"<html><head>
+            <script type="application/ld+json"></script>
+        </head><body></body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html root");
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(json_search(&root, &o), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // idiosyncrasies_search — year-first arm
+    // -----------------------------------------------------------------------
+
+    /// rationale: pin `idiosyncrasies_search`'s year-first arm
+    /// (extractors.rs:742 `parts[0].len() == 4` TRUE) — when the first
+    /// captured group is a 4-digit year, the (Y, M, D) ordering is read
+    /// directly without the day/month swap (extractors.py:496-497).
+    #[test]
+    fn idiosyncrasies_search_year_first_arm() {
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        // "Published: 2024/06/15" → first group "2024" (len 4) → year-first.
+        let r = idiosyncrasies_search("Published: 2024/06/15", &o);
+        assert_eq!(r.as_deref(), Some("2024-06-15"));
     }
 }
