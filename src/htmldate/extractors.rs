@@ -1544,6 +1544,28 @@ mod tests {
         assert_eq!(json_search(&root, &o), None);
     }
 
+    /// rationale: pin `json_search`'s `pattern_search` MISS arm
+    /// (extractors.rs:722 `if let Some(found)` FALSE side) — a script whose
+    /// body DOES contain the `"date` substring (so the skip guard at
+    /// extractors.rs:719 passes) but carries no `dateModified`/`datePublished`
+    /// + ISO value that `pattern_search` can extract, so the loop falls
+    /// through to the next script and ultimately returns None
+    /// (extractors.py:478-481).
+    #[test]
+    fn json_search_script_with_date_substring_but_no_iso_match() {
+        // "dateline" contains the "date substring but is not the
+        // dateModified/datePublished + ISO shape the json regexes match.
+        let html = r#"<html><head>
+            <script type="application/ld+json">
+            {"@type":"Article","dateline":"yesterday afternoon"}
+            </script>
+        </head><body></body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html root");
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(json_search(&root, &o), None);
+    }
+
     // -----------------------------------------------------------------------
     // idiosyncrasies_search — additional defensive arms
     // -----------------------------------------------------------------------
@@ -1697,5 +1719,105 @@ mod tests {
         // "Published: 2024/06/15" → first group "2024" (len 4) → year-first.
         let r = idiosyncrasies_search("Published: 2024/06/15", &o);
         assert_eq!(r.as_deref(), Some("2024-06-15"));
+    }
+
+    // -----------------------------------------------------------------------
+    // custom_parse — YMD_NO_SEP_PATTERN rejection sides (extractors.py:320-331)
+    // -----------------------------------------------------------------------
+
+    /// rationale: pin `custom_parse`'s YMD_NO_SEP_PATTERN `make_datetime`
+    /// None arm (extractors.rs:347 `if let Some(c)` FALSE side) — an
+    /// embedded 8-digit run whose middle/last fields are NOT a valid
+    /// calendar date. `\b(\d{8})\b` (ymd_no_sep_pattern) matches "20241345"
+    /// → y=2024, m=13, d=45 → `make_datetime` returns None (month > 12),
+    /// so the scan falls through to the YMD/YM/regex_parse arms (none
+    /// match) and `custom_parse` returns None (extractors.py:325-331).
+    #[test]
+    fn custom_parse_ymd_no_sep_invalid_calendar_falls_through() {
+        let min = dt(1995, 1, 1);
+        let max = dt(2030, 12, 31);
+        // Leading `x` bypasses the string[:4].isdigit() shortcut so the
+        // 8-digit run is only seen by the YMD_NO_SEP scan.
+        let r = custom_parse("x 20241345 y", "%Y-%m-%d", &min, &max);
+        assert_eq!(r, None);
+    }
+
+    /// rationale: pin `custom_parse`'s YMD_NO_SEP_PATTERN `is_valid_date`
+    /// FALSE arm (extractors.rs:350) — an embedded 8-digit run that IS a
+    /// valid calendar date but lies OUTSIDE the (min, max) window. "19920615"
+    /// → 1992-06-15 (valid calendar) but year 1992 < min 1995, so
+    /// `is_valid_date` returns false and the scan falls through to a None
+    /// result (extractors.py:329).
+    #[test]
+    fn custom_parse_ymd_no_sep_out_of_range_falls_through() {
+        let min = dt(1995, 1, 1);
+        let max = dt(2030, 12, 31);
+        let r = custom_parse("x 19920615 y", "%Y-%m-%d", &min, &max);
+        assert_eq!(r, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // custom_parse — YMD_PATTERN is_valid_date rejection (extractors.py:333-358)
+    // -----------------------------------------------------------------------
+
+    /// rationale: pin `custom_parse`'s YMD_PATTERN `is_valid_date` FALSE arm
+    /// (extractors.rs:380) — a separated `YYYY-MM-DD` whose calendar date is
+    /// valid but out of the (min, max) window. "1996-06-15" with max=1995
+    /// constructs successfully (make_datetime OK) but fails the window
+    /// check; the YM_PATTERN fallback ("1996-06") is likewise out of range,
+    /// so `custom_parse` returns None (extractors.py:355).
+    #[test]
+    fn custom_parse_ymd_pattern_out_of_range_returns_none() {
+        let min = dt(1990, 1, 1);
+        let max = dt(1995, 12, 31);
+        let r = custom_parse("x 1996-06-15 y", "%Y-%m-%d", &min, &max);
+        assert_eq!(r, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // custom_parse — YM_PATTERN month-year (reverse) arm (extractors.py:360-377)
+    // -----------------------------------------------------------------------
+
+    /// rationale: pin `custom_parse`'s YM_PATTERN `month2`/`year2` arm
+    /// (extractors.rs:392 `if last == Some("month")` FALSE side) — the
+    /// `MM[/.-]YYYY` alternation matches the reverse month-year form, whose
+    /// lastgroup is `year2`, not `month`. "06.2024" defaults day=1 and emits
+    /// 2024-06-01 (extractors.py:373-375).
+    #[test]
+    fn custom_parse_ym_pattern_month_year_reverse_arm() {
+        let min = dt(1995, 1, 1);
+        let max = dt(2030, 12, 31);
+        // Leading non-digit avoids the leading-digits shortcut; no day field
+        // so YMD_PATTERN misses and the MM.YYYY YM arm fires.
+        let r = custom_parse("edition 06.2024 issue", "%Y-%m-%d", &min, &max);
+        assert_eq!(r.as_deref(), Some("2024-06-01"));
+    }
+
+    /// rationale: pin `custom_parse`'s YM_PATTERN `is_valid_date` FALSE arm
+    /// (extractors.rs:403) — the reverse `MM.YYYY` form parses to a valid
+    /// calendar date (day defaulted to 1) but lies outside the window.
+    /// "06.1996" → 1996-06-01, rejected by max=1995, so `custom_parse`
+    /// falls through to regex_parse (no match) and returns None
+    /// (extractors.py:371-376).
+    #[test]
+    fn custom_parse_ym_pattern_out_of_range_returns_none() {
+        let min = dt(1990, 1, 1);
+        let max = dt(1995, 12, 31);
+        let r = custom_parse("issue 06.1996 here", "%Y-%m-%d", &min, &max);
+        assert_eq!(r, None);
+    }
+
+    /// rationale: pin `custom_parse`'s YM_PATTERN year-month `make_datetime`
+    /// None arm (extractors.rs:401 `if let Some(c)` FALSE side) — MONTH_RE is
+    /// `[0-1]?[0-9]` so the YM_PATTERN can capture month "00", which
+    /// `make_datetime` rejects (month not in 1..=12). "2024-00" yields no
+    /// candidate; regex_parse also misses, so the result is None
+    /// (extractors.py:365-368).
+    #[test]
+    fn custom_parse_ym_pattern_zero_month_returns_none() {
+        let min = dt(1995, 1, 1);
+        let max = dt(2030, 12, 31);
+        let r = custom_parse("x 2024-00 y", "%Y-%m-%d", &min, &max);
+        assert_eq!(r, None);
     }
 }

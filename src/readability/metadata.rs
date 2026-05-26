@@ -113,6 +113,11 @@ pub fn get_article_title(doc_root: &NodeRef) -> String {
         title_had_hierarchical_separators = regexps::title_hier_separator().is_match(&cur_title);
         // allSeparators = Array.from(origTitle.matchAll(/ [\|\-\\\/>»] /gi));
         // curTitle = origTitle.substring(0, allSeparators.pop().index);
+        // llvm-cov:branch-not-reachable: the enclosing `if` fired because
+        // `title_separator().is_match(cur_title)` was true, and at this point
+        // `cur_title == orig_title` (an unmodified clone), so `find_iter` on the
+        // same pattern over `orig_title` always yields ≥1 match — the `else`
+        // (None) side cannot occur (Readability.js:599-601 invariant).
         if let Some(last) = regexps::title_separator().find_iter(&orig_title).last() {
             cur_title = byte_substring(&orig_title, 0, last.start());
         }
@@ -133,11 +138,18 @@ pub fn get_article_title(doc_root: &NodeRef) -> String {
             .any(|h| js_trim(&text_content(h)) == trimmed_title);
         if !matched {
             // curTitle = origTitle.substring(origTitle.lastIndexOf(":") + 1)
+            // llvm-cov:branch-not-reachable: this whole block is gated by the
+            // `else if cur_title.contains(": ")` arm and `cur_title == orig_title`
+            // here, so `orig_title` is guaranteed to contain a ':' — `rfind`
+            // always returns Some (Readability.js:609-612 invariant).
             if let Some(pos) = orig_title.rfind(':') {
                 cur_title = byte_substring(&orig_title, pos + ':'.len_utf8(), orig_title.len());
             }
             if word_count(&cur_title) < 3 {
                 // curTitle = origTitle.substring(origTitle.indexOf(":") + 1)
+                // llvm-cov:branch-not-reachable: same `contains(": ")` gate —
+                // `orig_title` always contains ':', so `find` is always Some
+                // (Readability.js:613-615 invariant).
                 if let Some(pos) = orig_title.find(':') {
                     cur_title = byte_substring(&orig_title, pos + ':'.len_utf8(), orig_title.len());
                 }
@@ -202,6 +214,11 @@ fn byte_substring(s: &str, start: usize, end: usize) -> String {
     let a = a.min(s.len());
     let b = b.min(s.len());
     // a,b are derived from char-boundary-safe sources; guard anyway.
+    // llvm-cov:branch-not-reachable: every caller derives `start`/`end` from
+    // `Regex::find`/`str::find`/`rfind`/`indexOf` indices on THIS exact `&str`,
+    // which always land on UTF-8 char boundaries — so both `is_char_boundary`
+    // checks are always true and the `else` char-walk fallback cannot fire
+    // (documented invariant in this fn's own doc-comment).
     if s.is_char_boundary(a) && s.is_char_boundary(b) {
         s[a..b].to_string()
     } else {
@@ -821,6 +838,10 @@ fn utf8_char_len(b: u8) -> usize {
     } else if b < 0xC0 {
         // Continuation byte — should not appear at a code-point boundary in
         // valid UTF-8; defensively step by 1.
+        // llvm-cov:branch-not-reachable: `b` is always the LEADING byte of a
+        // code point (the caller only advances by full `utf8_char_len` strides
+        // over a valid `&str`), so a continuation byte (0x80..=0xBF) never
+        // reaches this arm.
         1
     } else if b < 0xE0 {
         2
@@ -2052,5 +2073,258 @@ mod tests {
     fn unescape_hex_entity_decoded() {
         // rationale: `&#x41;` -> 'A' via the hex radix arm (`b[2] == b'x'`).
         assert_eq!(unescape_html_entities("&#x41;"), "A");
+    }
+
+    // ===================================================================
+    // M12 Stage — branch coverage push (readability/metadata.rs)
+    // Per `wrk_docs/2026.05.26 - CC - Coverage Push Status Report.md`:
+    // get_article_title separator/heading arms, get_json_ld @type/@context
+    // residual, numeric-entity scanner edge arms, collect_meta_values
+    // negative shapes.
+    // ===================================================================
+
+    // ---- get_article_metadata_title / get_article_metadata — empty meta value
+
+    #[test]
+    fn metadata_title_skips_whitespace_only_meta_value() {
+        // rationale: `Readability.js:1803-1812` precedence loop — `values[key]`
+        // exists but `js_trim` reduced its content to "" (a `content=" "` meta).
+        // The `&& !v.is_empty()` guard FALSE side must skip it, falling through
+        // to the NEXT precedence key (`title`). collect_meta_values inserts the
+        // empty-after-trim value (content " " is non-empty pre-trim, so it is
+        // stored), exercising the empty-value skip at the precedence loop.
+        let (_d, r) = doc(
+            "<html><head><meta property=\"og:title\" content=\" \">\
+             <title>Real Doc Title Goes Here</title></head><body></body></html>",
+        );
+        // og:title is empty-after-trim -> skipped -> "title" key (document.title)
+        // wins via get_article_title fallback.
+        assert_eq!(get_article_metadata_title(&r), "Real Doc Title Goes Here");
+    }
+
+    #[test]
+    fn get_article_metadata_skips_whitespace_only_og_title() {
+        // rationale: same `!v.is_empty()` FALSE side inside get_article_metadata's
+        // own title precedence loop (`Readability.js:1803-1812`) — an empty
+        // og:title is skipped and the `title` key resolves to document.title.
+        let (_d, r) = doc(
+            "<html><head><meta property=\"og:title\" content=\" \">\
+             <title>Another Long Article Title Value</title></head><body></body></html>",
+        );
+        let md = get_article_metadata(&r, &JsonLd::default());
+        assert_eq!(md.title, "Another Long Article Title Value");
+    }
+
+    // ---- get_article_title — `: ` colon branch when ALSO has a separator-less
+    //      short curTitle that requires the lead-separator replace path.
+
+    #[test]
+    fn article_title_separator_word_count_lt3_uses_lead_separator_replace() {
+        // rationale: `Readability.js:602-608` — when a hierarchical separator is
+        // present BUT the substring before the last separator has <3 words, the
+        // code falls to `origTitle.replace(REGEXPS.titleLeadSeparator, "")`.
+        // "A | Real Long Article Heading Title": last sep gives curTitle "A"
+        // (1 word, <3) -> lead-separator replace drops "A |", leaving
+        // " Real Long Article Heading Title" -> normalised.
+        let (_d, r) = doc(
+            "<html><head><title>A | Real Long Article Heading Title</title></head><body></body></html>",
+        );
+        // After lead-separator strip + normalize: leading space trimmed.
+        assert_eq!(
+            get_article_title(&r),
+            "Real Long Article Heading Title"
+        );
+    }
+
+    // ---- get_article_title — `cond` second operand (L168/L170) ----
+
+    #[test]
+    fn article_title_hier_separator_keeps_shortened_when_word_count_minus_one_matches() {
+        // rationale: `Readability.js:617-619` final guard
+        //   if (curTitleWordCount <= 4 &&
+        //       (!titleHadHierarchicalSeparators ||
+        //        curTitleWordCount != wordCount(origTitle.replace(/sep+/g,"")) - 1))
+        //       curTitle = origTitle;
+        // Trace "Foo > Bar":
+        //   sep " > " present (hier=true). curTitle = "Foo" (before last sep),
+        //   wordCount("Foo")=1 < 3 -> lead-separator replace strips "Foo >" ->
+        //   " Bar" -> normalize/trim -> "Bar" (wordCount 1, <= 4).
+        //   orig without sep runs = "Foo  Bar" -> wordCount(/\s+/) = 2.
+        //   cond = !true || (1 != 2-1=1) = false || false = FALSE.
+        // So the `||` second operand is FALSE (this is the L168/L170 cond=FALSE
+        // path) and the shortened "Bar" is KEPT (NOT restored to origTitle).
+        let (_d, r) = doc("<html><head><title>Foo > Bar</title></head><body></body></html>");
+        assert_eq!(get_article_title(&r), "Bar");
+    }
+
+    // ---- get_json_ld — @type/@context residual arms ----
+
+    #[test]
+    fn json_ld_article_type_matches_api_reference_suffix() {
+        // rationale: `Readability.js:168-169` jsonLdArticleTypes — `APIReference`
+        // is the LAST alternative, anchored at END (`...|APIReference$`). A type
+        // ending in "APIReference" matches via the `s.ends_with` arm.
+        assert!(json_ld_article_type_matches("FooAPIReference"));
+    }
+
+    #[test]
+    fn json_ld_article_type_matches_middle_substring() {
+        // rationale: middle alternatives are UNANCHORED (JS `^A|B|C$` precedence)
+        // — `NewsArticle` matches as a substring anywhere.
+        assert!(json_ld_article_type_matches("xxNewsArticleyy"));
+    }
+
+    #[test]
+    fn json_ld_article_type_rejects_non_article() {
+        // rationale: the final `false` — a type that matches no alternative.
+        assert!(!json_ld_article_type_matches("Recipe"));
+    }
+
+    #[test]
+    fn schema_dot_org_matches_http_variant() {
+        // rationale: `Readability.js:1662` schemaDotOrgRegex — the
+        // `s == "http://schema.org"` arm (TRUE side) accepts the http scheme.
+        assert!(schema_dot_org_matches("http://schema.org"));
+    }
+
+    #[test]
+    fn schema_dot_org_matches_https_with_trailing_slash() {
+        // rationale: `/^https?...schema\.org\/?$/` — the optional trailing slash
+        // is stripped then compared against "https://schema.org".
+        assert!(schema_dot_org_matches("https://schema.org/"));
+    }
+
+    #[test]
+    fn schema_dot_org_rejects_other_host() {
+        assert!(!schema_dot_org_matches("https://example.org"));
+    }
+
+    #[test]
+    fn json_ld_title_prefers_headline_when_only_headline_similar() {
+        // rationale: `Readability.js:1690-1708` — both `name` and `headline`
+        // present AND differ -> similarity tie-break. When headline ~ article
+        // title (>0.75) but name does NOT, the `headline_matches && !name_matches`
+        // TRUE side picks `headline`. The article <title> equals the headline so
+        // text_similarity(headline, title) ~ 1.0; name is a distinct short brand.
+        let html = "<html><head>\
+            <title>The Quick Brown Fox Jumps Over The Lazy Dog Today</title>\
+            <script type=\"application/ld+json\">\
+            {\"@context\":\"https://schema.org\",\"@type\":\"Article\",\
+             \"name\":\"Brand\",\
+             \"headline\":\"The Quick Brown Fox Jumps Over The Lazy Dog Today\"}\
+            </script></head><body></body></html>";
+        let (_d, r) = doc(html);
+        let jl = get_json_ld(&r);
+        assert_eq!(
+            jl.title.as_deref(),
+            Some("The Quick Brown Fox Jumps Over The Lazy Dog Today")
+        );
+    }
+
+    // ---- canonical_url — rel match arms ----
+
+    #[test]
+    fn canonical_url_returns_href_for_rel_canonical() {
+        // rationale: `<link rel="canonical">` rel matches (TRUE side of
+        // `rel.eq_ignore_ascii_case("canonical")`) and a non-empty href returns.
+        let (_d, r) = doc(
+            "<html><head><link rel=\"canonical\" href=\"https://e.com/x\"></head><body></body></html>",
+        );
+        assert_eq!(canonical_url(&r).as_deref(), Some("https://e.com/x"));
+    }
+
+    #[test]
+    fn canonical_url_skips_non_canonical_rel() {
+        // rationale: the `rel.eq_ignore_ascii_case("canonical")` FALSE side — a
+        // `rel="stylesheet"` link is skipped, returning None when no canonical.
+        let (_d, r) = doc(
+            "<html><head><link rel=\"stylesheet\" href=\"a.css\"></head><body></body></html>",
+        );
+        assert!(canonical_url(&r).is_none());
+    }
+
+    #[test]
+    fn canonical_url_none_when_no_link() {
+        // rationale: the loop exhausts with no rel attribute present at all
+        // (`get_attribute(link, "rel")` None -> `if let` FALSE side).
+        let (_d, r) = doc(
+            "<html><head><link href=\"a.css\"></head><body></body></html>",
+        );
+        assert!(canonical_url(&r).is_none());
+    }
+
+    // ---- collect_meta_values — negative-shape arms (via get_article_metadata) ----
+
+    #[test]
+    fn collect_meta_values_ignores_unmatched_property() {
+        // rationale: `Readability.js:1771-1779` — a `<meta property>` whose value
+        // does NOT match propertyPattern (the `find()` None / FALSE side) is not
+        // stored; an unrelated property leaves title to the document.title path.
+        let (_d, r) = doc(
+            "<html><head><meta property=\"fb:app_id\" content=\"123\">\
+             <title>Fallback Document Title Here</title></head><body></body></html>",
+        );
+        let md = get_article_metadata(&r, &JsonLd::default());
+        assert_eq!(md.title, "Fallback Document Title Here");
+        assert!(md.site_name.is_none(), "no site_name from fb:app_id");
+    }
+
+    #[test]
+    fn collect_meta_values_ignores_unmatched_name() {
+        // rationale: `Readability.js:1781-1799` — a `<meta name>` not matching
+        // namePattern (`is_match` FALSE side) is dropped; a `name="viewport"`
+        // produces no byline/excerpt.
+        let (_d, r) = doc(
+            "<html><head><meta name=\"viewport\" content=\"width=device-width\">\
+             <title>Doc Title</title></head><body></body></html>",
+        );
+        let md = get_article_metadata(&r, &JsonLd::default());
+        assert!(md.byline.is_none() && md.excerpt.is_none());
+    }
+
+    #[test]
+    fn collect_meta_values_name_author_populates_byline() {
+        // rationale: namePattern is_match TRUE side — `name="author"` matches and
+        // is stored under "author", feeding the byline precedence.
+        let (_d, r) = doc(
+            "<html><head><meta name=\"author\" content=\"Jane Doe\">\
+             <title>Doc Title</title></head><body></body></html>",
+        );
+        let md = get_article_metadata(&r, &JsonLd::default());
+        assert_eq!(md.byline.as_deref(), Some("Jane Doe"));
+    }
+
+    // ---- try_numeric_entity — radix / boundary arms ----
+
+    #[test]
+    fn unescape_uppercase_hex_entity_decoded() {
+        // rationale: `Readability.js:1615` — `&#X41;` uses the `b[2] == b'X'`
+        // (uppercase) operand of the radix selector. Decodes to 'A'.
+        assert_eq!(unescape_html_entities("&#X41;"), "A");
+    }
+
+    #[test]
+    fn unescape_numeric_entity_runs_to_end_without_semicolon() {
+        // rationale: try_numeric_entity `p >= b.len()` middle operand of the
+        // `p == digit_start || p >= b.len() || b[p] != b';'` reject — a digit run
+        // that hits end-of-string with no ';' is not an entity.
+        assert_eq!(unescape_html_entities("&#65"), "&#65");
+    }
+
+    #[test]
+    fn unescape_four_byte_codepoint_entity() {
+        // rationale: utf8_char_len `b < 0xF0` FALSE side — a decoded 4-byte UTF-8
+        // codepoint (U+1F600 grinning face) is emitted then the scanner advances
+        // by its full 4-byte length. `&#128512;` = U+1F600.
+        let out = unescape_html_entities("a&#128512;b");
+        assert_eq!(out, "a\u{1F600}b");
+        assert!(out.contains('\u{1F600}'));
+    }
+
+    #[test]
+    fn unescape_too_short_numeric_entity_left_alone() {
+        // rationale: try_numeric_entity `b.len() < 4` TRUE side early-return —
+        // `&#x` (3 bytes after the &) is too short to be a numeric entity.
+        assert_eq!(unescape_html_entities("&#x"), "&#x");
     }
 }

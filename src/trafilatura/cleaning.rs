@@ -444,6 +444,10 @@ pub fn prune_html(tree: &NodeRef, focus: Focus) {
         // Tag must be in CUT_EMPTY_ELEMS.
         let tag = match &elem.data {
             NodeData::Element { name, .. } => name.local.as_ref(),
+            // llvm-cov:branch-not-reachable: `all_elements` is sourced from
+            // dom::get_elements_by_tag_name(tree, "*"), whose collector keeps
+            // ONLY NodeData::Element nodes (dom.rs:1083-1086). Every item here
+            // is therefore an Element; the non-element arm cannot fire.
             _ => continue,
         };
         if !CUT_EMPTY_ELEMS.contains(&tag) {
@@ -555,6 +559,10 @@ pub fn convert_tags(tree: &NodeRef, options: &Options) {
             // tag is one of REND_TAG_MAPPING keys; rend_of returns Some.
             let tag = match &elem.data {
                 NodeData::Element { name, .. } => name.local.as_ref().to_string(),
+                // llvm-cov:branch-not-reachable: `candidates` comes from
+                // get_elements_in_any -> dom::get_all_nodes_with_tag, which
+                // collects ONLY Element nodes (dom.rs:1101-1104). Non-element
+                // arm cannot fire.
                 _ => continue,
             };
             let Some(rend) = rend_of(&tag) else { continue };
@@ -601,6 +609,9 @@ pub fn convert_tags(tree: &NodeRef, options: &Options) {
     for elem in converted {
         let tag = match &elem.data {
             NodeData::Element { name, .. } => name.local.as_ref().to_string(),
+            // llvm-cov:branch-not-reachable: `converted` comes from
+            // get_elements_in_any -> dom::get_all_nodes_with_tag (Element-only
+            // collector, dom.rs:1101-1104). Non-element arm cannot fire.
             _ => continue,
         };
         match tag.as_str() {
@@ -622,6 +633,10 @@ pub fn convert_tags(tree: &NodeRef, options: &Options) {
             "details" => {
                 convert_details(&elem);
             }
+            // llvm-cov:branch-not-reachable: `converted` is filtered to
+            // exactly `conversions_keys` by get_elements_in_any, and every
+            // member of that list is matched by an arm above. The match is
+            // exhaustive over the only tags that can appear here.
             _ => unreachable!("conversions_keys filter is exhaustive"),
         }
     }
@@ -730,6 +745,9 @@ fn convert_lists(elem: &NodeRef) {
     // 290: elem.set("rend", elem.tag)
     let original_tag = match &elem.data {
         NodeData::Element { name, .. } => name.local.as_ref().to_string(),
+        // llvm-cov:branch-not-reachable: convert_lists is only called from
+        // convert_tags' CONVERSIONS dispatch over get_elements_in_any output
+        // (Element-only, dom.rs:1101-1104), so `elem` is always an Element.
         _ => return,
     };
     set_attribute(elem, "rend", &original_tag);
@@ -748,6 +766,9 @@ fn convert_lists(elem: &NodeRef) {
     for sub in subelems {
         let sub_tag = match &sub.data {
             NodeData::Element { name, .. } => name.local.as_ref().to_string(),
+            // llvm-cov:branch-not-reachable: `subelems` comes from
+            // get_elements_in_any -> dom::get_all_nodes_with_tag (Element-only
+            // collector, dom.rs:1101-1104). Non-element arm cannot fire.
             _ => continue,
         };
         // 295-299: rend bookkeeping for dd/dt.
@@ -772,6 +793,9 @@ fn convert_lists(elem: &NodeRef) {
 fn convert_quotes(elem: &NodeRef) {
     let tag = match &elem.data {
         NodeData::Element { name, .. } => name.local.as_ref().to_string(),
+        // llvm-cov:branch-not-reachable: convert_quotes is dispatched from
+        // convert_tags over get_elements_in_any output (Element-only,
+        // dom.rs:1101-1104); `elem` is always an Element.
         _ => return,
     };
     let mut code_flag = false;
@@ -809,6 +833,9 @@ fn convert_quotes(elem: &NodeRef) {
 fn convert_headings(elem: &NodeRef) {
     let original_tag = match &elem.data {
         NodeData::Element { name, .. } => name.local.as_ref().to_string(),
+        // llvm-cov:branch-not-reachable: convert_headings is dispatched from
+        // convert_tags over get_elements_in_any output (Element-only,
+        // dom.rs:1101-1104); `elem` is always an Element.
         _ => return,
     };
     // 323: elem.attrib.clear()
@@ -1631,6 +1658,10 @@ pub fn sanitize_tree(tree: &NodeRef, options: &Options) -> (String, usize) {
     for elem in dom::get_all_nodes_with_tag(tree, &["td", "th", "tr"]) {
         let tag = match local_name(&elem) {
             Some(t) => t,
+            // llvm-cov:branch-not-reachable: this loop iterates
+            // dom::get_all_nodes_with_tag output, which contains ONLY Element
+            // nodes (dom.rs:1101-1104), and `local_name` returns Some for every
+            // Element. The None arm cannot fire here.
             None => continue,
         };
         if tag.as_str() == "tr" {
@@ -3202,5 +3233,189 @@ mod tests {
         assert!(get_elements_by_tag_name(&b, "hi").is_empty());
         let t = crate::readability::dom::text_content(&b);
         assert!(t.contains("x") && t.contains("bold") && t.contains("y"));
+    }
+
+    // ---- Coverage: tree_cleaning images=true (htmlprocessing.py:58-61) ---
+
+    /// rationale: htmlprocessing.py:58-61 — `if options.images:` removes the
+    /// PRESERVE_IMG_CLEANING tags (`figure`/`picture`/`source`,
+    /// settings_constants.rs:113) from `cleaning_list` and removes `img` from
+    /// `stripping_list`. Pins the images=true arm (cleaning.rs:244-246): a
+    /// `<picture>` wrapper and an `<img>` both SURVIVE, whereas under the
+    /// default (images=false) they would be cleaned / stripped.
+    #[test]
+    fn tree_cleaning_images_true_preserves_picture_wrapper_and_img() {
+        let dom = parse(
+            "<div><p>body text</p><picture><img src='x.png'></picture></div>",
+        );
+        let b = body(&dom);
+        let opts = Options {
+            images: true,
+            ..Options::default()
+        };
+        tree_cleaning(&b, &opts);
+        // <picture> is in PRESERVE_IMG_CLEANING — NOT removed from the tree
+        // when images=true (it would be subtree-cleaned otherwise).
+        assert_eq!(
+            get_elements_by_tag_name(&b, "picture").len(),
+            1,
+            "picture wrapper must survive when images=true"
+        );
+        // <img> is removed from stripping_list — survives as a wrapper.
+        assert_eq!(
+            get_elements_by_tag_name(&b, "img").len(),
+            1,
+            "img must survive when images=true"
+        );
+    }
+
+    /// Negative control for the images arm: with the DEFAULT options
+    /// (images=false) the same `<picture>`/`<img>` are cleaned / stripped, so
+    /// the images=true test above is genuinely pinning the conditional rather
+    /// than an unconditional survival. rationale: settings.py:407-429 lists
+    /// `img` in MANUALLY_STRIPPED and PRESERVE_IMG_CLEANING members in
+    /// MANUALLY_CLEANED by default.
+    #[test]
+    fn tree_cleaning_images_false_default_removes_picture_and_img() {
+        let dom = parse(
+            "<div><p>body text</p><picture><img src='x.png'></picture></div>",
+        );
+        let b = body(&dom);
+        tree_cleaning(&b, &Options::default());
+        assert!(
+            get_elements_by_tag_name(&b, "picture").is_empty(),
+            "picture cleaned by default"
+        );
+        assert!(
+            get_elements_by_tag_name(&b, "img").is_empty(),
+            "img stripped by default"
+        );
+    }
+
+    // ---- Coverage: convert_link with no base_url (htmlprocessing.py:374-378) -
+
+    /// rationale: htmlprocessing.py:374-378 — when `target` (the href) is
+    /// present but `base_url` is None, the href is used VERBATIM (no
+    /// `fix_relative_urls` call). Pins the `None => href` arm of convert_link's
+    /// base-url match (cleaning.rs:682-685), which the existing convert_link
+    /// tests never hit (they all pass `Some(base)`).
+    #[test]
+    fn convert_link_without_base_url_uses_href_verbatim() {
+        let dom = parse(r#"<html><body><a href="/relative/path">x</a></body></html>"#);
+        let b = body(&dom);
+        let a = get_elements_by_tag_name(&b, "a")[0].clone();
+        // base_url None: the relative href is NOT resolved, used as-is.
+        convert_link(&a, None);
+        let refs = get_elements_by_tag_name(&b, "ref");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(
+            crate::readability::dom::get_attribute(&refs[0], "target").as_deref(),
+            Some("/relative/path"),
+            "with no base_url the href is used verbatim"
+        );
+    }
+
+    /// rationale: end-to-end variant — `convert_tags(links=true, url=None)`
+    /// routes every `<a href>` through convert_link with `base_url = None`
+    /// (cleaning.rs:537-543 yields None when options.url is None). Pins the
+    /// same `None => href` arm through the public convert_tags entry point.
+    #[test]
+    fn convert_tags_links_true_no_url_keeps_relative_href_verbatim() {
+        let dom = parse(r#"<html><body><div><a href="/foo">A</a></div></body></html>"#);
+        let b = body(&dom);
+        let opts = Options {
+            links: true,
+            url: None,
+            ..Options::default()
+        };
+        convert_tags(&b, &opts);
+        let refs = get_elements_by_tag_name(&b, "ref");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(
+            crate::readability::dom::get_attribute(&refs[0], "target").as_deref(),
+            Some("/foo"),
+            "no base_url -> relative href unchanged"
+        );
+    }
+
+    // ---- Coverage: handle_textnode lb->p rename (htmlprocessing.py:248-249) -
+
+    /// rationale: htmlprocessing.py:243-249 — when an element has no text and
+    /// no element children, its tail is moved into text; AND when that element
+    /// is an `<lb>` with `comments_fix=true`, it is retagged to `<p>`
+    /// (htmlprocessing.py:248: `if comments_fix and elem.tag == "lb":
+    /// elem.tag = "p"`). Pins the lb->p rename arm (cleaning.rs:1363-1371):
+    /// the returned node is the NEW `<p>` carrying the moved-in text.
+    #[test]
+    fn handle_textnode_lb_becomes_p_when_comments_fix_and_tail_only() {
+        // <div><lb/>TAIL</div> — lb has no text, no element children, tail
+        // "moved here". With comments_fix=true the lb is retagged to <p> and
+        // the tail becomes its text.
+        let wrap = create_element("div");
+        let lb = create_element("lb");
+        dom::append_child(&wrap, &lb);
+        set_tail(&lb, Some("moved here"));
+        let opts = Options::default();
+        let got = handle_textnode(&lb, &opts, /*comments_fix=*/ true, /*preserve_spaces=*/ false);
+        let got = got.expect("lb with moved tail survives as <p>");
+        // The returned node is a fresh <p> (the old lb is detached).
+        assert_eq!(
+            local_name(&got).as_deref(),
+            Some("p"),
+            "lb must be retagged to p under comments_fix"
+        );
+        assert_eq!(
+            element_text(&got).as_deref(),
+            Some("moved here"),
+            "the lb's tail moves into the new p's text"
+        );
+        // The new <p> now lives under the wrapper (the lb is gone).
+        assert!(
+            get_elements_by_tag_name(&wrap, "lb").is_empty(),
+            "the original lb must be replaced"
+        );
+        assert_eq!(get_elements_by_tag_name(&wrap, "p").len(), 1);
+    }
+
+    // ---- Coverage: sanitize_tree th -> role=head + cell (external.py:177-180) -
+
+    /// rationale: external.py:172-180 — the table-cell rename pass retags
+    /// `<th>` to `<cell role="head">` (set `role="head"` BEFORE retag so the
+    /// attribute is cloned onto the new node), `<td>` to `<cell>` (no role),
+    /// and `<tr>` to `<row>`. Pins the `th` branch (cleaning.rs:1644-1645) —
+    /// the `set_attribute(&elem, "role", "head")` arm — plus the tr->row and
+    /// td->cell arms in the same pass.
+    #[test]
+    fn sanitize_tree_th_becomes_cell_with_role_head() {
+        let html = r#"<html><body>
+            <table>
+                <tr><th>Header cell content here</th><td>Data cell content here</td></tr>
+            </table>
+        </body></html>"#;
+        let dom = parse(html);
+        let b = body(&dom);
+        let opts = Options::default();
+        let _ = sanitize_tree(&b, &opts);
+        // No table-html tags remain — all retagged to TEI cell/row.
+        assert!(get_elements_by_tag_name(&b, "th").is_empty(), "th retagged");
+        assert!(get_elements_by_tag_name(&b, "td").is_empty(), "td retagged");
+        assert!(get_elements_by_tag_name(&b, "tr").is_empty(), "tr retagged");
+        let rows = get_elements_by_tag_name(&b, "row");
+        assert_eq!(rows.len(), 1, "tr -> row");
+        let cells = get_elements_by_tag_name(&b, "cell");
+        assert_eq!(cells.len(), 2, "th and td -> cell");
+        // Exactly one cell carries role="head" (the former <th>); the other
+        // (former <td>) has no role.
+        let head_cells: Vec<&NodeRef> = cells
+            .iter()
+            .filter(|c| {
+                crate::readability::dom::get_attribute(c, "role").as_deref() == Some("head")
+            })
+            .collect();
+        assert_eq!(
+            head_cells.len(),
+            1,
+            "only the former <th> cell carries role=head"
+        );
     }
 }

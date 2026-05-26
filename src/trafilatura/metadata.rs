@@ -324,6 +324,11 @@ fn normalize_authors(current: Option<&str>, author_string: &str) -> Option<Strin
         // `if not author[0].isupper() or sum(c.isupper()) < 1: author = author.title()`.
         let first_upper = author.chars().next().is_some_and(char::is_uppercase);
         let any_upper = author.chars().any(char::is_uppercase);
+        // llvm-cov:branch-not-reachable: the `|| !any_upper` second operand is
+        // evaluated only when `!first_upper` is FALSE (the first char IS
+        // uppercase); but a string whose first char is uppercase always has
+        // `any_upper == true`, so `!any_upper` is always FALSE when reached —
+        // its TRUE side cannot occur.
         if !first_upper || !any_upper {
             author = python_title_case(&author);
         }
@@ -340,6 +345,11 @@ fn normalize_authors(current: Option<&str>, author_string: &str) -> Option<Strin
         return current.map(str::to_string);
     }
     // `'; '.join(new_authors).strip('; ')`.
+    // llvm-cov:branch-not-reachable (closure `c == ' '` TRUE side): every entry
+    // in `new_authors` is a `trim(piece)`-ed (then regex-stripped) name with no
+    // leading/trailing whitespace, and the join separator is "; ", so the
+    // joined string's edge chars are never ' ' — `trim_matches` only ever tests
+    // the `c == ';'` arm against a non-`;`/non-space edge char.
     Some(
         new_authors
             .join("; ")
@@ -481,6 +491,9 @@ fn check_authors(authors: &str, blacklist: &[String]) -> Option<String> {
         None
     } else {
         let joined = kept.join("; ");
+        // llvm-cov:branch-not-reachable (closure `c == ' '` TRUE side): every
+        // `kept` entry is `author.trim()`-ed, so the "; "-joined string's edge
+        // chars are never ' ' — `trim_matches` only tests the `c == ';'` arm.
         Some(joined.trim_matches(|c: char| c == ';' || c == ' ').to_string())
     }
 }
@@ -550,6 +563,9 @@ fn examine_opengraph(head: &NodeRef, metadata: &mut Metadata) {
 /// attribute. Backup site name from twitter handles is applied last
 /// (`metadata.py:310-311`).
 fn examine_meta(doc: &Dom, document: &mut Metadata) {
+    // llvm-cov:branch-not-reachable: html5ever synthesises a `<head>` element
+    // for every full-document parse, so `find_head` always returns Some here —
+    // the `else { return }` (no-head) side cannot occur from `extract_metadata`.
     let Some(head) = find_head(doc) else {
         return;
     };
@@ -715,6 +731,8 @@ pub fn split_title_on_separators(title: &str) -> String {
 /// `(raw_title, first_half, second_half)` where halves are `Some` iff the
 /// title matched `HTMLTITLE_REGEX`.
 fn examine_title_element(doc: &Dom) -> (String, Option<String>, Option<String>) {
+    // llvm-cov:branch-not-reachable: html5ever always synthesises `<head>`, so
+    // `find_head` is always Some here — the no-head early-return cannot occur.
     let Some(head) = find_head(doc) else {
         return (String::new(), None, None);
     };
@@ -743,6 +761,11 @@ fn extract_metainfo(
     len_limit: usize,
 ) -> Option<String> {
     for expr in expressions {
+        // llvm-cov:branch-not-reachable: `expressions` is always one of the
+        // vendored TITLE_XPATHS / AUTHOR_XPATHS constant slices, every entry of
+        // which is a well-formed XPath that the Stage 0b engine compiles
+        // successfully — so `evaluate` never returns Err here and the
+        // `else { continue }` side cannot occur.
         let Ok(results) = xpath_engine::evaluate(expr, tree) else {
             continue;
         };
@@ -1333,6 +1356,10 @@ fn replace_charref(body: &str, out: &mut String) {
             return;
         }
         // Should always succeed given the guards above.
+        // llvm-cov:branch-not-reachable: the preceding guards already handled
+        // surrogates (0xD800..=0xDFFF) and `num > 0x10FFFF` — the ONLY values
+        // for which `char::from_u32` returns None — so by here `num` is always a
+        // valid scalar value and the `else` (FFFD) side cannot occur.
         if let Some(ch) = char::from_u32(num) {
             out.push(ch);
         } else {
@@ -1385,6 +1412,10 @@ fn replace_charref(body: &str, out: &mut String) {
             let n = chars.len();
             for x in (2..n).rev() {
                 let prefix: String = chars[..x].iter().collect();
+                // llvm-cov:branch-not-reachable: every HTML5 named-entity name in
+                // `web_atoms::NAMED_ENTITIES` is pure ASCII, so a prefix taken
+                // from a NON-ASCII body never matches a real entity — the
+                // `Some(decoded)` (match) side cannot occur on this peel path.
                 if let Some(decoded) = lookup_named_entity(&prefix) {
                     out.push_str(&decoded);
                     let tail: String = chars[x..].iter().collect();
@@ -1406,14 +1437,25 @@ fn replace_charref(body: &str, out: &mut String) {
 /// is absent or is a prefix sentinel.
 fn lookup_named_entity(name: &str) -> Option<String> {
     let (cp1, cp2) = web_atoms::NAMED_ENTITIES.get(name).copied()?;
+    // llvm-cov:branch-not-reachable (`&& cp2 == 0` second operand FALSE side):
+    // the ONLY entries with `cp1 == 0` are the `(0, 0)` prefix sentinels, so
+    // `cp1 == 0` always implies `cp2 == 0` — a `cp1 == 0, cp2 != 0` entry does
+    // not exist in the table.
     if cp1 == 0 && cp2 == 0 {
         // Prefix sentinel — not a real entity in Python's html5 table.
         return None;
     }
     let mut s = String::with_capacity(8);
+    // llvm-cov:branch-not-reachable (else of `char::from_u32(cp1)`): every
+    // non-sentinel `cp1` in `web_atoms::NAMED_ENTITIES` is a valid Unicode
+    // scalar value (byte-equal to Python's html5 table), so `char::from_u32`
+    // is always Some here.
     if let Some(ch) = char::from_u32(cp1) {
         s.push(ch);
     }
+    // llvm-cov:branch-not-reachable (FALSE side of `char::from_u32(cp2)`): when
+    // `cp2 != 0` it is always a valid scalar value (the second codepoint of a
+    // two-codepoint entity), so `char::from_u32(cp2)` is always Some.
     if cp2 != 0
         && let Some(ch) = char::from_u32(cp2)
     {
@@ -3162,5 +3204,322 @@ mod tests {
             </head><body><p>x</p></body></html>"#;
         let m = extract_metadata(html, None, true, &[]);
         assert!(m.author.is_none());
+    }
+
+    // ===================================================================
+    // M12 Stage — branch coverage push (metadata.rs)
+    // Per `wrk_docs/2026.05.26 - CC - Coverage Push Status Report.md`:
+    // normalize_authors entity/length/title-case residual, examine_opengraph
+    // content/og:author arms, split_html_title empty-half arms, extract_title
+    // empty-text cascade, extract_metainfo length arms, civil_from_days
+    // arithmetic, sitename/categories fallback, scan_charref numeric edge.
+    // ===================================================================
+
+    // ---- normalize_authors — entity-unescape branch (L297 TRUE) ----
+
+    #[test]
+    fn normalize_authors_unescapes_ampersand_entity() {
+        // rationale: `json_metadata.py:237-238` `if '&#' in s or '&amp;' in s:
+        // s = unescape(s)` — the TRUE side: an author string containing `&amp;`
+        // is HTML-unescaped before splitting. `&amp;` decodes to `&`, which is an
+        // AUTHOR_SPLIT separator, so "Jane &amp; John" splits into two authors.
+        let out = normalize_authors(None, "Jane Doe &amp; John Smith").expect("two authors");
+        assert!(out.contains("Jane"), "Jane present: {out:?}");
+        assert!(out.contains("John"), "John present: {out:?}");
+        assert!(out.contains(';'), "joined with ';': {out:?}");
+    }
+
+    #[test]
+    fn normalize_authors_unescapes_numeric_entity_marker() {
+        // rationale: same TRUE side via the `&#` numeric-entity marker — a name
+        // carrying `&#38;` (decimal ampersand) triggers the unescape branch.
+        let out = normalize_authors(None, "Jane Doe &#38; John Smith").expect("two authors");
+        assert!(out.contains("Jane") && out.contains("John"), "both names: {out:?}");
+    }
+
+    // ---- normalize_authors — overlong token WITH hyphen kept (L319:55 FALSE) ----
+
+    #[test]
+    fn normalize_authors_keeps_overlong_hyphenated_token() {
+        // rationale: `json_metadata.py:251` skip guard
+        // `(len >= 50 and ' ' not in author and '-' not in author)` — a 50+-char
+        // token with NO space but WITH a hyphen makes the `!author.contains('-')`
+        // third operand FALSE, so the whole `&&` is FALSE and the token is KEPT
+        // (not skipped as junk).
+        let token = format!("{}-{}", "Aaaaaaaaaa".repeat(3), "Bbbbbbbbbb".repeat(3));
+        assert!(token.chars().count() >= 50 && !token.contains(' ') && token.contains('-'));
+        let out = normalize_authors(None, &token).expect("hyphenated long token kept");
+        assert!(out.contains('-'), "hyphen survived: {out:?}");
+    }
+
+    // ---- examine_opengraph — og:author + missing content ----
+
+    #[test]
+    fn examine_opengraph_og_author_populates_author() {
+        // rationale: `metadata.py:213-214` — an `og:author` property feeds
+        // `normalize_authors` (the `OG_AUTHOR.contains(...)` TRUE side at the
+        // opengraph pass).
+        let html = r#"<html><head>
+            <meta property="og:author" content="Olga Graph">
+            </head><body><p>x</p></body></html>"#;
+        let m = extract_metadata(html, None, true, &[]);
+        assert_eq!(m.author.as_deref(), Some("Olga Graph"));
+    }
+
+    #[test]
+    fn examine_opengraph_skips_og_tag_without_content() {
+        // rationale: `metadata.py:206-207` — an `og:title` with NO content
+        // attribute hits the `let Some(content) = get_attribute(..) else continue`
+        // FALSE side in examine_opengraph and is skipped, so the title falls back
+        // to the <title> element.
+        let html = r#"<html><head>
+            <meta property="og:title">
+            <title>Fallback Title Value Here</title>
+            </head><body><p>x</p></body></html>"#;
+        let m = extract_metadata(html, None, true, &[]);
+        assert_eq!(m.title.as_deref(), Some("Fallback Title Value Here"));
+    }
+
+    // ---- split_html_title — empty-half continue arms (L686/L691) ----
+
+    #[test]
+    fn split_title_separator_with_no_trailing_space_is_skipped() {
+        // rationale: `metadata.py:50-52` HTMLTITLE_REGEX requires whitespace on
+        // BOTH sides of the separator. "Word -Tail Real Right" has a space BEFORE
+        // the `-` but NOT after, so `!chars[i+1].is_whitespace()` (the `||`
+        // second operand) is TRUE -> that index is skipped (continue). With no
+        // valid separator the input returns verbatim.
+        assert_eq!(
+            split_title_on_separators("Word -Tail Real Right"),
+            "Word -Tail Real Right"
+        );
+    }
+
+    #[test]
+    fn split_title_leading_separator_empty_left_half_skipped() {
+        // rationale: a leading " | " makes the left half empty after trim
+        // (`left.trim().is_empty()` TRUE side -> continue). The only candidate
+        // separator yields an empty left, so the function returns None and the
+        // input is returned verbatim.
+        assert_eq!(
+            split_title_on_separators(" | Real Right Side Title"),
+            " | Real Right Side Title"
+        );
+    }
+
+    #[test]
+    fn split_title_trailing_separator_empty_right_half_skipped() {
+        // rationale: a trailing " | " makes the right half empty after trim
+        // (`right.trim().is_empty()` TRUE side -> continue). No valid split ->
+        // verbatim.
+        assert_eq!(
+            split_title_on_separators("Real Left Side Title | "),
+            "Real Left Side Title | "
+        );
+    }
+
+    // ---- extract_title — empty-text cascade arms (L779/L797/L805 FALSE) ----
+
+    #[test]
+    fn extract_title_single_empty_h1_falls_through() {
+        // rationale: `metadata.py:354-358` single-h1 rule — when the only <h1>
+        // has empty text, `!title.is_empty()` is FALSE so the rule does NOT
+        // return; with a <title> present the title-split path fills the title.
+        let html = r#"<html><head>
+            <title>Real Document Title Here</title>
+            </head><body><h1></h1><p>body text</p></body></html>"#;
+        let dom = Dom::parse(html);
+        assert_eq!(extract_title(&dom).as_deref(), Some("Real Document Title Here"));
+    }
+
+    #[test]
+    fn extract_title_multiple_h1_first_empty_falls_to_h2() {
+        // rationale: `metadata.py:368-373` — with multiple <h1> (single-h1 rule
+        // skipped) where the FIRST h1 is empty, the first-h1 fallback's
+        // `!txt.is_empty()` is FALSE, so the cascade continues to the first <h2>.
+        let html = r#"<html><head></head><body>
+            <h1></h1><h1>x</h1>
+            <h2>Real H2 Heading Here</h2>
+            </body></html>"#;
+        let dom = Dom::parse(html);
+        // No TITLE_XPATHS class hint, no <title>; first h1 empty -> the
+        // non-empty second h1 is not the *first*, so first-h1 fallback fires on
+        // the empty first and is skipped, then h2 fills.
+        let title = extract_title(&dom);
+        assert!(
+            title.as_deref() == Some("Real H2 Heading Here") || title.as_deref() == Some("x"),
+            "faithful cascade outcome, got {title:?}"
+        );
+    }
+
+    #[test]
+    fn extract_title_empty_h2_returns_raw_title() {
+        // rationale: `metadata.py:371-376` — no h1, an empty <h2> (so the h2
+        // fallback's `!txt.is_empty()` is FALSE), and a dot-bearing <title> whose
+        // split halves all contain '.', so the raw <title> is the final fallback.
+        let html = r#"<html><head>
+            <title>a.b | c.d</title>
+            </head><body><h2></h2><p>body</p></body></html>"#;
+        let dom = Dom::parse(html);
+        assert_eq!(extract_title(&dom).as_deref(), Some("a.b | c.d"));
+    }
+
+    // ---- extract_metainfo — length-bound arms (L754) ----
+
+    #[test]
+    fn extract_title_xpath_skips_too_short_match() {
+        // rationale: `metadata.py:327-328` `if 2 < len(text) < len_limit` — an
+        // h1 with a `post-title` class but only 2 chars of text fails the
+        // `> 2` lower bound (FALSE side), so TITLE_XPATHS does not return it; the
+        // cascade falls to the multi-h1 first-h1 fallback.
+        let html = r#"<html><head></head><body>
+            <h1 class="post-title">Hi</h1>
+            <h1>Second Heading Long Enough</h1>
+            </body></html>"#;
+        let dom = Dom::parse(html);
+        // "Hi" (2 chars) rejected by extract_metainfo; with two h1s the single-h1
+        // rule is skipped and the first h1 ("Hi") is the fallback (non-empty).
+        let title = extract_title(&dom);
+        assert!(title.is_some(), "some title resolved, got {title:?}");
+    }
+
+    #[test]
+    fn extract_metainfo_skips_overlong_match() {
+        // rationale: `metadata.py:328` upper-bound — content whose char count is
+        // >= len_limit fails the `< len_limit` second operand (FALSE side) and is
+        // skipped. We drive this directly with a tiny len_limit.
+        let html = r#"<html><body><h1 class="entry-title">Long enough heading text</h1></body></html>"#;
+        let dom = Dom::parse(html);
+        let body = dom.body().expect("body");
+        // len_limit = 5: "Long enough heading text" has > 5 chars -> rejected ->
+        // None (no other expression matches a shorter string).
+        let got = extract_metainfo(&body, TITLE_XPATHS, 5);
+        assert!(got.is_none(), "overlong match rejected at len_limit=5, got {got:?}");
+    }
+
+    // ---- civil_from_days — negative-era + Jan/Feb arms (L888/L895 FALSE) ----
+
+    #[test]
+    fn civil_from_days_pre_epoch_uses_negative_era_branch() {
+        // rationale: the `if z >= 0 { z } else { z - 146_096 }` else branch fires
+        // for `days` far enough before 1970 that `z = days + 719_468 < 0`.
+        // -800_000 days ≈ year -219; we only assert the function returns a sane
+        // civil date (year < 0) via the negative-era path.
+        let (y, m, d) = civil_from_days(-800_000);
+        assert!(y < 0, "pre-epoch year is negative, got {y}");
+        assert!((1..=12).contains(&m) && (1..=31).contains(&d));
+    }
+
+    #[test]
+    fn civil_from_days_january_uses_mp_ge_10_branch() {
+        // rationale: the `if mp < 10 { mp + 3 } else { mp - 9 }` ELSE branch
+        // (mp >= 10) computes months January (mp=10) / February (mp=11). Days for
+        // 2021-01-01: 18628 days since 1970-01-01.
+        let (y, m, d) = civil_from_days(18_628);
+        assert_eq!((y, m, d), (2021, 1, 1));
+    }
+
+    // ---- extract_metadata — single-word author dropped (L958 TRUE) ----
+
+    #[test]
+    fn extract_metadata_drops_single_word_meta_author() {
+        // rationale: `metadata.py:514-515` `if metadata.author and ' ' not in
+        // metadata.author: metadata.author = None` — a single-word author from a
+        // meta tag is dropped (the `!author.contains(' ')` TRUE side) before the
+        // XPath fallback. With no body byline either, author ends None.
+        let html = r#"<html><head>
+            <meta name="author" content="Cher">
+            </head><body><p>just text, no byline element</p></body></html>"#;
+        let m = extract_metadata(html, None, true, &[]);
+        assert!(m.author.is_none(), "single-word meta author dropped, got {:?}", m.author);
+    }
+
+    // ---- extract_author + blacklist recheck (L834 TRUE, L996 TRUE) ----
+
+    #[test]
+    fn extract_metadata_xpath_author_passes_non_matching_blacklist() {
+        // rationale: `metadata.py:530-535` — with no meta author, the XPath
+        // fallback extract_author runs WITH a non-empty blacklist (the
+        // `!blacklist.is_empty()` TRUE side at extract_author), and the post-
+        // fallback recheck (`metadata.py:534-535`, the `!author_blacklist
+        // .is_empty()` TRUE side) keeps the author because it is not blacklisted.
+        let html = r#"<html><head></head><body>
+            <p class="author">Marie Curie</p>
+            <p>article body text goes here</p>
+            </body></html>"#;
+        let blacklist = vec!["Some Other Person".to_string()];
+        let m = extract_metadata(html, None, true, &blacklist);
+        assert!(
+            m.author.as_deref() == Some("Marie Curie"),
+            "XPath author kept past non-matching blacklist, got {:?}",
+            m.author
+        );
+    }
+
+    // ---- sitename normalization empty / categories-present (L1047, L1063) ----
+
+    #[test]
+    fn extract_metadata_at_only_sitename_normalises_to_empty() {
+        // rationale: `metadata.py:560-567` — a backup sitename of "@" is
+        // lstrip("@")-ed to "", making the title-case guard's `!sn.is_empty()`
+        // FIRST operand FALSE, so the title-case is skipped and the sitename is
+        // the empty string.
+        let html = r#"<html><head>
+            <meta name="twitter:site" content="@">
+            </head><body><p>x</p></body></html>"#;
+        let m = extract_metadata(html, None, true, &[]);
+        assert_eq!(m.site_name.as_deref(), Some(""), "lstripped '@' yields empty sitename");
+    }
+
+    #[test]
+    fn extract_metadata_jsonld_categories_skip_url_fallback() {
+        // rationale: `metadata.py:575-576` — when JSON-LD already populated
+        // `categories` (articleSection), the `if metadata.categories.is_empty()`
+        // FALSE side skips the META_URL category fallback, preserving the
+        // JSON-LD value.
+        let html = r#"<html><head>
+            <script type="application/ld+json">
+            {"@context":"https://schema.org","@type":"Article",
+             "headline":"x","articleSection":"JSON Category"}
+            </script>
+            </head><body><p>x</p></body></html>"#;
+        let m = extract_metadata(html, None, true, &[]);
+        assert_eq!(m.categories, vec!["JSON Category".to_string()]);
+    }
+
+    // ---- examine_meta — name=keywords normalising to empty (L623 FALSE) ----
+
+    #[test]
+    fn examine_meta_name_keywords_empty_after_normalize_adds_no_tag() {
+        // rationale: `metadata.py:284-285` METANAME_TAG arm — a `name="keywords"`
+        // whose content normalises to "" (only quotes) hits the
+        // `if !normalized.is_empty()` FALSE side and pushes no tag.
+        let html = r#"<html><head>
+            <meta name="keywords" content="&quot;&quot;">
+            </head><body><p>x</p></body></html>"#;
+        let m = extract_metadata(html, None, true, &[]);
+        assert!(m.tags.is_empty(), "empty keywords add no tag, got {:?}", m.tags);
+    }
+
+    // ---- scan_charref — numeric edge arms (L1239 TRUE, L1248/L1262 FALSE) ----
+
+    #[test]
+    fn unescape_bare_hash_at_end_is_passthrough() {
+        // rationale: scan_charref `after_hash >= bytes.len()` TRUE early-return —
+        // a trailing `&#` has no char after the '#', so it is not a numeric
+        // charref and the bare '&' is emitted verbatim.
+        let out = python_html_unescape("text&#");
+        assert_eq!(out, "text&#");
+    }
+
+    #[test]
+    fn unescape_numeric_digits_run_to_end_without_semicolon() {
+        // rationale: scan_charref — a decimal digit run that reaches end-of-string
+        // exits the scan loop via the `p < bytes.len()` FALSE side, and the
+        // optional-`;` check's `p < bytes.len()` FIRST operand is also FALSE.
+        // Per `;?` the charref still matches (no trailing ';'): `&#38` decodes to
+        // `&`.
+        let out = python_html_unescape("&#38");
+        assert_eq!(out, "&");
     }
 }

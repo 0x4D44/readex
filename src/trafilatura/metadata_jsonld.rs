@@ -153,6 +153,10 @@ const JSON_PUBLISHER_SCHEMA: &[&str] = &[
 /// `json.JSONDecodeError` catch, minus the regex-rescue path — see the
 /// module header).
 pub fn extract_meta_json(dom: &Dom, metadata: &mut Metadata) {
+    // llvm-cov:branch-not-reachable: `Dom::parse` (html5ever) always synthesises
+    // an `<html>` root element for any input, so `root_element()` is always
+    // Some here — the `None` early-return cannot be reached from the public
+    // entry point. (Defensive guard retained for the type signature.)
     let Some(root) = dom.root_element() else {
         return;
     };
@@ -225,6 +229,10 @@ fn extract_json(schema: &Value, metadata: &mut Metadata) {
                 }
             } else if is_liveblog_with_updates(parent) {
                 // `json_metadata.py:153-154`: liveblogposting carve-out.
+                // llvm-cov:branch-not-reachable: `is_liveblog_with_updates`
+                // already returned true ONLY when `parent.get("liveBlogUpdate")`
+                // is_some(), so `get(...)` here is always Some — the `else`
+                // (None) side cannot occur (the predicate is the invariant).
                 if let Some(updates) = parent.get("liveBlogUpdate") {
                     match updates {
                         Value::Array(arr) => effective.extend(arr.iter()),
@@ -808,6 +816,11 @@ fn extract_json_author(elemtext: &str, regex: &Regex) -> Option<String> {
             .get(1)
             .or_else(|| caps.get(2))
             .map(|m| m.as_str().to_string());
+        // llvm-cov:branch-not-reachable: JSON_AUTHOR_1 is a two-alternative
+        // pattern where each alternative carries one capture group (group 1 or
+        // group 2), and JSON_AUTHOR_2 carries a single mandatory group — so any
+        // successful `captures` populates at least one of group 1 / group 2.
+        // The `None` (break) side cannot occur.
         let Some(candidate) = candidate else { break };
         // `while mymatch and ' ' in mymatch[1]` — only loop while the
         // candidate contains a space.
@@ -851,6 +864,12 @@ fn normalize_json(s: &str) -> String {
                         // Lone surrogate — drop.
                         return String::new();
                     }
+                    // llvm-cov:branch-not-reachable: the regex captures exactly
+                    // 4 hex digits, so `cp <= 0xFFFF`; the surrogate range was
+                    // already returned above; every remaining BMP scalar value
+                    // is a valid `char`, so `char::from_u32` is always Some — the
+                    // None side (returning the empty fallback below for this
+                    // path) cannot occur.
                     if let Some(c) = char::from_u32(cp) {
                         return c.to_string();
                     }
@@ -877,6 +896,10 @@ fn extract_json_parse_error(elem: &str, metadata: &mut Metadata) {
     let element_text_author = json_author_remove_re().replace_all(elem, "").into_owned();
     let author = extract_json_author(&element_text_author, json_author_1_re())
         .or_else(|| extract_json_author(&element_text_author, json_author_2_re()));
+    // llvm-cov:branch-not-reachable: `extract_json_author` accumulates names
+    // ONLY through `merge_author`, which returns a non-empty `Some` (or `None`),
+    // so `author` is never `Some("")` — the `!a.is_empty()` FALSE side cannot
+    // occur.
     if let Some(a) = author
         && !a.is_empty()
     {
@@ -886,6 +909,9 @@ fn extract_json_parse_error(elem: &str, metadata: &mut Metadata) {
     // ── pagetype (`json_metadata.py:183-189`)
     if elem.contains("@type")
         && let Some(caps) = json_type_re().captures(elem)
+        // llvm-cov:branch-not-reachable: JSON_TYPE = `"@type"\s*:\s*"([^"]*)"`
+        // has a single MANDATORY capture group, so any successful `captures`
+        // populates group 1 — `caps.get(1)` is always Some here.
         && let Some(group) = caps.get(1)
     {
         let candidate = normalize_json(&group.as_str().to_ascii_lowercase());
@@ -897,6 +923,9 @@ fn extract_json_parse_error(elem: &str, metadata: &mut Metadata) {
     // ── publisher (`json_metadata.py:191-197`)
     if elem.contains("\"publisher\"")
         && let Some(caps) = json_publisher_re().captures(elem)
+        // llvm-cov:branch-not-reachable: JSON_PUBLISHER has a single MANDATORY
+        // capture group `([^"\\]+)`, so a successful `captures` always
+        // populates group 1.
         && let Some(group) = caps.get(1)
         && !group.as_str().contains(',')
     {
@@ -909,6 +938,9 @@ fn extract_json_parse_error(elem: &str, metadata: &mut Metadata) {
     // ── category (`json_metadata.py:200-203`)
     if elem.contains("\"articleSection\"")
         && let Some(caps) = json_category_re().captures(elem)
+        // llvm-cov:branch-not-reachable: JSON_CATEGORY has a single MANDATORY
+        // capture group `([^"\\]+)`, so a successful `captures` always
+        // populates group 1.
         && let Some(group) = caps.get(1)
     {
         let cleaned = normalize_json(group.as_str());
@@ -926,6 +958,9 @@ fn extract_json_parse_error(elem: &str, metadata: &mut Metadata) {
         ] {
             if elem.contains(key)
                 && let Some(caps) = regex.captures(elem)
+                // llvm-cov:branch-not-reachable: both JSON_NAME and JSON_HEADLINE
+                // have a single MANDATORY capture group `([^"\\]+)`, so a
+                // successful `captures` always populates group 1.
                 && let Some(group) = caps.get(1)
             {
                 let cleaned = normalize_json(group.as_str());
@@ -2725,5 +2760,297 @@ mod tests {
         let author = m.author.expect("recovered authors");
         assert!(author.contains("Jane Roe"), "first author present: {author:?}");
         assert!(author.contains("John Doe"), "second author present: {author:?}");
+    }
+
+    // ===================================================================
+    // M12 Stage — branch coverage push (metadata_jsonld.rs)
+    // Per `wrk_docs/2026.05.26 - CC - Coverage Push Status Report.md`:
+    // walk_article / process_parent / extract_author_names residual
+    // polymorphic shapes; extract_json_parse_error salvage arms.
+    // ===================================================================
+
+    // ---- walk_article — `!cleaned.is_empty()` FALSE sides ----
+    // A schema.org value that is ONLY HTML tags normalizes (tag-strip + trim)
+    // to "", exercising the `if !cleaned.is_empty()` FALSE side of each field.
+
+    #[test]
+    fn walk_article_articlesection_string_empty_after_strip_adds_nothing() {
+        // rationale: `json_metadata.py:126-130` String arm — articleSection that
+        // is only HTML tags normalizes to "" -> `!cleaned.is_empty()` FALSE ->
+        // no category pushed.
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "articleSection": "<b></b>"}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.categories.is_empty(), "empty section adds nothing");
+    }
+
+    #[test]
+    fn walk_article_articlesection_array_empty_entry_skipped() {
+        // rationale: articleSection Array arm — an entry that strips to "" is
+        // skipped (FALSE side) while a real entry is kept.
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "articleSection": ["<i></i>", "Real Cat"]}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.categories, vec!["Real Cat"]);
+    }
+
+    #[test]
+    fn walk_article_keywords_string_empty_part_skipped() {
+        // rationale: keywords String arm comma-split — an all-tags part strips to
+        // "" (FALSE side) and is not pushed; the real keyword survives.
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "keywords": "<b></b>,realtag"}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.tags, vec!["realtag"]);
+    }
+
+    #[test]
+    fn walk_article_keywords_array_empty_entry_skipped() {
+        // rationale: keywords Array arm — an all-tags entry strips to "" (FALSE
+        // side) and is skipped.
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "keywords": ["<span></span>", "kept"]}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.tags, vec!["kept"]);
+    }
+
+    #[test]
+    fn walk_article_headline_empty_after_strip_leaves_title_none() {
+        // rationale: `json_metadata.py:132-137` headline arm — a tags-only
+        // headline strips to "" (`!cleaned.is_empty()` FALSE) so title is NOT set
+        // by the headline branch.
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "headline": "<b></b>"}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.title.is_none(), "empty headline leaves title None");
+    }
+
+    #[test]
+    fn walk_article_name_empty_after_strip_leaves_title_none() {
+        // rationale: the `else if name` title arm — a tags-only `name` (with no
+        // headline) strips to "" (FALSE side) so title stays None.
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "name": "<i></i>"}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.title.is_none(), "empty name leaves title None");
+    }
+
+    #[test]
+    fn walk_article_datepublished_empty_after_strip_leaves_date_none() {
+        // rationale: datePublished arm — a tags-only value strips to "" (FALSE
+        // side) so date is not set.
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "datePublished": "<b></b>"}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.date.is_none(), "empty datePublished leaves date None");
+    }
+
+    #[test]
+    fn walk_article_datemodified_empty_after_strip_leaves_date_none() {
+        // rationale: the `else if dateModified` arm — a tags-only dateModified
+        // (with no datePublished) strips to "" (FALSE side) so date stays None.
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "dateModified": "<i></i>"}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.date.is_none(), "empty dateModified leaves date None");
+    }
+
+    #[test]
+    fn walk_article_image_string_empty_after_strip_leaves_image_none() {
+        // rationale: image candidate (String) that strips to "" -> the
+        // `!cleaned.is_empty()` FALSE side leaves image None.
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "image": "<b></b>"}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.image.is_none(), "empty image leaves image None");
+    }
+
+    #[test]
+    fn walk_article_datemodified_fills_date_when_no_datepublished() {
+        // rationale: the `else if dateModified` arm TRUE side — a real
+        // dateModified (no datePublished) fills date.
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "dateModified": "2024-03-04"}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.date.as_deref(), Some("2024-03-04"));
+    }
+
+    // ---- process_parent — Person URL-name guard FALSE side ----
+
+    #[test]
+    fn process_parent_person_http_name_skipped() {
+        // rationale: `json_metadata.py:90-92` inner Person — the
+        // `!name.starts_with("http")` FALSE side: a Person nested in process_parent
+        // whose `name` is a URL is NOT written as author. Here a Person is a
+        // sibling content block (an array at top level keeps process_parent).
+        let html = r#"<html><head><script type="application/ld+json">
+        [{"@context": "https://schema.org", "@type": "Person",
+          "name": "http://example.com/jane"}]
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.author.is_none(), "http person name is not author");
+    }
+
+    // ---- is_plausible_sitename — both-http second operand FALSE ----
+
+    #[test]
+    fn is_plausible_sitename_current_http_candidate_also_http_falls_through() {
+        // rationale: `json_metadata.py:57-64` — when current starts with "http"
+        // AND candidate ALSO starts with "http", the `&& !candidate.starts_with`
+        // second operand is FALSE, so the early `return true` is skipped and the
+        // length/webpage rule decides. Here candidate is longer -> still true.
+        assert!(is_plausible_sitename(
+            Some("http://a"),
+            "http://longer-name",
+            "organization"
+        ));
+        // And the length-shorter both-http case returns false (webpage rule path
+        // with non-webpage type but shorter candidate).
+        assert!(!is_plausible_sitename(
+            Some("http://longer-current"),
+            "http://x",
+            "organization"
+        ));
+    }
+
+    // ---- extract_author_names — givenName/familyName non-string parts empty ----
+
+    #[test]
+    fn extract_author_names_given_family_non_string_yields_no_name() {
+        // rationale: `json_metadata.py:119-120` — when `givenName` and
+        // `familyName` keys exist but are NON-string (numbers), the
+        // `filter_map(as_str)` collects nothing and `parts.is_empty()` TRUE side
+        // returns None, so no author is produced.
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Article",
+         "author": {"@type": "Person", "givenName": 1, "familyName": 2}}
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.author.is_none(), "non-string given/family names yield no author");
+    }
+
+    // ---- extract_json_author — no-space candidate breaks the loop ----
+
+    #[test]
+    fn parse_error_author_all_tags_after_strip_not_accumulated() {
+        // rationale: extract_json_author — a captured author candidate that
+        // CONTAINS a space (passes the `' ' in mymatch[1]` gate) but is only HTML
+        // tags + whitespace normalizes (tag-strip + trim) to "" -> the
+        // `!cleaned.is_empty()` FALSE side does NOT accumulate it. The block is
+        // malformed (trailing OOPS) so it routes through the parse-error path.
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context":"https://schema.org","@type":"NewsArticle",
+         "author":{"name":"<b> </b>"} OOPS
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.author.is_none(), "all-tags author not accumulated, got {:?}", m.author);
+    }
+
+    #[test]
+    fn parse_error_author_without_space_breaks_loop() {
+        // rationale: `json_metadata.py:165` `while ... ' ' in mymatch[1]` — a
+        // recovered author candidate with NO space breaks the loop immediately
+        // (the `if !candidate.contains(' ') { break }` TRUE side), so a
+        // single-token author is not accumulated.
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context":"https://schema.org","@type":"NewsArticle",
+         "author":{"name":"Solo"} OOPS-malformed
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.author.is_none(), "single-token author not recovered, got {:?}", m.author);
+    }
+
+    // ---- extract_json_parse_error — section-level negative shapes ----
+
+    #[test]
+    fn parse_error_publisher_with_comma_in_name_skipped() {
+        // rationale: `json_metadata.py:191-197` — the publisher `name` capture
+        // containing a ',' fails the `!group.contains(',')` guard (FALSE side),
+        // so no sitename is set from the malformed publisher block.
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context":"https://schema.org","@type":"NewsArticle",
+         "publisher":{"name":"Acme, Inc"} OOPS
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.site_name.is_none(), "comma publisher name skipped, got {:?}", m.site_name);
+    }
+
+    #[test]
+    fn parse_error_type_present_but_regex_no_match_sets_no_pagetype() {
+        // rationale: `json_metadata.py:183-189` — `elem.contains("@type")` is TRUE
+        // (substring) but the JSON_TYPE regex does not match a quoted value
+        // (`captures` None / FALSE side), so pagetype stays None.
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context":"https://schema.org" "@type" : broken-no-quotes OOPS
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.pagetype.is_none(), "no pagetype from unquoted @type");
+    }
+
+    #[test]
+    fn parse_error_publisher_substring_present_but_regex_no_match() {
+        // rationale: `elem.contains("\"publisher\"")` TRUE but JSON_PUBLISHER
+        // regex captures nothing (no `"name":"..."` follows) -> `captures` None
+        // FALSE side -> site_name stays None.
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@type":"NewsArticle","publisher": broken OOPS
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.site_name.is_none());
+    }
+
+    #[test]
+    fn parse_error_articlesection_substring_present_but_regex_no_match() {
+        // rationale: `elem.contains("\"articleSection\"")` TRUE but JSON_CATEGORY
+        // regex captures nothing -> `captures` None FALSE side -> categories
+        // stays empty.
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@type":"NewsArticle","articleSection": broken OOPS
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.categories.is_empty());
+    }
+
+    #[test]
+    fn parse_error_recovers_articlesection_category() {
+        // rationale: `json_metadata.py:200-203` happy path — a well-formed
+        // articleSection in an OTHERWISE malformed block is recovered as the sole
+        // category (drives the `!cleaned.is_empty()` TRUE side of the category arm).
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@type":"NewsArticle","articleSection": "Politics" OOPS-trailing
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert_eq!(m.categories, vec!["Politics"]);
+    }
+
+    // ---- normalize_json — \uXXXX valid escape decode (non-surrogate) ----
+
+    #[test]
+    fn normalize_json_decodes_valid_unicode_escape() {
+        // rationale: `json_metadata.py:218` JSON_UNICODE_REPLACE — a valid
+        // non-surrogate escape (here the six literal chars backslash-u-0-0-4-1)
+        // decodes to 'A' via the `char::from_u32` Some arm. The "\\u0041" string
+        // literal is the literal backslash sequence (NOT a Rust unicode escape).
+        assert_eq!(normalize_json("x\\u0041y"), "xAy");
     }
 }

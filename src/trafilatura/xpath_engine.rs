@@ -568,6 +568,15 @@ impl Parser {
                 } else {
                     // Edge case: parens around a path with no steps. Not
                     // achievable via the trafilatura corpus.
+                    // llvm-cov:branch-not-reachable: the only token sequence
+                    // that yields a zero-step Path is a bare `.` (parse_path
+                    // L626-634), and that arm returns the empty Path ONLY when
+                    // the next token is None (end of input). Inside parens the
+                    // next token is `)`, which the bare-`.` grammar rejects as
+                    // a Parse error ("expected '/' or '//' after '.'", L635-639)
+                    // BEFORE this paren branch ever sees a stepless Path. So a
+                    // `(...)`-group reaching `[N]` always has >= 1 step, and
+                    // `last_mut()` is always Some.
                     return Err(XPathError::Unsupported(
                         "predicate on empty paren-path".into(),
                     ));
@@ -2600,5 +2609,411 @@ mod tests {
         // the `is_infinite` arm (xpath_engine.rs:1424-1427).
         assert_eq!(format_number(f64::INFINITY), "Infinity");
         assert_eq!(format_number(f64::NEG_INFINITY), "-Infinity");
+    }
+
+    // ---- eval_expr_str string-coercion conformance arms ------------------
+    //
+    // W3C XPath 1.0 §3.2 (Function Calls) coerces each argument to the type
+    // the function expects. `contains(string, string)` / `translate(string,
+    // string, string)` therefore force their FIRST argument through the
+    // node/value -> string conversion of §4.2 (boolean -> "true"/"false") and
+    // §4.4 (number -> string). Trafilatura's `xpaths.py` only ever passes
+    // `@attr`, `@a|@b`, or `translate(@attr, ...)` as that first arg, so the
+    // boolean/SelfTagTest/nested-function string-coercion arms in
+    // `eval_expr_str` are conformance arms reachable only when a function wraps
+    // such a sub-expression. These tests build exactly those shapes.
+
+    #[test]
+    fn contains_self_tag_test_coerces_boolean_to_string_true() {
+        // rationale: W3C XPath 1.0 §4.2 — `boolean -> string` yields "true"
+        // for true. `contains(self::div, "tru")` coerces `self::div` (a
+        // boolean) to "true" when the context node is a <div>, so the substring
+        // "tru" is found. Pins eval_expr_str's `Expr::SelfTagTest` arm
+        // (xpath_engine.rs:1310-1317, true side at :1315).
+        let d = parse_dom("<html><body><div id='a'/><span id='b'/></body></html>");
+        let r = evaluate(".//*[contains(self::div, 'tru')]", &body(&d)).unwrap();
+        // Only the <div> coerces to "true" (contains "tru"); the <span>
+        // coerces to "false" (does not contain "tru").
+        assert_eq!(ids(&r), vec!["a"]);
+    }
+
+    #[test]
+    fn contains_self_tag_test_coerces_boolean_to_string_false() {
+        // rationale: W3C XPath 1.0 §4.2 — `boolean -> string` yields "false"
+        // for false. `contains(self::div, "fal")` finds "fal" only when the
+        // node is NOT a div (coerces to "false"). Pins the false side of
+        // eval_expr_str's `Expr::SelfTagTest` arm (xpath_engine.rs:1317).
+        let d = parse_dom("<html><body><div id='a'/><span id='b'/></body></html>");
+        let r = evaluate(".//*[contains(self::div, 'fal')]", &body(&d)).unwrap();
+        // <span> coerces to "false" (contains "fal"); <div> coerces to "true".
+        assert_eq!(ids(&r), vec!["b"]);
+    }
+
+    #[test]
+    fn contains_or_expression_coerces_boolean_to_string() {
+        // rationale: W3C XPath 1.0 §4.2 — an `or` expression is a boolean;
+        // coerced to a string it is "true"/"false". `contains(@x or @y, 'tru')`
+        // matches an element with @x OR @y (Or = true -> "true" -> contains
+        // "tru"). Pins eval_expr_str's `Expr::Or` arm (xpath_engine.rs:1330,
+        // true side at :1333).
+        let d = parse_dom(
+            "<html><body>\
+                <div id='a' x='1'/>\
+                <div id='b' y='1'/>\
+                <div id='c' z='1'/>\
+            </body></html>",
+        );
+        let r = evaluate(".//div[contains(@x or @y, 'tru')]", &body(&d)).unwrap();
+        // a (@x) and b (@y) -> Or true -> "true"; c -> "false".
+        assert_eq!(ids(&r), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn contains_and_expression_coerces_boolean_false_to_string() {
+        // rationale: W3C XPath 1.0 §4.2 — an `and` expression coerced to a
+        // string. `contains(@x and @y, 'fal')` matches only when the And is
+        // FALSE ("false" contains "fal"); when both attrs are present the And
+        // is true ("true" does not contain "fal"). Pins eval_expr_str's
+        // `Expr::And` arm + its false side (xpath_engine.rs:1330, :1335).
+        let d = parse_dom(
+            "<html><body>\
+                <div id='a' x='1' y='1'/>\
+                <div id='b' x='1'/>\
+            </body></html>",
+        );
+        let r = evaluate(".//div[contains(@x and @y, 'fal')]", &body(&d)).unwrap();
+        // a has both -> And true -> "true" (no "fal"); b lacks @y -> And
+        // false -> "false" (contains "fal").
+        assert_eq!(ids(&r), vec!["b"]);
+    }
+
+    #[test]
+    fn contains_eq_expression_coerces_boolean_to_string() {
+        // rationale: W3C XPath 1.0 §4.2 — an `=` comparison is a boolean,
+        // coerced to "true"/"false". `contains(@class='post' , 'tru')` matches
+        // only elements whose @class equals "post" (Eq true -> "true"). Pins
+        // eval_expr_str's `Expr::Eq` arm (xpath_engine.rs:1330 via the
+        // Or|And|Eq match, true side at :1333).
+        let d = parse_dom(
+            "<html><body>\
+                <div id='a' class='post'/>\
+                <div id='b' class='other'/>\
+            </body></html>",
+        );
+        let r = evaluate(".//div[contains(@class='post', 'tru')]", &body(&d)).unwrap();
+        assert_eq!(ids(&r), vec!["a"]);
+    }
+
+    #[test]
+    fn contains_nested_contains_coerces_boolean_to_string() {
+        // rationale: W3C XPath 1.0 §4.2 + §4.3 — `contains()` returns a
+        // boolean; nesting it as the first arg of an outer `contains()` forces
+        // the inner result through boolean -> string. `contains(contains(@id,
+        // 'x'), 'tru')` matches when @id contains "x" (inner true -> "true" ->
+        // outer finds "tru"). Pins eval_expr_str's `Expr::FnContains` arm
+        // (xpath_engine.rs:1338-1343, true side at :1340).
+        let d = parse_dom(
+            "<html><body>\
+                <div id='axb'/>\
+                <div id='nomatch'/>\
+            </body></html>",
+        );
+        let r = evaluate(".//div[contains(contains(@id, 'x'), 'tru')]", &body(&d)).unwrap();
+        // "axb" contains "x" -> inner true -> "true" (has "tru"); "nomatch"
+        // has no "x" -> inner false -> "false".
+        assert_eq!(ids(&r), vec!["axb"]);
+    }
+
+    #[test]
+    fn contains_nested_starts_with_coerces_boolean_false_to_string() {
+        // rationale: W3C XPath 1.0 §4.2 — `starts-with()` returns a boolean;
+        // nested as `contains(starts-with(@id, 'c'), 'fal')` it matches only
+        // when @id does NOT start with "c" (false -> "false" -> contains
+        // "fal"). Pins eval_expr_str's `Expr::FnStartsWith` arm + false side
+        // (xpath_engine.rs:1338, :1342).
+        let d = parse_dom(
+            "<html><body>\
+                <div id='comments'/>\
+                <div id='body'/>\
+            </body></html>",
+        );
+        let r = evaluate(".//div[contains(starts-with(@id, 'c'), 'fal')]", &body(&d)).unwrap();
+        // "comments" starts with "c" -> "true" (no "fal"); "body" -> "false"
+        // (has "fal").
+        assert_eq!(ids(&r), vec!["body"]);
+    }
+
+    #[test]
+    fn translate_of_boolean_expression_coerces_to_string() {
+        // rationale: W3C XPath 1.0 §4.2 — `translate(string, from, to)`
+        // coerces its FIRST arg to a string. With a boolean first arg
+        // (`self::div`) on a <div>, the string is "true"; translating 't'->'T'
+        // yields "True" — which a wrapping `contains(_, 'True')` then matches.
+        // Pins eval_expr_str's `Expr::FnTranslate` arm reached via string
+        // coercion of its first argument (xpath_engine.rs:1310-1317 for the
+        // inner SelfTagTest, exercised inside translate at :1345-1349).
+        let d = parse_dom("<html><body><div id='a'/><span id='b'/></body></html>");
+        let r = evaluate(
+            ".//*[contains(translate(self::div, 't', 'T'), 'True')]",
+            &body(&d),
+        )
+        .unwrap();
+        // <div> -> "true" -> translate t->T -> "True" -> contains "True".
+        // <span> -> "false" -> "false" -> no "True".
+        assert_eq!(ids(&r), vec!["a"]);
+    }
+
+    // ---- eval_expr_bool conformance arms ---------------------------------
+
+    #[test]
+    fn bare_attribute_union_predicate_is_boolean_truth() {
+        // rationale: W3C XPath 1.0 §3.3 — a predicate node-set is true iff
+        // non-empty. A bare `[@id|@class]` union predicate is true iff the
+        // element has @id OR @class. Pins eval_expr_bool's
+        // `Expr::AttributeUnion` arm (xpath_engine.rs:1242).
+        let d = parse_dom(
+            "<html><body>\
+                <div id_marker='1' id='x'/>\
+                <div id_marker='2' class='y'/>\
+                <div id_marker='3'/>\
+            </body></html>",
+        );
+        let r = evaluate(".//div[@id|@class]", &body(&d)).unwrap();
+        let markers: Vec<String> = r
+            .iter()
+            .map(|n| get_attribute(n, "id_marker").unwrap_or_default())
+            .collect();
+        // 1 (@id) and 2 (@class) qualify; 3 has neither -> empty union -> false.
+        assert_eq!(markers, vec!["1", "2"]);
+    }
+
+    #[test]
+    fn bare_string_literal_predicate_is_true_when_nonempty() {
+        // rationale: W3C XPath 1.0 §4.3 — `boolean(string)` is true iff the
+        // string length is > 0. A bare non-empty string literal predicate
+        // `['x']` is therefore always true and selects every node. Pins
+        // eval_expr_bool's `Expr::Literal` arm (xpath_engine.rs:1251).
+        let d = parse_dom("<html><body><div id='a'/><div id='b'/></body></html>");
+        let r = evaluate(".//div['x']", &body(&d)).unwrap();
+        // Non-empty literal -> true for every div.
+        assert_eq!(ids(&r), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn bare_empty_string_literal_predicate_is_false() {
+        // rationale: W3C XPath 1.0 §4.3 — `boolean("")` is false (zero
+        // length). A bare empty-string predicate `['']` filters everything
+        // out. Pins the false side of eval_expr_bool's `Expr::Literal` arm
+        // (xpath_engine.rs:1251).
+        let d = parse_dom("<html><body><div id='a'/></body></html>");
+        let r = evaluate(".//div['']", &body(&d)).unwrap();
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn number_in_boolean_context_is_true_when_nonzero() {
+        // rationale: W3C XPath 1.0 §4.3 — `boolean(number)` is true iff the
+        // number is neither zero nor NaN. A number reaches boolean context as
+        // an operand of `or`: `[1 or @missing]` evaluates `boolean(1)` (true)
+        // for the left operand. Pins eval_expr_bool's `Expr::Number` arm,
+        // true side (xpath_engine.rs:1252). XPath has no arithmetic surface in
+        // Trafilatura, so this is a conformance arm reachable only by a crafted
+        // numeric operand.
+        let d = parse_dom("<html><body><div id='a'/></body></html>");
+        let r = evaluate(".//div[1 or @missing]", &body(&d)).unwrap();
+        assert_eq!(ids(&r), vec!["a"]);
+    }
+
+    #[test]
+    fn number_zero_in_boolean_context_is_false() {
+        // rationale: W3C XPath 1.0 §4.3 — `boolean(0)` is false. `[0 and @x]`
+        // short-circuits to false on the left numeric operand even when @x
+        // exists. Pins the false side of eval_expr_bool's `Expr::Number` arm
+        // (xpath_engine.rs:1252).
+        let d = parse_dom("<html><body><div id='a' x='1'/></body></html>");
+        let r = evaluate(".//div[0 and @x]", &body(&d)).unwrap();
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn bare_translate_predicate_is_boolean_truth_of_string() {
+        // rationale: W3C XPath 1.0 §4.3 — a `translate()` result is a string;
+        // in boolean (predicate) context it is true iff non-empty. A bare
+        // `[translate(@id, 'x', 'y')]` predicate is true iff @id is non-empty
+        // after translation. Pins eval_expr_bool's `Expr::FnTranslate` arm
+        // (xpath_engine.rs:1270-1280) — the unwrapped (not contains-wrapped)
+        // shape the doc-comment calls "mostly defensive".
+        let d = parse_dom(
+            "<html><body>\
+                <div id_marker='1' id='abc'/>\
+                <div id_marker='2' id=''/>\
+                <div id_marker='3'/>\
+            </body></html>",
+        );
+        let r = evaluate(".//div[translate(@id, 'a', 'A')]", &body(&d)).unwrap();
+        let markers: Vec<String> = r
+            .iter()
+            .map(|n| get_attribute(n, "id_marker").unwrap_or_default())
+            .collect();
+        // 1: @id "abc" -> "Abc" non-empty -> true. 2/3: empty/absent @id ->
+        // "" -> false.
+        assert_eq!(markers, vec!["1"]);
+    }
+
+    // ---- bare child-element-test boolean truth (Expr::ChildElementTest) --
+
+    #[test]
+    fn bare_child_element_test_predicate_is_boolean_truth() {
+        // rationale: lxml treats a bare element name inside a predicate as
+        // `child::name`, whose node-set truth is "has at least one such child
+        // element" (W3C XPath 1.0 §3.3). Trafilatura's AUTHOR_XPATHS use the
+        // `rel` shape this way. Pins eval_expr_bool's `Expr::ChildElementTest`
+        // arm (xpath_engine.rs:1244-1250).
+        let d = parse_dom(
+            "<html><body>\
+                <div id='a'><rel/></div>\
+                <div id='b'><span/></div>\
+            </body></html>",
+        );
+        let r = evaluate(".//div[rel]", &body(&d)).unwrap();
+        // a has a <rel> child -> true; b does not -> false.
+        assert_eq!(ids(&r), vec!["a"]);
+    }
+
+    // ---- parser residual arms --------------------------------------------
+
+    #[test]
+    fn paren_around_union_with_positional_is_unsupported() {
+        // rationale: the engine's DA-B-1 contract (xpath_engine.rs:556-561)
+        // declares `(union)[N]` paren-around-union-with-positional as
+        // unimplemented because `xpaths.py` never emits it. Pins the
+        // `XPath::Union` arm of parse_path's paren branch (xpath_engine.rs:538)
+        // and its Unsupported return.
+        let err = parse("(.//a|.//b)[1]").unwrap_err();
+        match err {
+            XPathError::Unsupported(_) => {}
+            other => panic!("expected Unsupported for (union)[N], got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_union_inside_parens_exercises_union_loop_then_rejects() {
+        // rationale: `parse_xpath_inside_parens` loops over `|`-separated
+        // paths to accumulate an `XPath::Union` (xpath_engine.rs:672-677).
+        // parse_path then sees a Union inside the parens and — by the DA-B-1
+        // contract — rejects it as Unsupported (xpath_engine.rs:538,556-561)
+        // because no `xpaths.py` pattern materialises a paren-wrapped union.
+        // This input exercises the union-accumulation loop (two paths pushed)
+        // even though the overall parse is intentionally rejected.
+        let err = parse("(.//time|.//figure)").unwrap_err();
+        match err {
+            XPathError::Unsupported(_) => {}
+            other => panic!("expected Unsupported for paren-wrapped union, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn paren_path_then_trailing_descendant_step() {
+        // rationale: parse_path allows further `/step` / `//step` segments
+        // after a `(...)` group (xpath_engine.rs:580-587). `(.//div)//a`
+        // selects anchors descended from any div in the group. Pins the
+        // trailing-step loop after the paren branch.
+        let d = parse_dom(
+            "<html><body>\
+                <div id='wrap'><a id='a'/></div>\
+                <a id='b'/>\
+            </body></html>",
+        );
+        let r = evaluate("(.//div)//a", &body(&d)).unwrap();
+        assert_eq!(ids(&r), vec!["a"]);
+    }
+
+    #[test]
+    fn absolute_single_slash_path_from_root() {
+        // rationale: parse_path's `Some(Tok::Slash)` arm marks the path
+        // absolute and parses the first step on the Child axis
+        // (xpath_engine.rs:596-604). `/html/body/div` walks from the document
+        // root through explicit children. Pins the single-`/` absolute arm.
+        let d = parse_dom("<html><body><div id='a'/></body></html>");
+        let r = evaluate("/html/body/div", &body(&d)).unwrap();
+        assert_eq!(ids(&r), vec!["a"]);
+    }
+
+    #[test]
+    fn dot_then_single_slash_child_step() {
+        // rationale: parse_path's `Some(Tok::Dot)` -> `Some(Tok::Slash)` arm
+        // parses `./step` as a relative Child step (xpath_engine.rs:616-619).
+        // `./div` selects only direct div children of the context. Pins the
+        // `./` single-slash arm (distinct from the `.//` double-slash arm).
+        let d = parse_dom(
+            "<html><body><div id='a'/><section><div id='b'/></section></body></html>",
+        );
+        let r = evaluate("./div", &body(&d)).unwrap();
+        // Only the direct-child div (a), not the nested one (b).
+        assert_eq!(ids(&r), vec!["a"]);
+    }
+
+    #[test]
+    fn attribute_axis_step_yields_empty_set() {
+        // rationale: parse_step_body accepts `@name` at STEP level
+        // (xpath_engine.rs:690-694), but apply_step's `Axis::Attribute` arm
+        // returns an empty node-set for safety because Trafilatura only uses
+        // `@attr` inside predicates, never as a step (xpath_engine.rs:1103-1108
+        // comment). Pins the step-level `@attr` parse arm; the engine yields
+        // an empty result by contract.
+        let d = parse_dom("<html><body><div id='a'/></body></html>");
+        let r = evaluate(".//div/@id", &body(&d)).unwrap();
+        assert!(
+            r.is_empty(),
+            "attribute-axis step is intentionally empty per DA-B-1"
+        );
+    }
+
+    #[test]
+    fn attribute_predicate_on_text_node_is_always_false() {
+        // rationale: a `text()` step surfaces Text nodes as context
+        // (xpath_engine.rs:1064). Applying an `@attr` predicate to a Text node
+        // hits attr_exists's non-element guard, which returns false because a
+        // text node has no attributes (xpath_engine.rs:1353-1357). Pins the
+        // `!is_element(node)` early-return arm. W3C XPath 1.0 §5.3: the
+        // attribute axis of a non-element node is empty.
+        let d = parse_dom("<html><body><p>hello</p></body></html>");
+        // Positive control: the text() step DOES surface a text node, so the
+        // predicate genuinely runs (and is filtered out), rather than the set
+        // being vacuously empty.
+        assert_eq!(evaluate(".//p/text()", &body(&d)).unwrap().len(), 1);
+        let r = evaluate(".//p/text()[@class]", &body(&d)).unwrap();
+        assert!(r.is_empty(), "a text node has no attributes -> predicate false");
+    }
+
+    #[test]
+    fn self_tag_test_on_text_node_is_always_false() {
+        // rationale: `self::name` on a Text-node context hits
+        // element_name_matches, whose `local_name` is None for a non-element
+        // node, returning false (xpath_engine.rs:1170-1174). Pins the
+        // `None => false` arm. A `text()` step provides the Text context.
+        let d = parse_dom("<html><body><p>hello</p></body></html>");
+        // Positive control: the text() step surfaces a text node.
+        assert_eq!(evaluate(".//p/text()", &body(&d)).unwrap().len(), 1);
+        let r = evaluate(".//p/text()[self::p]", &body(&d)).unwrap();
+        assert!(
+            r.is_empty(),
+            "a text node has no element name -> self::p is false"
+        );
+    }
+
+    #[test]
+    fn child_wildcard_step_selects_direct_element_children() {
+        // rationale: apply_step's `Axis::Child` + `NodeTest::Wildcard` arm
+        // returns the direct element children of the context
+        // (xpath_engine.rs:1059). A bare `*` step (relative Child axis)
+        // selects body's direct element children only. Pins the child-wildcard
+        // arm (distinct from the descendant `.//*` wildcard).
+        let d = parse_dom(
+            "<html><body><div id='a'><span id='nested'/></div><p id='b'/></body></html>",
+        );
+        let r = evaluate("*", &body(&d)).unwrap();
+        // Direct children of body: div (a) and p (b); NOT the nested span.
+        assert_eq!(ids(&r), vec!["a", "b"]);
     }
 }

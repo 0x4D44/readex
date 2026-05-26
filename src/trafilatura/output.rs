@@ -237,6 +237,12 @@ pub(crate) fn delete_element(element: &NodeRef, keep_tail: bool) {
 /// sibling (matching the lxml tail-run semantic).
 fn collect_following_text_siblings(element: &NodeRef) -> Vec<NodeRef> {
     let Some(p) = parent(element) else {
+        // llvm-cov:branch-not-reachable: the only caller is
+        // delete_element(keep_tail=false) (output.rs:226), which is itself
+        // guarded by an early `if parent(element).is_none() { return }`
+        // (output.rs:216-218). So by the time this fn runs, `element` always
+        // has a parent. The guard is kept for local robustness (the fn is a
+        // faithful tail-run helper) but cannot fire from any live call path.
         return Vec::new();
     };
     let kids = p.children.borrow();
@@ -829,6 +835,11 @@ pub(crate) fn xmltotxt(xmloutput: Option<&NodeRef>, include_formatting: bool) ->
 pub(crate) fn sanitize_tree(root: &NodeRef) {
     for elem in descendants_and_self(root) {
         let Some(tag) = local_name(&elem) else {
+            // llvm-cov:branch-not-reachable: descendants_and_self pushes `root`
+            // then only recurses into `children()` (Element-only, dom.rs:581-
+            // 588), so the only candidate non-element is `root` itself. The
+            // sole caller (control_xml_output, output.rs:2736) always passes a
+            // `<doc>` / `<TEI>` Element root. So `local_name` is always Some.
             continue;
         };
         let parent_tag = parent(&elem)
@@ -2101,6 +2112,11 @@ fn _move_element_one_level_up(element: &NodeRef) {
     let insert_at = gp_idx_of_p.map(|i| i + 1).unwrap_or_else(|| {
         // fall back to end. `element` is still under `p` at this point, so
         // gp's child count is the correct "append" index.
+        //
+        // llvm-cov:branch-not-reachable: `gp` was obtained as `parent(&p)`
+        // (output.rs:2081), so `p` is by construction a child of `gp` and
+        // `position_of(&gp, &p)` always returns Some. The None fallback cannot
+        // fire; it is defensive belt-and-braces for the lxml `index()` shape.
         children(&gp).len()
     });
     dom::insert_with_tail(&gp, element, insert_at);
@@ -2119,6 +2135,16 @@ fn _move_element_one_level_up(element: &NodeRef) {
     // sibling run). Capture the trimmed value and apply it AFTER `new_elem`
     // is spliced into `gp` below; otherwise the tail (the old `<p>` tail) is
     // silently dropped (rcdom reparent-tail bug class).
+    //
+    // llvm-cov:branch-not-reachable (the `new_elem_tail.is_some()` true side
+    // here and the `set_tail(&new_elem, ...)` at output.rs:2144-2145): in the
+    // rcdom port a tail is a *following sibling Text node*, not an lxml-style
+    // attribute. `element` was just spliced into `gp` at `gp.index(p) + 1`
+    // (output.rs:2100-2112), i.e. directly BETWEEN `p` and any tail-text node
+    // that used to follow `p`. So by the time `tail(&p)` is read here, `p`'s
+    // immediate following sibling is the moved `element` (an Element), and
+    // `tail(&p)` is always None. The original-`<p>`-had-a-tail case therefore
+    // cannot reach the Some side. Kept as a faithful port of xml.py:598-601.
     let new_elem_tail = tail(&p)
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty());
@@ -2577,6 +2603,11 @@ fn following_element_siblings(element: &NodeRef) -> Vec<NodeRef> {
         let pos = position_of(&p, element)?;
         Some((p, pos))
     })() else {
+        // llvm-cov:branch-not-reachable: the sole caller is
+        // _move_element_one_level_up (output.rs:2086), which has already
+        // unwrapped `parent(element)` into `p` at output.rs:2080 before this
+        // runs. So `element` always has a parent (and is found in it). The
+        // None arm is defensive only.
         return Vec::new();
     };
     p.children
@@ -2783,6 +2814,11 @@ fn is_blank(s: &str) -> bool {
 /// [`serialize_xml_pretty`]'s doc) — libxml2 never re-enables it deeper down.
 fn write_element_pretty(element: &NodeRef, out: &mut String, depth: usize, formatting: bool) {
     let Some(tag) = local_name(element) else {
+        // llvm-cov:branch-not-reachable: the entry point serialize_xml_pretty
+        // is always handed an Element root (build_xml_output / build_tei_output
+        // produce a `<doc>` / `<TEI>` element), and the recursion below only
+        // ever descends into `children(element)`, which filters to Element
+        // nodes (dom.rs:581-588). So `local_name` is always Some here.
         return;
     };
 
@@ -6901,6 +6937,136 @@ mod tests {
         // Indented form: root child on its own line.
         assert!(s.contains("\n  <kid>hi</kid>"), "got: {s}");
     }
+
+    // -------------------------------------------------------------------
+    // Coverage: check_tei complex-head + move-up integration (xml.py:205-210)
+    // -------------------------------------------------------------------
+
+    /// `check_tei`: a `<head>` with element children that is nested inside a
+    /// `<p>` exercises BOTH the complex-head conversion (xml.py:206-208) and
+    /// the move-one-level-up (xml.py:209-210). The existing TEI tests call
+    /// `_tei_handle_complex_head` / `_move_element_one_level_up` in isolation;
+    /// this drives them through `check_tei`'s Pass-1 integration so the
+    /// `parent.replace(elem, new_elem)` splice (output.rs:2412-2418) and the
+    /// `p_tag == "p"` move-up dispatch (output.rs:2425-2427) are covered.
+    #[test]
+    fn check_tei_complex_head_inside_p_converts_and_moves_up() {
+        // <TEI><text><body><div type="entry">
+        //   <p><head rend="h2">title<hi>X</hi></head>after</p>
+        // </div></body></text></TEI>
+        let tei = create_element("TEI");
+        let textel = create_element("text");
+        append_child(&tei, &textel);
+        let bodyel = create_element("body");
+        append_child(&textel, &bodyel);
+        let div = build_elem("div", None, vec![], &[("type", "entry")]);
+        append_child(&bodyel, &div);
+        let p = build_elem("p", None, vec![], &[]);
+        append_child(&div, &p);
+        // <head> WITH an element child (so it is "complex" / non-leaf).
+        let head = build_elem("head", Some("title"), vec![], &[("rend", "h2")]);
+        let hi = build_elem("hi", Some("X"), vec![], &[]);
+        append_child(&head, &hi);
+        append_child(&p, &head);
+        // a tail on head triggers the head_tail re-apply path (xml.py:415-417).
+        set_tail(&head, Some("after"));
+
+        check_tei(&tei);
+
+        // Head was renamed to <ab type="header"> (Pass 1), flattened of its
+        // <p>/element children by _tei_handle_complex_head, and lifted out of
+        // the <p> by _move_element_one_level_up. After: an <ab> exists under
+        // the <div> (the grandparent), no longer under <p>.
+        let abs = get_elements_by_tag_name(&tei, "ab");
+        assert_eq!(abs.len(), 1, "head converted to a single <ab>");
+        let ab = &abs[0];
+        assert_eq!(
+            get_attribute(ab, "type").as_deref(),
+            Some("header"),
+            "ab carries type=header"
+        );
+        // The <ab> must now be a direct child of the <div>, not the <p>
+        // (it was moved one level up out of the p).
+        let ab_parent_tag = parent(ab).and_then(|pp| local_name(&pp)).unwrap_or_default();
+        assert_eq!(
+            ab_parent_tag, "div",
+            "ab lifted out of <p> to the grandparent <div>"
+        );
+        // No <head> tag remains.
+        assert!(get_elements_by_tag_name(&tei, "head").is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // Coverage: write_teitree / xmltocsv with a present commentsbody
+    // -------------------------------------------------------------------
+
+    /// `write_teitree` (via `build_tei_output`): when the document HAS a
+    /// `commentsbody`, the `Some(cb)` arm renames it to `<div>` rather than
+    /// synthesising an empty one (xml.py:405-408). Pins output.rs:2363 — the
+    /// `Some(cb) => replace_element_tag(cb, "div")` arm — which the existing
+    /// TEI tests (all `commentsbody: None`) never reach.
+    #[test]
+    fn build_tei_output_with_comments_renames_commentsbody_to_div() {
+        let body = create_element("body");
+        let p = build_elem("p", Some("Body text here."), vec![], &[]);
+        append_child(&body, &p);
+        let commentsbody = create_element("body");
+        let cp = build_elem("p", Some("A comment."), vec![], &[]);
+        append_child(&commentsbody, &cp);
+        let doc = Document {
+            metadata: Metadata::default(),
+            body,
+            commentsbody: Some(commentsbody),
+            raw_text: String::new(),
+        };
+        let out = build_tei_output(&doc);
+        // The comments body must appear as <div type="comments"> carrying the
+        // comment paragraph.
+        let comment_divs: Vec<NodeRef> = get_elements_by_tag_name(&out, "div")
+            .into_iter()
+            .filter(|d| get_attribute(d, "type").as_deref() == Some("comments"))
+            .collect();
+        assert_eq!(comment_divs.len(), 1, "one comments div");
+        let comment_text = dom::text_content(&comment_divs[0]);
+        assert!(
+            comment_text.contains("A comment."),
+            "comments div must carry the comment text, got: {comment_text:?}"
+        );
+    }
+
+    /// `xmltocsv`: when the comments body produces non-empty text, the
+    /// comments column holds that text rather than the `null` token. Pins
+    /// output.rs:1551-1554 — the `else { comments_text }` arm — which the
+    /// existing CSV tests (all empty comments) never reach.
+    #[test]
+    fn xmltocsv_emits_comment_text_when_commentsbody_nonempty() {
+        let body = create_element("body");
+        let p = build_elem("p", Some("Main body content."), vec![], &[]);
+        append_child(&body, &p);
+        let commentsbody = create_element("body");
+        let cp = build_elem("p", Some("Reader comment text."), vec![], &[]);
+        append_child(&commentsbody, &cp);
+        let doc = Document {
+            metadata: Metadata::default(),
+            body,
+            commentsbody: Some(commentsbody),
+            raw_text: String::new(),
+        };
+        let row = xmltocsv(&doc, false, "\t", "null", true);
+        let cols: Vec<&str> = row.trim_end_matches("\r\n").split('\t').collect();
+        // Column 8 (index 7) is text; column 9 (index 8) is comments.
+        assert!(
+            cols[7].contains("Main body content."),
+            "text col must hold body text, got: {:?}",
+            cols[7]
+        );
+        assert!(
+            cols[8].contains("Reader comment text."),
+            "comments col must hold comment text (not null), got: {:?}",
+            cols[8]
+        );
+    }
+
 }
 
 

@@ -1803,6 +1803,53 @@ mod tests {
         assert!(r.as_deref().unwrap().contains("2020"));
     }
 
+    /// rationale: pin `select_candidate`'s "some-but-not-all valid" arm
+    /// (core.rs:629 `validation.iter().all(...)` FALSE side, then
+    /// core.rs:638 `validation.iter().any(...)` TRUE side → pick the index
+    /// that validated at core.rs:640). Two distinct years sit in the top-2
+    /// window: one inside the (min, max) window and one above max. Python
+    /// core.py:402-403 (`elif any(validation): return bestmatch[index]`).
+    ///
+    /// Note: the candidate years must both be matchable by `year_pattern`
+    /// (`YEAR_RE = 199[0-9]|20[0-3][0-9]`, i.e. 1990-2039) so that two years
+    /// are captured and the `validation` vector has length 2; the (min, max)
+    /// window is set TIGHTER than that regex range to make one fall out.
+    #[test]
+    fn select_candidate_some_valid_picks_validated_index() {
+        use super::super::regex_catalogues::{year_pattern, ymd_pattern};
+        let mut m = HashMap::new();
+        // max=2030 → 2024 validates, 2038 (matches 20[0-3][0-9]) does not.
+        // original=false → reverse sort puts " 2038-06-15 " at patterns[0];
+        // validation=[false (2038), true (2024)] → all=false, any=true →
+        // position(true)=1 → patterns[1] = " 2024-06-15 ".
+        m.insert(" 2024-06-15 ".to_string(), 2usize);
+        m.insert(" 2038-06-15 ".to_string(), 5usize);
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        let r = select_candidate(&m, ymd_pattern(), year_pattern(), &o);
+        // Only the in-window 2024 validates, so it is selected despite
+        // 2038 having the higher count.
+        assert!(r.as_deref().unwrap().contains("2024"));
+    }
+
+    /// rationale: pin `select_candidate`'s "none valid" arm (core.rs:629
+    /// `.all()` FALSE, core.rs:638 `.any()` FALSE → else → None at
+    /// core.rs:644). Both top-2 years are matchable by `year_pattern`
+    /// (2035, 2038 ∈ 20[0-3][0-9]) but lie ABOVE max 2030, so neither
+    /// validates and the function returns None (core.py:404-406 —
+    /// `else: return None`).
+    #[test]
+    fn select_candidate_none_valid_returns_none() {
+        use super::super::regex_catalogues::{year_pattern, ymd_pattern};
+        let mut m = HashMap::new();
+        // Both 2035 and 2038 are above max 2030 → validation = [false, false]
+        // → all=false, any=false → else → None.
+        m.insert(" 2035-06-15 ".to_string(), 2usize);
+        m.insert(" 2038-06-15 ".to_string(), 3usize);
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        let r = select_candidate(&m, ymd_pattern(), year_pattern(), &o);
+        assert_eq!(r, None);
+    }
+
     // -----------------------------------------------------------------------
     // search_pattern
     // -----------------------------------------------------------------------
@@ -2606,6 +2653,59 @@ mod tests {
         assert_eq!(examine_header(&root, &o), None);
     }
 
+    /// rationale: pin `examine_header`'s meta-safeguard second-operand
+    /// (core.rs:407 `!has_datetime` FALSE side) — a meta carrying ONLY a
+    /// `datetime` attribute (NO `content`) passes the
+    /// `!has_content && !has_datetime` guard via the datetime disjunct, so
+    /// the loop body runs. The `name=` branch reads `content` (None here),
+    /// so `tryfunc(None)` yields None and headerdate stays None
+    /// (core.py:262-267 — `"content" not in attrib and "datetime" not in
+    /// attrib`).
+    #[test]
+    fn examine_header_meta_with_datetime_but_no_content_runs_body() {
+        let html = r#"<html><head>
+            <meta name="datePublished" datetime="2024-06-15">
+        </head><body></body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts_orig("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        // datetime is present (guard passes) but the name= branch reads
+        // `content`, which is absent → tryfunc(None) → None.
+        assert_eq!(examine_header(&root, &o), None);
+    }
+
+    /// rationale: pin `examine_header`'s `property=` arm where `tryfunc`
+    /// returns None (core.rs:441 `if let Some(att)` FALSE side) — a
+    /// recognised `property` (article:published_time) whose content is an
+    /// unparseable date means `attempt` is None, so neither headerdate nor
+    /// reserve is set (core.py:289-292 guard the assignment on a successful
+    /// parse).
+    #[test]
+    fn examine_header_property_unparseable_content_sets_nothing() {
+        let html = r#"<html><head>
+            <meta property="article:published_time" content="not a date at all">
+        </head><body></body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts_orig("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(examine_header(&root, &o), None);
+    }
+
+    /// rationale: pin `examine_header`'s itemprop arm where `tryfunc`
+    /// returns None (core.rs:460 `if let Some(att)` FALSE side) — an
+    /// ITEMPROP_ATTRS itemprop (datePublished) whose datetime/content
+    /// candidate fails to parse leaves headerdate unset (core.py:306-308).
+    #[test]
+    fn examine_header_itemprop_unparseable_content_sets_nothing() {
+        let html = r#"<html><head>
+            <meta itemprop="datePublished" content="gibberish">
+        </head><body></body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts_orig("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(examine_header(&root, &o), None);
+    }
+
     /// rationale: pin `examine_header`'s early-break (`headerdate.is_some()
     /// break`) — multiple matching metas should stop at the first.
     #[test]
@@ -2636,6 +2736,40 @@ mod tests {
         let dom = Dom::parse(html);
         let root = dom.root_element().expect("html");
         let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(examine_abbr_elements(&root, &o).as_deref(), Some("2024-06-15"));
+    }
+
+    /// rationale: pin `examine_abbr_elements`'s `data-utime` ORIGINAL arm
+    /// (core.rs:735 `take_original` TRUE side — `options.original &&
+    /// (reference == 0 || candidate < reference)`). With original=true the
+    /// first numeric data-utime sets `reference` (reference starts at 0, so
+    /// the `reference == 0` disjunct fires), mirroring Python's
+    /// "pick the oldest" branch (core.py:460-461).
+    #[test]
+    fn examine_abbr_data_utime_original_arm_sets_reference() {
+        // 1718409600 = 2024-06-15 00:00:00 UTC.
+        let html = r#"<html><body>
+            <abbr data-utime="1718409600">Jun 15, 2024</abbr>
+        </body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts_orig("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(examine_abbr_elements(&root, &o).as_deref(), Some("2024-06-15"));
+    }
+
+    /// rationale: pin `examine_abbr_elements`'s class+title ORIGINAL
+    /// success arm (core.rs:756 `if attempt.is_some()` TRUE side → early
+    /// `return attempt`). With original=true and a VALID title, the parsed
+    /// date is returned immediately without going through compare_reference
+    /// (core.py:470-475).
+    #[test]
+    fn examine_abbr_class_title_original_valid_returns_immediately() {
+        let html = r#"<html><body>
+            <abbr class="published" title="2024-06-15">Jun 15</abbr>
+        </body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts_orig("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
         assert_eq!(examine_abbr_elements(&root, &o).as_deref(), Some("2024-06-15"));
     }
 
@@ -2927,6 +3061,67 @@ mod tests {
         let html = "<html><body>info 2020 © 2024 Inc.</body></html>";
         let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
         assert_eq!(search_page(html, &o).as_deref(), Some("2024-01-01"));
+    }
+
+    /// rationale: pin `search_page`'s LONG_TEXT_PATTERN / regex_parse arm
+    /// (core.py:767-775; core.rs:1232-1240) — an English-prose date with NO
+    /// numeric MM/DD form misses every earlier numeric arm (THREE_COMP,
+    /// SELECT_YMD, DATESTRINGS, SLASHES, YYYYMM, MMYYYY) and no copyright
+    /// symbol is present, so flow reaches `regex_parse`, which parses
+    /// "January 15, 2024" and emits via validate_and_convert.
+    #[test]
+    fn search_page_regex_parse_english_prose_arm() {
+        let html = "<html><body><p>Posted on January 15, 2024 by the editor.</p></body></html>";
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(search_page(html, &o).as_deref(), Some("2024-01-15"));
+    }
+
+    /// rationale: pin `search_page`'s regex_parse copyear gate FALSE side
+    /// (core.rs:1233 — `dateobject.map(|d| d.year >= copyear)` is false when
+    /// the prose date predates the copyright year). With "© 2024" setting
+    /// copyear=2024 and an English-prose "January 15, 2020", the regex_parse
+    /// arm is gated out (2020 < 2024) and the copyright catchall surfaces
+    /// 2024-01-01 (core.py:769 `dateobject.year >= copyear`).
+    #[test]
+    fn search_page_regex_parse_below_copyear_uses_catchall() {
+        let html =
+            "<html><body><p>Originally January 15, 2020. © 2024 Acme.</p></body></html>";
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        // regex_parse finds 2020-01-15 but the copyear gate rejects it;
+        // the copyright catchall returns 2024-01-01.
+        assert_eq!(search_page(html, &o).as_deref(), Some("2024-01-01"));
+    }
+
+    /// rationale: pin `search_page`'s YYYYMM_PATTERN `validate_and_convert`
+    /// FALSE side (core.rs:1176) — a `YYYY/MM` whose YEAR passes
+    /// `plausible_year_filter` (year-level window) but whose constructed
+    /// month-granular date falls OUTSIDE the (min, max) window, so
+    /// validate_and_convert rejects it. With max = 2024-03-31 the YYYYMM
+    /// "2024/06" builds 2024-06-01, which exceeds max → the YYYYMM arm
+    /// returns None and the cascade falls through to the SIMPLE arm, which
+    /// validates the bare YEAR 2024 against the YEAR window (synth
+    /// "2024-01-01" ≤ max) and emits 2024-01-01 (core.py:728-732 + 783-803).
+    #[test]
+    fn search_page_yyyymm_validate_rejects_month_past_max() {
+        // 2024 is inside the year window [2020, 2024] used by both
+        // plausible_year_filter and the SIMPLE arm, but 2024-06-01 > max
+        // 2024-03-31, so the YYYYMM validate_and_convert rejects (L1176
+        // FALSE) and the bare-year SIMPLE rescue surfaces 2024-01-01.
+        let html = "<html><body>archive bucket 2024/06 entries</body></html>";
+        let o = opts("%Y-%m-%d", (2020, 1, 1), (2024, 3, 31));
+        assert_eq!(search_page(html, &o).as_deref(), Some("2024-01-01"));
+    }
+
+    /// rationale: pin `search_page`'s copyright-catchall
+    /// `validate_and_convert` path (core.rs:1250 TRUE side) in isolation —
+    /// a page whose ONLY signal is a copyright year reaches arm 9 and emits
+    /// `copyear-01-01` via validate_and_convert with a custom outputformat,
+    /// exercising the format-emit branch of the catchall (core.py:777-781).
+    #[test]
+    fn search_page_copyright_catchall_custom_format() {
+        let html = "<html><body><footer>© 2024 Acme Inc.</footer></body></html>";
+        let o = opts("%d.%m.%Y", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(search_page(html, &o).as_deref(), Some("01.01.2024"));
     }
 
     // -----------------------------------------------------------------------

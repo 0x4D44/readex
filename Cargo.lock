@@ -489,7 +489,7 @@ dependencies = [
 
 [[package]]
 name = "readex"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "html5ever",
  "markup5ever_rcdom",
