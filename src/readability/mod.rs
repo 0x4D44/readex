@@ -472,6 +472,60 @@ mod tests {
         );
     }
 
+    /// `Readability.js:2772` — `_serializer(articleContent)`. When the caller
+    /// opts in via `include_html(true)`, the per-attempt closure serializes the
+    /// scored `articleContent` into `Article.content_html`; default is `None`.
+    /// rationale: pin the `if include_html { Some(serialize) }` true arm
+    /// (mod.rs:315) which the default `parse()` path never crosses.
+    #[test]
+    fn parse_include_html_populates_content_html_serializer() {
+        let html = "<html><head><title>T Long Enough Title Here</title></head>\
+            <body><div class=content>\
+            <p>First paragraph of genuine readable prose comfortably past the twenty-five character minimum.</p>\
+            <p>Second paragraph also has enough words to score as real article content here.</p>\
+            </div></body></html>";
+        let a = Readability::new_from_html(html)
+            .include_html(true)
+            .parse()
+            .expect("article");
+        let h = a
+            .content_html
+            .as_deref()
+            .expect("content_html populated when include_html(true)");
+        assert!(
+            h.contains("First paragraph of genuine readable prose"),
+            "serialized articleContent carries the body prose: {h:?}"
+        );
+    }
+
+    /// `Readability.js:2759-2763` — first-`<p>` excerpt fallback skips a
+    /// leading whitespace-only paragraph. When the article's first `<p>`
+    /// trims to empty, `t.is_empty()` is true and that paragraph yields `None`
+    /// for the excerpt (so the metadata excerpt, if any, still wins).
+    /// rationale: pin the `if t.is_empty() { None }` true arm (mod.rs:312),
+    /// reached only when the first paragraph has whitespace-only text content.
+    #[test]
+    fn parse_first_paragraph_excerpt_skips_whitespace_only_paragraph() {
+        // metadata excerpt present so the precedence keeps it regardless; the
+        // point is to drive the empty-first-<p> branch in the fallback builder
+        // without it crashing or leaking whitespace as an excerpt. A
+        // `<p><img></p>` survives the empty-`<p>` removal (content_element_count
+        // == 1) but its `text_content.trim()` is "", so the excerpt-fallback
+        // builder hits its `t.is_empty()` true arm.
+        let html = "<html><head><title>T Long Enough Title Here</title>\
+            <meta name=\"description\" content=\"Meta excerpt present\">\
+            </head><body><div class=content>\
+            <p><img src=\"x.jpg\"></p>\
+            <p>Real readable prose paragraph comfortably beyond twenty-five characters of content here.</p>\
+            </div></body></html>";
+        let a = parse(html).expect("article");
+        assert_eq!(
+            a.excerpt.as_deref(),
+            Some("Meta excerpt present"),
+            "metadata excerpt kept; whitespace-only first <p> must not leak as excerpt"
+        );
+    }
+
     #[test]
     fn parse_empty_document_returns_none_faithful_stage1c_retry_exhaustion() {
         // FAITHFUL Stage-1c behaviour (changed from the Stage-1a/1b

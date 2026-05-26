@@ -1926,4 +1926,130 @@ mod tests {
         let ld = get_json_ld(&r);
         assert_eq!(ld.title.as_deref(), Some("Right"));
     }
+
+    // ---- get_article_title — separator/colon cascade residue ----
+
+    #[test]
+    fn article_title_separator_short_first_part_strips_leading_segment() {
+        // rationale: `Readability.js:582-585` — when the substring before the
+        // last separator has wordCount < 3, curTitle is recomputed as
+        // `origTitle.replace(/^[^\|\-\\\/>»]*[\|\-\\\/>»]/, "")` (strip up to and
+        // including the FIRST separator). Title "X | A Real Article Headline":
+        // before-last-sep is "X" (1 word < 3) -> lead-strip yields
+        // " A Real Article Headline" -> trim/normalize -> 4 words, hier=false so
+        // the <=4 guard restores origTitle.
+        let (_d, r) = doc(
+            "<html><head><title>X | A Real Article Headline Here</title></head><body></body></html>",
+        );
+        // First part "X" has <3 words -> lead-separator strip path taken;
+        // 5-word result > 4 so the <=4 guard does not restore origTitle.
+        assert_eq!(get_article_title(&r), "A Real Article Headline Here");
+    }
+
+    #[test]
+    fn article_title_colon_after_last_short_falls_back_to_first_colon() {
+        // rationale: `Readability.js:606-612` — ": " present, no heading match;
+        // after-last-colon substring has wordCount < 3, so curTitle falls back to
+        // `origTitle.substring(indexOf(":")+1)` (after the FIRST colon).
+        // "Brand: Section: Hi" -> after last colon = " Hi" (1 word < 3) ->
+        // after first colon = " Section: Hi".
+        let (_d, r) = doc(
+            "<html><head><title>Brand: Section: Hi</title></head><body><p>x</p></body></html>",
+        );
+        // 2 words after normalize -> <=4 guard with hier=false restores origTitle.
+        assert_eq!(get_article_title(&r), "Brand: Section: Hi");
+    }
+
+    #[test]
+    fn article_title_colon_long_prefix_keeps_full_title() {
+        // rationale: `Readability.js:613-615` — ": " present, no heading match,
+        // after-last-colon has >=3 words, AND the prefix before the first colon
+        // has wordCount > 5 -> curTitle = origTitle (keep the whole thing).
+        let (_d, r) = doc(
+            "<html><head><title>One Two Three Four Five Six: After The Colon Part Here</title></head>\
+             <body><p>x</p></body></html>",
+        );
+        assert_eq!(
+            get_article_title(&r),
+            "One Two Three Four Five Six: After The Colon Part Here"
+        );
+    }
+
+    #[test]
+    fn article_title_very_long_no_separator_multiple_h1_keeps_long_title() {
+        // rationale: `Readability.js:617-624` — no separator, no ": ", length
+        // > 150; the single-h1 rule needs EXACTLY one <h1>. With two <h1> the
+        // `hOnes.length === 1` FALSE side leaves the long curTitle in place.
+        let long = "Word ".repeat(40); // ~200 chars, 40 words, no separator/colon
+        let long = long.trim();
+        let html = format!(
+            "<html><head><title>{long}</title></head><body><h1>A</h1><h1>B</h1></body></html>"
+        );
+        let (_d, r) = doc(&html);
+        // >150 chars, two h1 -> curTitle unchanged; 40 words > 4 -> kept.
+        assert_eq!(get_article_title(&r), long);
+    }
+
+    // ---- byte_substring — defensive start>end swap ----
+
+    #[test]
+    fn byte_substring_swaps_when_start_exceeds_end() {
+        // rationale: JS `substring(a, b)` swaps the arguments when a > b
+        // (`:197-201`). byte_substring(s, 5, 2) must yield the same slice as
+        // byte_substring(s, 2, 5).
+        assert_eq!(byte_substring("abcdefg", 5, 2), "cde");
+    }
+
+    // ---- is_url_like — scheme-prefix predicate negative sides ----
+
+    #[test]
+    fn is_url_like_rejects_leading_colon() {
+        // rationale: `Readability.js:441-448` _isUrl — a colon at position 0
+        // (no scheme name) is not a valid absolute URL (`if colon == 0` arm).
+        assert!(!is_url_like(":nonsense"));
+    }
+
+    #[test]
+    fn is_url_like_rejects_non_alpha_scheme_start() {
+        // rationale: WHATWG scheme must start with an ASCII letter; "1http:" has
+        // a leading digit (`!bytes[0].is_ascii_alphabetic()` TRUE side).
+        assert!(!is_url_like("1http://example.com"));
+    }
+
+    #[test]
+    fn is_url_like_rejects_invalid_scheme_char() {
+        // rationale: scheme chars must be `[A-Za-z0-9+\-.]`; an underscore in the
+        // scheme fails the `.all(...)` predicate.
+        assert!(!is_url_like("ht_tp://example.com"));
+    }
+
+    #[test]
+    fn is_url_like_rejects_no_colon() {
+        // rationale: no colon at all -> `position(|b| b == b':')` None arm ->
+        // not a URL.
+        assert!(!is_url_like("just-a-plain-byline-name"));
+    }
+
+    // ---- unescape_html_entities — numeric edge shapes ----
+
+    #[test]
+    fn unescape_numeric_entity_without_semicolon_left_alone() {
+        // rationale: `Readability.js:1615-1623` numeric form requires a trailing
+        // ';'. `&#65` (no ';') fails `try_numeric_entity` (the `b[p] != b';'`
+        // arm) and the bare '&' is copied verbatim.
+        assert_eq!(unescape_html_entities("A&#65 B"), "A&#65 B");
+    }
+
+    #[test]
+    fn unescape_numeric_entity_empty_digit_run_left_alone() {
+        // rationale: `&#;` has no digits (`p == digit_start`) -> not a numeric
+        // entity -> '&' copied verbatim.
+        assert_eq!(unescape_html_entities("x&#;y"), "x&#;y");
+    }
+
+    #[test]
+    fn unescape_hex_entity_decoded() {
+        // rationale: `&#x41;` -> 'A' via the hex radix arm (`b[2] == b'x'`).
+        assert_eq!(unescape_html_entities("&#x41;"), "A");
+    }
 }

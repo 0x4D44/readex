@@ -144,6 +144,10 @@ fn is_tag_boundary(b: u8) -> bool {
 /// all-lowercase ASCII) appears anywhere in `haystack` when both are
 /// lowered. Short-circuits on first match.
 fn contains_ci(haystack: &[u8], needle: &[u8]) -> bool {
+    // llvm-cov:branch-not-reachable: the `needle.is_empty()` true side. The
+    // only caller (`preprocess_html`) passes non-empty byte literals (`b"</br"`,
+    // `b"<td"`, ...), so `needle` is never empty. (The `haystack.len() <
+    // needle.len()` short side IS exercised, e.g. by the empty-input test.)
     if needle.is_empty() || haystack.len() < needle.len() {
         return false;
     }
@@ -1218,6 +1222,10 @@ impl Dom {
         }
 
         // 768-770: clone every attribute onto the replacement.
+        // llvm-cov:branch-not-reachable: both `if let Element` false sides.
+        // `replacement` is built by `create_element` (always an Element), and
+        // `set_node_tag` is only ever called to retag an existing element node,
+        // so both destructures always succeed on the ported paths.
         if let NodeData::Element { attrs: old, .. } = &node.data
             && let NodeData::Element { attrs: new, .. } = &replacement.data
         {
@@ -1326,6 +1334,9 @@ impl Dom {
             // Append to prev's data in place.
             let kids = parent.children.borrow();
             let prev = &kids[idx - 1];
+            // llvm-cov:branch-not-reachable: the `if let Text` false side.
+            // `prev_is_text` was computed from the very same node's data just
+            // above, so this destructure always matches inside the branch.
             if let NodeData::Text { contents } = &prev.data {
                 // Round-trip via String -> StrTendril: Tendril's in-place
                 // append isn't on the publicly-stable surface, and one
@@ -1726,6 +1737,9 @@ pub fn replace_element_tag(elem: &NodeRef, new_tag: &str) -> NodeRef {
     // site via `elem.attrib.clear()` then sets specific ones — we faithfully
     // copy them here, and the caller calls `clear_attributes` / `set_attribute`
     // afterwards if needed). This preserves the "rename only" semantic.
+    // llvm-cov:branch-not-reachable: both `if let Element` false sides.
+    // `replacement` is from `create_element` (always Element) and
+    // `replace_element_tag` is only called to retag existing element nodes.
     if let NodeData::Element { attrs: old, .. } = &elem.data
         && let NodeData::Element { attrs: new, .. } = &replacement.data
     {
@@ -3404,5 +3418,206 @@ mod tests {
         let input = "<td\x0Cclass=\"x\">cell</td>";
         let result = preprocess_html(input);
         assert_eq!(&*result, "<div\x0Cclass=\"x\">cell</div>");
+    }
+
+    /// `preprocess_html` stray-cell quick-scan (`dom.rs:218-223`): the `<tr`
+    /// limb of the `||` chain is reached and TRUE only when neither `<td` nor
+    /// `<th` appears earlier. An isolated `<tr>` triggers the rewrite.
+    /// rationale: pin the `contains_ci(b"<tr")` true side (dom.rs:220), which
+    /// the all-cell-tags fixture short-circuits before reaching.
+    #[test]
+    fn preprocess_stray_tr_only_triggers_cell_rewrite() {
+        let result = preprocess_html("<tr>row</tr>");
+        assert!(matches!(result, Cow::Owned(_)), "stray <tr> triggers rewrite");
+        assert!(result.contains("<div>"), "stray <tr> rewritten: {result:?}");
+    }
+
+    /// As above for the `<tbody` limb (dom.rs:221) — reached only when `<td`,
+    /// `<th`, `<tr` are all absent.
+    /// rationale: pin the `contains_ci(b"<tbody")` true side.
+    #[test]
+    fn preprocess_stray_tbody_only_triggers_cell_rewrite() {
+        let result = preprocess_html("<tbody>x</tbody>");
+        assert!(matches!(result, Cow::Owned(_)), "stray <tbody> triggers rewrite");
+    }
+
+    /// As above for the `<tfoot` limb (dom.rs:222) — reached only when `<td`,
+    /// `<th`, `<tr`, `<tbody` are all absent.
+    /// rationale: pin the `contains_ci(b"<tfoot")` true side.
+    #[test]
+    fn preprocess_stray_tfoot_only_triggers_cell_rewrite() {
+        let result = preprocess_html("<tfoot>x</tfoot>");
+        assert!(matches!(result, Cow::Owned(_)), "stray <tfoot> triggers rewrite");
+    }
+
+    /// `set_element_text` (`dom.rs:726-749`): the three negative arms.
+    /// rationale: pin (a) the `leading_count > 0` false arm (dom.rs:734) — an
+    /// element with no leading text run; (b) the `let Some(s) = value` None
+    /// arm (dom.rs:743) — `value = None` clears nothing extra; (c) the
+    /// `s.is_empty()` true arm (dom.rs:744) — `value = Some("")` inserts no
+    /// text node.
+    #[test]
+    fn set_element_text_negative_arms() {
+        // (a) element with no leading Text child, set a value → text inserted.
+        let dom = Dom::parse("<div><span>kid</span></div>");
+        let div = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        set_element_text(&div, Some("lead"));
+        assert!(text_content(&div).starts_with("lead"));
+
+        // (b) value = None on an element with a leading text run → run drained,
+        // nothing inserted.
+        let dom2 = Dom::parse("<div>old<span>k</span></div>");
+        let div2 = get_elements_by_tag_name(&dom2.body().unwrap(), "div")[0].clone();
+        set_element_text(&div2, None);
+        assert_eq!(text_content(&div2), "k", "None clears the leading text run");
+
+        // (c) value = Some("") → leading run drained, empty string inserts no node.
+        let dom3 = Dom::parse("<div>old<span>k</span></div>");
+        let div3 = get_elements_by_tag_name(&dom3.body().unwrap(), "div")[0].clone();
+        set_element_text(&div3, Some(""));
+        assert_eq!(text_content(&div3), "k", "empty string inserts no text node");
+    }
+
+    /// `set_tail` (`dom.rs:769-796`): the detached and empty-string arms.
+    /// rationale: pin (a) the `parent_and_index(elem)` None arm (dom.rs:770) —
+    /// a detached element is a no-op; (b) the `s.is_empty()` true arm
+    /// (dom.rs:791) — `Some("")` inserts no tail text node.
+    #[test]
+    fn set_tail_detached_and_empty_arms() {
+        // (a) detached element — no parent → no-op (must not panic).
+        let orphan = create_element("span");
+        set_tail(&orphan, Some("tail"));
+        assert!(parent(&orphan).is_none());
+
+        // (b) attached element, value = Some("") → tail run drained, nothing
+        // inserted.
+        let dom = Dom::parse("<div><span>a</span>tail<b>b</b></div>");
+        let span = get_elements_by_tag_name(&dom.body().unwrap(), "span")[0].clone();
+        set_tail(&span, Some(""));
+        // The "tail" text between <span> and <b> is drained, none re-inserted.
+        assert_eq!(text_content(&dom.body().unwrap()), "ab");
+    }
+
+    /// `set_attribute` / `remove_attribute` (`dom.rs:883-901`): the non-element
+    /// no-op guard. Both are documented as no-ops on non-element nodes.
+    /// rationale: pin the `if let Element` false arms (dom.rs:884, 899) by
+    /// calling each on a Text node — no panic, no effect.
+    #[test]
+    fn set_and_remove_attribute_noop_on_text_node() {
+        let t = create_text_node("hello");
+        set_attribute(&t, "class", "x"); // no-op on a Text node
+        assert!(get_attribute(&t, "class").is_none());
+        remove_attribute(&t, "class"); // also a no-op
+        assert_eq!(text_content(&t), "hello");
+    }
+
+    /// `replace_child` (`dom.rs:994-1008`): the "old_node is not a child of
+    /// parent" no-op (the `let Some(pos) = pos else return`).
+    /// rationale: pin the None arm (dom.rs:1000) — replacing a node that is
+    /// not a child leaves both trees unchanged.
+    #[test]
+    fn replace_child_noop_when_old_not_a_child() {
+        let dom = Dom::parse("<div><a>a</a></div>");
+        let div = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let stranger = create_element("b"); // never a child of div
+        let fresh = create_element("c");
+        replace_child(&div, &fresh, &stranger);
+        // div unchanged: still just <a>, and `fresh` was not adopted.
+        assert_eq!(get_elements_by_tag_name(&div, "c").len(), 0);
+        assert!(parent(&fresh).is_none());
+        assert_eq!(get_elements_by_tag_name(&div, "a").len(), 1);
+    }
+
+    /// `insert_with_tail` (`dom.rs:1052-1069`): the no-tail path — when `child`
+    /// has no tail, neither the pre-move drain nor the post-move re-apply runs.
+    /// rationale: pin the `captured.is_some()` false arm (dom.rs:1056) and the
+    /// `if let Some(t) = captured` None arm (dom.rs:1066).
+    #[test]
+    fn insert_with_tail_no_tail_child_moves_plainly() {
+        // <src><x>x</x></src><dst></dst> — <x> has no following Text sibling,
+        // so it has no tail. Move it into <dst>.
+        let dom = Dom::parse("<div id=src><x>x</x></div><div id=dst></div>");
+        let body = dom.body().unwrap();
+        let divs = get_elements_by_tag_name(&body, "div");
+        let src = divs
+            .iter()
+            .find(|d| get_attribute(d, "id").as_deref() == Some("src"))
+            .unwrap()
+            .clone();
+        let dst = divs
+            .iter()
+            .find(|d| get_attribute(d, "id").as_deref() == Some("dst"))
+            .unwrap()
+            .clone();
+        let x = get_elements_by_tag_name(&src, "x")[0].clone();
+        insert_with_tail(&dst, &x, 0);
+        assert_eq!(get_elements_by_tag_name(&dst, "x").len(), 1, "x moved into dst");
+        assert_eq!(get_elements_by_tag_name(&src, "x").len(), 0, "x left src");
+    }
+
+    /// `set_node_tag` (`dom.rs:1202`): the detached-node arm — `replaceChild`
+    /// is a no-op when the node has no parent (documented as defensive but
+    /// reachable by calling the public method on a parentless element).
+    /// rationale: pin the `parent_and_index(node)` None arm (dom.rs:1202). The
+    /// retag still creates the replacement, moves children, and copies attrs.
+    #[test]
+    fn set_node_tag_detached_node_no_parent_splice() {
+        // A parentless element with a child and an attribute.
+        let orphan = create_element("h1");
+        set_attribute(&orphan, "class", "title");
+        let kid = create_text_node("heading");
+        kid.parent.set(Some(Rc::downgrade(&orphan)));
+        orphan.children.borrow_mut().push(kid);
+
+        let mut dom = Dom::parse("<div></div>");
+        let new = dom.set_node_tag(&orphan, "h2");
+        assert_eq!(tag_name(&new).as_deref(), Some("H2"));
+        assert_eq!(text_content(&new), "heading", "children moved to replacement");
+        assert_eq!(
+            get_attribute(&new, "class").as_deref(),
+            Some("title"),
+            "attributes cloned onto replacement even when detached"
+        );
+        assert!(parent(&new).is_none(), "no parent to splice into");
+    }
+
+    /// `delete_with_tail_preserve` (`dom.rs:1270`): the detached-element no-op.
+    /// rationale: pin the `parent_and_index(elem)` None arm — deleting a
+    /// parentless element does nothing and does not panic.
+    #[test]
+    fn delete_with_tail_preserve_detached_is_noop() {
+        let mut dom = Dom::parse("<div></div>");
+        let orphan = create_element("span");
+        dom.delete_with_tail_preserve(&orphan); // no parent → no-op
+        assert!(parent(&orphan).is_none());
+    }
+
+    /// `replace_element_tag` (`dom.rs:1736`): the detached-element arm — the
+    /// splice into the parent slot is skipped, but the replacement is still
+    /// built (children moved, attributes cloned).
+    /// rationale: pin the `parent_and_index(elem)` None arm (dom.rs:1736).
+    #[test]
+    fn replace_element_tag_detached_builds_replacement_without_splice() {
+        let orphan = create_element("b");
+        set_attribute(&orphan, "data-k", "v");
+        let kid = create_text_node("bold");
+        kid.parent.set(Some(Rc::downgrade(&orphan)));
+        orphan.children.borrow_mut().push(kid);
+
+        let new = replace_element_tag(&orphan, "strong");
+        assert_eq!(tag_name(&new).as_deref(), Some("STRONG"));
+        assert_eq!(text_content(&new), "bold");
+        assert_eq!(get_attribute(&new, "data-k").as_deref(), Some("v"));
+        assert!(parent(&new).is_none(), "detached → no splice");
+    }
+
+    /// `clear_attributes` (`dom.rs:1747-1751`): the non-element no-op guard.
+    /// rationale: pin the `if let Element` false arm (dom.rs:1748) — calling
+    /// it on a Text node does nothing and does not panic.
+    #[test]
+    fn clear_attributes_noop_on_text_node() {
+        let t = create_text_node("text");
+        clear_attributes(&t); // no-op on a non-element
+        assert_eq!(text_content(&t), "text");
     }
 }

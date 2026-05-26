@@ -857,6 +857,33 @@ mod tests {
         assert!(textfilter(&p), "textfilter on empty <p> must return true");
     }
 
+    #[test]
+    fn textfilter_explicit_empty_text_node_returns_true() {
+        // rationale: pin the True side of `if s.is_empty()` at utils.rs:299
+        // — Python `utils.py:447`'s `not testtext` is truthy-falsy on `""`.
+        // The `p_with_text("")` helper builds a <p> with NO text child, so
+        // `element_text` is `None` and the function returns via the
+        // `testtext is None` fast path (utils.rs:295) — it never reaches
+        // L299. To exercise the empty-STRING arm we must build a <p> that
+        // carries an EXPLICIT empty Text-node child, so `element_text`
+        // returns `Some("")` (not `None`). That is the genuine
+        // `testtext == ""` shape: lxml's `element.text` is the empty string
+        // when an element wraps a zero-length text run.
+        let p = create_element("p");
+        crate::readability::dom::append_child(&p, &create_text_node(""));
+        // Sanity: element_text must now be Some("") (NOT None) so the
+        // L295 `is_none()` fast path is skipped and L299 is reached.
+        assert_eq!(
+            element_text(&p).as_deref(),
+            Some(""),
+            "test setup: an explicit empty Text child must surface as Some(\"\")"
+        );
+        assert!(
+            textfilter(&p),
+            "textfilter on an empty-string text run must return true (utils.py:447)"
+        );
+    }
+
     // ---- text_chars_test boundary cases (utils.py:452-456) -----------------
 
     #[test]

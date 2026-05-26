@@ -571,11 +571,21 @@ fn extract_comments_from_html(
     cleaning_opts: &trafilatura::cleaning::Options,
 ) -> String {
     let dom = readability::dom::Dom::parse(html);
+    // llvm-cov:branch-not-reachable: html5ever ALWAYS synthesises an <html>
+    // root element for any input string, including the empty string —
+    // `Dom::parse("").root_element()` returns `Some(_)`. The `None` arm is
+    // defensive and only fires if html5ever's contract changes; no synthetic
+    // HTML can drive it from the public API.
     let Some(html_root) = dom.root_element() else {
         return String::new();
     };
     trafilatura::cleaning::tree_cleaning(&html_root, cleaning_opts);
     trafilatura::cleaning::convert_tags(&html_root, cleaning_opts);
+    // llvm-cov:branch-not-reachable: html5ever ALWAYS synthesises a <body>
+    // child of <html> for any input — `Dom::parse("").body()` returns
+    // `Some(_)`. The `None` arm is defensive (same shape as the
+    // `root_element()` guard above) and is unreachable through any HTML
+    // input.
     let Some(body) = dom.body() else {
         return String::new();
     };
@@ -3666,5 +3676,162 @@ mod tests {
         assert!(b.contains("ContentTooShort"), "got: {b:?}");
         // ContentTooShort's Debug must include the field values too.
         assert!(b.contains('7') && b.contains('9'), "got: {b:?}");
+    }
+
+    // ====================================================================
+    // Second pass — `min_word_count > 0` SATISFIED (the && right-operand
+    // evaluating FALSE → `Ok` is returned).
+    //
+    // The existing `threshold_*` tests above pin three shapes:
+    //   - min_word_count == 0 (the `> 0` left-operand False → skip gate),
+    //   - min_word_count == 1 + EMPTY body (gate fires, {0,1}),
+    //   - min_word_count == 9999 + substantive (gate fires, {real,9999}).
+    //
+    // None of them exercises the case where `min_word_count > 0` is TRUE
+    // **and** the content SATISFIES it (`word_count < threshold` is FALSE,
+    // so the `&&` short-circuits False and the function returns `Ok`). That
+    // is the documented contract (HLD §7.6): "the check fires AFTER the
+    // extraction succeeds" — a positive minimum the content MEETS must NOT
+    // be turned into a `ContentTooShort` error. These tests pin the False
+    // side of the `word_count < threshold` conjunct at each public
+    // formatter entry (lib.rs:552 / :711 / :817 / :889 / :985 / :1105 /
+    // :1231 / :1332).
+    // ====================================================================
+
+    /// rationale: HLD §7.6 — `extract_with` with `min_word_count == 1` on a
+    /// substantive article returns `Ok` (the gate's `word_count < 1`
+    /// conjunct is False because the real yield is ≥ 1 word).
+    #[test]
+    fn extract_with_positive_threshold_satisfied_returns_ok() {
+        let opts = Options {
+            min_word_count: 1,
+            ..Options::default()
+        };
+        let e = extract_with(SUBSTANTIVE_HTML, None, &opts)
+            .expect("article meeting min_word_count=1 must Ok");
+        assert!(e.word_count >= 1, "real yield must satisfy the threshold");
+        assert!(!e.text.is_empty());
+    }
+
+    /// rationale: core.py:73-98 — `extract_to_markdown` returns `Ok` when
+    /// the article meets a positive `min_word_count` (False side of the
+    /// `word_count < threshold` gate at the markdown formatter entry).
+    #[test]
+    fn extract_to_markdown_positive_threshold_satisfied_returns_ok() {
+        let opts = Options {
+            min_word_count: 1,
+            ..Options::default()
+        };
+        let md = extract_to_markdown(SUBSTANTIVE_HTML, None, &opts)
+            .expect("article meeting min_word_count=1 must Ok");
+        assert!(!md.is_empty(), "markdown body must be non-empty");
+    }
+
+    /// rationale: core.py:71-98 — `extract_to_txt` returns `Ok` when the
+    /// article meets a positive `min_word_count`.
+    #[test]
+    fn extract_to_txt_positive_threshold_satisfied_returns_ok() {
+        let opts = Options {
+            min_word_count: 1,
+            ..Options::default()
+        };
+        let s = extract_to_txt(SUBSTANTIVE_HTML, None, &opts)
+            .expect("article meeting min_word_count=1 must Ok");
+        assert!(!s.is_empty());
+    }
+
+    /// rationale: xml.py JSON branch — `extract_to_json` returns `Ok` when
+    /// the article meets a positive `min_word_count`.
+    #[test]
+    fn extract_to_json_positive_threshold_satisfied_returns_ok() {
+        let opts = Options {
+            min_word_count: 1,
+            ..Options::default()
+        };
+        let j = extract_to_json(SUBSTANTIVE_HTML, None, &opts)
+            .expect("article meeting min_word_count=1 must Ok");
+        assert!(j.contains('{'), "json output must be a JSON object");
+    }
+
+    /// rationale: xml.py CSV branch — `extract_to_csv` returns `Ok` when
+    /// the article meets a positive `min_word_count`.
+    #[test]
+    fn extract_to_csv_positive_threshold_satisfied_returns_ok() {
+        let opts = Options {
+            min_word_count: 1,
+            ..Options::default()
+        };
+        let c = extract_to_csv(SUBSTANTIVE_HTML, None, &opts)
+            .expect("article meeting min_word_count=1 must Ok");
+        assert!(!c.is_empty());
+    }
+
+    /// rationale: xml.py:186-235 XML branch — `extract_to_xml` returns `Ok`
+    /// when the article meets a positive `min_word_count`.
+    #[test]
+    fn extract_to_xml_positive_threshold_satisfied_returns_ok() {
+        let opts = Options {
+            min_word_count: 1,
+            ..Options::default()
+        };
+        let x = extract_to_xml(SUBSTANTIVE_HTML, None, &opts)
+            .expect("article meeting min_word_count=1 must Ok");
+        assert!(x.contains('<'), "xml output must contain markup");
+    }
+
+    /// rationale: xml.py:186-235 TEI branch — `extract_to_tei` returns `Ok`
+    /// when the article meets a positive `min_word_count`.
+    #[test]
+    fn extract_to_tei_positive_threshold_satisfied_returns_ok() {
+        let opts = Options {
+            min_word_count: 1,
+            ..Options::default()
+        };
+        let t = extract_to_tei(SUBSTANTIVE_HTML, None, &opts)
+            .expect("article meeting min_word_count=1 must Ok");
+        assert!(t.starts_with("<TEI"), "got: {t:?}");
+    }
+
+    /// rationale: HLD §7.6 — the M2 `extract_via_readability` path returns
+    /// `Ok` when the article meets a positive `min_word_count` (False side
+    /// of the gate at lib.rs:1332).
+    #[test]
+    fn extract_via_readability_positive_threshold_satisfied_returns_ok() {
+        let opts = Options {
+            min_word_count: 1,
+            ..Options::default()
+        };
+        let e = extract_via_readability(SUBSTANTIVE_HTML, None, &opts)
+            .expect("article meeting min_word_count=1 must Ok");
+        assert!(e.word_count >= 1);
+        assert!(!e.text.is_empty());
+    }
+
+    /// rationale: lib.rs:1295 — `extract_via_readability` maps an article
+    /// whose Readability-derived title is the empty string to `title:
+    /// None` (the True side of `if article.title.is_empty()`). The existing
+    /// tests only feed documents with a real `<title>` (so the title is
+    /// always non-empty); a `<body>`-only article with no title element
+    /// drives the empty-title arm. Mozilla Readability returns an empty
+    /// title string when no `<title>`/`<h1>` heading is resolvable.
+    #[test]
+    fn extract_via_readability_empty_title_maps_to_none() {
+        // No <title>, no <h1> — substantive body so parse() returns
+        // Some(article), but article.title resolves to "".
+        let html = "<html><body><article><p>This is a substantial body of \
+            readable prose with no title element anywhere in the document, so \
+            the Readability title resolver yields an empty string and the M2 \
+            path must map that to a None title rather than Some(\"\"). We pad \
+            the paragraph with enough words to clear the scorer thresholds and \
+            keep the article subtree as the top candidate for extraction.</p>\
+            </article></body></html>";
+        let e = extract_via_readability(html, None, &Options::default())
+            .expect("substantive body must extract");
+        assert!(!e.text.is_empty(), "body text must be extracted");
+        assert!(
+            e.title.is_none(),
+            "an empty Readability title must map to None, got {:?}",
+            e.title
+        );
     }
 }

@@ -2942,4 +2942,224 @@ mod tests {
         let out = python_html_unescape("café &amp; 中文");
         assert_eq!(out, "café & 中文");
     }
+
+    // ---- assign_og_property — preserve-when-Some guards (FALSE side) -------
+
+    #[test]
+    fn assign_og_property_preserves_description_when_some() {
+        // rationale: `metadata.py:142-144` OG_PROPERTIES maps og:description ->
+        // description only when the slot is None. A pre-populated description
+        // must survive a second og:description.
+        let mut m = Metadata {
+            description: Some("First".into()),
+            ..Default::default()
+        };
+        assign_og_property(&mut m, "og:description", "Second");
+        assert_eq!(m.description.as_deref(), Some("First"));
+    }
+
+    #[test]
+    fn assign_og_property_preserves_site_name_when_some() {
+        // rationale: `metadata.py:145` og:site_name -> sitename gated by is_none();
+        // an existing sitename is not overwritten.
+        let mut m = Metadata {
+            site_name: Some("First Site".into()),
+            ..Default::default()
+        };
+        assign_og_property(&mut m, "og:site_name", "Second Site");
+        assert_eq!(m.site_name.as_deref(), Some("First Site"));
+    }
+
+    #[test]
+    fn assign_og_property_preserves_pagetype_when_some() {
+        // rationale: `metadata.py:149` og:type -> pagetype gated by is_none();
+        // an existing pagetype is not overwritten.
+        let mut m = Metadata {
+            pagetype: Some("article".into()),
+            ..Default::default()
+        };
+        assign_og_property(&mut m, "og:type", "website");
+        assert_eq!(m.pagetype.as_deref(), Some("article"));
+    }
+
+    // ---- normalize_authors — negative-shape arms --------------------------
+
+    #[test]
+    fn normalize_authors_skips_overlong_single_token() {
+        // rationale: `json_metadata.py:251` `if not author or (len(author) >= 50
+        // and ' ' not in author and '-' not in author): continue`. A 50+-char
+        // token with no space and no hyphen is discarded as junk; with no
+        // prior authors the result is None (new_authors stays empty).
+        let token = "a".repeat(55);
+        assert_eq!(normalize_authors(None, &token), None);
+    }
+
+    #[test]
+    fn normalize_authors_keeps_overlong_token_with_space() {
+        // rationale: same guard FALSE side — a 50+-char string that DOES contain
+        // a space is kept (it is a plausible multi-word byline, not a junk token).
+        let long_name = format!("{} {}", "Alexander".repeat(3), "Hamiltonsson".repeat(3));
+        let out = normalize_authors(None, &long_name).expect("long spaced name kept");
+        assert!(out.contains(' '), "spaced long name retained, got {out:?}");
+    }
+
+    #[test]
+    fn normalize_authors_no_entity_path_skips_unescape() {
+        // rationale: `json_metadata.py:237-238` `if '&#' in s or '&amp;' in s:
+        // s = unescape(s)` — the FALSE side: a plain name with no entity marker
+        // bypasses the unescape branch and is returned verbatim (title-cased).
+        let out = normalize_authors(None, "Jane Doe").expect("plain name kept");
+        assert_eq!(out, "Jane Doe");
+    }
+
+    #[test]
+    fn normalize_authors_drops_superstring_of_existing_author() {
+        // rationale: `json_metadata.py:255-256` dedup rule
+        // `if author not in new_authors and all(x not in author for x in
+        // new_authors)`. A new candidate that CONTAINS an existing author as a
+        // substring (e.g. "Jane Doe Smith" ⊇ "Jane Doe") fails `all(...)` and is
+        // NOT appended; the existing list is returned unchanged.
+        let out = normalize_authors(Some("Jane Doe"), "Jane Doe Smith").expect("kept current");
+        assert_eq!(out, "Jane Doe");
+    }
+
+    // ---- normalize_tags — empty-after-trim arm ----------------------------
+
+    #[test]
+    fn normalize_tags_returns_empty_for_whitespace_only() {
+        // rationale: `metadata.py:160-166` — `normalize_tags` trims first; a
+        // whitespace-only input trims to empty and short-circuits to "".
+        assert_eq!(normalize_tags("   "), "");
+    }
+
+    // ---- check_authors — empty / all-blacklisted arms ---------------------
+
+    #[test]
+    fn check_authors_skips_empty_segments() {
+        // rationale: `metadata.py:172-176` — the `if not author: continue`
+        // (empty segment) FALSE side: `"; ; Jane"` splits to ["", " ", " Jane"];
+        // the blank segments are skipped and only "Jane" survives.
+        let out = check_authors("; ; Jane", &[]).expect("kept Jane");
+        assert_eq!(out, "Jane");
+    }
+
+    #[test]
+    fn check_authors_all_empty_returns_none() {
+        // rationale: `metadata.py:177-179` — when every segment is blank, `kept`
+        // is empty and the function returns None.
+        assert_eq!(check_authors(" ; ; ", &[]), None);
+    }
+
+    // ---- extract_title — fallback cascade arms ----------------------------
+
+    #[test]
+    fn extract_title_falls_back_to_first_h1_when_multiple() {
+        // rationale: `metadata.py:368-370` — when there are MULTIPLE <h1> (so the
+        // single-h1 rule at :355 is skipped), no TITLE_XPATHS hit, and no <title>
+        // separator-split, the first <h1> text is the fallback.
+        let html = r#"<html><head></head><body>
+            <h1>First Heading</h1><h1>Second Heading</h1>
+            </body></html>"#;
+        let dom = Dom::parse(html);
+        assert_eq!(extract_title(&dom).as_deref(), Some("First Heading"));
+    }
+
+    #[test]
+    fn extract_title_falls_back_to_first_h2() {
+        // rationale: `metadata.py:371-373` — no h1 at all, no title, no xpath hit;
+        // the first <h2> is the fallback.
+        let html = r#"<html><head></head><body>
+            <h2>Sub Heading</h2><p>body</p>
+            </body></html>"#;
+        let dom = Dom::parse(html);
+        assert_eq!(extract_title(&dom).as_deref(), Some("Sub Heading"));
+    }
+
+    #[test]
+    fn extract_title_keeps_dotful_title_half_as_last_resort() {
+        // rationale: `metadata.py:364-367` then `:376` — when BOTH separator
+        // halves contain a "." (so the `if '.' not in ...` arm never fires) and
+        // there is no h1/h2, the raw <title> survives as the final fallback.
+        let html = r#"<html><head>
+            <title>file.txt | doc.pdf</title>
+            </head><body><p>only body text</p></body></html>"#;
+        let dom = Dom::parse(html);
+        // Neither half is dot-free; no h1/h2 -> raw title returned verbatim.
+        assert_eq!(extract_title(&dom).as_deref(), Some("file.txt | doc.pdf"));
+    }
+
+    // ---- examine_meta — negative-side contracts ---------------------------
+
+    #[test]
+    fn examine_meta_article_tag_empty_after_normalize_adds_no_tag() {
+        // rationale: `metadata.py:251-252` — `if value: metadata.tags.append(...)`.
+        // An `article:tag` whose content normalizes to "" (only quotes) must NOT
+        // push an empty tag (the `if !normalized.is_empty()` FALSE side).
+        let html = r#"<html><head>
+            <meta property="article:tag" content="&quot;&quot;">
+            </head><body><p>x</p></body></html>"#;
+        let m = extract_metadata(html, None, true, &[]);
+        assert!(m.tags.is_empty(), "empty tag not added, got {:?}", m.tags);
+    }
+
+    #[test]
+    fn examine_meta_article_publisher_does_not_overwrite_site_name() {
+        // rationale: `metadata.py:258-259` `if not document.sitename` guard
+        // FALSE side — an og:site_name set first blocks article:publisher.
+        let html = r#"<html><head>
+            <meta property="og:site_name" content="OG Site">
+            <meta property="article:publisher" content="Publisher Co">
+            </head><body><p>x</p></body></html>"#;
+        let m = extract_metadata(html, None, true, &[]);
+        assert_eq!(m.site_name.as_deref(), Some("OG Site"));
+    }
+
+    #[test]
+    fn examine_meta_property_image_does_not_overwrite_existing() {
+        // rationale: `metadata.py:260-261` METANAME_IMAGE arm gated by
+        // `metadata.image is None` FALSE side — og:image set first wins over a
+        // later property=twitter:image.
+        let html = r#"<html><head>
+            <meta property="og:image" content="https://e.com/og.jpg">
+            <meta property="twitter:image" content="https://e.com/tw.jpg">
+            </head><body><p>x</p></body></html>"#;
+        let m = extract_metadata(html, None, true, &[]);
+        assert_eq!(m.image.as_deref(), Some("https://e.com/og.jpg"));
+    }
+
+    #[test]
+    fn examine_meta_name_twitter_url_does_not_overwrite_existing_url() {
+        // rationale: `metadata.py:286-287` `name == "twitter:url" and not
+        // document.url` FALSE side — an og:url set first blocks twitter:url.
+        let html = r#"<html><head>
+            <meta property="og:url" content="https://e.com/canonical">
+            <meta name="twitter:url" content="https://e.com/twitter">
+            </head><body><p>x</p></body></html>"#;
+        let m = extract_metadata(html, None, true, &[]);
+        assert_eq!(m.url.as_deref(), Some("https://e.com/canonical"));
+    }
+
+    #[test]
+    fn examine_meta_itemprop_headline_does_not_overwrite_title() {
+        // rationale: `metadata.py:296-297` `itemprop == "headline" and not
+        // document.title` FALSE side — og:title set first blocks itemprop headline.
+        let html = r#"<html><head>
+            <meta property="og:title" content="OG Title Wins">
+            <meta itemprop="headline" content="Itemprop Headline">
+            </head><body><p>x</p></body></html>"#;
+        let m = extract_metadata(html, None, true, &[]);
+        assert_eq!(m.title.as_deref(), Some("OG Title Wins"));
+    }
+
+    #[test]
+    fn examine_meta_skips_meta_with_property_but_no_content() {
+        // rationale: `metadata.py:244` `if content is None: continue` — a
+        // property=meta with no content attribute is skipped before the property
+        // dispatch (the `let Some(content) ... else continue` arm).
+        let html = r#"<html><head>
+            <meta property="article:author">
+            </head><body><p>x</p></body></html>"#;
+        let m = extract_metadata(html, None, true, &[]);
+        assert!(m.author.is_none());
+    }
 }

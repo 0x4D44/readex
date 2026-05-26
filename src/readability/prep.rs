@@ -168,6 +168,9 @@ pub(crate) fn unwrap_noscript_images(doc_root: &NodeRef) {
         // matches the image-extension regex, return early (KEEP); else
         // (fallthrough out of the for-loop) `img.remove()` (`:1912`).
         let mut keep = false;
+        // llvm-cov:branch-not-reachable: the `if let Element` else side. `img`
+        // comes from `get_elements_by_tag_name(doc_root, "img")`, which only
+        // yields Element nodes, so the destructure never fails.
         if let dom::NodeData::Element { attrs, .. } = &img.data {
             for a in attrs.borrow().iter() {
                 let name = &*a.name.local;
@@ -217,6 +220,10 @@ pub(crate) fn unwrap_noscript_images(doc_root: &NodeRef) {
             prev_element.clone()
         } else {
             let imgs = get_elements_by_tag_name(&prev_element, "img");
+            // llvm-cov:branch-not-reachable: the `else { continue }` (None)
+            // side. `_isSingleImage(prev_element)` just returned true, which
+            // for a non-IMG element means it descends to an IMG, so there is
+            // always at least one descendant img here.
             let Some(first) = imgs.into_iter().next() else {
                 continue;
             };
@@ -228,6 +235,9 @@ pub(crate) fn unwrap_noscript_images(doc_root: &NodeRef) {
         // so `tmp.getElementsByTagName("img")[0]` ≡
         // `noscript.getElementsByTagName("img")[0]`.
         let new_imgs = get_elements_by_tag_name(&noscript, "img");
+        // llvm-cov:branch-not-reachable: the `else { continue }` (None) side.
+        // `_isSingleImage(noscript)` (checked at the top of the loop) is only
+        // true when the noscript resolves to an IMG, so it always has an img.
         let Some(new_img) = new_imgs.into_iter().next() else {
             continue;
         };
@@ -238,6 +248,9 @@ pub(crate) fn unwrap_noscript_images(doc_root: &NodeRef) {
         // image-extension regex, copy onto newImg with a `data-old-` prefix
         // on the destination name if it already has an attribute by that
         // name. Skip if newImg already has the same name/value pair.
+        // llvm-cov:branch-not-reachable: the `if let Element` else side.
+        // `prev_img` is either `prev_element` (an element) or a descendant img
+        // from `get_elements_by_tag_name`, so it is always an Element node.
         let prev_attrs = if let dom::NodeData::Element { attrs, .. } = &prev_img.data {
             attrs
                 .borrow()
@@ -278,9 +291,15 @@ pub(crate) fn unwrap_noscript_images(doc_root: &NodeRef) {
         // tmp.firstElementChild, prevElement)`. The `tmp.firstElementChild`
         // is the noscript's first element child (since the noscript content
         // is exactly the `<img>` markup under inert parsing).
+        // llvm-cov:branch-not-reachable: the `else { continue }` (None) side.
+        // The noscript was found via `get_elements_by_tag_name(doc_root, ...)`,
+        // so it is a live descendant with a parent.
         let Some(parent_of_noscript) = parent(&noscript) else {
             continue;
         };
+        // llvm-cov:branch-not-reachable: the `else { continue }` (None) side.
+        // `_isSingleImage(noscript)` true ⇒ the noscript has a single element
+        // child (the img, possibly wrapped), so it always has a first child.
         let Some(first_elem_child) = children(&noscript).into_iter().next() else {
             continue;
         };
@@ -316,6 +335,10 @@ fn replace_brs(dom: &mut Dom, elem: &NodeRef) {
         if replaced {
             // var p = createElement("p"); br.parentNode.replaceChild(p, br);
             let p = create_element("p");
+            // llvm-cov:branch-not-reachable: the `else { continue }` (None)
+            // side. This `<br>` is a live descendant from the snapshot whose
+            // following `<br>` siblings were removed (not itself), so it still
+            // has a parent here.
             let Some(br_parent) = parent(&br) else {
                 continue;
             };
@@ -490,6 +513,9 @@ pub fn prep_article(
 
     // 22. Remove extra paragraphs.
     for paragraph in get_all_nodes_with_tag(article_content, &["p"]) {
+        // llvm-cov:branch-not-reachable: `parent(&paragraph).is_none()` true
+        // side. `<p>` cannot nest a `<p>` in HTML5 (auto-closed), so removing
+        // one paragraph never orphans another in this snapshot. Defensive guard.
         if dom::parent(&paragraph).is_none() {
             continue;
         }
@@ -529,6 +555,9 @@ pub fn clean(e: &NodeRef, tag: &str) {
         let mut keep = false;
         if is_embed {
             // Check every attribute value against _allowedVideoRegex.
+            // llvm-cov:branch-not-reachable: the `if let Some` None side.
+            // `any_attr_matches_videos` returns None only for a non-element,
+            // but `element` comes from `get_all_nodes_with_tag` (elements only).
             if let Some(attr_match) = any_attr_matches_videos(&element) {
                 keep = attr_match;
             }
@@ -550,6 +579,9 @@ pub fn clean(e: &NodeRef, tag: &str) {
 /// return false /* keep */`. Returns `Some(true)` if an attribute value
 /// matches the video regex (⇒ keep the node), else `Some(false)`.
 fn any_attr_matches_videos(element: &NodeRef) -> Option<bool> {
+    // llvm-cov:branch-not-reachable: the `if let Element` else side (returns
+    // None). The only caller (`clean`) passes elements from
+    // `get_all_nodes_with_tag`, so a non-element is never seen here.
     if let markup5ever_rcdom::NodeData::Element { attrs, .. } = &element.data {
         for a in attrs.borrow().iter() {
             if regexps::videos().is_match(&a.value) {
@@ -665,6 +697,9 @@ pub fn simplify_nested_elements(article_content: &NodeRef) {
                 clone_attributes_onto(&node, &child);
 
                 // node.parentNode.replaceChild(child, node)
+                // llvm-cov:branch-not-reachable: the `if let Some(p)` None
+                // side. `has_parent` was confirmed true at the top of the loop
+                // body before this unwrap branch runs.
                 if let Some(p) = parent(&node) {
                     replace_child(&p, &child, &node);
                 }
@@ -761,6 +796,9 @@ pub fn fix_lazy_images(root: &NodeRef) {
             if mediatype != "image/svg+xml" {
                 // any OTHER attribute value matching /\.(jpg|jpeg|png|webp)/i ?
                 let mut src_could_be_removed = false;
+                // llvm-cov:branch-not-reachable: the `if let Element` else
+                // side. `elem` comes from `get_all_nodes_with_tag(root, [img,
+                // picture, figure])`, so it is always an Element node.
                 if let markup5ever_rcdom::NodeData::Element { attrs, .. } = &elem.data {
                     for a in attrs.borrow().iter() {
                         if a.name.local.to_string() == "src" {
@@ -825,6 +863,10 @@ pub fn fix_lazy_images(root: &NodeRef) {
             if let Some(target_attr) = copy_to {
                 if elem_tag == "IMG" || elem_tag == "PICTURE" {
                     set_attribute(&elem, target_attr, value);
+                // llvm-cov:branch-not-reachable: the `elem_tag == "FIGURE"`
+                // false side. `targets` are only img/picture/figure; the
+                // preceding `if` consumed IMG/PICTURE, so in this else-if
+                // `elem_tag` is always "FIGURE".
                 } else if elem_tag == "FIGURE"
                     && get_all_nodes_with_tag(&elem, &["img", "picture"]).is_empty()
                 {
@@ -2015,5 +2057,210 @@ mod tests {
         let dom5 = Dom::parse(r#"<div></div>"#);
         let div = get_elements_by_tag_name(&dom5.body().unwrap(), "div")[0].clone();
         assert!(!is_single_image(&div));
+    }
+
+    /// `_prepDocument` (`Readability.js:659-670`): the `if (doc.body)` guard
+    /// false side — a document with NO body still strips styles and retags
+    /// font without touching `_replaceBrs`.
+    /// rationale: pin `if let Some(b) = body` false arm (prep.rs:54) by passing
+    /// `body = None`.
+    #[test]
+    fn prep_document_with_no_body_still_strips_styles() {
+        let mut dom = Dom::parse("<html><head><style>.a{}</style></head></html>");
+        let root = dom.root_element().unwrap();
+        // Pass None for body: exercises the `if let Some(b)` false side.
+        prep_document(&mut dom, &root, None);
+        assert!(
+            get_elements_by_tag_name(&root, "style").is_empty(),
+            "style tags removed even when body is None (Readability.js:659-661)"
+        );
+    }
+
+    /// `_clean` (`Readability.js:2182-2206`): a non-`<object>` embed
+    /// (`<iframe>`) with no video attribute is removed; the `tagName ===
+    /// "OBJECT"` text-content fallback is NOT consulted for it.
+    /// rationale: pin the false side of `tag_name(&element) == "OBJECT"`
+    /// (prep.rs:537) — only `<object>` reaches the inner-content video check.
+    #[test]
+    fn clean_iframe_non_object_skips_object_text_check() {
+        let dom =
+            Dom::parse(r#"<div>keep<iframe src="https://example.com/page"></iframe></div>"#);
+        let div = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        clean(&div, "iframe");
+        assert!(
+            get_elements_by_tag_name(&div, "iframe").is_empty(),
+            "non-video iframe removed; object-text check not reached (Readability.js:2196 false)"
+        );
+        assert_eq!(text_content(&div), "keep");
+    }
+
+    /// `_clean` (`Readability.js:2191-2199`): an `<object>` whose INNER TEXT
+    /// carries a video URL (no video attribute) is KEPT via the object
+    /// inner-content video check.
+    /// rationale: pin the true side of `regexps::videos().is_match(text)`
+    /// (prep.rs:538) — the object-text fallback keeps an embedded video URL.
+    #[test]
+    fn clean_object_with_video_url_in_text_is_kept() {
+        // No attribute on the object, so any_attr_matches returns Some(false);
+        // the inner-text fallback sees the youtube URL and keeps it.
+        let dom = Dom::parse(
+            r#"<div><object>https://www.youtube.com/embed/abc</object><object>plain</object>txt</div>"#,
+        );
+        let div = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        clean(&div, "object");
+        let objs = get_elements_by_tag_name(&div, "object");
+        assert_eq!(objs.len(), 1, "the video-URL object survives, plain removed");
+        assert!(
+            text_content(&objs[0]).contains("youtube.com"),
+            "kept object is the one with a video URL in its text (Readability.js:2196-2199)"
+        );
+    }
+
+    /// `any_attr_matches_videos` (`Readability.js:2186-2189`): an embed whose
+    /// attribute value is NOT a video URL returns `Some(false)` so the embed
+    /// is removed.
+    /// rationale: pin the false side of `regexps::videos().is_match(&a.value)`
+    /// (prep.rs:555) — a non-video attribute does not keep the embed.
+    #[test]
+    fn clean_embed_with_non_video_attribute_is_removed() {
+        let dom = Dom::parse(r#"<div>keep<embed width="100" height="50"></embed></div>"#);
+        let div = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        clean(&div, "embed");
+        assert!(
+            get_elements_by_tag_name(&div, "embed").is_empty(),
+            "embed with only non-video attrs is removed (Readability.js:2186-2189 no match)"
+        );
+    }
+
+    /// `prep_article` empty-`<p>` pass (`Readability.js:835-850`): the FULL
+    /// `prep_article` (not the stage-1a slice) keeps a `<p>` with text and a
+    /// `<p>` carrying an `<img>`, removing only the whitespace-only `<p>`.
+    /// rationale: drive both false sides of
+    /// `content_element_count == 0 && get_inner_text(...).is_empty()`
+    /// (prep.rs:498) — text-bearing `<p>` fails `is_empty`, img-bearing `<p>`
+    /// fails the content-count, only the empty `<p>` is removed.
+    #[test]
+    fn prep_article_full_empty_p_removal_keeps_text_and_img_paragraphs() {
+        let mut dom = Dom::parse(
+            r#"<div id="readability-page-1"><p>Genuine readable prose paragraph well beyond twenty-five characters of content.</p><p>   </p><p><img src="photo.jpg"></p></div>"#,
+        );
+        let art = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let flags = crate::readability::helpers::Flags::default();
+        prep_article(&mut dom, &flags, &art);
+        let ps = get_elements_by_tag_name(&art, "p");
+        // The whitespace-only <p> removed; text <p> + img <p> survive.
+        assert_eq!(
+            ps.len(),
+            2,
+            "empty <p> removed, text and img paragraphs kept (Readability.js:835-850)"
+        );
+        assert!(text_content(&art).contains("Genuine readable prose"));
+        assert_eq!(
+            get_elements_by_tag_name(&art, "img").len(),
+            1,
+            "the img-bearing <p> is kept (content_element_count != 0)"
+        );
+    }
+
+    /// `_simplifyNestedElements` (`Readability.js:549-559`): the single
+    /// `<SECTION>` child unwrap (the `|| _hasSingleTagInsideElement(node,
+    /// "SECTION")` limb), mirror of the DIV case.
+    /// rationale: pin the true side of `has_single_tag_inside_element(&node,
+    /// "SECTION")` (prep.rs:652) — a div wrapping a single section is unwrapped.
+    #[test]
+    fn simplify_nested_elements_unwraps_single_section_child() {
+        let dom = Dom::parse(
+            r#"<body><article><div class="wrap"><section class="inner">section text</section></div></article></body>"#,
+        );
+        let art = get_elements_by_tag_name(&dom.body().unwrap(), "article")[0].clone();
+        simplify_nested_elements(&art);
+        // The wrapping <div> is unwrapped; the <section> survives with the
+        // div's attrs cloned onto it.
+        assert_eq!(
+            get_elements_by_tag_name(&art, "div").len(),
+            0,
+            "single-section-child div unwrapped (Readability.js:549-559 SECTION limb)"
+        );
+        let sections = get_elements_by_tag_name(&art, "section");
+        assert_eq!(sections.len(), 1);
+        assert_eq!(text_content(&sections[0]), "section text");
+        assert_eq!(
+            get_attribute(&sections[0], "class").as_deref(),
+            Some("wrap"),
+            "wrapping div's class cloned onto the section"
+        );
+    }
+
+    /// `_unwrapNoscriptImages` attribute copy (`Readability.js:1947-1951`):
+    /// an attribute whose NAME is neither `src` nor `srcset` but whose VALUE
+    /// matches the image-extension regex IS a source attribute and gets copied.
+    /// rationale: pin the true side of `regexps::image_extension().is_match
+    /// (&value)` (prep.rs:258) — the value-regex limb of the source-attr test.
+    #[test]
+    fn unwrap_noscript_images_copies_attr_with_image_extension_value() {
+        // prev img: src=placeholder.png (survives pass 1 by name) + a
+        // data-hires="hires.jpg" whose NAME is not src/srcset but whose value
+        // ends in .jpg ⇒ source attr via the value-regex limb.
+        let dom = Dom::parse(
+            r#"<html><body><div><img src="placeholder.png" data-hires="hires.jpg"><noscript><img src="real.jpg"></noscript></div></body></html>"#,
+        );
+        unwrap_noscript_images(&dom.document());
+        let body = dom.body().unwrap();
+        let div = get_elements_by_tag_name(&body, "div")[0].clone();
+        let imgs = get_elements_by_tag_name(&div, "img");
+        assert_eq!(imgs.len(), 1);
+        assert_eq!(
+            get_attribute(&imgs[0], "data-hires").as_deref(),
+            Some("hires.jpg"),
+            "image-extension-valued attr copied via the value-regex limb (Readability.js:1947-1951)"
+        );
+    }
+
+    /// `_replaceBrs` (`Readability.js:719-742`): the move-into-`<p>` loop stops
+    /// at a `<br><br>` chain (`tag == BR` true + next BR), and stops at a
+    /// non-phrasing block; and a non-whitespace last child halts the trailing
+    /// trim.
+    /// rationale: pin (a) the `tag_name(&n) == "BR"` true arm (prep.rs:328),
+    /// (b) the `!is_phrasing_content(&n)` true arm (prep.rs:334), and (c) the
+    /// `is_whitespace(&lc)` false arm (prep.rs:344).
+    #[test]
+    fn replace_brs_move_loop_stops_on_br_chain_and_block() {
+        // After the first <br><br> collapse, the new <p> absorbs phrasing
+        // siblings until it meets a non-phrasing <div> (334 true). The <p>'s
+        // last child is the non-whitespace text "phrase" (344 false → trim
+        // stops immediately).
+        let mut dom = Dom::parse("<div>start<br><br>phrase<div>block</div>tail</div>");
+        let body = dom.body().unwrap();
+        let div = get_elements_by_tag_name(&body, "div")[0].clone();
+        replace_brs(&mut dom, &body);
+        let ps = get_elements_by_tag_name(&div, "p");
+        assert_eq!(ps.len(), 1, "one <p> from the br-chain collapse");
+        assert_eq!(
+            text_content(&ps[0]),
+            "phrase",
+            "phrasing absorbed up to the non-phrasing <div> (Readability.js:734 break)"
+        );
+        // The inner <div>block</div> stayed outside the <p>.
+        assert!(text_content(&div).contains("block"));
+    }
+
+    /// `_replaceBrs` (`Readability.js:719-723`): the move loop breaks when a
+    /// following `<br>` begins a NEW `<br><br>` chain, leaving the second chain
+    /// for its own iteration.
+    /// rationale: pin the `tag == BR` true arm AND the inner "next is BR" break
+    /// (prep.rs:328-332) — a `phrase<br><br>...` run after the first collapse.
+    #[test]
+    fn replace_brs_two_separate_br_chains() {
+        // foo<br><br>bar<br><br>baz : two separate chains. The first collapse
+        // creates a <p>; while filling it the loop meets the second <br><br>
+        // chain (328 true, inner next-BR true) and breaks, leaving the second
+        // chain to be handled by a later br iteration.
+        let mut dom = Dom::parse("<div>foo<br><br>bar<br><br>baz</div>");
+        let body = dom.body().unwrap();
+        let div = get_elements_by_tag_name(&body, "div")[0].clone();
+        replace_brs(&mut dom, &body);
+        let ps = get_elements_by_tag_name(&div, "p");
+        assert_eq!(ps.len(), 2, "two <p> elements from two separate br chains");
+        assert_eq!(text_content(&div), "foobarbaz");
     }
 }

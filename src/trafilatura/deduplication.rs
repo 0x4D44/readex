@@ -981,6 +981,36 @@ mod tests {
         assert!(!cache.contains("a"));
     }
 
+    #[test]
+    fn lru_cache_touch_absent_key_is_noop() {
+        // rationale: pin the documented "No-op if `key` is absent" contract
+        // at deduplication.rs:231 — `touch` on a key NOT in `recency` must
+        // leave the cache state unchanged. The F-side of the `if let Some`
+        // at L233 is reachable only via direct call (the public API
+        // (`put`/`contains`) keeps `counts` and `recency` in sync so it
+        // never asks to touch an absent key). Calling `touch` directly
+        // exercises the F-side and pins the no-op contract — both the
+        // documented contract and llvm-cov's branch coverage are served
+        // by the same assertion.
+        let mut cache = LruCache::new(4);
+        cache.put("a".to_string());
+        cache.put("b".to_string());
+        // Sanity: recency snapshot before the absent-key touch.
+        assert_eq!(cache.recency.len(), 2);
+        assert_eq!(cache.len(), 2);
+        // The key "ghost" is not in recency → `position` returns None →
+        // F-side fires → method exits without mutation.
+        cache.touch("ghost");
+        // Cache state must be byte-identical post-touch.
+        assert_eq!(
+            cache.recency,
+            vec!["a".to_string(), "b".to_string()],
+            "touch on absent key must not mutate recency"
+        );
+        assert_eq!(cache.len(), 2, "counts unchanged");
+        assert!(cache.contains("a") && cache.contains("b"));
+    }
+
     // -----------------------------------------------------------------------
     // duplicate_test (deduplication.py:243-254)
     // -----------------------------------------------------------------------
@@ -1086,6 +1116,28 @@ mod tests {
         assert!(!duplicate_test_node(&p, &opts));
         assert!(!duplicate_test_node(&p, &opts));
         assert!(duplicate_test_node(&p, &opts));
+    }
+
+    #[test]
+    fn collect_itertext_joined_skips_empty_text_nodes() {
+        // rationale: pin the False side of `if !data.is_empty()` in
+        // `walk_text` (deduplication.rs:446) — a zero-length Text-node
+        // child contributes NOTHING to the itertext join. Python's
+        // `" ".join(element.itertext())` likewise skips an empty string
+        // run (lxml's `itertext` yields `""` only when `.text`/`.tail` is
+        // the empty string, and `" ".join([...,""])` would leave a double
+        // space; our port drops empty runs entirely so the join is clean).
+        // We build a <p> with an EXPLICIT empty Text child followed by a
+        // real one, then assert the join carries only the non-empty run.
+        use crate::readability::dom::{append_child, create_element, create_text_node};
+        let p = create_element("p");
+        append_child(&p, &create_text_node("")); // empty run → False side
+        append_child(&p, &create_text_node("real")); // non-empty → True side
+        let joined = collect_itertext_joined(&p);
+        assert_eq!(
+            joined, "real",
+            "empty Text node must be skipped, leaving only the non-empty run"
+        );
     }
 
     // -----------------------------------------------------------------------

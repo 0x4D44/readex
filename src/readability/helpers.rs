@@ -720,4 +720,84 @@ mod tests {
         assert_eq!(tag_name(&s1).as_deref(), Some("B"));
         assert!(next_sibling(&kids[1]).is_none());
     }
+
+    /// `inline_style_prop` (`Readability.js:2694-2707` reader half): the
+    /// declaration loop must **skip** a declaration whose property name does
+    /// not match the one queried and keep scanning. Here `color` precedes
+    /// `display`; querying `display` must walk past `color` (the false side of
+    /// the `if let Some(v) && k.eq_ignore_ascii_case(prop)` guard) and still
+    /// find `display:none`. A malformed declaration with no `:` also exercises
+    /// the `let Some(v)` false side (the splitn yields no value).
+    /// rationale: pin the non-matching-property continue arm AND the
+    /// no-value (None) arm of the `if let Some(v)` (helpers.rs:142).
+    #[test]
+    fn inline_style_prop_skips_non_matching_declaration() {
+        // color:red is a present declaration whose key != "display"; the loop
+        // must continue past it to reach display:none.
+        let (_d, n) = el(r#"<div style="color:red;display:none">x</div>"#, "div");
+        assert!(
+            !is_probably_visible(&n),
+            "display:none after an unrelated color declaration still hides (Readability.js:2696)"
+        );
+
+        // A declaration with no `:` separator yields `kv.next() == None` for
+        // the value — the `if let Some(v) = v` false (None) arm fires.
+        let (_d2, n2) = el(r#"<div style="display;visibility:hidden">x</div>"#, "div");
+        assert!(
+            !is_probably_visible(&n2),
+            "valueless `display` decl falls through; visibility:hidden still hides"
+        );
+    }
+
+    /// `is_whitespace` (`Readability.js:2042-2048`): a non-`BR` **element**
+    /// node is not whitespace (the false side of `is_element && tag == BR`),
+    /// and a non-text/non-element node (a Comment) takes the `is_element`
+    /// false side of the `&&`.
+    /// rationale: pin both halves of the `&&` false (helpers.rs:184) — only
+    /// text nodes (trimmed empty) and `<br>` elements count as whitespace.
+    #[test]
+    fn is_whitespace_non_br_element_is_not_whitespace() {
+        // Element that is not BR ⇒ tag != BR false arm.
+        let (_d, n) = el(r#"<div> </div>"#, "div");
+        assert!(
+            !is_whitespace(&n),
+            "an element other than <br> is never _isWhitespace (Readability.js:2046)"
+        );
+        // Comment (neither text nor element) ⇒ is_element false arm.
+        let comment = markup5ever_rcdom::Node::new(dom::NodeData::Comment {
+            contents: "c".into(),
+        });
+        assert!(
+            !is_whitespace(&comment),
+            "a Comment is not _isWhitespace (is_element false arm)"
+        );
+    }
+
+    /// `is_element_without_content` (`Readability.js:2002-2011`): called on a
+    /// **text** node it returns false immediately (`!is_element` true arm).
+    /// rationale: pin helpers.rs:204 — the function only classifies elements.
+    #[test]
+    fn is_element_without_content_text_node_is_false() {
+        let t = dom::create_text_node("hello");
+        assert!(
+            !is_element_without_content(&t),
+            "_isElementWithoutContent on a Text node is false (it gates on isElement)"
+        );
+    }
+
+    /// `is_phrasing_content` (`Readability.js:2031-2040`): a node that is
+    /// neither a text node nor has a `tagName` (a Comment) is **not** phrasing.
+    /// rationale: pin the `tag_name(...) else { return false }` else arm
+    /// (helpers.rs:257). Comments are stripped at parse time, so construct one
+    /// directly (same pattern as dom.rs:2085).
+    #[test]
+    fn is_phrasing_content_comment_node_is_not_phrasing() {
+        let comment = markup5ever_rcdom::Node::new(dom::NodeData::Comment {
+            contents: "c".into(),
+        });
+        assert!(
+            !is_phrasing_content(&comment),
+            "a Comment has no tagName ⇒ not phrasing content (Readability.js:2031-2040)"
+        );
+    }
 }

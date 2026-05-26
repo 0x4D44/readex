@@ -494,6 +494,11 @@ pub fn html2txt(content: &str, clean: bool) -> String {
         return String::new();
     }
     let dom_handle = Dom::parse(content);
+    // llvm-cov:branch-not-reachable: html5ever ALWAYS synthesises an <html>
+    // root element for any non-empty input (the `content.is_empty()`
+    // fast-path above already short-circuits the empty case). The `None`
+    // arm is defensive against a hypothetical future html5ever contract
+    // change and is unreachable through any caller-supplied string.
     let Some(root) = dom_handle.root_element() else {
         return String::new();
     };
@@ -512,6 +517,12 @@ fn html2txt_from_tree(tree_root: &NodeRef, clean: bool) -> String {
         .into_iter()
         .next();
     // baseline.py:119-120 — if body is None: return ""
+    // llvm-cov:branch-not-reachable: html5ever ALWAYS synthesises a <body>
+    // child of <html>, so `.//body` against any parsed tree always yields
+    // at least one match. The `None` arm here mirrors Python's defensive
+    // `body is None` (lxml DOES allow body-less HtmlElements via direct
+    // construction; html5ever does not). Unreachable through any HTML
+    // string input.
     let Some(body) = body else {
         return String::new();
     };
@@ -1344,6 +1355,27 @@ mod tests {
         let out = baseline(html);
         // Path 2 wins (Organization JSON has no articleBody → JSON-LD
         // contributes nothing → article path takes over).
+        assert!(out.length > 100);
+        assert!(out.text.contains("Lorem ipsum"));
+    }
+
+    #[test]
+    fn jsonld_empty_script_is_skipped() {
+        // rationale: pin the True side of `raw.is_empty()` at
+        // baseline.rs:252 — Python's `if elem.text and 'articleBody' in
+        // elem.text` (baseline.py:44) short-circuits on the empty-text
+        // case (`elem.text` is falsy for an empty/whitespace script body).
+        // The companion test `jsonld_script_without_articlebody_substring`
+        // pins the `!contains("articleBody")` True side; this one pins the
+        // LEFT disjunct of the `||` — an empty `<script>` body — driving
+        // the loop's `continue` without parsing.
+        let html = r#"<html><body>
+            <script type="application/ld+json"></script>
+            <article>Lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim.</article>
+        </body></html>"#;
+        let out = baseline(html);
+        // The empty JSON-LD script contributes nothing; path 2 wins via
+        // the long <article>.
         assert!(out.length > 100);
         assert!(out.text.contains("Lorem ipsum"));
     }

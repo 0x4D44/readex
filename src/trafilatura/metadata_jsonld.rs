@@ -2643,4 +2643,86 @@ mod tests {
         let m = run(html);
         assert!(m.title.is_none());
     }
+
+    // ── extract_meta_json entry-point edges ───────────────────────────────
+
+    /// rationale: `metadata.py:177` — a whitespace-only `<script ld+json>` body
+    /// is skipped (`if raw_text.trim().is_empty(): continue`), leaving metadata
+    /// untouched.
+    #[test]
+    fn jsonld_whitespace_only_script_is_skipped() {
+        let html = r#"<html><head><script type="application/ld+json">
+
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.title.is_none() && m.author.is_none());
+    }
+
+    /// rationale: the script selector matches but the element has no text child
+    /// (`element_text` returns None) — the `let Some(raw_text) ... else continue`
+    /// arm. A self-shaped empty script contributes nothing.
+    #[test]
+    fn jsonld_empty_script_element_is_skipped() {
+        let html = r#"<html><head>
+            <script type="application/ld+json"></script>
+            </head><body></body></html>"#;
+        let m = run(html);
+        assert!(m.title.is_none() && m.author.is_none());
+    }
+
+    /// rationale: a document with no `<html>` root element (a bare text
+    /// fragment) hits the `let Some(root) = dom.root_element() else return`
+    /// guard — extract_meta_json is a no-op.
+    #[test]
+    fn jsonld_no_root_element_is_noop() {
+        let dom = Dom::parse("just a bare text fragment, no elements");
+        let mut meta = Metadata::default();
+        extract_meta_json(&dom, &mut meta);
+        assert!(meta.title.is_none() && meta.author.is_none());
+    }
+
+    // ── normalize_json (the \uXXXX-decoding variant) direct coverage ──────
+
+    /// rationale: `json_metadata.py:218-220` — when the string contains a
+    /// backslash, `\n`/`\r`/`\t` escape sequences are stripped and `\uXXXX`
+    /// escapes are decoded to the literal code point. (This is the regex-rescue
+    /// `normalize_json`, distinct from the post-parse `normalize_json_string`.)
+    #[test]
+    fn normalize_json_decodes_unicode_escape_and_strips_control_escapes() {
+        // `A` → 'A'; `\n`/`\t` escape literals are dropped.
+        assert_eq!(normalize_json(r"HeAllo\nWorld"), "HeAlloWorld");
+    }
+
+    /// rationale: `json_metadata.py:219` lone-surrogate guard — a `\uD800`
+    /// (high surrogate, not part of a pair) is dropped rather than emitted.
+    #[test]
+    fn normalize_json_drops_lone_surrogate_escape() {
+        assert_eq!(normalize_json(r"A\uD800B"), "AB");
+    }
+
+    /// rationale: the `s.contains('\\')` FALSE side — a plain string with no
+    /// backslash bypasses the escape-processing branch and is only tag-stripped
+    /// + trimmed.
+    #[test]
+    fn normalize_json_plain_string_bypasses_escape_branch() {
+        assert_eq!(normalize_json("  Plain Title  "), "Plain Title");
+    }
+
+    // ── extract_json_author multi-author + no-space break ─────────────────
+
+    /// rationale: `json_metadata.py:178-181` regex-rescue author loop — the
+    /// `while ... ' ' in mymatch[1]` loop consumes successive `"author":"..."`
+    /// matches while each candidate has a space, merging them with "; ". This
+    /// drives the loop body more than once and the consume-and-continue arm.
+    #[test]
+    fn parse_error_recovers_multiple_spaced_authors() {
+        let html = r#"<html><head><script type="application/ld+json">
+        {"@context":"https://schema.org","@type":"NewsArticle",
+         "author":{"name":"Jane Roe"},"author":{"name":"John Doe"} OOPS
+        </script></head><body></body></html>"#;
+        let m = run(html);
+        let author = m.author.expect("recovered authors");
+        assert!(author.contains("Jane Roe"), "first author present: {author:?}");
+        assert!(author.contains("John Doe"), "second author present: {author:?}");
+    }
 }

@@ -3097,6 +3097,62 @@ mod tests {
         );
     }
 
+    /// rationale: readability_lxml.py:487-488 — `is_probably_readerable`
+    /// augments its candidate node-set with the UNIQUE parents of every
+    /// `<div>` that contains a `<br>` (the `nodes.append(parent)` arm at
+    /// readability_fork.rs:1661). Article fixtures use `<p>` wrappers, so
+    /// the `<div><br>` shape is never the substantive candidate in the
+    /// existing tests. Here a single substantive `<div>` whose only block
+    /// separator is a `<br>` (NOT a `<p>`) must be enumerated via the
+    /// div>br augmentation and clear the readerable threshold — pinning
+    /// the True side of the `div` + not-already-present conjuncts at
+    /// readability_fork.rs:1658-1659.
+    #[test]
+    fn is_probably_readerable_collects_div_with_br_parent() {
+        // No <p>/<pre>/<article>: the ONLY candidates are the <div>s,
+        // reached exclusively through the <br>-parent collection arm. The
+        // score is sum(sqrt(len - 140)) over visible candidates; one ~330
+        // char div alone yields only sqrt(190) ≈ 13.8 (< 20.0). Two such
+        // divs accumulate ~27.6 → above the 20.0 default threshold. Each
+        // div carries a `<br>` so it enters the node-set only via the
+        // div>br augmentation arm (readability_lxml.py:487-488).
+        let div = "<div>This div holds a long run of substantive article prose \
+            with internal commas, multiple clauses, and a single line break<br>that \
+            splits it, comfortably exceeding the one hundred and forty character \
+            content-length floor so the div-with-br parent collection arm enumerates \
+            it for scoring purposes.</div>";
+        let html = format!("<html><body>{div}{div}</body></html>");
+        assert!(
+            is_probably_readerable(&html),
+            "substantive <div>s containing <br> must be collected via the div>br parent arm"
+        );
+    }
+
+    /// rationale: readability_lxml.py:501-502 — a candidate node whose
+    /// parent is an `<li>` that ALSO contains a `<p>` is SKIPPED (the
+    /// XPath `./parent::li/p` is non-empty). Pins the True side of the
+    /// `<li>` parent + has-`<p>` conjuncts at readability_fork.rs:1686-1687
+    /// (the `continue` at :1689). We build a single `<p>` candidate nested
+    /// directly under an `<li>` that contains it; because the `<li>` holds
+    /// a `<p>`, the candidate is excluded and the page scores 0 → not
+    /// readerable, even though the `<p>` text alone clears the length floor.
+    #[test]
+    fn is_probably_readerable_skips_p_whose_li_parent_has_p() {
+        // The ONLY substantive candidate is the <p>; its parent is an <li>
+        // that contains a <p> (itself) → the li>p skip arm fires, the <p>
+        // contributes 0, and the document is not readerable.
+        let html = "<html><body><ul><li><p>This paragraph sits directly inside \
+            a list item and carries well over one hundred and forty characters of \
+            real prose, with commas and clauses, but because its parent list item \
+            contains a paragraph the readerable heuristic deliberately skips it as \
+            a likely list-embedded note rather than article body text.</p></li>\
+            </ul></body></html>";
+        assert!(
+            !is_probably_readerable(html),
+            "a <p> whose <li> parent contains a <p> must be skipped (readability_lxml.py:501-502)"
+        );
+    }
+
     /// `try_readability` succeeds on minimal HTML where own extraction
     /// would yield short text — the readability fork's `summary()` walks
     /// the scored candidate set even when the input is sparse.
@@ -3162,6 +3218,36 @@ mod tests {
                 json_algo.chars().count()
             ),
             "JSON-LD-prefixed algo text must NOT win even when long (external.py:73 guard)"
+        );
+    }
+
+    /// rationale: external.py:66-69 — the first two arms of
+    /// `cascade_prefers_readability` that the `cascade_picks_longer_extraction`
+    /// test does NOT reach:
+    ///   - `algo_len == 0` → keep own (False) — readability produced nothing.
+    ///   - `algo_len == own_len` → keep own (False) — equal-length tie keeps
+    ///     own (external.py:66 `len_algo in (0, len_text)`).
+    ///   - `own_len == 0 && algo_len > 0` → take readability (True) — own
+    ///     produced nothing but readability did (external.py:68-69).
+    ///
+    /// Pins the True side of L1777 (algo_len==0) and L1781 (own empty), and
+    /// the equal-length disjunct.
+    #[test]
+    fn cascade_arbiter_empty_and_equal_length_arms() {
+        // algo empty → keep own (algo_len == 0 True disjunct).
+        assert!(
+            !cascade_prefers_readability("some own text", 13, "", 0),
+            "empty algo must keep own (external.py:66)"
+        );
+        // equal lengths → keep own (algo_len == len_text disjunct).
+        assert!(
+            !cascade_prefers_readability("abcdefghij", 10, "0123456789", 10),
+            "equal-length algo/own must keep own (external.py:66)"
+        );
+        // own empty, algo non-empty → take readability (external.py:68-69).
+        assert!(
+            cascade_prefers_readability("", 0, "readability produced a real body", 32),
+            "own empty + algo non-empty must take readability (external.py:68-69)"
         );
     }
 

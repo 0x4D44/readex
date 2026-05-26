@@ -2305,4 +2305,134 @@ mod tests {
         // rationale: `if let Some(stripped) = rest[..].strip_prefix('.')` else fall.
         assert_eq!(strip_www_prefix("wwwsomething"), "wwwsomething");
     }
+
+    // ---- urljoin / fix_relative_urls — RFC-3986 catalogue residue --------
+
+    #[test]
+    fn urljoin_base_without_scheme_returns_reference_verbatim() {
+        // rationale: Python `urljoin` with a base that has no scheme cannot
+        // resolve the reference; our port returns the reference unchanged
+        // (the `let Some(base_scheme) = base_scheme else` arm). Drive it via
+        // fix_relative_urls so the reference is a same-treatment relative path.
+        // base has no `://` -> split_scheme(base).0 == None.
+        assert_eq!(fix_relative_urls("not-a-url", "page.html"), "page.html");
+    }
+
+    #[test]
+    fn fix_relative_urls_empty_reference_returns_base() {
+        // rationale: `urljoin(base, "")` returns the base verbatim (RFC-3986
+        // reference resolution with an empty reference — the `if reference
+        // .is_empty()` arm).
+        assert_eq!(
+            fix_relative_urls("https://e.com/a/b", ""),
+            "https://e.com/a/b"
+        );
+    }
+
+    #[test]
+    fn fix_relative_urls_query_only_reference_replaces_query() {
+        // rationale: urlutils.py:123 -> urljoin; a `?`-only reference keeps the
+        // base path and replaces the query (drops base query/fragment).
+        assert_eq!(
+            fix_relative_urls("https://e.com/a?old=1#frag", "?new=2"),
+            "https://e.com/a?new=2"
+        );
+    }
+
+    #[test]
+    fn fix_relative_urls_fragment_only_reference_keeps_path_and_query() {
+        // rationale: a `#`-only reference keeps base path+query, replaces fragment.
+        assert_eq!(
+            fix_relative_urls("https://e.com/a?x=1#old", "#new"),
+            "https://e.com/a?x=1#new"
+        );
+    }
+
+    #[test]
+    fn fix_relative_urls_other_host_scheme_less_with_path() {
+        // rationale: urlutils.py:118-121 — a scheme-less reference whose netloc
+        // differs from the base's gets `http:` prepended (NOT base's scheme).
+        assert_eq!(
+            fix_relative_urls("https://e.com/a", "//cdn.other.com/img.png"),
+            "http://cdn.other.com/img.png"
+        );
+    }
+
+    #[test]
+    fn fix_relative_urls_absolute_path_replaces_entire_base_path() {
+        // rationale: urljoin RFC-3986 — a `/`-leading reference replaces the
+        // base path entirely (keeps scheme+netloc).
+        assert_eq!(
+            fix_relative_urls("https://e.com/deep/nested/page", "/top.html"),
+            "https://e.com/top.html"
+        );
+    }
+
+    // ---- find_link_with_rel / x-default — attr-present-but-no-href --------
+
+    #[test]
+    fn extract_url_canonical_link_without_href_falls_through() {
+        // rationale: `metadata.py:154` `link[@rel="canonical"]` — the `href`
+        // getter FALSE side: a <link rel="canonical"> with NO href yields no
+        // URL, so extract_url falls through to default_url.
+        let dom = parse(
+            r#"<html><head>
+                <link rel="canonical">
+                </head><body></body></html>"#,
+        );
+        assert_eq!(
+            extract_url(&dom, Some("https://fallback.example.com/")).as_deref(),
+            Some("https://fallback.example.com/")
+        );
+    }
+
+    #[test]
+    fn extract_url_alternate_x_default_without_href_falls_through() {
+        // rationale: `metadata.py:156` alternate/x-default selector — rel+hreflang
+        // match but `href` getter FALSE side: no URL extracted.
+        let dom = parse(
+            r#"<html><head>
+                <link rel="alternate" hreflang="x-default">
+                </head><body></body></html>"#,
+        );
+        assert_eq!(
+            extract_url(&dom, Some("https://fallback.example.com/")).as_deref(),
+            Some("https://fallback.example.com/")
+        );
+    }
+
+    // ---- is_valid_url — extra negative shapes -----------------------------
+
+    #[test]
+    fn is_valid_url_accepts_uppercase_scheme() {
+        // rationale: `filters.py:253-271` scheme check is case-insensitive; our
+        // gate's `to_ascii_lowercase().starts_with("https://")` arm accepts an
+        // uppercase scheme with a dotted host.
+        assert!(is_valid_url("HTTPS://Example.COM/path"));
+    }
+
+    // ---- extract_domain — single-label host (no fast-path) ----------------
+
+    #[test]
+    fn extract_domain_single_label_host_falls_to_www_strip() {
+        // rationale: `urlutils.py:14-21` DOMAIN_REGEX fast path needs >=2 labels;
+        // a single-label host (`labels.len() >= 2` FALSE) falls to the www-strip
+        // fallback, which returns the host unchanged when there is no www prefix.
+        assert_eq!(extract_domain("http://localhost/x").as_deref(), Some("localhost"));
+    }
+
+    // ---- parse_license_element — empty link text (strict + non-strict) ----
+
+    #[test]
+    fn extract_license_rel_license_empty_text_no_href_match_returns_none() {
+        // rationale: `metadata.py:456-461` — a rel=license <a> with no LICENSE_REGEX
+        // href match and EMPTY text returns None (the `if t.is_empty()` arm),
+        // so extract_license overall yields None.
+        let dom = parse(
+            r#"<html><head></head><body>
+                <a rel="license" href="/about/"></a>
+                </body></html>"#,
+        );
+        assert_eq!(extract_license(&dom), None);
+    }
 }

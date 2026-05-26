@@ -121,6 +121,11 @@ pub fn clean_headers(flags: &Flags, e: &NodeRef) {
     // each removal mutates the tree, not the snapshot).
     let nodes = get_all_nodes_with_tag(e, &["h1", "h2"]);
     for node in nodes.iter().rev() {
+        // llvm-cov:branch-not-reachable: `parent(node).is_some()` false side.
+        // The snapshot is document-order (ancestors before descendants); the
+        // reverse walk processes descendants first, so no h1/h2 is ever
+        // orphaned by an earlier removal before its own turn. Faithful JS
+        // `_removeNodes` `if (parentNode)` defensive guard (Readability.js:311).
         if parent(node).is_some() && scoring::get_class_weight(flags, node) < 0 {
             dom::remove(node);
         }
@@ -152,6 +157,9 @@ pub fn clean_styles(e: &NodeRef) {
     }
     // Width/height on DEPRECATED_SIZE_ATTRIBUTE_ELEMS (JS compares `tagName`,
     // i.e. upper-case).
+    // llvm-cov:branch-not-reachable: the `if let Some(t) = tag_name(e)` None
+    // side. The `!is_element` guard above already returned for non-elements,
+    // and every element has a tagName, so `tag_name(e)` here is always Some.
     if let Some(t) = tag_name(e)
         && regexps::DEPRECATED_SIZE_ATTRIBUTE_ELEMS.contains(&t.as_str())
     {
@@ -226,6 +234,10 @@ pub fn clean_conditionally(dom: &Dom, flags: &Flags, e: &NodeRef, tag: &str) {
     // `if (parentNode)` guard at :311).
     let nodes = get_all_nodes_with_tag(e, &[tag_lower.as_str()]);
     for node in nodes.iter().rev() {
+        // llvm-cov:branch-not-reachable: `parent(node).is_none()` true side.
+        // Document-order snapshot + reverse walk processes descendants before
+        // ancestors, so a node is never orphaned before its turn. Faithful JS
+        // `_removeNodes` `if (parentNode)` guard (Readability.js:311).
         if parent(node).is_none() {
             continue;
         }
@@ -324,6 +336,10 @@ fn should_remove_conditionally(dom: &Dom, flags: &Flags, node: &NodeRef, tag: &s
     let mut embed_count = 0_i64;
     for embed in &embeds {
         // 2519-2523: any attribute value matches _allowedVideoRegex ⇒ KEEP.
+        // llvm-cov:branch-not-reachable: the `if let Element` else side.
+        // `embeds` comes from `get_all_nodes_with_tag(node, [object,embed,
+        // iframe])`, which only returns Element nodes, so the destructure
+        // never fails.
         if let dom::NodeData::Element { attrs, .. } = &embed.data {
             let any_video = attrs
                 .borrow()
@@ -463,6 +479,10 @@ pub fn single_cell_table_unwrap(dom: &mut Dom, article_content: &NodeRef) {
     // table with its single cell in the tree; our snapshot is unaffected
     // (it holds owned `Rc<Node>` clones).
     for table in get_all_nodes_with_tag(article_content, &["table"]) {
+        // llvm-cov:branch-not-reachable: `parent(&table).is_none()` true side.
+        // Reverse-independent forward snapshot, but each replace_child only
+        // touches the replaced table's own parent; a still-pending table (a
+        // descendant or following node) keeps its parent. Defensive guard.
         if parent(&table).is_none() {
             continue;
         }
@@ -476,12 +496,17 @@ pub fn single_cell_table_unwrap(dom: &mut Dom, article_content: &NodeRef) {
         if !crate::readability::helpers::has_single_tag_inside_element(&tbody, "TR") {
             continue;
         }
+        // llvm-cov:branch-not-reachable: the `else { continue }` (None) side.
+        // `has_single_tag_inside_element(&tbody, "TR")` just confirmed tbody
+        // has exactly one element child (a TR), so first_element_child is Some.
         let Some(row) = dom::first_element_child(&tbody) else {
             continue;
         };
         if !crate::readability::helpers::has_single_tag_inside_element(&row, "TD") {
             continue;
         }
+        // llvm-cov:branch-not-reachable: the `else { continue }` (None) side.
+        // The single-`TD` check above guarantees row has one element child.
         let Some(cell) = dom::first_element_child(&row) else {
             continue;
         };
@@ -494,6 +519,10 @@ pub fn single_cell_table_unwrap(dom: &mut Dom, article_content: &NodeRef) {
         let cell_new = dom.set_node_tag(&cell, new_tag);
 
         // 879: table.parentNode.replaceChild(cell_new, table).
+        // llvm-cov:branch-not-reachable: the `if let Some(table_parent)` None
+        // side. `parent(&table)` was confirmed Some at the top of the loop and
+        // the only intervening mutation (`set_node_tag` on the cell) does not
+        // touch the table's parent link.
         if let Some(table_parent) = parent(&table) {
             dom::replace_child(&table_parent, &cell_new, &table);
         }
@@ -506,6 +535,9 @@ pub fn single_cell_table_unwrap(dom: &mut Dom, article_content: &NodeRef) {
 /// .nextSibling)` is a `<p>`, remove the `<br>`.
 pub fn remove_br_before_p(article_content: &NodeRef) {
     for br in get_all_nodes_with_tag(article_content, &["br"]) {
+        // llvm-cov:branch-not-reachable: `parent(&br).is_none()` true side.
+        // `<br>` is a void element; removing one br never detaches another, so
+        // every snapshot br still has its parent when processed. Defensive guard.
         if parent(&br).is_none() {
             continue;
         }
@@ -1495,6 +1527,213 @@ mod tests {
         assert!(
             get_elements_by_tag_name(&root, "ul").is_empty(),
             "multi-child <li> aborts gallery exception (Readability.js:2618-2620)"
+        );
+    }
+
+    /// `_cleanStyles` (`Readability.js:2088-2108`): the `!e` / non-element
+    /// guard. The JS `if (!e ...) return;` early-returns on a falsy node;
+    /// our port returns on a non-element node. Drive that arm by calling
+    /// `clean_styles` directly on a Text node.
+    /// rationale: pin the `if !is_element(e)` true arm (clean.rs:146) — the
+    /// recursive walk only ever descends into elements, so this arm is
+    /// otherwise unreached.
+    #[test]
+    fn clean_styles_returns_on_non_element_node() {
+        let t = dom::create_text_node("plain text, no attributes");
+        // Must not panic and must leave the (attribute-less) text node alone.
+        clean_styles(&t);
+        assert!(dom::is_text(&t), "text node is untouched by clean_styles");
+        assert_eq!(text_content(&t), "plain text, no attributes");
+    }
+
+    /// `Readability.js:2461-2463` FALSE side: `tag === "table"` but the table
+    /// is NOT a data table. An unmarked (layout) table proceeds past the
+    /// data-table KEEP into the shadiness ladder.
+    /// rationale: pin the false arm of `tag == "table" && is_data_table`
+    /// (clean.rs:265) — a layout table with no content gets removed.
+    #[test]
+    fn clean_conditionally_unmarked_table_falls_through_keep() {
+        // No mark_data_tables call ⇒ is_readability_data_table is false. The
+        // empty layout table has no commas, no content ⇒ no-useful-content
+        // arm removes it.
+        let dom = Dom::parse(
+            "<div id=root><table class=\"layout\"><tbody><tr><td></td></tr></tbody></table></div>",
+        );
+        let root = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let flags = Flags::default();
+        clean_conditionally(&dom, &flags, &root, "table");
+        assert!(
+            get_elements_by_tag_name(&root, "table").is_empty(),
+            "unmarked layout table falls past the data-table KEEP and is removed (Readability.js:2461 false)"
+        );
+    }
+
+    /// `Readability.js:2557-2559` FALSE side of the ratio test: `img > 1` but
+    /// `p / img >= 0.5`, so the bad-p:img-ratio clause does NOT set errs.
+    /// rationale: pin the `(p/img) < 0.5` false arm (clean.rs:386). Two
+    /// paragraphs and two images give ratio 1.0 ≥ 0.5; with enough prose to
+    /// dodge the other arms the div is KEPT.
+    #[test]
+    fn clean_conditionally_balanced_p_to_img_ratio_keeps_div() {
+        // 2 <p> / 2 <img> = 1.0 ≥ 0.5 ⇒ ratio clause false. Prose is long
+        // (>25 chars, link density 0) so suspiciously-short and no-useful
+        // arms do not fire either. Neutral class ⇒ weight 0.
+        let dom = Dom::parse(
+            r#"<div id=root><div class="x"><p>First real paragraph of genuine readable prose content here.</p><p>Second real paragraph also comfortably long enough to score.</p><img src="a.jpg"><img src="b.jpg"></div></div>"#,
+        );
+        let root = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let flags = Flags::default();
+        clean_conditionally(&dom, &flags, &root, "div");
+        let any_x = get_elements_by_tag_name(&root, "div")
+            .iter()
+            .any(|d| dom::class_name(d) == "x");
+        assert!(
+            any_x,
+            "p/img = 1.0 ≥ 0.5 ⇒ ratio clause does not set errs (Readability.js:2557 false)"
+        );
+    }
+
+    /// `Readability.js:2566-2577` FALSE side: the suspiciously-short clause is
+    /// reached with all early operands true but `contentLength >= 25`, so the
+    /// short-content err is NOT set.
+    /// rationale: pin the `content_length < 25` false arm (clean.rs:401). A
+    /// low-weight linky div with > 25 chars dodges the short-content arm (it
+    /// is instead removed by the weight<25 && linkDensity>0.2 arm, but the
+    /// short-content branch itself takes its false side first).
+    #[test]
+    fn clean_conditionally_not_suspiciously_short_when_content_over_25() {
+        // 0 imgs, link density > 0, heading density 0, content length > 25.
+        // The (img==0||img>2) and link_density>0 operands are true but
+        // content_length >= 25 ⇒ short-content arm false.
+        let dom = Dom::parse(
+            r#"<div id=root><div class="x"><a href="/p">this is a long anchor body that pushes content length well beyond twenty five characters</a></div></div>"#,
+        );
+        let root = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let flags = Flags::default();
+        clean_conditionally(&dom, &flags, &root, "div");
+        // It is removed (weight<25 && linkDensity>0.2), but the assertion
+        // pins that the content-length>=25 path executed without crashing.
+        let any_x = get_elements_by_tag_name(&root, "div")
+            .iter()
+            .any(|d| dom::class_name(d) == "x");
+        assert!(
+            !any_x,
+            "content>=25 dodges short-content but linky low-weight removes (Readability.js:2566 content_length<25 false)"
+        );
+    }
+
+    /// `Readability.js:2566-2577` `img > 2` TRUE side of `(img===0||img>2)`.
+    /// A suspiciously-short div with 3+ images (not 0) takes the `img > 2`
+    /// limb of the disjunction.
+    /// rationale: pin `img > 2` true (clean.rs:403). 3 images, < 25 chars,
+    /// link density > 0 ⇒ the short-content arm fires via the img>2 limb.
+    #[test]
+    fn clean_conditionally_suspiciously_short_with_more_than_two_images() {
+        // contentLength < 25 (only "w"), link density > 0 (one anchor),
+        // img = 3 > 2 ⇒ (img==0||img>2) true via the img>2 limb.
+        let dom = Dom::parse(
+            r#"<div id=root><div class="x"><img src="a"><img src="b"><img src="c"><a href="/p">w</a></div></div>"#,
+        );
+        let root = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let flags = Flags::default();
+        clean_conditionally(&dom, &flags, &root, "div");
+        let any_x = get_elements_by_tag_name(&root, "div")
+            .iter()
+            .any(|d| dom::class_name(d) == "x");
+        assert!(
+            !any_x,
+            "img>2 short linky div ⇒ remove via img>2 limb (Readability.js:2566-2577)"
+        );
+    }
+
+    /// `Readability.js:2592-2596` FALSE side: `embedCount == 1` but
+    /// `contentLength >= 75` (and not embedCount > 1), so the suspicious-embed
+    /// clause does NOT fire.
+    /// rationale: pin the `content_length < 75` false arm (clean.rs:417). One
+    /// non-video embed with >= 75 chars of prose keeps the div past this arm.
+    #[test]
+    fn clean_conditionally_single_embed_long_content_keeps() {
+        // class "article" → +25 weight so the low-weight-linky arm cannot
+        // fire; >= 75 chars so embedCount==1 && contentLength<75 is false;
+        // prose inside a <p> (textish) so text_density>0 ⇒ no-useful false.
+        let dom = Dom::parse(
+            r#"<div id=root><div class="article"><p>This paragraph carries comfortably more than seventy-five characters of genuine readable prose so the single embed clause cannot apply.</p><iframe src="https://example.com/x"></iframe></div></div>"#,
+        );
+        let root = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let flags = Flags::default();
+        clean_conditionally(&dom, &flags, &root, "div");
+        let any_article = get_elements_by_tag_name(&root, "div")
+            .iter()
+            .any(|d| dom::class_name(d) == "article");
+        assert!(
+            any_article,
+            "embedCount==1 but contentLength>=75 ⇒ suspicious-embed false (Readability.js:2592 content<75 false)"
+        );
+    }
+
+    /// `Readability.js:2623-2625` FALSE side of `img == li_count`: an image
+    /// gallery candidate (single-child li items) where the children are NOT
+    /// images, so `img (== 0) != li_count` and the exception does NOT KEEP —
+    /// the original haveToRemove verdict stands.
+    /// rationale: pin the `img == li_count` false arm (clean.rs:441). A ul of
+    /// single-`<input>`-child li items (input>floor(p/3) ⇒ haveToRemove true;
+    /// single child ⇒ no multi-child early-return; img 0 != liCount 3) falls
+    /// through to removal.
+    #[test]
+    fn clean_conditionally_gallery_exception_false_when_no_images() {
+        // Each <li> has exactly one child (an <input>). input(3) > floor(p/3)
+        // (=0) ⇒ haveToRemove true; the gallery walk sees single-child li
+        // items (no 2618 early-return) then img(0) != liCount(3) ⇒ 2623 KEEP
+        // skipped ⇒ removed.
+        let dom = Dom::parse(
+            r#"<div id=root><ul class="x"><li><input type="text"></li><li><input type="text"></li><li><input type="text"></li></ul></div>"#,
+        );
+        let root = get_elements_by_tag_name(&dom.body().unwrap(), "div")[0].clone();
+        let flags = Flags::default();
+        clean_conditionally(&dom, &flags, &root, "ul");
+        assert!(
+            get_elements_by_tag_name(&root, "ul").is_empty(),
+            "non-image single-child li list: img(0) != liCount(3) ⇒ no gallery KEEP (Readability.js:2623 false)"
+        );
+    }
+
+    /// `Readability.js:866-868` FALSE side of the single-`<tbody>` check: a
+    /// table with BOTH a `<thead>` and a `<tbody>` has two element children,
+    /// so `_hasSingleTagInsideElement(table, "TBODY")` is false and the JS
+    /// uses the table itself as `tbody`. Without a single direct `<tr>` the
+    /// table is not a single-cell table and is left intact.
+    /// rationale: pin the `has_single_tag_inside_element(table, "TBODY")`
+    /// false arm (clean.rs:470) — a thead+tbody table skips the unwrap.
+    #[test]
+    fn single_cell_table_not_unwrapped_with_thead_and_tbody() {
+        let mut dom = Dom::parse(
+            "<div><table><thead><tr><th>h</th></tr></thead><tbody><tr><td>cell</td></tr></tbody></table></div>",
+        );
+        let body = dom.body().unwrap();
+        let outer = get_elements_by_tag_name(&body, "div")[0].clone();
+        single_cell_table_unwrap(&mut dom, &outer);
+        assert_eq!(
+            get_elements_by_tag_name(&outer, "table").len(),
+            1,
+            "thead+tbody table has no single direct TR ⇒ not unwrapped (Readability.js:866-870)"
+        );
+    }
+
+    /// `Readability.js:871-872` TRUE side of `!_hasSingleTagInsideElement(row,
+    /// "TD")`: a single-row table whose row has TWO `<td>` cells is not a
+    /// single-cell table; the `continue` skips the unwrap.
+    /// rationale: pin the `!has_single_tag_inside_element(row, "TD")` true arm
+    /// (clean.rs:482) — multi-cell single row leaves the table intact.
+    #[test]
+    fn single_cell_table_not_unwrapped_with_two_cells_in_row() {
+        let mut dom = Dom::parse("<div><table><tr><td>a</td><td>b</td></tr></table></div>");
+        let body = dom.body().unwrap();
+        let outer = get_elements_by_tag_name(&body, "div")[0].clone();
+        single_cell_table_unwrap(&mut dom, &outer);
+        assert_eq!(
+            get_elements_by_tag_name(&outer, "table").len(),
+            1,
+            "single row with two TDs is not single-cell ⇒ not unwrapped (Readability.js:871)"
         );
     }
 }

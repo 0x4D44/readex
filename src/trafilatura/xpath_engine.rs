@@ -2194,6 +2194,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn tokenize_name_with_underscore() {
+        // rationale: pin the True side of `c == '_'` in `is_name_cont`
+        // (xpath_engine.rs:448) — Name tokens are NCNames per XML 1.0 plus
+        // `-`/`_`/`.`/digit-after-first. The Trafilatura corpus XPath
+        // strings never use underscores in names, so this defensive
+        // character-class arm is otherwise unhit. We tokenize a name with
+        // an interior `_` and assert the entire identifier is captured as
+        // one Name token (NOT split at the underscore).
+        let toks = Tokenizer::new(".//my_div").tokenize().expect("tokenize ok");
+        // Locate the Name("my_div") token among the emitted stream.
+        let saw = toks.iter().any(|t| matches!(t, Tok::Name(s) if s == "my_div"));
+        assert!(
+            saw,
+            "underscore must be a name-continuation char, got tokens {toks:?}"
+        );
+    }
+
     // ---- Parser error paths -----------------------------------------------
 
     #[test]
@@ -2212,6 +2230,23 @@ mod tests {
         // path" Parse arm fires.
         let err = parse(".//div ]").unwrap_err();
         assert!(matches!(err, XPathError::Parse(_)));
+    }
+
+    #[test]
+    fn parse_error_on_trailing_tokens_after_union() {
+        // rationale: pin the True side of `self.pos != self.toks.len()` at
+        // xpath_engine.rs:507 — once a union (path | path | …) has been
+        // fully consumed, ANY remaining tokens (e.g. a stray closing
+        // bracket or comma) trip the "trailing tokens after union" Parse
+        // error. The Trafilatura corpus never produces such inputs, so
+        // this parser-error path is exercised only by hand-crafted
+        // malformed XPath. Companion to `parse_error_on_trailing_tokens_
+        // after_path` (single-path variant at xpath_engine.rs:494).
+        let err = parse(".//a|.//b ]").unwrap_err();
+        assert!(
+            matches!(err, XPathError::Parse(_)),
+            "trailing token after union must yield Parse error, got {err:?}"
+        );
     }
 
     #[test]
@@ -2522,5 +2557,47 @@ mod tests {
         // rationale: when `from` is non-empty and `to` is empty, every
         // character in `from` is deleted from the source.
         assert_eq!(translate("foobar", "fb", ""), "ooar");
+    }
+
+    // ---- format_number (W3C XPath 1.0 §4.4 number-to-string) -------------
+
+    #[test]
+    fn format_number_integer_drops_trailing_zero() {
+        // rationale: W3C XPath 1.0 §4.4 — an integer-valued number renders
+        // with NO decimal point or fractional part. Pins the
+        // `n == n.trunc()` integer arm (xpath_engine.rs:1430).
+        assert_eq!(format_number(0.0), "0");
+        assert_eq!(format_number(1.0), "1");
+        assert_eq!(format_number(-7.0), "-7");
+        assert_eq!(format_number(42.0), "42");
+    }
+
+    #[test]
+    fn format_number_fractional_keeps_decimal() {
+        // rationale: W3C XPath 1.0 §4.4 — a non-integer renders with its
+        // fractional digits. Pins the fall-through `format!("{}", n)` arm
+        // (xpath_engine.rs:1433) — the False side of the integer gate.
+        assert_eq!(format_number(1.5), "1.5");
+        assert_eq!(format_number(-0.25), "-0.25");
+    }
+
+    #[test]
+    fn format_number_nan_renders_literal_nan() {
+        // rationale: W3C XPath 1.0 §4.4 — "NaN is converted to the string
+        // NaN". Pins the defensive `n.is_nan()` arm (xpath_engine.rs:1420).
+        // No XPath surface produces NaN (numeric literals are always
+        // finite), so this conformance arm is only reachable by direct
+        // call — exactly what a unit test pins.
+        assert_eq!(format_number(f64::NAN), "NaN");
+    }
+
+    #[test]
+    fn format_number_infinities_render_signed_literals() {
+        // rationale: W3C XPath 1.0 §4.4 — "positive infinity is converted
+        // to the string Infinity" / "negative infinity is converted to the
+        // string -Infinity". Pins BOTH sides of the `n > 0.0` branch inside
+        // the `is_infinite` arm (xpath_engine.rs:1424-1427).
+        assert_eq!(format_number(f64::INFINITY), "Infinity");
+        assert_eq!(format_number(f64::NEG_INFINITY), "-Infinity");
     }
 }

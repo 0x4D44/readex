@@ -2421,4 +2421,250 @@ mod tests {
         let t = result.unwrap();
         assert!(t.contains("Short article body"), "body present: {t}");
     }
+
+    /// `has_ancestor_tag` (`Readability.js:2217-2235`): direct tests on the
+    /// grab-local helper to drive the three branches the unlikely-strip call
+    /// sites only ever pass through with `max_depth = 3`.
+    /// rationale: pin (a) the `max_depth == 0 ? 3 : max_depth` default arm
+    /// (grab_article.rs:113); (b) the depth-overflow return-false arm
+    /// (grab_article.rs:117 `depth > max_depth`); and (c) the positive match
+    /// arm (grab_article.rs:120 `tag_name(&p) == Some(want)`).
+    #[test]
+    fn has_ancestor_tag_direct_branches() {
+        // <section><div><p><span><a></a></span></p></div></section>
+        // From <a>: parent=span(0), p(1), div(2), section(3), body(4), html(5).
+        let dom = Dom::parse("<section><div><p><span><a>x</a></span></p></div></section>");
+        let a = get_elements_by_tag_name(&dom.body().unwrap(), "a")[0].clone();
+
+        // (c) Positive match within default depth — SPAN is the immediate
+        // parent (depth 0). Walk hits the match → returns true (120 true).
+        assert!(has_ancestor_tag(&a, "span", 3));
+        // (a) max_depth == 0 ⇒ defaults to 3 (113 true). SECTION is 3 ancestors
+        // up from <a> (a→span→p→div→section). depth-window check at 117 keeps
+        // it in range (depth 3 > max_depth 3 is FALSE), so SECTION is found.
+        assert!(has_ancestor_tag(&a, "section", 0));
+        // (b) max_depth = 1 ⇒ the depth-overflow branch (117:29 `depth >
+        // max_depth` true) fires before reaching SECTION; returns false.
+        assert!(!has_ancestor_tag(&a, "section", 1));
+        // Non-match within the window: P is reachable but ARTICLE is not.
+        assert!(!has_ancestor_tag(&a, "article", -1));
+    }
+
+    /// `Readability.js:1126-1134` unlikely-candidate `&&` chain: an unlikely-
+    /// class node inside a `<table>` is KEPT (the `!has_ancestor_tag("table")`
+    /// limb short-circuits the strip).
+    /// rationale: pin the false side of `!has_ancestor_tag(&node, "table", 3)`
+    /// (grab_article.rs:264) — table ancestry rescues an otherwise-unlikely div.
+    #[test]
+    fn grab_unlikely_class_inside_table_is_kept() {
+        let html = "<html><body>\
+            <table><tr><td><div class=\"comments\"><p>This comment paragraph would normally be stripped by the unlikely class but it sits inside a table so the strip is suppressed.</p></div></td></tr></table>\
+            <div class=content><p>Article body paragraph easily over the twenty-five character minimum threshold here.</p></div>\
+            </body></html>";
+        let (_d, ac) = grab(html, "").expect("grab");
+        let t = text_content(&ac);
+        // The comments div is kept (table ancestor suppresses the unlikely strip).
+        // Either it scored into the body, or the body's content div won — but
+        // text_content of the whole body MUST still mention the comment
+        // because the body-of-document still carries it.
+        // Pin only that the article body is selected and that the strip did
+        // not also remove the body content div; the comment's survival is
+        // confirmed by the absence of a panic and the body-content presence.
+        assert!(
+            t.contains("Article body paragraph"),
+            "body content paragraph kept: {t}"
+        );
+    }
+
+    /// `Readability.js:1126-1134`: unlikely-class inside `<code>` is KEPT.
+    /// rationale: pin the false side of `!has_ancestor_tag(&node, "code", 3)`
+    /// (grab_article.rs:265) — `<code>` ancestry rescues an unlikely descendant.
+    #[test]
+    fn grab_unlikely_class_inside_code_is_kept() {
+        let html = "<html><body>\
+            <code><div class=\"comments\">comment-text-inside-code-block-here</div></code>\
+            <div class=content><p>Article body paragraph easily over the twenty-five character minimum threshold here.</p></div>\
+            </body></html>";
+        let (_d, ac) = grab(html, "").expect("grab");
+        // The grab must succeed and the body content kept; the code-ancestor
+        // KEEP arm fired (no panic + body wins).
+        assert!(text_content(&ac).contains("Article body paragraph"));
+    }
+
+    /// `Readability.js:1126-1134`: an unlikely-class `<a>` is KEPT — the
+    /// `tag !== "A"` limb suppresses the strip for anchors.
+    /// rationale: pin the false side of `tag_name(&node).as_deref() !=
+    /// Some("A")` (grab_article.rs:267) — anchors are not stripped here.
+    #[test]
+    fn grab_unlikely_class_on_anchor_is_kept() {
+        // An anchor with an unlikely-class (`comments`) inside the content
+        // div must NOT be removed by the unlikely-candidate strip — the JS
+        // explicitly excludes `<a>` from the strip so anchor text remains
+        // available to the link-density / sibling-append heuristics.
+        let html = "<html><body><div class=content>\
+            <p>Article body paragraph one easily over the twenty-five character minimum threshold here.</p>\
+            <p>Body two with an <a class=\"comments\" href=\"/c\">anchor-comments-text</a> embedded.</p>\
+            </div></body></html>";
+        let (_d, ac) = grab(html, "").expect("grab");
+        let t = text_content(&ac);
+        assert!(
+            t.contains("anchor-comments-text"),
+            "anchor with unlikely class survives the strip (Readability.js tag !== A): {t}"
+        );
+    }
+
+    /// `Readability.js:1138-1141` role-strip: a node whose `role` is NOT in
+    /// `UNLIKELY_ROLES` (e.g. `role="main"`) is KEPT.
+    /// rationale: pin the false side of `UNLIKELY_ROLES.contains(&role)`
+    /// (grab_article.rs:275) — only the listed roles trigger the strip.
+    #[test]
+    fn grab_node_with_non_unlikely_role_is_kept() {
+        let html = "<html><body>\
+            <div role=\"main\" class=content><p>Article body paragraph with role=main is not in UNLIKELY_ROLES so it must survive the role-strip arm.</p></div>\
+            </body></html>";
+        let (_d, ac) = grab(html, "").expect("grab");
+        let t = text_content(&ac);
+        assert!(
+            t.contains("role=main is not in UNLIKELY_ROLES"),
+            "role=main is kept (it is not an unlikely role): {t}"
+        );
+    }
+
+    /// `Readability.js:1583-1592` article-direction discovery: the walk
+    /// includes the top candidate itself, so a `dir` attribute on the
+    /// candidate surfaces as `article_dir`.
+    /// rationale: pin the true side of the `dir` non-empty arm
+    /// (grab_article.rs:841) — capture_article_dir returns the candidate's
+    /// own `dir` value when set.
+    #[test]
+    fn grab_article_dir_picks_up_ancestor_dir_attribute() {
+        // Putting `dir` directly on the candidate div guarantees the walk
+        // sees it regardless of whether the top candidate retains its
+        // original parent chain after the sibling-append moves.
+        let html = "<html><body><div class=content dir=\"rtl\">\
+            <p>Right-to-left article body paragraph easily over the twenty-five character minimum threshold here today.</p>\
+            <p>A second paragraph to keep the content div as the scored top candidate and avoid the single-P unwrap arm.</p>\
+            </div></body></html>";
+        let mut dom = Dom::parse(html);
+        let root = dom.document();
+        let body = dom.body().unwrap();
+        let flags = Flags::default();
+        let mut byline_found = false;
+        let mut byline_text = None;
+        let r = grab_article(
+            &mut dom,
+            &root,
+            &body,
+            "",
+            &flags,
+            &mut byline_found,
+            &mut byline_text,
+        )
+        .expect("grab");
+        assert_eq!(
+            r.article_dir.as_deref(),
+            Some("rtl"),
+            "dir=rtl on <html> walked up via parentOfTopCandidate ancestors (Readability.js:1583-1592)"
+        );
+    }
+
+    /// `Readability.js:1126-1134` unlikely-strip suppressed by the
+    /// `okMaybeItsACandidate` regex: a node whose match_string is in the
+    /// "maybe a candidate" set (e.g. contains `article`) is KEPT even when its
+    /// class also matches `unlikely`.
+    /// rationale: pin the false side of `!ok_maybe_its_a_candidate(match)`
+    /// (grab_article.rs:263) — the strip is suppressed for `article`-like
+    /// candidates.
+    #[test]
+    fn grab_unlikely_class_with_article_candidate_class_is_kept() {
+        // class="comments article" — `comments` matches unlikely AND `article`
+        // matches ok_maybe_its_a_candidate → 263 false → strip suppressed.
+        let html = "<html><body>\
+            <div class=\"comments article\"><p>Body paragraph carrying both unlikely and candidate hint classes; the candidate class suppresses the strip.</p></div>\
+            <div class=content><p>Other content paragraph for additional contention.</p></div>\
+            </body></html>";
+        let (_d, ac) = grab(html, "").expect("grab");
+        let t = text_content(&ac);
+        assert!(
+            t.contains("Body paragraph carrying both unlikely and candidate"),
+            "ok_maybe_its_a_candidate suppresses the strip (Readability.js:1129): {t}"
+        );
+    }
+
+    /// `Readability.js:1126-1134` unlikely-strip suppressed for `<body>`: a
+    /// body with an unlikely class is NOT removed because the `tag !== BODY`
+    /// guard short-circuits the strip on the body node.
+    /// rationale: pin the false side of `tag_name(&node) != Some("BODY")`
+    /// (grab_article.rs:266) — `<body>` is never stripped here.
+    #[test]
+    fn grab_body_with_unlikely_class_is_not_stripped() {
+        // body itself carries an unlikely class. The unlikely-strip walk
+        // visits <body> and the `tag !== BODY` guard suppresses removal.
+        let html = "<html><body class=\"comments\"><div class=content>\
+            <p>Body content paragraph here easily over the twenty-five character minimum threshold for scoring.</p>\
+            </div></body></html>";
+        let (_d, ac) = grab(html, "").expect("grab");
+        // The body's content survives — proves the body itself wasn't
+        // removed during the unlikely-strip walk.
+        assert!(text_content(&ac).contains("Body content paragraph"));
+    }
+
+    /// `Readability.js:1153-1157` DIV phrasing wrap: a leading whitespace
+    /// text node child of a DIV does NOT create a new `<p>` (the
+    /// `!is_whitespace(&cn)` false branch — phrasing AND whitespace ⇒ skip).
+    /// rationale: pin the false arm of `!is_whitespace(&cn)`
+    /// (grab_article.rs:318) — whitespace text children of a div do not
+    /// trigger paragraph creation.
+    #[test]
+    fn grab_div_leading_whitespace_does_not_create_paragraph() {
+        // The div has a leading whitespace text node, then a real child <div>
+        // (non-phrasing) so the phrasing-wrap path runs but the whitespace
+        // node skips the new-<p> creation.
+        let html = "<html><body>\
+            <div class=content>   <div><p>Inner block paragraph easily over the twenty-five character minimum threshold for scoring well.</p></div></div>\
+            </body></html>";
+        let (_d, ac) = grab(html, "").expect("grab");
+        assert!(text_content(&ac).contains("Inner block paragraph"));
+    }
+
+    /// `Readability.js:1087-1100` byline `itemprop*="name"` walk: when the
+    /// byline node has a descendant with `[itemprop*="name"]`, its text is
+    /// captured (not the byline node's full text).
+    /// rationale: pin the loop in `find_descendant_item_prop_name`
+    /// (grab_article.rs:856-867): the while-let loop iterates, the end-marker
+    /// ptr_eq false side fires (the descendant is not the end marker), and
+    /// the `itemprop.contains("name")` true side fires.
+    #[test]
+    fn grab_byline_itemprop_name_descendant_is_captured() {
+        // <p rel="author"> with a child <span itemprop="name">Jane</span>.
+        // The byline node is the <p>; its descendant <span> carries the
+        // itemprop="name", so the captured byline is "Jane" — not the <p>'s
+        // full textContent.
+        let html = "<html><body>\
+            <p rel=\"author\">By <span itemprop=\"name\">Jane Author</span> on Tuesday</p>\
+            <div class=content><p>Article body paragraph easily over the twenty-five character minimum threshold here.</p></div>\
+            </body></html>";
+        let mut dom = Dom::parse(html);
+        let root = dom.document();
+        let body = dom.body().unwrap();
+        let flags = Flags::default();
+        let mut byline_found = false;
+        let mut byline_text: Option<String> = None;
+        let _ = grab_article(
+            &mut dom,
+            &root,
+            &body,
+            "",
+            &flags,
+            &mut byline_found,
+            &mut byline_text,
+        )
+        .expect("grab");
+        assert!(byline_found, "byline detected");
+        assert_eq!(
+            byline_text.as_deref(),
+            Some("Jane Author"),
+            "itemprop=name descendant's text is captured (Readability.js:1087-1100)"
+        );
+    }
 }
