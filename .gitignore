@@ -48,7 +48,10 @@ benchmark/broad/sweep.pid
 # for, so committing it would defeat the scrub's purpose.
 .publish-prep/
 
-# Coverage baseline scratch — large reports and HTML drill-down kept locally only.
-wrk_docs/coverage_baseline/baseline.json
-wrk_docs/coverage_baseline/baseline_run.stderr.log
-wrk_docs/coverage_baseline/html/
+# Coverage baseline scratch — large llvm-cov JSON exports and HTML drill-downs
+# are regenerable and kept locally only. Analysis scripts (*.py) and the
+# *_summary.txt digests stay tracked as the deliverable record. (*.stderr.log
+# is already covered by the global *.log rule above.)
+wrk_docs/coverage_baseline/*.json
+wrk_docs/coverage_baseline/html*/
+wrk_docs/coverage_baseline/secondpass_*.txt
