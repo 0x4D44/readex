@@ -219,6 +219,12 @@ fn repair_relative_url(dom: &Dom, rel: &str) -> Option<String> {
         if (attrtype.starts_with("og:") || attrtype.starts_with("twitter:"))
             && let Some(content) = get_attribute(&elem, "content")
             && let Some(base) = get_base_url(&content)
+            // llvm-cov:branch-not-reachable: `get_base_url` returns `None` for an
+            // empty netloc (`urlutils.py:76-84` port; the `if netloc.is_empty()`
+            // guard at the `get_base_url` body), so when it yields `Some(_)` the
+            // string is always `scheme://<non-empty netloc>` — never empty. The
+            // `!base.is_empty()` FALSE side is therefore unreachable; the guard
+            // is retained to mirror the Python `if base_url:` truthiness check.
             && !base.is_empty()
         {
             return Some(format!("{base}{rel}"));
@@ -786,6 +792,11 @@ pub fn extract_date(dom: &Dom, max_date: (i32, u32, u32)) -> Option<String> {
 /// Returns a deduplicated list (Python uses `dict.fromkeys(...)` —
 /// insertion-order preserving dedup at `metadata.py:446`).
 pub(crate) fn extract_catstags(dom: &Dom, metatype: &str) -> Vec<String> {
+    // llvm-cov:branch-not-reachable (else arm): html5ever's `parse_document`
+    // always synthesises a `<body>` for a full-document parse, so `dom.body()`
+    // is `Some` for every `Dom::parse` snapshot (dom.rs:419-420 contract). The
+    // `else { Vec::new() }` arm mirrors the Python `if tree is None` defensive
+    // guard but cannot fire on a real parse.
     let Some(body) = dom.body() else {
         return Vec::new();
     };
@@ -805,10 +816,22 @@ pub(crate) fn extract_catstags(dom: &Dom, metatype: &str) -> Vec<String> {
     // semantics.
     let metatype_lower = metatype.to_ascii_lowercase();
     for expr in xpath_list {
+        // llvm-cov:branch-not-reachable (Err arm): `xpath_list` is one of the
+        // fixed `CATEGORIES_XPATHS` / `TAGS_XPATHS` constants, every one of
+        // which parses + evaluates cleanly on the Stage 0b engine (pinned by
+        // `tests/xpath_constants_engine_coverage.rs`). `evaluate` never returns
+        // `Err` for these literals, so the `else { continue }` arm is dead; it
+        // mirrors lxml's compile-error tolerance verbatim.
         let Ok(matches) = xpath_engine::evaluate(expr, &body) else {
             continue;
         };
         for elem in &matches {
+            // llvm-cov:branch-not-reachable (None arm): every CATEGORIES_XPATHS
+            // / TAGS_XPATHS expression ends in `//a[@href]` (xpaths.py:236-256),
+            // so the engine only yields anchors that carry an `href` attribute;
+            // `get_attribute(elem, "href")` is therefore always `Some`. The
+            // `else { continue }` arm guards a shape the `[@href]` predicate
+            // already excludes.
             let Some(href) = get_attribute(elem, "href") else {
                 continue;
             };
@@ -828,6 +851,11 @@ pub(crate) fn extract_catstags(dom: &Dom, metatype: &str) -> Vec<String> {
     // Category fallback (`metadata.py:437-441`).
     if metatype == "category"
         && results.is_empty()
+        // llvm-cov:branch-not-reachable (None arm): `find_head` walks the
+        // synthesised `<head>` html5ever always emits for a full-document parse
+        // (dom.rs `find_head` / root_element contract), so for any `Dom::parse`
+        // snapshot it is `Some`. The `&& let Some(head)` FALSE side mirrors the
+        // Python `if not head` guard but cannot fire on a real parse.
         && let Some(head) = find_head(dom)
     {
         for elem in get_elements_by_tag_name(&head, "meta") {
@@ -2435,5 +2463,562 @@ mod tests {
                 </body></html>"#,
         );
         assert_eq!(extract_license(&dom), None);
+    }
+
+    // ===================================================================
+    // M12 Stage 4 (single-file push) — RFC-3986 / courlan edge-arm branches
+    // -------------------------------------------------------------------
+    // Each test below forces the previously-unhit side of a production
+    // branch, citing the courlan / urllib / metadata.py invariant it pins.
+    // ===================================================================
+
+    // ---- walk_url_selectors: whitespace-only href (metadata.py:154) ------
+
+    #[test]
+    fn extract_url_whitespace_only_canonical_href_is_skipped() {
+        // rationale: `walk_url_selectors` guard `&& !u.trim().is_empty()`
+        // (metadata.py iterates URL_SELECTORS and takes the first NON-empty
+        // href). A `<link rel="canonical" href="   ">` yields a whitespace
+        // href whose `trim()` is empty -> the FALSE side fires, the selector
+        // is skipped, and extract_url falls through to default_url.
+        let dom = parse(
+            r#"<html><head>
+                <link rel="canonical" href="   ">
+                </head><body></body></html>"#,
+        );
+        assert_eq!(
+            extract_url(&dom, Some("https://fallback.example.com/")).as_deref(),
+            Some("https://fallback.example.com/")
+        );
+    }
+
+    // ---- first_base_href: <base> without href (metadata.py:155) ----------
+
+    #[test]
+    fn extract_url_base_element_without_href_falls_through() {
+        // rationale: `first_base_href` getter `if let Some(href) = get_attribute
+        // (&base, "href")` FALSE side — a `<base>` element carrying NO href
+        // attribute yields no URL, so URL_SELECTORS[1] contributes nothing and
+        // extract_url falls through to default_url.
+        let dom = parse(
+            r#"<html><head>
+                <base target="_blank">
+                </head><body></body></html>"#,
+        );
+        assert_eq!(
+            extract_url(&dom, Some("https://fallback.example.com/")).as_deref(),
+            Some("https://fallback.example.com/")
+        );
+    }
+
+    // ---- find_alternate_x_default: rel match but no hreflang -------------
+
+    #[test]
+    fn extract_url_alternate_without_hreflang_is_skipped() {
+        // rationale: `find_alternate_x_default` `if rel_match && hreflang_match`
+        // — the `hreflang_match` (second &&-operand) FALSE side. A `<link
+        // rel="alternate">` WITHOUT an `hreflang="x-default"` matches rel but
+        // not hreflang, so the alternate selector (metadata.py:156) contributes
+        // nothing and extract_url falls through to default_url.
+        let dom = parse(
+            r#"<html><head>
+                <link rel="alternate" href="https://example.com/fr">
+                </head><body></body></html>"#,
+        );
+        assert_eq!(
+            extract_url(&dom, Some("https://fallback.example.com/")).as_deref(),
+            Some("https://fallback.example.com/")
+        );
+    }
+
+    // ---- repair_relative_url: og:/twitter: discrimination ----------------
+
+    #[test]
+    fn extract_url_repairs_relative_via_twitter_meta() {
+        // rationale: `repair_relative_url` guard `attrtype.starts_with("og:")
+        // || attrtype.starts_with("twitter:")` (metadata.py:399-406). With a
+        // `twitter:url` meta (and no `og:`), the `og:` operand is FALSE so the
+        // `twitter:` operand is evaluated and TRUE — repairing the relative
+        // canonical from the twitter base.
+        let dom = parse(
+            r#"<html><head>
+                <link rel="canonical" href="/article/42">
+                <meta name="twitter:url" content="https://twit.example.com/x">
+                </head><body></body></html>"#,
+        );
+        assert_eq!(
+            extract_url(&dom, None).as_deref(),
+            Some("https://twit.example.com/article/42")
+        );
+    }
+
+    #[test]
+    fn extract_url_relative_ignores_non_og_twitter_meta_then_repairs() {
+        // rationale: a leading non-og/non-twitter meta (`description`) makes
+        // BOTH operands of the metadata.py:399 guard FALSE (the `twitter:`
+        // FALSE side); the loop then reaches the `og:url` meta and repairs.
+        let dom = parse(
+            r#"<html><head>
+                <link rel="canonical" href="/p/9">
+                <meta name="description" content="not a url at all">
+                <meta property="og:url" content="https://og.example.com/home">
+                </head><body></body></html>"#,
+        );
+        assert_eq!(
+            extract_url(&dom, None).as_deref(),
+            Some("https://og.example.com/p/9")
+        );
+    }
+
+    #[test]
+    fn extract_url_relative_og_meta_without_content_skipped() {
+        // rationale: `repair_relative_url` `&& let Some(content) = get_attribute
+        // (&elem, "content")` FALSE side — an `og:` meta with NO content
+        // attribute is skipped; with no other base source the relative URL
+        // falls through is_valid_url (schemeless -> invalid) to default_url.
+        let dom = parse(
+            r#"<html><head>
+                <link rel="canonical" href="/p/9">
+                <meta property="og:url">
+                </head><body></body></html>"#,
+        );
+        assert_eq!(
+            extract_url(&dom, Some("https://def.example.com/")).as_deref(),
+            Some("https://def.example.com/")
+        );
+    }
+
+    #[test]
+    fn extract_url_relative_og_content_without_base_skipped() {
+        // rationale: `&& let Some(base) = get_base_url(&content)` FALSE side —
+        // an `og:url` whose content has no scheme yields `get_base_url == None`
+        // (urlutils.py:76-84 needs `://`), so it is skipped and the relative
+        // URL falls through to default_url.
+        let dom = parse(
+            r#"<html><head>
+                <link rel="canonical" href="/p/9">
+                <meta property="og:url" content="example.com-no-scheme">
+                </head><body></body></html>"#,
+        );
+        assert_eq!(
+            extract_url(&dom, Some("https://def.example.com/")).as_deref(),
+            Some("https://def.example.com/")
+        );
+    }
+
+    // ---- extract_domain: empty authority / empty host --------------------
+
+    #[test]
+    fn extract_domain_empty_authority_returns_none() {
+        // rationale: `extract_domain` `if authority.is_empty()` TRUE side —
+        // `https:///path` has an empty authority (the `/path` begins at index
+        // 0 after the scheme), so DOMAIN_REGEX cannot match -> None.
+        assert_eq!(extract_domain("https:///path"), None);
+    }
+
+    #[test]
+    fn extract_domain_userinfo_with_empty_host_returns_none() {
+        // rationale: `extract_domain` `if host.is_empty()` TRUE side — after
+        // splitting `user@` userinfo (urlutils.py `.split("@")[-1]`) the host
+        // component of `https://user@/path` is empty -> None.
+        assert_eq!(extract_domain("https://user@/path"), None);
+    }
+
+    #[test]
+    fn extract_domain_short_remainder_falls_to_www_strip() {
+        // rationale: `extract_domain` fast-path `if (2..=63).contains(&rest_len)`
+        // FALSE side — host `abcd.x` has a 4-char non-final label (`abcd`) but
+        // the remainder after `abcd.` is `x` (1 char), failing DOMAIN_REGEX's
+        // `[^/?#]{2,63}` remainder (urlutils.py:14-21). The fast path rejects
+        // it and the www-strip fallback returns the host verbatim.
+        assert_eq!(extract_domain("https://abcd.x/p").as_deref(), Some("abcd.x"));
+    }
+
+    // ---- meta_url_sitename: w-prefix without digits / without dot --------
+
+    #[test]
+    fn meta_url_sitename_w_prefix_no_digits_keeps_host() {
+        // rationale: `meta_url_sitename` `if digits_end > 0 && ...` FALSE side
+        // via the FIRST operand — host `web.example.com` begins with `w` but no
+        // digit follows (`w[0-9]+\.` needs >=1 digit, metadata.py:46), so the
+        // prefix is NOT stripped and the bare host is kept.
+        assert_eq!(
+            meta_url_sitename("https://web.example.com/x"),
+            Some("web.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn meta_url_sitename_w_digits_without_dot_keeps_host() {
+        // rationale: `&& r[digits_end..].starts_with('.')` FALSE side — host
+        // `w3x.example.com` has digits after `w` but no `.` immediately after
+        // them, so `w[0-9]+\.` does not match and the host is kept verbatim.
+        assert_eq!(
+            meta_url_sitename("https://w3x.example.com/x"),
+            Some("w3x.example.com".to_string())
+        );
+    }
+
+    // ---- strip_port: digit-predecessor / empty port ---------------------
+
+    #[test]
+    fn strip_port_keeps_when_colon_predecessor_is_digit() {
+        // rationale: `strip_port` `if prev_is_digit` TRUE side — Python's
+        // lookbehind `STRIP_PORT_REGEX = r"(?<=\D):\d+"` only strips a port when
+        // the char before `:` is a NON-digit. For `1.2.3.4:80` the predecessor
+        // is `4` (a digit), so the port is NOT stripped (matches the IPv4
+        // dotted-quad guard).
+        assert_eq!(strip_port("1.2.3.4:80"), "1.2.3.4:80");
+    }
+
+    #[test]
+    fn strip_port_keeps_when_port_empty() {
+        // rationale: `strip_port` `if port.is_empty() || ...` TRUE side via the
+        // FIRST operand — a trailing `:` with nothing after it (`example.com:`)
+        // has an empty port segment, so `\d+` cannot match and the authority is
+        // returned unchanged.
+        assert_eq!(strip_port("example.com:"), "example.com:");
+    }
+
+    // ---- fix_relative_urls / urljoin: same-netloc + empty-netloc ---------
+
+    #[test]
+    fn fix_relative_urls_protocol_relative_same_host_inherits_scheme() {
+        // rationale: urlutils.py:118-121 guard `!unetloc.is_empty() && unetloc
+        // != base_netloc` is FALSE here because the reference's netloc EQUALS
+        // the base's (`e.com`); execution falls through to urljoin (line 123),
+        // whose `if let Some(rnetloc) = ref_netloc` TRUE side then rebuilds the
+        // URL as `<base-scheme>://<ref-netloc><ref-path>`.
+        assert_eq!(
+            fix_relative_urls("https://e.com/a", "//e.com/b/c"),
+            "https://e.com/b/c"
+        );
+    }
+
+    #[test]
+    fn fix_relative_urls_empty_netloc_protocol_relative() {
+        // rationale: urlutils.py:118 guard FALSE side via the FIRST operand
+        // `!unetloc.is_empty()` — a bare `//` reference splits to an EMPTY
+        // netloc, so the guard is FALSE and execution falls through to urljoin,
+        // which emits `<scheme>://` with the (empty) reference authority.
+        assert_eq!(fix_relative_urls("https://e.com/a", "//"), "https://");
+    }
+
+    // ---- split_scheme: empty scheme / invalid-char scheme ----------------
+
+    #[test]
+    fn fix_relative_urls_base_with_empty_scheme_returns_reference() {
+        // rationale: `split_scheme` `if !scheme.is_empty() && ...` FALSE side
+        // via the FIRST operand — a base beginning with `://` has an empty
+        // scheme, so split_scheme yields `(None, _)`; urljoin then cannot
+        // resolve and returns the reference verbatim.
+        assert_eq!(fix_relative_urls("://no-scheme/x", "page.html"), "page.html");
+    }
+
+    #[test]
+    fn fix_relative_urls_base_with_invalid_scheme_char_returns_reference() {
+        // rationale: `split_scheme` `&& scheme.chars().all(...)` FALSE side —
+        // a base scheme containing `!` (not in RFC-3986's `ALPHA / DIGIT / "+"
+        // / "-" / "."`) makes `all()` FALSE, so split_scheme yields `(None, _)`
+        // and urljoin returns the reference verbatim. Also exercises the
+        // closure's `is_ascii_alphanumeric()` FALSE side on `!`.
+        assert_eq!(fix_relative_urls("ht!tp://host/x", "page.html"), "page.html");
+    }
+
+    #[test]
+    fn fix_relative_urls_reference_scheme_with_plus_is_recognised() {
+        // rationale: `split_scheme` closure `c == '+'` TRUE side — a reference
+        // scheme `git+ssh` contains a `+` (a valid RFC-3986 scheme char), so
+        // the closure accepts it and split_scheme recognises the scheme. With a
+        // different host + a real scheme, fix_relative_urls returns it verbatim
+        // (urlutils.py:118-120).
+        assert_eq!(
+            fix_relative_urls("https://e.com/a", "git+ssh://other.host/repo"),
+            "git+ssh://other.host/repo"
+        );
+    }
+
+    #[test]
+    fn fix_relative_urls_reference_scheme_with_dash_and_dot_is_recognised() {
+        // rationale: `split_scheme` closure `c == '-'` TRUE side (the `-` in
+        // `a-b`) and the trailing `c == '.'` operand (the `.` in `b.c`) — a
+        // reference scheme `a-b.c` is all-valid RFC-3986 scheme chars, so
+        // split_scheme recognises it and fix_relative_urls returns the
+        // different-host absolute URL verbatim.
+        assert_eq!(
+            fix_relative_urls("https://e.com/a", "a-b.c://other.host/x"),
+            "a-b.c://other.host/x"
+        );
+    }
+
+    // ---- is_valid_url: uppercase http:// (not https) --------------------
+
+    #[test]
+    fn is_valid_url_accepts_uppercase_http_scheme() {
+        // rationale: `is_valid_url` scheme `||` chain `url.to_ascii_lowercase()
+        // .starts_with("http://")` TRUE side — `HTTP://...` is neither verbatim
+        // `http://` nor `https://` nor lowercased-`https://`, so it is only
+        // accepted via the lowercased-`http://` operand (filters.py:253-271
+        // case-insensitive scheme check).
+        assert!(is_valid_url("HTTP://Example.COM/path"));
+    }
+
+    // ---- normalize_url / collapse_path_slashes: PATH2 /.. arms ----------
+
+    #[test]
+    fn normalize_url_strips_trailing_dotdot_to_empty_path() {
+        // rationale: `collapse_path_slashes` PATH2 loop `after.is_empty() ||
+        // after.starts_with('/')` TRUE side via the FIRST operand — a path of
+        // exactly `/..` strips to an empty remainder (clean.py PATH2
+        // `^(?:/\.\.(?![^/]))+`), so the normalized path is empty.
+        assert_eq!(normalize_url("https://e.com/.."), "https://e.com");
+    }
+
+    #[test]
+    fn normalize_url_keeps_dotdot_when_not_a_full_segment() {
+        // rationale: `collapse_path_slashes` PATH2 `after.starts_with('/')`
+        // FALSE side — `/..x` is NOT a `/..` segment (the negative lookahead
+        // `(?![^/])` in clean.py PATH2 forbids a trailing non-slash char), so
+        // it is left intact rather than stripped.
+        assert_eq!(normalize_url("https://e.com/..x"), "https://e.com/..x");
+    }
+
+    // ---- extract_catstags: empty-text matching anchor --------------------
+
+    #[test]
+    fn extract_catstags_skips_matching_anchor_with_empty_text() {
+        // rationale: `extract_catstags` `if !t.is_empty() && ...` FALSE side via
+        // the FIRST operand — an anchor whose href matches `/tag/` but whose
+        // text is empty (after line_processing) contributes nothing; the second
+        // anchor with text is what populates results.
+        let dom = parse(
+            r#"<html><head></head><body>
+                <div class="tags">
+                    <a href="/tag/empty"></a>
+                    <a href="/tag/rust">rust</a>
+                </div>
+            </body></html>"#,
+        );
+        let tags = extract_catstags(&dom, "tag");
+        assert_eq!(tags, vec!["rust".to_string()]);
+    }
+
+    // ---- extract_catstags category fallback: meta content arms ----------
+
+    #[test]
+    fn extract_catstags_category_section_meta_without_content_skipped() {
+        // rationale: category fallback `if (is_section || is_subject_name) &&
+        // let Some(content) = get_attribute(&elem, "content")` FALSE side — a
+        // `<meta property="article:section">` with NO content attribute matches
+        // the section predicate but yields no content, so it is skipped and the
+        // overall result is empty (metadata.py:437-441).
+        let dom = parse(
+            r#"<html><head>
+                <meta property="article:section">
+            </head><body><p>x</p></body></html>"#,
+        );
+        assert!(extract_catstags(&dom, "category").is_empty());
+    }
+
+    #[test]
+    fn extract_catstags_category_section_meta_whitespace_content_skipped() {
+        // rationale: category fallback `if !t.is_empty() && ...` FALSE side via
+        // the FIRST operand — a section meta whose content is whitespace-only
+        // trims to empty, so it adds nothing (metadata.py:437-441 collects only
+        // non-empty section/subject text).
+        let dom = parse(
+            r#"<html><head>
+                <meta property="article:section" content="   ">
+            </head><body><p>x</p></body></html>"#,
+        );
+        assert!(extract_catstags(&dom, "category").is_empty());
+    }
+
+    #[test]
+    fn extract_catstags_category_section_meta_dedupes_duplicate_content() {
+        // rationale: category fallback `if !t.is_empty() && !results.contains
+        // (&t)` FALSE side via the SECOND operand — two section metas with the
+        // same content yield one entry (metadata.py:446 `dict.fromkeys`
+        // insertion-order dedup applies to the fallback path too).
+        let dom = parse(
+            r#"<html><head>
+                <meta property="article:section" content="Politics">
+                <meta name="dcterms.subject" content="Politics">
+            </head><body><p>x</p></body></html>"#,
+        );
+        assert_eq!(
+            extract_catstags(&dom, "category"),
+            vec!["Politics".to_string()]
+        );
+    }
+
+    // ---- extract_license: footer/div anchor href present-but-no-match ----
+
+    #[test]
+    fn extract_license_footer_anchor_with_href_no_match_no_text_returns_none() {
+        // rationale: `extract_license` footer loop guard `if get_attribute(&a,
+        // "href").is_some() && ...` — the href IS present (TRUE) but parse_license
+        // _element returns None (no LICENSE_REGEX match, no strict text match),
+        // so the overall result is None (metadata.py:465-479).
+        let dom = parse(
+            r#"<html><head></head><body>
+                <p>article</p>
+                <footer>
+                    <a href="https://example.com/about">About us</a>
+                </footer>
+            </body></html>"#,
+        );
+        assert!(extract_license(&dom).is_none());
+    }
+
+    #[test]
+    fn extract_license_div_footer_anchor_with_href_strict_text_match() {
+        // rationale: `extract_license` div.footer loop guard `if get_attribute
+        // (&a, "href").is_some() && let Some(result) = parse_license_element(&a,
+        // true)` — href present AND the strict TEXT_LICENSE_REGEX matches the
+        // anchor text, so the matched substring is returned (metadata.py:473-477).
+        let dom = parse(
+            r#"<html><head></head><body>
+                <div id="site-footer">
+                    <a href="https://example.com/legal">Creative Commons by-nc 3.0</a>
+                </div>
+            </body></html>"#,
+        );
+        assert_eq!(
+            extract_license(&dom).as_deref(),
+            Some("Creative Commons by-nc 3.0")
+        );
+    }
+
+    // ---- parse_license_element: whitespace text trims to empty -----------
+
+    #[test]
+    fn extract_license_rel_license_whitespace_text_returns_none() {
+        // rationale: `parse_license_element` `if t.is_empty()` TRUE side — a
+        // rel=license anchor whose href has NO LICENSE_REGEX match and whose
+        // text is whitespace-only (element_text -> Some("   "), trim -> "")
+        // returns None, so extract_license overall yields None
+        // (metadata.py:456-461). Distinct from the EMPTY-text case where
+        // element_text returns None and short-circuits before this arm.
+        let dom = parse(
+            "<html><head></head><body>\
+                <a rel=\"license\" href=\"https://e.com/x\">   </a>\
+                </body></html>",
+        );
+        assert!(extract_license(&dom).is_none());
+    }
+
+    // ---- match_license_regex: version second/third char invalid ----------
+
+    #[test]
+    fn match_license_regex_rejects_when_third_char_not_dot() {
+        // rationale: `match_license_regex` version guard `&& dot == '.'` FALSE
+        // side — `/by/12/` has a valid first digit but the third char is `2`,
+        // not `.`, failing `[1-9]\.[0-9]` (metadata.py:56-58). No match.
+        assert_eq!(match_license_regex("https://e.com/by/12/"), None);
+    }
+
+    #[test]
+    fn match_license_regex_rejects_when_minor_not_digit() {
+        // rationale: `match_license_regex` version guard `&& minor.is_ascii
+        // _digit()` FALSE side — `/by/1.x/` has major=`1`, dot=`.`, but minor=`x`
+        // is not a digit, failing `[1-9]\.[0-9]`. No match.
+        assert_eq!(match_license_regex("https://e.com/by/1.x/"), None);
+    }
+
+    // ---- match_text_license_regex: optional-version char arms ------------
+
+    #[test]
+    fn match_text_license_regex_token_with_nondigit_major_keeps_base() {
+        // rationale: `match_text_license_regex` `&& major.is_ascii_digit()`
+        // FALSE side — `cc by-sa abc` has three trailing chars but the first
+        // (`a`) is not a digit, so the optional `([1-9]\.[0-9])?` is NOT
+        // consumed and the base `cc by-sa` is returned (TEXT_LICENSE_REGEX,
+        // metadata.py:60-62).
+        assert_eq!(
+            match_text_license_regex("cc by-sa abc").as_deref(),
+            Some("cc by-sa")
+        );
+    }
+
+    #[test]
+    fn match_text_license_regex_token_with_nondot_keeps_base() {
+        // rationale: `&& dot == '.'` FALSE side — `cc by-sa 123` has major=`1`
+        // but the second char is `2`, not `.`, so the optional version is not
+        // consumed; the base `cc by-sa` is returned.
+        assert_eq!(
+            match_text_license_regex("cc by-sa 123").as_deref(),
+            Some("cc by-sa")
+        );
+    }
+
+    #[test]
+    fn match_text_license_regex_token_with_nondigit_minor_keeps_base() {
+        // rationale: `&& minor.is_ascii_digit()` FALSE side — `cc by-sa 1.x`
+        // has major=`1`, dot=`.`, but minor=`x` is not a digit, so the optional
+        // version is not consumed; the base `cc by-sa` is returned.
+        assert_eq!(
+            match_text_license_regex("cc by-sa 1.x").as_deref(),
+            Some("cc by-sa")
+        );
+    }
+
+    // ---- find_link_with_rel: <link> without a rel attribute --------------
+
+    #[test]
+    fn extract_url_link_without_rel_attribute_is_ignored() {
+        // rationale: `find_link_with_rel` `if let Some(rel) = get_attribute(&link,
+        // "rel")` FALSE side — a `<link href="...">` with NO `rel` attribute
+        // (e.g. a bare resource link) is skipped by the canonical scan
+        // (metadata.py:154 `link[@rel="canonical"]`); the subsequent
+        // canonical link is what wins.
+        let dom = parse(
+            r#"<html><head>
+                <link href="https://example.com/style.css">
+                <link rel="canonical" href="https://example.com/real">
+                </head><body></body></html>"#,
+        );
+        assert_eq!(
+            extract_url(&dom, None).as_deref(),
+            Some("https://example.com/real")
+        );
+    }
+
+    // ---- extract_license div.footer loop: href-getter / parse arms ------
+
+    #[test]
+    fn extract_license_div_footer_anchor_without_href_skipped() {
+        // rationale: `extract_license` div.footer loop guard `if get_attribute
+        // (&a, "href").is_some()` FALSE side — an anchor inside a div#footer with
+        // NO href is skipped; with no other license source the result is None
+        // (metadata.py:473-477). The footer-element loop above finds nothing
+        // first, so execution reaches the div.footer loop.
+        let dom = parse(
+            r#"<html><head></head><body>
+                <p>article</p>
+                <div id="footer">
+                    <a>no href just text</a>
+                </div>
+            </body></html>"#,
+        );
+        assert!(extract_license(&dom).is_none());
+    }
+
+    #[test]
+    fn extract_license_div_footer_anchor_href_no_license_match_skipped() {
+        // rationale: div.footer loop `&& let Some(result) = parse_license_element
+        // (&a, true)` FALSE side — an anchor with an href but NO LICENSE_REGEX
+        // match and NO strict TEXT_LICENSE_REGEX text match yields None from
+        // parse_license_element, so the loop continues and the overall result
+        // is None (metadata.py:473-477).
+        let dom = parse(
+            r#"<html><head></head><body>
+                <p>article</p>
+                <div class="site-footer">
+                    <a href="https://example.com/contact">Contact</a>
+                </div>
+            </body></html>"#,
+        );
+        assert!(extract_license(&dom).is_none());
     }
 }
