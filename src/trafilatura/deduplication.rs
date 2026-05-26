@@ -1364,4 +1364,279 @@ mod tests {
         assert!(is_similar_domain("example.com", "examplx.com"));
         assert!(!is_similar_domain_with("example.com", "examplx.com", 0.9));
     }
+
+    // ===========================================================================
+    // LRU cache branch-coverage tests (Stage 10)
+    // ===========================================================================
+
+    // ---- LruCache.touch absent-key arm (deduplication.rs:233) --------------
+
+    #[test]
+    fn lru_cache_contains_absent_key_returns_false_without_touch() {
+        // rationale: pin the `else` arm of `contains` (deduplication.rs:188).
+        // For an absent key, `counts.contains_key` is False; `touch` is NOT
+        // called; the function returns False. The Python `.get()` analogue
+        // returns -1 sentinel; our `contains` returns False (the boolean
+        // equivalent of "key absent").
+        let mut cache = LruCache::new(4);
+        cache.put("alpha".to_string());
+        assert!(!cache.contains("beta"));
+        // Sanity: alpha is still present and unmoved (touch was not called
+        // on beta).
+        assert!(cache.contains("alpha"));
+    }
+
+    // ---- LruCache eviction at exact capacity threshold ---------------------
+
+    #[test]
+    fn lru_cache_eviction_exactly_at_threshold_n() {
+        // rationale: Stage 10 brief — "LRU cache eviction arms when capacity
+        // is exactly at threshold". With capacity=N, the (N+1)-th distinct
+        // insert MUST evict the oldest. With capacity=1 the threshold is
+        // hit on the second insert; pins the boundary `recency.len() >=
+        // capacity` (deduplication.rs:222) True path at the smallest
+        // capacity where eviction is observable (capacity=0 is the inert
+        // sub-arm already covered by `lru_cache_capacity_zero_is_inert`).
+        let mut cache = LruCache::new(1);
+        cache.put("first".to_string());
+        assert!(cache.contains("first"));
+        cache.put("second".to_string()); // evicts "first"
+        assert!(!cache.contains("first"), "capacity=1 means second insert evicts first");
+        assert!(cache.contains("second"));
+        // count should reset to 1 — eviction removes the entry entirely.
+        assert_eq!(cache.count("second"), 1);
+    }
+
+    #[test]
+    fn lru_cache_eviction_fills_then_evicts_in_fifo_order() {
+        // rationale: with capacity=3 and no `contains` touches between
+        // inserts, the recency ring is FIFO. Inserting 5 distinct keys
+        // evicts the first two; the surviving set is the last 3 inserted.
+        // Pins the eviction loop's invariant: `recency.remove(0)` evicts
+        // the head (= LRU), not the tail. Also exercises the increment-
+        // existing-key path when we put a repeat of one of the survivors.
+        let mut cache = LruCache::new(3);
+        for k in ["k1", "k2", "k3", "k4", "k5"] {
+            cache.put(k.to_string());
+        }
+        assert!(!cache.contains("k1"));
+        assert!(!cache.contains("k2"));
+        assert!(cache.contains("k3"));
+        assert!(cache.contains("k4"));
+        assert!(cache.contains("k5"));
+        assert_eq!(cache.len(), 3);
+        // Re-put k3: count goes to 2, k3 moves to MRU. Re-put k3 again:
+        // count=3, k3 still MRU. Insert k6: evicts the current LRU (k4 since
+        // k3 was just touched).
+        cache.put("k3".to_string());
+        cache.put("k3".to_string());
+        assert_eq!(cache.count("k3"), 3);
+        cache.put("k6".to_string());
+        assert!(!cache.contains("k4"), "k4 is now the LRU after k3 touches");
+        assert!(cache.contains("k3"));
+        assert!(cache.contains("k5"));
+        assert!(cache.contains("k6"));
+    }
+
+    #[test]
+    fn lru_cache_len_reflects_eviction() {
+        // rationale: pin the `LruCache::len()` accessor against an
+        // evict-then-grow sequence. After 3 inserts on capacity=2, len() is
+        // 2; the cache never grows past capacity. Companion to
+        // `lru_cache_evicts_oldest_when_full`.
+        let mut cache = LruCache::new(2);
+        assert_eq!(cache.len(), 0);
+        assert!(cache.is_empty());
+        cache.put("a".to_string());
+        assert_eq!(cache.len(), 1);
+        cache.put("b".to_string());
+        assert_eq!(cache.len(), 2);
+        cache.put("c".to_string()); // evicts a
+        assert_eq!(cache.len(), 2);
+        assert!(!cache.is_empty());
+    }
+
+    // ---- duplicate_test_node empty-text fast-fail (deduplication.rs:387) --
+
+    #[test]
+    fn duplicate_test_node_empty_subtree_skips_gate() {
+        // rationale: `collect_itertext_joined` returns "" for an element with
+        // no text descendants; `trim("")` is "". `duplicate_test` sees
+        // `codepoints=0 > min_size`, which is False for any non-zero min
+        // (the Stage 8 default is 100) — pins the False side of the size
+        // gate (deduplication.rs:387). The function still records via
+        // `put_in_cache` (the fall-through at deduplication.rs:406).
+        use crate::readability::dom::create_element;
+        use crate::trafilatura::cleaning::Options;
+        let _g = LOCK.lock().unwrap();
+        clear_lru_test();
+        let p = create_element("p");
+        let opts = Options::default();
+        assert!(!duplicate_test_node(&p, &opts));
+        // Sanity: the empty trimmed text WAS recorded.
+        let n = with_lru_test(|c| c.count(""));
+        assert_eq!(n, 1, "fall-through put_in_cache records the empty key");
+    }
+
+    // ---- collect_itertext_joined visits both text + nested element kids ----
+
+    #[test]
+    fn duplicate_test_node_walks_nested_elements() {
+        // rationale: `walk_text` (deduplication.rs:440-454) recurses into
+        // element children and appends each non-empty Text node's data.
+        // Build a `<div>` with mixed text + element children and verify the
+        // dedup signature is built from ALL the leaf text in document
+        // order — pins the Element-arm recursion + Text-arm append branches.
+        use crate::readability::dom::{Dom, append_child, create_element, set_element_text};
+        use crate::trafilatura::cleaning::Options;
+        let _g = LOCK.lock().unwrap();
+        clear_lru_test();
+        let _dom = Dom::parse("<html><body></body></html>");
+        let div = create_element("div");
+        let p1 = create_element("p");
+        set_element_text(&p1, Some(&"a".repeat(60)));
+        let p2 = create_element("p");
+        set_element_text(&p2, Some(&"b".repeat(60)));
+        append_child(&div, &p1);
+        append_child(&div, &p2);
+        let opts = Options {
+            dedup: true,
+            min_duplcheck_size: 100,
+            max_repetitions: 1,
+            ..Options::default()
+        };
+        // First two calls: count goes 1, 2 — neither > 1 → false.
+        assert!(!duplicate_test_node(&div, &opts));
+        assert!(!duplicate_test_node(&div, &opts));
+        // Third call: count = 3 > 1 → true (the duplicate trip).
+        assert!(duplicate_test_node(&div, &opts));
+    }
+
+    // ---- strip_extension forbidden-character arms (deduplication.rs:841-844) -
+
+    #[test]
+    fn strip_extension_rejects_suffix_with_forward_slash() {
+        // rationale: STRIP_EXTENSION regex character class `[^/?#]` excludes
+        // `/` (deduplication.py:22). When the candidate suffix contains a
+        // `/` the regex fails to match and `re.sub` returns the input
+        // unchanged. Pins the False side of `!suffix.contains('/')` (the
+        // AND-chain at deduplication.rs:842).
+        let s = "example.co/path";
+        // `rfind('.')` finds the dot at index 7 ("example.co/path" → suffix
+        // "co/path"). suffix contains '/'. No strip.
+        assert_eq!(strip_extension(s), s);
+    }
+
+    #[test]
+    fn strip_extension_rejects_suffix_with_question_mark() {
+        // rationale: same as above for `?` (deduplication.rs:843).
+        let s = "example.co?q=1";
+        assert_eq!(strip_extension(s), s);
+    }
+
+    #[test]
+    fn strip_extension_rejects_suffix_with_hash() {
+        // rationale: same as above for `#` (deduplication.rs:844).
+        let s = "example.co#frag";
+        assert_eq!(strip_extension(s), s);
+    }
+
+    // ---- sequence_ratio empty pair short-circuit (deduplication.rs:753) ---
+
+    #[test]
+    fn sequence_ratio_empty_empty_returns_one() {
+        // rationale: pin the CPython quirk — `SequenceMatcher(None, '',
+        // '').ratio() == 1.0`. The Rust port short-circuits at
+        // deduplication.rs:753 when `total == 0`. The companion test
+        // `sequence_ratio_matches_python_difflib_on_known_cases` already
+        // pins it; here we exercise the early-return in isolation against
+        // the surrounding paths.
+        assert_eq!(sequence_ratio("", ""), 1.0);
+    }
+
+    // ---- py_isalnum empty-input False arm (deduplication.rs:483) ----------
+
+    #[test]
+    fn sample_tokens_strips_to_empty_token_rejected() {
+        // rationale: when a raw whitespace-separated piece is composed
+        // ENTIRELY of punctuation (e.g. "!!!"), `.trim_matches(PYTHON_
+        // PUNCTUATION)` yields "". Python `"".isalnum()` is False (empty
+        // string is non-alphanumeric per str.isalnum docs) — pins the
+        // `if s.is_empty() return false` arm of `py_isalnum`
+        // (deduplication.rs:483). The all-punct piece is therefore dropped
+        // from the token list.
+        let toks = sample_tokens("hello !!! world", 4);
+        assert!(toks.iter().all(|t| !t.is_empty()));
+        assert!(!toks.iter().any(|t| t == &"!!!".to_string()));
+        // The surviving tokens should be "hello" and "world".
+        assert!(toks.iter().any(|t| t == &"hello".to_string()));
+        assert!(toks.iter().any(|t| t == &"world".to_string()));
+    }
+
+    // ---- sample_tokens length threshold sweep (deduplication.rs:541) ------
+
+    #[test]
+    fn sample_tokens_falls_through_to_smallest_threshold() {
+        // rationale: pin the `i in (0..=4).rev()` sweep — when no
+        // length-threshold yields `>= length/2` tokens, the function falls
+        // through to `i=0` (tokens with `len > 0`, i.e. all of them) and
+        // returns whatever the last iteration produced. With length=64
+        // (half=32) and only 4 short tokens (each `len > 0` but all `len <=
+        // 4`), the sweep traverses i=4 (zero match), i=3 (zero), i=2
+        // (depends), i=1 (depends), i=0 (4 tokens). 4 < 32, so the
+        // function returns the LAST sample (i=0) — pins the loop-falls-
+        // through arm.
+        let toks = sample_tokens("a bb ccc dddd", 64);
+        // i=0: 4 tokens > 0 chars. None of the cascade thresholds were met.
+        assert_eq!(toks.len(), 4);
+    }
+
+    #[test]
+    fn sample_tokens_returns_early_at_threshold_match() {
+        // rationale: pin the True side of `sample.len() >= half`
+        // (deduplication.rs:541). With length=4 → half=2, and 3 tokens of
+        // length 5 ("hello", "world", "abcde"), the i=4 iteration finds
+        // 3 tokens > 4 chars; 3 >= 2 ⇒ early return.
+        let toks = sample_tokens("hello world abcde", 4);
+        assert_eq!(
+            toks,
+            vec!["hello".to_string(), "world".to_string(), "abcde".to_string()]
+        );
+    }
+
+    // ---- Simhash all-tokens-empty path (deduplication.rs:655, 668) --------
+
+    #[test]
+    fn simhash_all_whitespace_input_collapses_to_empty_token_set() {
+        // rationale: input "   \t\n  " has no non-whitespace tokens; the
+        // simhash accumulator stays all-zero; the `v >= 0` rule at
+        // deduplication.rs:668 collapses all 64 bits to 1 (since 0 >= 0
+        // is True for every position). Result: u64::MAX, same as the
+        // empty-string case. Pins the True side of `v >= 0` for the
+        // boundary value 0.
+        let s = Simhash::new("   \t\n  ");
+        assert_eq!(s.hash, u64::MAX);
+    }
+
+    #[test]
+    fn simhash_with_length_clamps_to_64() {
+        // rationale: `with_length` clamps to `[1, 64]` (deduplication.rs:648).
+        // Both extremes are observable: length=0 → clamped to 1; length=100
+        // → clamped to 64. Pins the clamp.
+        let s_low = Simhash::with_length("hello", 0);
+        assert_eq!(s_low.length, 1, "length 0 clamps to 1");
+        let s_high = Simhash::with_length("hello", 100);
+        assert_eq!(s_high.length, 64, "length 100 clamps to 64");
+    }
+
+    // ---- Simhash similarity boundary checks (deduplication.rs:688-693) ----
+
+    #[test]
+    fn simhash_similarity_against_self_is_unity() {
+        // rationale: `a.similarity(&a)` ⇒ Hamming distance 0 ⇒ ratio
+        // `(L - 0) / L == 1.0` for every L in [1, 64]. Pins the unity
+        // case directly.
+        let a = Simhash::new("nothing special here");
+        assert!((a.similarity(&a) - 1.0).abs() < 1e-12);
+    }
 }

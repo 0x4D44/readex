@@ -277,9 +277,21 @@ mod tests {
 
     #[test]
     fn manually_cleaned_contains_canonical_boilerplate_tags() {
-        // The "important" group must include the canonical chrome:
+        // The "important" group must include the canonical chrome.
+        //
+        // Branch contract: the `||` short-circuits on a per-tag basis. To
+        // pin BOTH halves of the OR, the iterated set MUST include:
+        //   1. tags only in MANUALLY_CLEANED (`script` etc.) — LHS=True path,
+        //   2. tags only in MANUALLY_STRIPPED (`abbr`, `tbody` etc.) — LHS=False
+        //      forces the RHS evaluation, RHS=True closes the loop.
+        // Without (2), the RHS `contains` is never reached. settings.py:407-429
+        // (MANUALLY_STRIPPED) and settings.py:349-404 (MANUALLY_CLEANED)
+        // together must cover every boilerplate tag the cleaner handles.
         for tag in [
+            // cleaned-only (LHS True)
             "aside", "footer", "form", "head", "iframe", "nav", "script", "style",
+            // stripped-only (LHS False, RHS True) — exercises the RHS half.
+            "abbr", "cite", "font", "tbody", "thead", "tfoot",
         ] {
             assert!(
                 MANUALLY_CLEANED.contains(&tag) || MANUALLY_STRIPPED.contains(&tag),
@@ -346,5 +358,80 @@ mod tests {
             vec!["ins"],
             "Only 'ins' is expected to appear in both lists per Trafilatura source"
         );
+    }
+
+    // ---- short-circuit OR branch coverage (settings.py:407-429 STRIPPED-but-
+    //      not-CLEANED tags exercise the right-hand `contains` arm) ----------
+
+    #[test]
+    fn manually_stripped_only_tag_lights_or_right_arm() {
+        // rationale: the canonical-boilerplate-tags assertion uses
+        //   `MANUALLY_CLEANED.contains(&tag) || MANUALLY_STRIPPED.contains(&tag)`
+        // (settings_constants.rs:285). For tags that are in MANUALLY_STRIPPED
+        // but NOT in MANUALLY_CLEANED (settings.py:407-429 — `abbr`, `cite`,
+        // `font`, `tbody`, etc.) the short-circuit forces the right-hand
+        // `MANUALLY_STRIPPED.contains` arm to evaluate True. This pins the
+        // contract that BOTH catalogs participate in the "is this a cleaning
+        // tag?" check.
+        for tag in ["abbr", "cite", "font", "tbody", "thead", "tfoot", "small"] {
+            // Sanity check the asymmetric membership before exercising the OR.
+            assert!(
+                !MANUALLY_CLEANED.contains(&tag),
+                "{tag} unexpectedly in MANUALLY_CLEANED",
+            );
+            assert!(
+                MANUALLY_STRIPPED.contains(&tag),
+                "{tag} should be in MANUALLY_STRIPPED",
+            );
+            // The OR expression: first half False, second half True.
+            let in_either = MANUALLY_CLEANED.contains(&tag) || MANUALLY_STRIPPED.contains(&tag);
+            assert!(in_either, "{tag} should be matched by either catalog");
+        }
+    }
+
+    #[test]
+    fn unknown_tag_lights_or_both_false_arm() {
+        // rationale: the OR at settings_constants.rs:285 still needs the
+        // "neither catalog matches" case for the False-side of the second
+        // `contains` to be observed. Tags that Trafilatura intentionally
+        // leaves OUT of both catalogs (e.g. plain `<p>`, `<div>`, `<span>`,
+        // `<h1>`) flow through `tree_cleaning` untouched. Per settings.py:344
+        // these are the "considered-but-excluded" tags — `<p>` and `<div>`
+        // specifically appear in the trailing comments and the surrounding
+        // discussion.
+        for tag in ["p", "div", "span", "h1", "article", "section"] {
+            assert!(
+                !MANUALLY_CLEANED.contains(&tag),
+                "{tag} should NOT be in MANUALLY_CLEANED",
+            );
+            assert!(
+                !MANUALLY_STRIPPED.contains(&tag),
+                "{tag} should NOT be in MANUALLY_STRIPPED",
+            );
+            // The OR expression: both halves False.
+            let in_either = MANUALLY_CLEANED.contains(&tag) || MANUALLY_STRIPPED.contains(&tag);
+            assert!(!in_either, "{tag} should not be matched by either catalog");
+        }
+    }
+
+    #[test]
+    fn cleaned_only_tag_short_circuits_or_left_arm() {
+        // rationale: pins the LEFT-half True path of the OR at
+        // settings_constants.rs:285 — tags in MANUALLY_CLEANED (and NOT in
+        // MANUALLY_STRIPPED) short-circuit on the first `contains` and never
+        // consult MANUALLY_STRIPPED. settings.py:349-404 lists the cleaned-
+        // only tags.
+        for tag in ["script", "style", "iframe", "nav", "footer", "aside", "form"] {
+            assert!(
+                MANUALLY_CLEANED.contains(&tag),
+                "{tag} should be in MANUALLY_CLEANED",
+            );
+            assert!(
+                !MANUALLY_STRIPPED.contains(&tag),
+                "{tag} should NOT be in MANUALLY_STRIPPED",
+            );
+            let in_either = MANUALLY_CLEANED.contains(&tag) || MANUALLY_STRIPPED.contains(&tag);
+            assert!(in_either, "{tag} should match via MANUALLY_CLEANED");
+        }
     }
 }

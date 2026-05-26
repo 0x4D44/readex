@@ -722,4 +722,189 @@ mod tests {
         set_tail(&ps[0], None);
         assert!(tail(&ps[0]).is_none());
     }
+
+    // ===========================================================================
+    // Branch-coverage tests for the under-exercised paths
+    // ===========================================================================
+
+    // ---- is_image_element first-loop fall-through (utils.py:351-353) -------
+
+    #[test]
+    fn is_image_element_no_src_no_data_src_falls_through_to_false() {
+        // rationale: utils.py:349-360 — when `data-src` and `src` are BOTH
+        // absent / non-image, the first `for attr in ("data-src", "src")`
+        // loop's `is_image_file(src)` branch (utils.rs:173) evaluates False
+        // every iteration. The element then enters the for..else "scan every
+        // data-src* attribute" fallback. With no data-src* attribute either,
+        // the function returns False — pinning the both-loops-fall-through
+        // path.
+        let img = create_element("img");
+        // No src, no data-src, no data-src* either. Faithful to lxml's
+        // `element.get("src", "")` returning "" → `is_image_file("")` False.
+        assert!(!is_image_element(&img));
+    }
+
+    #[test]
+    fn is_image_element_data_src_present_but_non_image_falls_to_data_src_scan() {
+        // rationale: the for..else scan kicks in after BOTH first-loop arms
+        // (`data-src`, `src`) yielded `is_image_file=false`. Setting
+        // `data-src` to a non-image URL keeps the first loop arms False,
+        // forcing the second loop's `name.starts_with("data-src")` check
+        // (utils.rs:180) to evaluate. Because that attribute IS the same
+        // `data-src`, `is_image_file` runs again on the same value — both
+        // halves of the `&&` short-circuit get exercised (LHS True, RHS
+        // False), and the function still returns False.
+        let img = create_element("img");
+        set_attribute(&img, "data-src", "javascript:void(0)");
+        assert!(!is_image_element(&img));
+    }
+
+    #[test]
+    fn is_image_element_data_src_variant_present_but_non_image() {
+        // rationale: pins the False side of the inner `is_image_file` check
+        // inside the for..else loop (utils.rs:180 RHS). The attribute name
+        // matches the `data-src*` prefix (LHS True) but the value is NOT
+        // an image (RHS False) — so the loop continues without returning.
+        let img = create_element("img");
+        set_attribute(&img, "data-src-large", "javascript:0");
+        assert!(!is_image_element(&img));
+    }
+
+    #[test]
+    fn is_image_element_non_data_src_attribute_skipped() {
+        // rationale: the LHS of the for..else inner condition
+        // (`name.starts_with("data-src")`, utils.rs:180) evaluates False for
+        // attributes whose name does NOT start with `data-src` (e.g. `alt`,
+        // `width`). The short-circuit keeps `is_image_file` from running.
+        // Combined with no src/data-src/data-src* the function returns False.
+        let img = create_element("img");
+        set_attribute(&img, "alt", "x.png"); // alt looks image-ish but isn't checked
+        set_attribute(&img, "width", "100");
+        assert!(!is_image_element(&img));
+    }
+
+    // ---- is_image_file empty-string non-match (utils.py:367) ---------------
+
+    #[test]
+    fn is_image_file_empty_string_does_not_match() {
+        // rationale: `is_image_file(Some(""))` — passes the None guard and
+        // the >8192 guard, runs IMAGE_EXTENSION.search("") which can never
+        // match (the regex requires at least one non-whitespace char before
+        // the extension). Pins the False return from the regex search arm.
+        assert!(!is_image_file(Some("")));
+    }
+
+    // ---- splitlines_python edge cases (utils.rs:262, 266) -----------------
+
+    #[test]
+    fn splitlines_python_lone_carriage_return_at_end() {
+        // rationale: pins the CRLF detector when `\r` is the LAST char of
+        // input (utils.rs:262 second `&&` condition False side — `i+1 >=
+        // chars.len()`). The lone `\r` still terminates a line; the absence
+        // of a following `\n` MUST NOT panic on out-of-bounds indexing.
+        assert_eq!(splitlines_python("a\r"), vec!["a"]);
+    }
+
+    #[test]
+    fn splitlines_python_carriage_return_then_non_newline() {
+        // rationale: pins the THIRD `&&` arm of the CRLF detector
+        // (`chars[i+1].1 == '\n'` — utils.rs:262). When `\r` is followed by
+        // a non-`\n` (e.g. another char), the detector's full condition
+        // resolves False; both `\r` and the next-line "rb" must be emitted
+        // as separate lines per Python `str.splitlines`.
+        assert_eq!(splitlines_python("a\rb\rc"), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn splitlines_python_newline_at_end_with_trailing_text() {
+        // rationale: pins `start < s.len()` (utils.rs:271) — when input has
+        // text AFTER the last newline, that trailing run must be emitted
+        // (Python `"a\nb".splitlines() == ["a", "b"]`). The companion
+        // contract: `start == s.len()` (no trailing run) — covered by
+        // `splitlines_python_matches_lf_crlf_cr` (`"a\n"` → `["a"]`).
+        assert_eq!(splitlines_python("a\nb"), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn splitlines_python_only_newline_yields_empty_first_line() {
+        // rationale: input is a single `\n` → first line is the empty
+        // string before the break. Python: `"\n".splitlines() == [""]`.
+        // Pins the case where `idx == start` at the break point and the
+        // post-break `i >= chars.len()` branch (utils.rs:266 else arm).
+        assert_eq!(splitlines_python("\n"), vec![""]);
+    }
+
+    #[test]
+    fn splitlines_python_empty_input_returns_empty_vec() {
+        // rationale: empty input never enters the loop; `start = 0 == s.len()`
+        // so no trailing-run push. Python: `"".splitlines() == []`.
+        let empty: Vec<&str> = Vec::new();
+        assert_eq!(splitlines_python(""), empty);
+    }
+
+    // ---- p_with_text empty-text branch (utils.rs:460) ----------------------
+
+    #[test]
+    fn textfilter_with_empty_text_helper_returns_true() {
+        // rationale: the local test helper `p_with_text` at utils.rs:457-466
+        // has an `if !text.is_empty()` branch (utils.rs:460). Existing tests
+        // only ever pass non-empty text, so the False side of that branch is
+        // never observed. Calling with the empty string exercises the False
+        // side; we then assert `textfilter` returns true via its
+        // "text-or-tail is None" fast path (utils.py:447) — both contracts
+        // pinned in one test.
+        let p = p_with_text("");
+        assert!(textfilter(&p), "textfilter on empty <p> must return true");
+    }
+
+    // ---- text_chars_test boundary cases (utils.py:452-456) -----------------
+
+    #[test]
+    fn text_chars_test_mixed_content_and_whitespace() {
+        // rationale: `text_chars_test` returns True iff the string is
+        // non-empty AND not-all-whitespace (utils.py:455). Pins the
+        // `string.isspace()` False arm with mixed input: leading/trailing
+        // whitespace plus content. The companion all-whitespace cases are
+        // pinned in `text_chars_test_smoke`.
+        assert!(text_chars_test(Some(" x")));
+        assert!(text_chars_test(Some("x ")));
+        assert!(text_chars_test(Some(" x ")));
+        assert!(text_chars_test(Some("\nx\n")));
+    }
+
+    #[test]
+    fn text_chars_test_single_non_whitespace_char() {
+        // rationale: pin the minimum-positive case — a one-codepoint
+        // non-whitespace string. Python `bool("a") and not "a".isspace()` is
+        // True. The Rust port's `chars().all(is_whitespace)` over a single
+        // non-whitespace char returns False → `!False == True`.
+        assert!(text_chars_test(Some("a")));
+        assert!(text_chars_test(Some("1")));
+        // Non-ASCII alphanumeric — still True.
+        assert!(text_chars_test(Some("ä")));
+    }
+
+    // ---- trim boundary cases (utils.py:340-346) ----------------------------
+
+    #[test]
+    fn trim_preserves_internal_single_spaces() {
+        // rationale: `" ".join(s.split())` collapses runs of whitespace to a
+        // single space (utils.py:343). A string with single internal spaces
+        // already passes through unchanged — pins the identity case.
+        assert_eq!(trim("a b c"), "a b c");
+    }
+
+    #[test]
+    fn trim_collapses_runs_of_whitespace() {
+        // rationale: pin the canonical contract — multiple consecutive
+        // whitespace chars (mixed kinds) collapse to ONE space.
+        assert_eq!(trim("a   b\t\tc\n\nd"), "a b c d");
+    }
+
+    #[test]
+    fn trim_only_whitespace_returns_empty() {
+        // rationale: Python `" ".join("   ".split()) == " ".join([]) == ""`.
+        // `.strip()` on `""` is `""`. Pins the empty-output arm.
+        assert_eq!(trim("\t\n\r "), "");
+    }
 }

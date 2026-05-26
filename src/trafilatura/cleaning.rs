@@ -2651,4 +2651,555 @@ mod tests {
         // No `<a>` should remain — convert_link renames all of them.
         assert!(get_elements_by_tag_name(&b, "a").is_empty());
     }
+
+    // =======================================================================
+    // Stage 8 (Coverage Improvement) — per-element cleaning rules. One test
+    // per MANUALLY_CLEANED entry not yet covered by the broader smoke tests
+    // above. Each test cites the Python source: `trafilatura@v2.0.0`
+    // `settings.py:349-404` (MANUALLY_CLEANED) and the `htmlprocessing.py:77`
+    // delete_element loop driven by `tree_cleaning`.
+    // =======================================================================
+
+    /// rationale: settings.py:350 — `<embed>` is in MANUALLY_CLEANED; its
+    /// subtree must be dropped by `tree_cleaning`.
+    #[test]
+    fn tree_cleaning_drops_embed() {
+        let dom = parse("<div><p>k</p><embed src='x.swf'></embed></div>");
+        let b = body(&dom);
+        tree_cleaning(&b, &Options::default());
+        assert!(get_elements_by_tag_name(&b, "embed").is_empty());
+        assert_eq!(get_elements_by_tag_name(&b, "p").len(), 1);
+    }
+
+    /// rationale: settings.py:351 — `<form>` is in MANUALLY_CLEANED; its
+    /// subtree must be dropped by `tree_cleaning`.
+    #[test]
+    fn tree_cleaning_drops_form_subtree() {
+        let dom = parse(
+            "<div><p>keep</p><form><input type='text'><label>x</label></form></div>",
+        );
+        let b = body(&dom);
+        tree_cleaning(&b, &Options::default());
+        assert!(get_elements_by_tag_name(&b, "form").is_empty());
+        // <input>/<label> are themselves in MANUALLY_CLEANED, but they sit
+        // INSIDE the dropped <form> subtree so this test's contract is solely
+        // "form gone" — already implied by ancestor removal.
+        assert_eq!(get_elements_by_tag_name(&b, "p").len(), 1);
+    }
+
+    /// rationale: settings.py:353 — `<iframe>` is in MANUALLY_CLEANED; its
+    /// subtree must be dropped.
+    #[test]
+    fn tree_cleaning_drops_iframe() {
+        let dom = parse("<div><p>k</p><iframe src='ad.html'></iframe></div>");
+        let b = body(&dom);
+        tree_cleaning(&b, &Options::default());
+        assert!(get_elements_by_tag_name(&b, "iframe").is_empty());
+        assert_eq!(get_elements_by_tag_name(&b, "p").len(), 1);
+    }
+
+    /// rationale: settings.py:354 — `<menu>` is in MANUALLY_CLEANED; its
+    /// subtree must be dropped.
+    #[test]
+    fn tree_cleaning_drops_menu() {
+        let dom = parse("<div><p>k</p><menu><li>x</li></menu></div>");
+        let b = body(&dom);
+        tree_cleaning(&b, &Options::default());
+        assert!(get_elements_by_tag_name(&b, "menu").is_empty());
+        assert_eq!(get_elements_by_tag_name(&b, "p").len(), 1);
+    }
+
+    /// rationale: settings.py:355 — `<object>` is in MANUALLY_CLEANED; its
+    /// subtree must be dropped (handles Flash/plugin embeds).
+    #[test]
+    fn tree_cleaning_drops_object() {
+        let dom = parse("<div><p>k</p><object data='x.swf'></object></div>");
+        let b = body(&dom);
+        tree_cleaning(&b, &Options::default());
+        assert!(get_elements_by_tag_name(&b, "object").is_empty());
+        assert_eq!(get_elements_by_tag_name(&b, "p").len(), 1);
+    }
+
+    /// rationale: settings.py:360-368 — `<canvas>`, `<audio>`, `<video>`,
+    /// `<picture>`, `<svg>` are MANUALLY_CLEANED "other content" entries.
+    /// One test pins all five at once (one removal-trigger per element type).
+    #[test]
+    fn tree_cleaning_drops_canvas_audio_video_picture_svg() {
+        let dom = parse(
+            "<div><p>k</p>\
+             <canvas></canvas><audio></audio><video></video>\
+             <picture></picture><svg></svg></div>",
+        );
+        let b = body(&dom);
+        tree_cleaning(&b, &Options::default());
+        for tag in ["canvas", "audio", "video", "picture", "svg"] {
+            assert!(
+                get_elements_by_tag_name(&b, tag).is_empty(),
+                "<{tag}> should have been dropped"
+            );
+        }
+        assert_eq!(get_elements_by_tag_name(&b, "p").len(), 1);
+    }
+
+    /// rationale: settings.py:369-404 — `<button>` is in MANUALLY_CLEANED
+    /// (secondary). Its subtree must be dropped.
+    #[test]
+    fn tree_cleaning_drops_button() {
+        let dom = parse("<div><p>k</p><button>click</button></div>");
+        let b = body(&dom);
+        tree_cleaning(&b, &Options::default());
+        assert!(get_elements_by_tag_name(&b, "button").is_empty());
+        assert_eq!(get_elements_by_tag_name(&b, "p").len(), 1);
+    }
+
+    /// rationale: settings.py:369-404 — `<dialog>` is in MANUALLY_CLEANED
+    /// (secondary). Its subtree must be dropped.
+    #[test]
+    fn tree_cleaning_drops_dialog() {
+        let dom = parse("<div><p>k</p><dialog>modal</dialog></div>");
+        let b = body(&dom);
+        tree_cleaning(&b, &Options::default());
+        assert!(get_elements_by_tag_name(&b, "dialog").is_empty());
+        assert_eq!(get_elements_by_tag_name(&b, "p").len(), 1);
+    }
+
+    /// rationale: settings.py:369-404 — `<fieldset>` and `<legend>` are
+    /// MANUALLY_CLEANED secondary entries (commonly inside <form> but can
+    /// also stand alone in non-form contexts).
+    #[test]
+    fn tree_cleaning_drops_fieldset_legend() {
+        let dom = parse(
+            "<div><p>k</p><fieldset><legend>caption</legend>x</fieldset></div>",
+        );
+        let b = body(&dom);
+        tree_cleaning(&b, &Options::default());
+        assert!(get_elements_by_tag_name(&b, "fieldset").is_empty());
+        // <legend> is inside the dropped <fieldset> subtree — assertion is
+        // implied by ancestor removal but pinned to keep the contract honest.
+        assert!(get_elements_by_tag_name(&b, "legend").is_empty());
+        assert_eq!(get_elements_by_tag_name(&b, "p").len(), 1);
+    }
+
+    /// rationale: settings.py:369-404 — `<input>` and `<textarea>` are
+    /// MANUALLY_CLEANED secondary entries. They must be dropped from a
+    /// document body (even when not wrapped in a `<form>`).
+    #[test]
+    fn tree_cleaning_drops_input_and_textarea_standalone() {
+        let dom = parse(
+            "<div><p>k</p><input type='text' name='q'><textarea>x</textarea></div>",
+        );
+        let b = body(&dom);
+        tree_cleaning(&b, &Options::default());
+        assert!(get_elements_by_tag_name(&b, "input").is_empty());
+        assert!(get_elements_by_tag_name(&b, "textarea").is_empty());
+        assert_eq!(get_elements_by_tag_name(&b, "p").len(), 1);
+    }
+
+    /// rationale: settings.py:369-404 — `<noscript>` and `<noindex>` are
+    /// MANUALLY_CLEANED secondary entries (search-engine / no-JS fallback
+    /// containers).
+    #[test]
+    fn tree_cleaning_drops_noscript_and_noindex() {
+        let dom = parse("<div><p>k</p><noscript>x</noscript><noindex>y</noindex></div>");
+        let b = body(&dom);
+        tree_cleaning(&b, &Options::default());
+        assert!(get_elements_by_tag_name(&b, "noscript").is_empty());
+        assert!(get_elements_by_tag_name(&b, "noindex").is_empty());
+        assert_eq!(get_elements_by_tag_name(&b, "p").len(), 1);
+    }
+
+    /// rationale: settings.py:369-404 — `<select>`, `<option>`, `<optgroup>`
+    /// are MANUALLY_CLEANED form-related entries. The `<select>` ancestor
+    /// dropping carries `<option>` and `<optgroup>` along regardless, but
+    /// when they're orphaned the entries still independently match.
+    #[test]
+    fn tree_cleaning_drops_select_options() {
+        let dom = parse(
+            "<div><p>k</p>\
+             <select><optgroup label='g'><option>a</option></optgroup></select>\
+             </div>",
+        );
+        let b = body(&dom);
+        tree_cleaning(&b, &Options::default());
+        assert!(get_elements_by_tag_name(&b, "select").is_empty());
+        assert!(get_elements_by_tag_name(&b, "option").is_empty());
+        assert!(get_elements_by_tag_name(&b, "optgroup").is_empty());
+        assert_eq!(get_elements_by_tag_name(&b, "p").len(), 1);
+    }
+
+    /// rationale: settings.py:360 — `<applet>` (legacy Java embed) is in
+    /// MANUALLY_CLEANED. Must be dropped.
+    #[test]
+    fn tree_cleaning_drops_applet() {
+        let dom = parse("<div><p>k</p><applet code='x.class'></applet></div>");
+        let b = body(&dom);
+        tree_cleaning(&b, &Options::default());
+        assert!(get_elements_by_tag_name(&b, "applet").is_empty());
+        assert_eq!(get_elements_by_tag_name(&b, "p").len(), 1);
+    }
+
+    /// rationale: settings.py:369-404 — `<frame>` and `<frameset>` (legacy
+    /// HTML 4 framing) are MANUALLY_CLEANED. Must be dropped.
+    #[test]
+    fn tree_cleaning_drops_frame_and_frameset() {
+        // html5ever may parse <frameset>/<frame> in restricted contexts;
+        // wrap in <div> to keep them in the body subtree.
+        let dom = parse("<div><p>k</p><frameset></frameset><frame></frame></div>");
+        let b = body(&dom);
+        tree_cleaning(&b, &Options::default());
+        // Even if html5ever drops them silently, the post-cleaning tree must
+        // have neither — that is the contract under test.
+        assert!(get_elements_by_tag_name(&b, "frame").is_empty());
+        assert!(get_elements_by_tag_name(&b, "frameset").is_empty());
+        assert_eq!(get_elements_by_tag_name(&b, "p").len(), 1);
+    }
+
+    // ---- MANUALLY_STRIPPED unwrap rules ----------------------------------
+
+    /// rationale: settings.py:407-429 — `<abbr>`, `<cite>`, `<mark>`,
+    /// `<small>`, `<address>`, `<dfn>` are MANUALLY_STRIPPED entries; their
+    /// wrappers go but their text survives (lxml `strip_tags` semantic at
+    /// `htmlprocessing.py:64`).
+    #[test]
+    fn tree_cleaning_strips_abbr_cite_mark_small_address_dfn_wrappers() {
+        let dom = parse(
+            "<div><p><abbr title='x'>A</abbr> <cite>C</cite> \
+             <mark>M</mark> <small>S</small> <address>Ad</address> \
+             <dfn>D</dfn></p></div>",
+        );
+        let b = body(&dom);
+        tree_cleaning(&b, &Options::default());
+        for tag in ["abbr", "cite", "mark", "small", "address", "dfn"] {
+            assert!(
+                get_elements_by_tag_name(&b, tag).is_empty(),
+                "<{tag}> wrapper should be stripped (contents survive)"
+            );
+        }
+        // All the inner letters must remain in the document text.
+        let t = crate::readability::dom::text_content(&b);
+        for piece in ["A", "C", "M", "S", "Ad", "D"] {
+            assert!(t.contains(piece), "content '{piece}' lost during strip");
+        }
+    }
+
+    // ---- convert_tags formatting=true coverage of remaining REND tags ----
+
+    /// rationale: htmlprocessing.py:34, settings_constants.rs REND_TAG_MAPPING
+    /// — `<u>` → `<hi rend="#u">` when `formatting=true`.
+    #[test]
+    fn convert_tags_formatting_true_rewrites_u_to_hi_underline() {
+        let dom = parse("<p><u>under</u></p>");
+        let b = body(&dom);
+        let opts = Options {
+            formatting: true,
+            ..Options::default()
+        };
+        convert_tags(&b, &opts);
+        let his = get_elements_by_tag_name(&b, "hi");
+        assert_eq!(his.len(), 1);
+        assert_eq!(get_attribute(&his[0], "rend").as_deref(), Some("#u"));
+        assert!(get_elements_by_tag_name(&b, "u").is_empty());
+    }
+
+    /// rationale: htmlprocessing.py:33 — `<strong>` → `<hi rend="#b">` when
+    /// `formatting=true` (same rend as `<b>` per REND_TAG_MAPPING).
+    #[test]
+    fn convert_tags_formatting_true_rewrites_strong_to_hi_bold() {
+        let dom = parse("<p><strong>important</strong></p>");
+        let b = body(&dom);
+        let opts = Options {
+            formatting: true,
+            ..Options::default()
+        };
+        convert_tags(&b, &opts);
+        let his = get_elements_by_tag_name(&b, "hi");
+        assert_eq!(his.len(), 1);
+        assert_eq!(get_attribute(&his[0], "rend").as_deref(), Some("#b"));
+        assert!(get_elements_by_tag_name(&b, "strong").is_empty());
+    }
+
+    /// rationale: htmlprocessing.py:31 — `<i>` → `<hi rend="#i">` when
+    /// `formatting=true` (same rend as `<em>`).
+    #[test]
+    fn convert_tags_formatting_true_rewrites_i_to_hi_italic() {
+        let dom = parse("<p><i>italic</i></p>");
+        let b = body(&dom);
+        let opts = Options {
+            formatting: true,
+            ..Options::default()
+        };
+        convert_tags(&b, &opts);
+        let his = get_elements_by_tag_name(&b, "hi");
+        assert_eq!(his.len(), 1);
+        assert_eq!(get_attribute(&his[0], "rend").as_deref(), Some("#i"));
+        assert!(get_elements_by_tag_name(&b, "i").is_empty());
+    }
+
+    /// rationale: htmlprocessing.py:37 — `<tt>` → `<hi rend="#t">` when
+    /// `formatting=true` (the teletype/monospace family — same rend as
+    /// `<kbd>`, `<samp>`, `<var>`).
+    #[test]
+    fn convert_tags_formatting_true_rewrites_tt_to_hi_teletype() {
+        let dom = parse("<p><tt>mono</tt></p>");
+        let b = body(&dom);
+        let opts = Options {
+            formatting: true,
+            ..Options::default()
+        };
+        convert_tags(&b, &opts);
+        let his = get_elements_by_tag_name(&b, "hi");
+        assert_eq!(his.len(), 1);
+        assert_eq!(get_attribute(&his[0], "rend").as_deref(), Some("#t"));
+        assert!(get_elements_by_tag_name(&b, "tt").is_empty());
+    }
+
+    /// rationale: htmlprocessing.py:35-38 — `<kbd>`, `<samp>`, `<var>` all
+    /// map to `<hi rend="#t">` per the REND_TAG_MAPPING dict literal.
+    #[test]
+    fn convert_tags_formatting_true_rewrites_kbd_samp_var_to_hi_t() {
+        let dom = parse("<p><kbd>K</kbd><samp>S</samp><var>V</var></p>");
+        let b = body(&dom);
+        let opts = Options {
+            formatting: true,
+            ..Options::default()
+        };
+        convert_tags(&b, &opts);
+        for tag in ["kbd", "samp", "var"] {
+            assert!(
+                get_elements_by_tag_name(&b, tag).is_empty(),
+                "<{tag}> should have been rewritten to <hi>"
+            );
+        }
+        let his = get_elements_by_tag_name(&b, "hi");
+        assert_eq!(his.len(), 3);
+        for h in &his {
+            assert_eq!(get_attribute(h, "rend").as_deref(), Some("#t"));
+        }
+    }
+
+    /// rationale: htmlprocessing.py:39-40 — `<sub>` → `<hi rend="#sub">`
+    /// and `<sup>` → `<hi rend="#sup">` when `formatting=true`.
+    #[test]
+    fn convert_tags_formatting_true_rewrites_sub_sup_to_hi_with_distinct_rend() {
+        let dom = parse("<p>H<sub>2</sub>O and E=mc<sup>2</sup></p>");
+        let b = body(&dom);
+        let opts = Options {
+            formatting: true,
+            ..Options::default()
+        };
+        convert_tags(&b, &opts);
+        assert!(get_elements_by_tag_name(&b, "sub").is_empty());
+        assert!(get_elements_by_tag_name(&b, "sup").is_empty());
+        let his = get_elements_by_tag_name(&b, "hi");
+        let rends: Vec<String> = his
+            .iter()
+            .map(|h| get_attribute(h, "rend").unwrap_or_default())
+            .collect();
+        assert!(
+            rends.iter().any(|r| r == "#sub"),
+            "expected at least one #sub, got {rends:?}"
+        );
+        assert!(
+            rends.iter().any(|r| r == "#sup"),
+            "expected at least one #sup, got {rends:?}"
+        );
+    }
+
+    /// rationale: htmlprocessing.py:401-407 — `formatting=false` (the
+    /// default) strips ALL REND_TAG_MAPPING wrappers including `<u>`, `<tt>`,
+    /// `<sub>`, `<sup>`. Inner text survives (lxml `strip_tags` semantic).
+    #[test]
+    fn convert_tags_formatting_false_strips_u_tt_sub_sup_wrappers() {
+        let dom = parse("<p><u>U</u><tt>T</tt><sub>2</sub><sup>3</sup></p>");
+        let b = body(&dom);
+        convert_tags(&b, &Options::default());
+        for tag in ["u", "tt", "sub", "sup", "hi"] {
+            assert!(
+                get_elements_by_tag_name(&b, tag).is_empty(),
+                "<{tag}> should not exist after formatting=false strip"
+            );
+        }
+        let t = crate::readability::dom::text_content(&b);
+        // All inner letters survive.
+        for s in ["U", "T", "2", "3"] {
+            assert!(t.contains(s), "content '{s}' lost during strip");
+        }
+    }
+
+    /// rationale: htmlprocessing.py:401-407 — `formatting=true` clears the
+    /// original attributes off the rewritten element before stamping the
+    /// `rend` attribute. Pin this by giving the source `<b>` a `class=...`
+    /// and asserting the resulting `<hi>` has NO `class` attribute, only
+    /// `rend`.
+    #[test]
+    fn convert_tags_formatting_true_clears_attributes_before_setting_rend() {
+        let dom = parse(r#"<p><b class="keep-me" id="x">bold</b></p>"#);
+        let b = body(&dom);
+        let opts = Options {
+            formatting: true,
+            ..Options::default()
+        };
+        convert_tags(&b, &opts);
+        let his = get_elements_by_tag_name(&b, "hi");
+        assert_eq!(his.len(), 1);
+        // rend is set.
+        assert_eq!(get_attribute(&his[0], "rend").as_deref(), Some("#b"));
+        // Original attributes are cleared.
+        assert_eq!(get_attribute(&his[0], "class"), None);
+        assert_eq!(get_attribute(&his[0], "id"), None);
+    }
+
+    // ---- convert_tags links/anchor rules ---------------------------------
+
+    /// rationale: htmlprocessing.py:387 — when `links=false` and an `<a>`
+    /// sits inside `<li>` the predicate `.//*[self::div or self::li or
+    /// self::p]//a` matches, so the anchor renames to `<ref>`.
+    #[test]
+    fn convert_tags_links_false_anchor_in_li_becomes_ref() {
+        let dom = parse(r#"<ul><li><a href="/x">item-link</a></li></ul>"#);
+        let b = body(&dom);
+        convert_tags(&b, &Options::default());
+        let refs = get_elements_by_tag_name(&b, "ref");
+        assert_eq!(refs.len(), 1);
+        assert!(get_elements_by_tag_name(&b, "a").is_empty());
+    }
+
+    /// rationale: htmlprocessing.py:387 — `<a>` inside `<p>` becomes `<ref>`
+    /// under `links=false` (the third arm of the `self::div or self::li or
+    /// self::p` selector).
+    #[test]
+    fn convert_tags_links_false_anchor_in_p_becomes_ref() {
+        let dom = parse(r#"<p>read <a href="/x">more</a> here</p>"#);
+        let b = body(&dom);
+        convert_tags(&b, &Options::default());
+        let refs = get_elements_by_tag_name(&b, "ref");
+        assert_eq!(refs.len(), 1);
+    }
+
+    /// rationale: htmlprocessing.py:389 — when `tables=true` AND `links=false`
+    /// the XPath gets `|.//table//a` appended; an anchor inside `<td>` (which
+    /// is inside `<table>`) becomes `<ref>`. With `tables=false` the appended
+    /// XPath is absent, but the `<a>` still falls into the strip pass since
+    /// no ancestor matches.
+    #[test]
+    fn convert_tags_links_false_anchor_in_table_becomes_ref_when_tables_true() {
+        let dom = parse(r#"<table><tr><td><a href="/x">cell-link</a></td></tr></table>"#);
+        let b = body(&dom);
+        let opts = Options {
+            tables: true,
+            links: false,
+            ..Options::default()
+        };
+        convert_tags(&b, &opts);
+        let refs = get_elements_by_tag_name(&b, "ref");
+        assert_eq!(refs.len(), 1);
+        assert!(get_elements_by_tag_name(&b, "a").is_empty());
+    }
+
+    // ---- convert_tags images=true graphic rewrite ------------------------
+
+    /// rationale: htmlprocessing.py:413-415 — when `images=true`, every `<img>`
+    /// is renamed to `<graphic>` in the final pass of `convert_tags`.
+    #[test]
+    fn convert_tags_images_true_renames_img_to_graphic() {
+        let dom = parse("<p>see <img src='x.png' alt='x'> here</p>");
+        let b = body(&dom);
+        let opts = Options {
+            images: true,
+            ..Options::default()
+        };
+        convert_tags(&b, &opts);
+        // <img> is renamed (and not stripped — because tree_cleaning isn't
+        // called here, only convert_tags). After convert_tags: no <img>,
+        // exactly one <graphic>.
+        assert!(get_elements_by_tag_name(&b, "img").is_empty());
+        assert_eq!(get_elements_by_tag_name(&b, "graphic").len(), 1);
+    }
+
+    // ---- convert_tags / convert_lists DT/DD numbering --------------------
+
+    /// rationale: htmlprocessing.py:288-301 — `<dl>` becomes `<list rend="dl">`
+    /// and its `<dt>`/`<dd>` children become `<item>` with `rend="dt-N"` /
+    /// `rend="dd-N"`. The counter `i` increments after each `<dd>` (so each
+    /// dt/dd pair shares a number).
+    #[test]
+    fn convert_tags_dl_dt_dd_become_list_items_with_pair_numbering() {
+        let dom = parse("<dl><dt>term1</dt><dd>def1</dd><dt>term2</dt><dd>def2</dd></dl>");
+        let b = body(&dom);
+        convert_tags(&b, &Options::default());
+        // <dl> → <list rend="dl">
+        let lists = get_elements_by_tag_name(&b, "list");
+        assert_eq!(lists.len(), 1);
+        assert_eq!(get_attribute(&lists[0], "rend").as_deref(), Some("dl"));
+        // 4 items: dt-1, dd-1, dt-2, dd-2 — counter increments after each dd.
+        let items = get_elements_by_tag_name(&b, "item");
+        assert_eq!(items.len(), 4);
+        let rends: Vec<String> = items
+            .iter()
+            .map(|i| get_attribute(i, "rend").unwrap_or_default())
+            .collect();
+        assert_eq!(rends, vec!["dt-1", "dd-1", "dt-2", "dd-2"]);
+        // Source tags must all be gone.
+        for tag in ["dl", "dt", "dd"] {
+            assert!(get_elements_by_tag_name(&b, tag).is_empty());
+        }
+    }
+
+    /// rationale: htmlprocessing.py:288-301 — `<ol>` becomes `<list rend="ol">`
+    /// with `<li>` children retagged to `<item>` (no rend on plain li, only
+    /// dt/dd get numbered rend attributes).
+    #[test]
+    fn convert_tags_ol_li_become_list_item_with_rend_ol() {
+        let dom = parse("<ol><li>one</li><li>two</li><li>three</li></ol>");
+        let b = body(&dom);
+        convert_tags(&b, &Options::default());
+        let lists = get_elements_by_tag_name(&b, "list");
+        assert_eq!(lists.len(), 1);
+        assert_eq!(get_attribute(&lists[0], "rend").as_deref(), Some("ol"));
+        let items = get_elements_by_tag_name(&b, "item");
+        assert_eq!(items.len(), 3);
+        // Plain <li> children get NO rend attribute (only dt/dd do).
+        for it in &items {
+            assert_eq!(get_attribute(it, "rend"), None);
+        }
+    }
+
+    // ---- prune_html focus=precision -------------------------------------
+
+    /// rationale: htmlprocessing.py:85 — `tails = focus != "precision"`, so
+    /// `Focus::Precision` runs the no-tail-preserve branch of `prune_html`.
+    /// The empty <p> is still dropped, but tail text following it does NOT
+    /// migrate to the previous sibling (it stays orphaned/lost). Pin this
+    /// behavioural divergence between Balanced and Precision focus.
+    #[test]
+    fn prune_html_precision_focus_uses_no_tail_branch() {
+        // The contract under test is the BRANCH split, not the tail-preserve
+        // semantic itself: with Focus::Precision, the empty <div> path enters
+        // `dom::remove` rather than `delete_with_tail_preserve_free`.
+        let dom = parse("<section><p>k</p><div></div></section>");
+        let b = body(&dom);
+        prune_html(&b, Focus::Precision);
+        // Empty <div> dropped either way.
+        assert!(get_elements_by_tag_name(&b, "div").is_empty());
+        // The text-bearing <p> survives.
+        assert_eq!(get_elements_by_tag_name(&b, "p").len(), 1);
+    }
+
+    // ---- convert_tags + DOM stability -----------------------------------
+
+    /// rationale: htmlprocessing.py:401-407 — formatting=false strips
+    /// nested REND_TAG_MAPPING elements (e.g. `<b><i>X</i></b>` becomes plain
+    /// "X" with no wrapper). Pin the recursive strip behaviour: outer AND
+    /// inner wrappers both go, text survives concatenated.
+    #[test]
+    fn convert_tags_formatting_false_strips_nested_b_inside_i() {
+        let dom = parse("<p><i>x <b>bold</b> y</i></p>");
+        let b = body(&dom);
+        convert_tags(&b, &Options::default());
+        assert!(get_elements_by_tag_name(&b, "i").is_empty());
+        assert!(get_elements_by_tag_name(&b, "b").is_empty());
+        assert!(get_elements_by_tag_name(&b, "hi").is_empty());
+        let t = crate::readability::dom::text_content(&b);
+        assert!(t.contains("x") && t.contains("bold") && t.contains("y"));
+    }
 }

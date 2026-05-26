@@ -2120,4 +2120,407 @@ mod tests {
         let r = evaluate(xp, &body(&d)).unwrap();
         assert_eq!(ids(&r), vec!["a", "c"]);
     }
+
+    // =======================================================================
+    // Stage 8 (Coverage Improvement) — negative-shape coverage of parse()
+    // error paths and predicate edge cases. Sources cited: W3C XPath 1.0
+    // (https://www.w3.org/TR/1999/REC-xpath-19991116/), DA-B-1 operator
+    // catalog (module doc), and the parser's `XPathError::{Parse,Unsupported}`
+    // contract.
+    // =======================================================================
+
+    // ---- Tokenizer error paths --------------------------------------------
+
+    #[test]
+    fn tokenize_error_on_lone_colon() {
+        // rationale: a single ':' is not in the XPath 1.0 token set (the colon
+        // only appears inside the '::' axis separator). The tokenizer's
+        // ':' arm returns Parse when the following char is not ':'.
+        // Cites tokenize() ColonColon branch at xpath_engine.rs.
+        let err = parse(".//a:b").unwrap_err();
+        match err {
+            XPathError::Parse(msg) => assert!(msg.contains(':') || msg.contains("\':\'")),
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tokenize_error_on_unexpected_character() {
+        // rationale: characters outside the XPath 1.0 lexical alphabet trip
+        // the tokenizer's catch-all `_ =>` Parse arm. `$` is an XPath 1.0
+        // variable-reference prefix that the DA-B-1 catalog does NOT support.
+        let err = parse(".//div[@class=$var]").unwrap_err();
+        assert!(matches!(err, XPathError::Parse(_)));
+    }
+
+    #[test]
+    fn tokenize_error_on_bad_character_caret() {
+        // rationale: '^' is not in any XPath 1.0 production. The tokenizer
+        // catch-all reports it as an unexpected character.
+        let err = parse(".//div^foo").unwrap_err();
+        assert!(matches!(err, XPathError::Parse(_)));
+    }
+
+    #[test]
+    fn tokenize_unterminated_double_quoted_string_returns_parse_error() {
+        // rationale: the string-literal arm reports unterminated quotes per
+        // the tokenizer's `if !closed { return Err(Parse(...)) }` branch.
+        // Mirrors the existing `parse_error_on_unterminated_string`
+        // (single-quote case) for the double-quote alternative.
+        let err = parse(".//div[@class=\"unclosed").unwrap_err();
+        assert!(matches!(err, XPathError::Parse(_)));
+    }
+
+    #[test]
+    fn tokenize_number_with_decimal_then_step() {
+        // rationale: the numeric arm has a `seen_dot && peek-not-digit` lookback
+        // that emits the number and lets `.` lex separately. `1.foo` makes the
+        // `.` after `1` not part of the number; the number tokenizes as `1`,
+        // then `.` is a Step Dot. Without a following `/` or `//` the parser
+        // errors on `expected '/' or '//' after '.'` — pin that Parse error.
+        let err = parse("1.foo").unwrap_err();
+        assert!(matches!(err, XPathError::Parse(_)));
+    }
+
+    #[test]
+    fn tokenize_decimal_number_recognised() {
+        // rationale: the numeric arm with `seen_dot=true` accepts a single
+        // decimal point. `[1.5]` is parsed as a positional predicate; the
+        // parser's "non-integer or non-positive" rule then trips Unsupported.
+        let err = parse(".//div[1.5]").unwrap_err();
+        match err {
+            XPathError::Unsupported(_) => {}
+            other => panic!("expected Unsupported (non-integer positional), got {other:?}"),
+        }
+    }
+
+    // ---- Parser error paths -----------------------------------------------
+
+    #[test]
+    fn parse_error_on_empty_expression() {
+        // rationale: parse_path's `None => Err(Parse("empty XPath expression"))`
+        // arm fires on an empty input. The tokenizer accepts "" and returns
+        // an empty token list; the parser then has no first token.
+        let err = parse("").unwrap_err();
+        assert!(matches!(err, XPathError::Parse(_)));
+    }
+
+    #[test]
+    fn parse_error_on_trailing_tokens_after_path() {
+        // rationale: after parse_path() consumes the leading path, if more
+        // tokens remain and the next isn't a Pipe, the "trailing tokens after
+        // path" Parse arm fires.
+        let err = parse(".//div ]").unwrap_err();
+        assert!(matches!(err, XPathError::Parse(_)));
+    }
+
+    #[test]
+    fn parse_error_on_dot_with_no_slash_or_doubleslash() {
+        // rationale: the Dot branch has three arms: Slash, DoubleSlash, None
+        // (returns context-only Path). Anything else triggers the
+        // "expected '/' or '//' after '.'" Parse error.
+        let err = parse(".x").unwrap_err();
+        assert!(matches!(err, XPathError::Parse(_)));
+    }
+
+    #[test]
+    fn parse_bare_dot_returns_empty_path() {
+        // rationale: parse_path's `Dot -> None` arm encodes the bare `.`
+        // selector as an empty `Path { absolute=false, steps=[] }`. The
+        // evaluator then returns the context node only.
+        let p = parse(".").unwrap();
+        if let XPath::Path(p) = p {
+            assert!(!p.absolute);
+            assert!(p.steps.is_empty());
+        } else {
+            panic!("expected Path");
+        }
+    }
+
+    #[test]
+    fn parse_error_on_unterminated_predicate_bracket() {
+        // rationale: `[N` without `]` runs out of tokens inside the predicate
+        // and the parser's `expect(&Tok::RBracket)` returns Parse "expected
+        // ..., got EOF".
+        let err = parse(".//div[1").unwrap_err();
+        assert!(matches!(err, XPathError::Parse(_)));
+    }
+
+    #[test]
+    fn parse_error_on_predicate_without_step() {
+        // rationale: `[1` at the start of an expression has no step to attach
+        // the predicate to — parse_step_body sees `LBracket` as the first
+        // node-test token and emits the catch-all "expected node-test" Parse
+        // arm.
+        let err = parse("[1]").unwrap_err();
+        assert!(matches!(err, XPathError::Parse(_)));
+    }
+
+    #[test]
+    fn parse_error_on_lone_at_sign() {
+        // rationale: `@` is the attribute-axis prefix; the parser's `@`
+        // branch in parse_step_body bumps then expects a Name or Star. With
+        // neither, the "expected attribute name after '@'" Parse arm fires.
+        let err = parse("@").unwrap_err();
+        assert!(matches!(err, XPathError::Parse(_)));
+    }
+
+    #[test]
+    fn parse_error_on_trailing_double_slash() {
+        // rationale: trailing `//` with no node-test runs out of tokens; the
+        // parser then calls parse_step_body which hits its `other =>` Parse
+        // arm (EOF where a node-test is expected).
+        let err = parse(".//").unwrap_err();
+        assert!(matches!(err, XPathError::Parse(_)));
+    }
+
+    #[test]
+    fn parse_error_on_self_axis_without_tag() {
+        // rationale: `self::` with no following Name or Star runs the parser
+        // into its "expected tag after 'self::'" Parse arm.
+        let err = parse("self::").unwrap_err();
+        assert!(matches!(err, XPathError::Parse(_)));
+    }
+
+    #[test]
+    fn parse_error_on_unsupported_axis_following() {
+        // rationale: the parser only knows the four axes in DA-B-1
+        // (descendant-or-self, child, self, attribute). Other axes like
+        // `following::*` tokenize as Name + ColonColon, fall through to the
+        // bare-name path, then the trailing `::` is a trailing token Parse
+        // error (the catch-all after parse_path's last loop).
+        let err = parse("following::*").unwrap_err();
+        assert!(matches!(err, XPathError::Parse(_)));
+    }
+
+    #[test]
+    fn parse_error_on_unsupported_axis_preceding_sibling() {
+        // rationale: same shape as `following::*` — the engine rejects every
+        // axis outside DA-B-1. `preceding-sibling::*` tokenizes as a
+        // hyphenated Name then `::`, hitting the trailing-tokens Parse arm.
+        let err = parse("preceding-sibling::*").unwrap_err();
+        assert!(matches!(err, XPathError::Parse(_)));
+    }
+
+    #[test]
+    fn parse_error_on_unsupported_ancestor_axis() {
+        // rationale: same family — `ancestor::*` and `namespace::*` are
+        // outside the DA-B-1 catalog. The parser rejects them.
+        let err = parse("ancestor::*").unwrap_err();
+        assert!(matches!(err, XPathError::Parse(_)));
+    }
+
+    #[test]
+    fn parse_unsupported_function_namespace_uri() {
+        // rationale: dispatch_function's `other =>` Unsupported arm fires
+        // for any function not in the {contains, starts-with, translate}
+        // DA-B-1 catalog.
+        let err = parse(".//*[namespace-uri()='x']").unwrap_err();
+        assert!(matches!(err, XPathError::Unsupported(_)));
+    }
+
+    #[test]
+    fn parse_unsupported_function_position() {
+        // rationale: `position()` is XPath 1.0 standard but outside DA-B-1.
+        // The function dispatcher reports Unsupported. (Trafilatura uses
+        // bare `[N]` positional predicates instead.)
+        let err = parse(".//*[position()=2]").unwrap_err();
+        assert!(matches!(err, XPathError::Unsupported(_)));
+    }
+
+    #[test]
+    fn parse_error_on_contains_wrong_arity() {
+        // rationale: dispatch_function checks args.len()==2 for contains();
+        // anything else returns Parse with the arity error message.
+        let err = parse(".//div[contains(@class)]").unwrap_err();
+        assert!(matches!(err, XPathError::Parse(_)));
+    }
+
+    #[test]
+    fn parse_error_on_translate_wrong_arity() {
+        // rationale: translate() requires exactly 3 args; the dispatcher
+        // returns Parse if the arity differs.
+        let err = parse(".//div[translate(@id, 'a')]").unwrap_err();
+        assert!(matches!(err, XPathError::Parse(_)));
+    }
+
+    #[test]
+    fn parse_error_on_starts_with_wrong_arity() {
+        // rationale: starts-with() requires exactly 2 args; the dispatcher
+        // returns Parse if the arity differs.
+        let err = parse(".//div[starts-with(@id, 'a', 'b')]").unwrap_err();
+        assert!(matches!(err, XPathError::Parse(_)));
+    }
+
+    #[test]
+    fn parse_predicate_with_zero_is_unsupported() {
+        // rationale: positional predicates must be positive integers (XPath
+        // 1.0 §3.3 — positions are 1-indexed). The parser's `n < 1.0` arm
+        // reports Unsupported for `[0]`.
+        let err = parse(".//div[0]").unwrap_err();
+        assert!(matches!(err, XPathError::Unsupported(_)));
+    }
+
+    #[test]
+    fn parse_unsupported_union_of_non_attribute() {
+        // rationale: parse_union_expr only allows `@a|@b|...` unions inside a
+        // predicate (DA-B-1 catalog). A union of literals or function-calls
+        // is Unsupported.
+        let err = parse(".//div[contains('a'|'b', 'x')]").unwrap_err();
+        assert!(matches!(err, XPathError::Unsupported(_)));
+    }
+
+    #[test]
+    fn parse_error_on_at_inside_union_non_attribute() {
+        // rationale: predicate-internal union must consist of `@attr` refs;
+        // mixing `@a|literal` returns Unsupported per the second arm of
+        // parse_union_expr.
+        let err = parse(".//div[@class|'lit']").unwrap_err();
+        assert!(matches!(err, XPathError::Unsupported(_)));
+    }
+
+    // ---- Evaluator edge cases --------------------------------------------
+
+    #[test]
+    fn evaluate_text_axis_returns_text_descendants() {
+        // rationale: NodeTest::Text via the DescendantOrSelf axis lands in
+        // `descendant_text_nodes_as_elements` — pin that the count equals
+        // the number of text nodes (not elements). One <p> with text "x"
+        // has exactly one text descendant.
+        let d = parse_dom("<html><body><p>x</p><p>y</p></body></html>");
+        let r = evaluate(".//text()", &body(&d)).unwrap();
+        assert_eq!(r.len(), 2);
+    }
+
+    #[test]
+    fn evaluate_child_axis_with_text_test() {
+        // rationale: `text()` under the child axis (NodeTest::Text on
+        // Axis::Child) returns only direct text-node children — the
+        // `text_children` helper. Pin that nested text in <span> is excluded.
+        let d = parse_dom("<html><body>top<span>nested</span>after</body></html>");
+        let r = evaluate("text()", &body(&d)).unwrap();
+        // Two direct text children: "top" and "after".
+        assert_eq!(r.len(), 2);
+    }
+
+    #[test]
+    fn evaluate_self_axis_wildcard_on_element() {
+        // rationale: `self::*` matches the context iff it is an element.
+        // Pin the SelfAxis Wildcard arm.
+        let d = parse_dom("<html><body><div id='d'/></body></html>");
+        let div = evaluate(".//div", &body(&d)).unwrap()[0].clone();
+        let r = evaluate("self::*", &div).unwrap();
+        assert_eq!(ids(&r), vec!["d"]);
+    }
+
+    #[test]
+    fn evaluate_or_predicate_short_circuit() {
+        // rationale: Expr::Or short-circuits — left-truthy implies right is
+        // not evaluated. We can't observe the short-circuit directly, but
+        // we can pin that a truthy disjunction keeps the element even when
+        // the second disjunct would have been false.
+        let d = parse_dom("<html><body><div class='post' id='a'/><div id='b'/></body></html>");
+        let r = evaluate(".//div[@class='post' or @class='missing']", &body(&d)).unwrap();
+        assert_eq!(ids(&r), vec!["a"]);
+    }
+
+    #[test]
+    fn evaluate_and_predicate_both_required() {
+        // rationale: Expr::And short-circuits, both sides must be truthy.
+        // Pin the "both required" behaviour: one element matches both
+        // halves; the other matches only one.
+        let d = parse_dom(
+            "<html><body>\
+                <div class='post' data-x='1' id='a'/>\
+                <div class='post' id='b'/>\
+            </body></html>",
+        );
+        let r = evaluate(".//div[@class='post' and @data-x]", &body(&d)).unwrap();
+        assert_eq!(ids(&r), vec!["a"]);
+    }
+
+    #[test]
+    fn evaluate_eq_predicate_against_attribute() {
+        // rationale: Expr::Eq compares the string-values of the two sides.
+        // Pin attribute == literal as the bedrock case.
+        let d = parse_dom(
+            "<html><body><div role='article' id='a'/><div role='nav' id='b'/></body></html>",
+        );
+        let r = evaluate(".//div[@role='article']", &body(&d)).unwrap();
+        assert_eq!(ids(&r), vec!["a"]);
+    }
+
+    #[test]
+    fn evaluate_contains_empty_needle_is_true() {
+        // rationale: libxml2 / lxml contract: `contains(s, "")` is true for
+        // any `s`. Pinned by the FnContains branch's `if n.is_empty() { true }`
+        // early-return.
+        let d = parse_dom("<html><body><div class='x' id='a'/></body></html>");
+        let r = evaluate(".//div[contains(@class, '')]", &body(&d)).unwrap();
+        assert_eq!(ids(&r), vec!["a"]);
+    }
+
+    #[test]
+    fn evaluate_starts_with_empty_prefix_is_true() {
+        // rationale: libxml2 / lxml contract: `starts-with(s, "")` is true.
+        // Pinned by the FnStartsWith branch's `if n.is_empty() { true }`
+        // early-return.
+        let d = parse_dom("<html><body><div class='x' id='a'/></body></html>");
+        let r = evaluate(".//div[starts-with(@class, '')]", &body(&d)).unwrap();
+        assert_eq!(ids(&r), vec!["a"]);
+    }
+
+    #[test]
+    fn evaluate_empty_context_returns_empty() {
+        // rationale: when nothing in the document matches the node-test, the
+        // result is `Ok(vec![])` — never `Err`. Pin that contract: a
+        // syntactically valid pattern over an empty subtree returns empty.
+        let d = parse_dom("<html><body></body></html>");
+        let r = evaluate(".//article", &body(&d)).unwrap();
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn evaluate_positional_out_of_range_returns_empty() {
+        // rationale: positional `[N]` past the end returns an empty set,
+        // not an error. eval_one_path's `into_iter().nth(n)` yields `None`.
+        let d = parse_dom("<html><body><article id='a'/><article id='b'/></body></html>");
+        let r = evaluate("(.//article)[5]", &body(&d)).unwrap();
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn evaluate_number_literal_truthy_in_predicate() {
+        // rationale: Expr::Number is truthy iff `n != 0.0` (XPath 1.0 §3.4 —
+        // boolean(NaN) is false, boolean(0) is false, everything else true).
+        // We can't trivially write `[1]` (parser maps that to Positional), but
+        // `[1=1]` exercises the Number→Literal→Eq path via eval_expr_str's
+        // format_number arm.
+        let d = parse_dom("<html><body><div id='a'/></body></html>");
+        let r = evaluate(".//div[1=1]", &body(&d)).unwrap();
+        assert_eq!(ids(&r), vec!["a"]);
+    }
+
+    // ---- translate() edge cases ------------------------------------------
+
+    #[test]
+    fn translate_empty_src_is_empty() {
+        // rationale: per W3C XPath 1.0 §4.2, translate("", a, b) is "" —
+        // no characters to translate.
+        assert_eq!(translate("", "abc", "ABC"), "");
+    }
+
+    #[test]
+    fn translate_empty_from_passes_through() {
+        // rationale: when `from` is empty, no character can be translated;
+        // the input string is returned verbatim.
+        assert_eq!(translate("foo", "", ""), "foo");
+    }
+
+    #[test]
+    fn translate_empty_to_deletes_all_matches() {
+        // rationale: when `from` is non-empty and `to` is empty, every
+        // character in `from` is deleted from the source.
+        assert_eq!(translate("foobar", "fb", ""), "ooar");
+    }
 }

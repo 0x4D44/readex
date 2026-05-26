@@ -1044,4 +1044,307 @@ mod tests {
         assert_eq!(tag_name(&out.postbody).as_deref(), Some("BODY"));
         assert!(dom::parent(&out.postbody).is_none());
     }
+
+    // ===========================================================================
+    // Stage 10 — branch-coverage closers for each of the 5 baseline paths
+    // ===========================================================================
+
+    // ---- Path 1 multi-script accumulation (baseline.py:55-58) -------------
+
+    #[test]
+    fn jsonld_two_scripts_concatenate_temp_text() {
+        // rationale: pin the False side of `if temp_text.is_empty()` at
+        // baseline.rs:295 — Python's `temp_text += " " + text if temp_text
+        // else text` (baseline.py:56). Two JSON-LD scripts, each with a
+        // short articleBody (~60 chars), combined to > 100 chars so the
+        // > 100 gate at baseline.rs:303 fires. The second iteration sees
+        // `temp_text` already populated → enters the else arm
+        // (`push(' '); push_str(&text)`).
+        let body_a = "x".repeat(60);
+        let body_b = "y".repeat(60);
+        let html = format!(
+            r#"<html><body>
+                <script type="application/ld+json">{{"articleBody":"{}"}}</script>
+                <script type="application/ld+json">{{"articleBody":"{}"}}</script>
+            </body></html>"#,
+            body_a, body_b
+        );
+        let out = baseline(&html);
+        // Combined length > 100 ⇒ path 1 returns early.
+        assert!(out.length > 100);
+        // Both texts are present, separated by a single space (the else-arm
+        // accumulator at baseline.py:56).
+        assert!(out.text.contains(&body_a));
+        assert!(out.text.contains(&body_b));
+        assert!(
+            out.text.contains(&format!("{} {}", body_a, body_b)),
+            "expected single-space separator between the two articleBody texts"
+        );
+    }
+
+    // ---- Path 1 short articleBody adds a <p> but does NOT short-circuit ---
+
+    #[test]
+    fn jsonld_short_articlebody_adds_p_then_falls_through_to_path2_return() {
+        // rationale: pin the True side of `element_child_count(&postbody)
+        // > 0` at baseline.rs:347 — Python `len(postbody) > 0`
+        // (baseline.py:70). When JSON-LD produces a short (<100 char) `<p>`
+        // that lands in postbody, and the `<article>` scan finds nothing,
+        // path 2 STILL returns because `len(postbody)` is non-zero (the
+        // JSON-LD <p> is there). The returned `text` is the article-path
+        // temp_text (empty).
+        let short = "x".repeat(30); // < 100 chars
+        let html = format!(
+            r#"<html><body>
+                <script type="application/ld+json">{{"articleBody":"{}"}}</script>
+            </body></html>"#,
+            short
+        );
+        let out = baseline(&html);
+        // Path 2 returns with the JSON-LD `<p>` already in postbody. The
+        // returned text is the article-temp_text (empty string).
+        let ps = get_elements_by_tag_name(&out.postbody, "p");
+        assert_eq!(ps.len(), 1, "JSON-LD added one <p>; no article was found");
+        assert_eq!(out.text, "", "path 2 temp_text is empty when no article matched");
+        assert_eq!(out.length, 0);
+    }
+
+    // ---- Path 2 multi-article accumulation (baseline.py:69) ----------------
+
+    #[test]
+    fn article_path_two_articles_concatenate_temp_text() {
+        // rationale: pin the False side of `if temp_text.is_empty()` at
+        // baseline.rs:335 — same shape as the JSON-LD accumulator
+        // (baseline.py:69). Two `<article>` elements, each > 100 chars,
+        // produce a temp_text containing both, space-separated.
+        let body_a = "alpha ".repeat(20); // ~120 chars
+        let body_b = "bravo ".repeat(20); // ~120 chars
+        let html = format!(
+            "<html><body><article>{}</article><article>{}</article></body></html>",
+            body_a, body_b
+        );
+        let out = baseline(&html);
+        let ps = get_elements_by_tag_name(&out.postbody, "p");
+        assert_eq!(ps.len(), 2, "two articles → two <p>s in postbody");
+        // The combined text contains BOTH article contents.
+        assert!(out.text.contains("alpha"));
+        assert!(out.text.contains("bravo"));
+        // Path 2 returns with non-empty temp_text and length > 100.
+        assert!(out.length > 100);
+    }
+
+    // ---- Path 2 short-article fall-through (baseline.py:67 False side) -----
+
+    #[test]
+    fn article_path_short_article_does_not_register() {
+        // rationale: pin the False side of `if text.chars().count() > 100`
+        // at baseline.rs:331 — short `<article>` text is NOT promoted to
+        // postbody. The article scan completes with no `<p>` added; path 2's
+        // post-loop guard `element_child_count > 0` is False → fall through
+        // to path 3.
+        let short_article = "abc"; // 3 chars
+        // Path 3 should win with sufficient <p> text.
+        let html = format!(
+            "<html><body><article>{}</article>\
+             <p>{}</p></body></html>",
+            short_article,
+            "tag-set ".repeat(20) // ~160 chars in <p>
+        );
+        let out = baseline(&html);
+        // Path 3 wins: postbody has the <p>'s text.
+        assert!(out.length > 100);
+        assert!(out.text.contains("tag-set"));
+        // The 3-char article was NOT added to postbody.
+        let ps = get_elements_by_tag_name(&out.postbody, "p");
+        // path 3 added only the <p> (with the long text); the <article>'s
+        // text didn't make it because it was below the 100-char gate.
+        assert_eq!(ps.len(), 1);
+    }
+
+    // ---- Path 3 dedup HIT arm (baseline.py:80 False side) ------------------
+
+    #[test]
+    fn tag_set_dedup_hit_skips_duplicate_entry() {
+        // rationale: pin the False side of `if !results.contains(&entry)`
+        // at baseline.rs:377 — when a tag-set element's trimmed text already
+        // appears in the dedup set, the element is SKIPPED. We construct
+        // two `<p>`s with identical >100-char text; only ONE postbody <p>
+        // should result. (Companion to `tag_set_path_dedupes`, which uses
+        // shorter text and 5 distinct entries.)
+        let body = "duplicate-text ".repeat(10); // ~150 chars
+        let html = format!(
+            "<html><body><p>{}</p><p>{}</p></body></html>",
+            body, body
+        );
+        let out = baseline(&html);
+        let ps = get_elements_by_tag_name(&out.postbody, "p");
+        // Dedup: only ONE <p> survives.
+        assert_eq!(ps.len(), 1, "dedup HashSet collapses identical entries");
+        assert!(out.length > 100);
+    }
+
+    // ---- Path 4 body present but emits only whitespace pieces --------------
+
+    #[test]
+    fn path4_body_only_whitespace_yields_empty_joined() {
+        // rationale: pin the False side of `if !joined.is_empty()` at
+        // baseline.rs:428 — when path 4's itertext produces only
+        // whitespace pieces (all filtered to "" by `trim`), `joined` is the
+        // empty string, no Text child is appended to the `<p>`, and
+        // `text=""` / `length=0` is returned. The `<p>` is still present
+        // (path 4 always appends a `<p>` per baseline.py:92-96).
+        let html = "<html><body>   \t   \n   </body></html>";
+        let out = baseline(html);
+        let ps = get_elements_by_tag_name(&out.postbody, "p");
+        assert_eq!(ps.len(), 1, "path 4 always appends exactly one <p>");
+        // The <p> has NO text child (empty joined string).
+        assert_eq!(out.text, "");
+        assert_eq!(out.length, 0);
+    }
+
+    // ---- html2txt direct entry — empty input and clean=false branches ----
+
+    #[test]
+    fn html2txt_direct_empty_input_is_empty_string() {
+        // rationale: pin the empty-input early return at baseline.rs:492.
+        // Mirrors `baseline.py:116-117` (`if tree is None: return ""`).
+        assert_eq!(html2txt("", true), "");
+        assert_eq!(html2txt("", false), "");
+    }
+
+    #[test]
+    fn html2txt_clean_false_preserves_script_text() {
+        // rationale: pin the False side of `if clean` at baseline.rs:519 —
+        // when `clean=false`, `basic_cleaning` is NOT called and `<aside>`/
+        // `<script>` content WILL leak into the joined body text. This is
+        // the path-5 invocation contract inside `baseline` (it calls
+        // `html2txt_from_tree(&root, false)`).
+        let html = r#"<html><body>visible<aside>aside-text</aside></body></html>"#;
+        let out = html2txt(html, false);
+        assert!(out.contains("visible"));
+        assert!(
+            out.contains("aside-text"),
+            "with clean=false the aside content is preserved"
+        );
+    }
+
+    // ---- baseline path-4 reset preserves freshly-created body element -----
+
+    #[test]
+    fn path4_postbody_is_fresh_after_path3_partial_population() {
+        // rationale: pin baseline.py:89 — `postbody = Element('body')` is
+        // RE-ASSIGNED inside path 4, dropping any path-3 `<p>` children.
+        // We construct an input that adds path-3 <p>s with combined text <=
+        // 100 chars (so path 3 doesn't return), then path 4 takes over and
+        // emits exactly ONE <p>.
+        let html = "<html><body>\
+            <p>aa</p>\
+            <p>bb</p>\
+            <p>cc</p>\
+            <p>dd</p>\
+            (other body text)\
+        </body></html>";
+        let out = baseline(html);
+        let ps = get_elements_by_tag_name(&out.postbody, "p");
+        // Path 4 reset means EXACTLY one <p> survives in the synthetic
+        // postbody (not the 4 path-3 might have added).
+        assert_eq!(ps.len(), 1, "path 4 reset drops path-3 <p>s");
+        // The text contains content from the body itertext.
+        assert!(out.text.contains("aa"));
+        assert!(out.text.contains("bb"));
+        assert!(out.text.contains("(other body text)"));
+    }
+
+    // ---- append_text_paragraph empty-text arm (baseline.rs:585) -----------
+
+    #[test]
+    fn baseline_empty_articlebody_string_still_adds_p() {
+        // rationale: when JSON-LD `articleBody` is the empty string after
+        // trim (e.g. just punctuation/whitespace), Python's
+        // `SubElement(postbody, 'p').text = ""` still APPENDS a `<p>`
+        // (with no leading-text-child run). Pins the False side of
+        // `if !text.is_empty()` inside `append_text_paragraph`
+        // (baseline.rs:585).
+        //
+        // We engineer this via path 4: a body with whitespace-only content
+        // routes through `append_text_paragraph(&postbody, "")` at
+        // baseline.rs:456 (the path-5 fall-through) — wait, that's path 5.
+        // Actually baseline.py:92 (`p_elem = SubElement(postbody, 'p')`)
+        // always creates the <p>; the text is set conditionally.
+        //
+        // Direct exercise: call append_text_paragraph indirectly via path 5
+        // (html2txt fallback) where the html2txt returns "".
+        // path 5 only fires when <body> is absent — html5ever always
+        // synthesises <body>, so path 5 is effectively unreachable in
+        // baseline. Instead, exercise path 4 with whitespace-only body,
+        // which lands in baseline.rs:428's False branch: no Text child is
+        // appended to the path-4 <p> (the `append_text_paragraph` arm at
+        // baseline.rs:585 False side fires via the path-1/2/3 callers when
+        // a trimmed JSON-LD body collapses to "").
+        //
+        // Direct path 1: empty articleBody → loop iteration sees
+        // `json_body=""` and `continue`s (baseline.rs:272 True), so
+        // append_text_paragraph isn't called for "". This branch is hit
+        // only via the JSON-LD html-parse path when the inner trim
+        // collapses to "" — engineer that.
+        let html = r#"<html><body>
+            <script type="application/ld+json">{"articleBody":"<p>   </p>"}</script>
+        </body></html>"#;
+        let out = baseline(html);
+        // The inner load_html sees "<p>   </p>" → text_content "   " →
+        // trim() → "". `json_body` is non-empty (contains "<p>"), so the
+        // `if json_body.is_empty()` continue is NOT taken. The
+        // `append_text_paragraph(&postbody, "")` runs with text="" — the
+        // <p> is appended without a Text child.
+        // Path 1 temp_text accumulates "" → length 0 → does NOT return.
+        // Then path 2: no <article>; element_child_count is 1 (from the
+        // JSON-LD <p>) → path 2 returns with temp_text="".
+        // Postbody has exactly one <p>, and that <p> has no Text child.
+        let ps = get_elements_by_tag_name(&out.postbody, "p");
+        assert_eq!(ps.len(), 1);
+        // The <p> exists but has no children (the empty-text branch).
+        assert_eq!(ps[0].children.borrow().len(), 0);
+        assert_eq!(out.text, "");
+    }
+
+    // ---- baseline articleBody key but value is non-string (None/Number/Array)
+
+    #[test]
+    fn jsonld_articlebody_non_string_value_is_ignored() {
+        // rationale: pin the swallow-by-`as_str` arm. Python catches the
+        // `.get("articleBody", "")` returning a non-str (int/list/None) via
+        // the same try/except — Trafilatura's `json_body` ends up "" and
+        // the `if json_body:` check (baseline.rs:272 True side) skips. The
+        // Rust port routes through `.and_then(|b| b.as_str())` which is
+        // None for non-string values; `.unwrap_or_default()` makes it "".
+        let html = r#"<html><body>
+            <script type="application/ld+json">{"articleBody":123}</script>
+            <article>Lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim.</article>
+        </body></html>"#;
+        let out = baseline(html);
+        // Path 1 yields nothing (articleBody is a number → as_str returns
+        // None → json_body = "" → continue). Path 2 wins via the long
+        // <article>.
+        assert!(out.length > 100);
+        assert!(out.text.contains("Lorem ipsum"));
+    }
+
+    // ---- baseline path-1 articleBody-key-absent fast skip ------------------
+
+    #[test]
+    fn jsonld_script_without_articlebody_substring_is_skipped() {
+        // rationale: pin the True side of `if raw.is_empty() ||
+        // !raw.contains("articleBody")` (baseline.rs:252) — when a script
+        // body lacks the substring "articleBody" entirely, the loop
+        // continues without parsing. Faithful to baseline.py:44.
+        let html = r#"<html><body>
+            <script type="application/ld+json">{"@type":"Organization","name":"Foo"}</script>
+            <article>Lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim.</article>
+        </body></html>"#;
+        let out = baseline(html);
+        // Path 2 wins (Organization JSON has no articleBody → JSON-LD
+        // contributes nothing → article path takes over).
+        assert!(out.length > 100);
+        assert!(out.text.contains("Lorem ipsum"));
+    }
 }

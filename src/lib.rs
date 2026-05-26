@@ -3043,4 +3043,628 @@ mod tests {
         assert_eq!(a.categories, vec!["Tech".to_string()]);
         assert_eq!(a.hostname.as_deref(), Some("example.com"));
     }
+
+    // ====================================================================
+    // Stage 9 (HLD §7.6) — `min_word_count` gate branch coverage. For each
+    // public `extract_to_*` entry the three-arm contract is identical:
+    //
+    //   1. min_word_count == 0 + empty extraction  -> Ok (Bug-E2 default).
+    //   2. min_word_count == 1 + empty extraction  -> Err(ContentTooShort{0, 1}).
+    //   3. min_word_count == 9999 + real article    -> Err(ContentTooShort{real, 9999}).
+    //
+    // These pin the `opts.min_word_count > 0 && word_count < threshold`
+    // arms in `extract`, `extract_with`, `extract_to_markdown`,
+    // `extract_to_txt`, `extract_to_json`, `extract_to_xml`,
+    // `extract_to_csv`, `extract_to_tei`, plus `extract_via_readability`
+    // (the M2 legacy path).
+    // ====================================================================
+
+    /// Substantive HTML used by the `threshold_above_yield_rejects` tests.
+    /// Long enough to clear every cascade gate (min_extracted_size=250 by
+    /// default) so the cascade definitely yields a real word count we can
+    /// assert is below 9999.
+    const SUBSTANTIVE_HTML: &str = "<html><head><title>An Article</title></head><body>\
+        <article><p>This is a real readable paragraph with quite a few words \
+        in it because the unlikely-candidate strip cares about minimum body length, \
+        and we want the cascade to surface SOMETHING from the Trafilatura pipeline. \
+        Adding more text here so the various length-threshold gates don't reject this \
+        fixture outright; the M3 cascade has min_extracted_size=250 by default and \
+        we want to clear it comfortably.</p></article></body></html>";
+
+    // ---- extract (delegates to extract_with — keeps coverage honest) ----
+
+    /// rationale: M2 Stage 4 (HLD §7.6) — default Options path NEVER errors,
+    /// even on a body-less HTML. Pins the Bug-E2 contract on `extract`.
+    #[test]
+    fn extract_default_options_returns_ok_on_empty_extraction() {
+        let e = extract("<html><body></body></html>", None)
+            .expect("default path must Ok on empty body (Bug-E2)");
+        assert_eq!(e.text, "");
+        assert_eq!(e.word_count, 0);
+    }
+
+    // ---- extract_with: threshold_above_yield_rejects ----
+
+    /// rationale: M2 Stage 4 (HLD §7.6) — the `min_word_count > 0 &&
+    /// word_count < threshold` arm with a substantive extraction. Pins
+    /// that even a real article is rejected when the threshold is far
+    /// above its yield, and that `word_count` carries the real count
+    /// (not zero) — distinguishing this from the empty-body case.
+    #[test]
+    fn extract_with_threshold_above_yield_rejects() {
+        let opts = Options {
+            min_word_count: 9999,
+            ..Options::default()
+        };
+        let err = extract_with(SUBSTANTIVE_HTML, None, &opts)
+            .expect_err("real article well below 9999 must Err");
+        match err {
+            ExtractError::ContentTooShort {
+                word_count,
+                threshold,
+            } => {
+                assert_eq!(threshold, 9999);
+                assert!(word_count > 0, "word_count must be real: {word_count}");
+                assert!(word_count < 9999, "word_count must be below threshold: {word_count}");
+            }
+            other => panic!("expected ContentTooShort, got {other:?}"),
+        }
+    }
+
+    // ---- extract_to_markdown ----
+
+    /// rationale: M4 Stage 3 sub-stage B (core.py:73-98) — default-Options
+    /// path on an empty body returns an empty markdown string (NEVER errors).
+    /// Pins the Bug-E2 contract at the markdown formatter entry.
+    #[test]
+    fn extract_to_markdown_default_options_returns_ok_on_empty_extraction() {
+        let md = extract_to_markdown("<html><body></body></html>", None, &Options::default())
+            .expect("default path must Ok on empty body");
+        assert_eq!(md, "");
+    }
+
+    /// rationale: M4 Stage 3 sub-stage B (core.py:73-98) — `min_word_count=1`
+    /// on an empty extraction trips the `word_count < threshold` gate with
+    /// the precise pair `{0, 1}`. Distinguishes "min_word_count gate fires"
+    /// from "min_word_count==0 default path".
+    #[test]
+    fn extract_to_markdown_threshold_one_on_empty_returns_content_too_short() {
+        let opts = Options {
+            min_word_count: 1,
+            ..Options::default()
+        };
+        let err = extract_to_markdown("<html><body></body></html>", None, &opts)
+            .expect_err("must Err");
+        match err {
+            ExtractError::ContentTooShort { word_count, threshold } => {
+                assert_eq!(word_count, 0);
+                assert_eq!(threshold, 1);
+            }
+            other => panic!("expected ContentTooShort, got {other:?}"),
+        }
+    }
+
+    /// rationale: M4 Stage 3 sub-stage B (core.py:73-98) — substantive
+    /// article still triggers the gate when the threshold is far above
+    /// real yield; the reported `word_count` is non-zero (the genuine
+    /// formatted body word count), not a placeholder.
+    #[test]
+    fn extract_to_markdown_threshold_above_yield_rejects() {
+        let opts = Options {
+            min_word_count: 9999,
+            ..Options::default()
+        };
+        let err = extract_to_markdown(SUBSTANTIVE_HTML, None, &opts)
+            .expect_err("real article well below 9999 must Err");
+        match err {
+            ExtractError::ContentTooShort { word_count, threshold } => {
+                assert_eq!(threshold, 9999);
+                assert!(word_count > 0);
+                assert!(word_count < 9999);
+            }
+            other => panic!("expected ContentTooShort, got {other:?}"),
+        }
+    }
+
+    // ---- extract_to_txt ----
+
+    /// rationale: core.py:71-98 (the "txt" output_format branch) — the
+    /// default Options path NEVER errors on an empty body. Plain TXT
+    /// inherits Bug-E2 from extract_to_markdown's shared cascade shape.
+    #[test]
+    fn extract_to_txt_default_options_returns_ok_on_empty_extraction() {
+        let s = extract_to_txt("<html><body></body></html>", None, &Options::default())
+            .expect("default path must Ok on empty body");
+        assert_eq!(s, "");
+    }
+
+    /// rationale: core.py:71-98 — `min_word_count=1` on empty body trips
+    /// the gate with `{0, 1}` exactly as on the markdown formatter.
+    #[test]
+    fn extract_to_txt_threshold_one_on_empty_returns_content_too_short() {
+        let opts = Options {
+            min_word_count: 1,
+            ..Options::default()
+        };
+        let err = extract_to_txt("<html><body></body></html>", None, &opts)
+            .expect_err("must Err");
+        match err {
+            ExtractError::ContentTooShort { word_count, threshold } => {
+                assert_eq!(word_count, 0);
+                assert_eq!(threshold, 1);
+            }
+            other => panic!("expected ContentTooShort, got {other:?}"),
+        }
+    }
+
+    /// rationale: core.py:71-98 — substantive article rejected when
+    /// `min_word_count` is set above real yield; reported word_count is
+    /// the genuine TXT-formatted body's count.
+    #[test]
+    fn extract_to_txt_threshold_above_yield_rejects() {
+        let opts = Options {
+            min_word_count: 9999,
+            ..Options::default()
+        };
+        let err = extract_to_txt(SUBSTANTIVE_HTML, None, &opts)
+            .expect_err("real article well below 9999 must Err");
+        match err {
+            ExtractError::ContentTooShort { word_count, threshold } => {
+                assert_eq!(threshold, 9999);
+                assert!(word_count > 0);
+                assert!(word_count < 9999);
+            }
+            other => panic!("expected ContentTooShort, got {other:?}"),
+        }
+    }
+
+    /// rationale: core.py:71-98 — substantive article on default opts
+    /// produces a non-empty TXT body. Pins that the formatter is wired
+    /// up end-to-end (parses, cascades, xmltotxt-formats).
+    #[test]
+    fn extract_to_txt_returns_body_text_for_substantive_article() {
+        let s = extract_to_txt(SUBSTANTIVE_HTML, None, &Options::default())
+            .expect("substantive article must Ok");
+        assert!(
+            s.contains("readable paragraph"),
+            "expected body content, got: {s:?}"
+        );
+    }
+
+    /// rationale: core.py:73-91 — `with_metadata=true` prepends the
+    /// shared YAML `---` header on the TXT path (same header builder
+    /// as markdown). Pins the `opts.with_metadata` arm in
+    /// `extract_to_txt`.
+    #[test]
+    fn extract_to_txt_with_metadata_emits_yaml_header() {
+        let html = r#"<html><head>
+            <meta property="og:title" content="A TXT Title">
+            <meta property="article:author" content="TXT Author">
+            <link rel="canonical" href="https://example.com/txt">
+            <title>Fallback</title>
+            </head><body><article>
+            <p>A real readable paragraph with enough words to extract; lorem ipsum dolor
+            sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut
+            labore et dolore magna aliqua ut enim ad minim veniam quis nostrud
+            exercitation.</p>
+            </article></body></html>"#;
+        let opts = Options {
+            with_metadata: true,
+            ..Options::default()
+        };
+        let s = extract_to_txt(html, None, &opts).expect("ok");
+        assert!(s.starts_with("---\n"), "YAML header must open: {s:?}");
+        assert!(s.contains("title: A TXT Title"), "{s:?}");
+        assert!(s.contains("author: TXT Author"), "{s:?}");
+        assert!(s.contains("url: https://example.com/txt"), "{s:?}");
+    }
+
+    // ---- extract_to_json ----
+
+    /// rationale: M4 Stage 3 sub-stage C (core.py:66-67, xml.py:115-134) —
+    /// default Options on empty body returns a valid JSON object with
+    /// `text: ""` and `comments: ""`. Already covered by
+    /// `extract_to_json_empty_body_returns_empty_text` but named here
+    /// for the Stage 9 contract roster.
+    #[test]
+    fn extract_to_json_default_options_returns_ok_on_empty_extraction() {
+        let out = extract_to_json("<html><body></body></html>", None, &Options::default())
+            .expect("default path must Ok on empty body");
+        let v: serde_json::Value = serde_json::from_str(&out).expect("must parse");
+        assert_eq!(v["text"].as_str(), Some(""));
+    }
+
+    /// rationale: M4 Stage 3 sub-stage C — `min_word_count=1` on empty
+    /// body trips the gate with `{0, 1}`. Pins the gate arm specifically
+    /// for the JSON formatter (which counts on the same `xmltotxt(.., false)`
+    /// body text used by JSON's `text` field).
+    #[test]
+    fn extract_to_json_threshold_one_on_empty_returns_content_too_short() {
+        let opts = Options {
+            min_word_count: 1,
+            ..Options::default()
+        };
+        let err = extract_to_json("<html><body></body></html>", None, &opts)
+            .expect_err("must Err");
+        match err {
+            ExtractError::ContentTooShort { word_count, threshold } => {
+                assert_eq!(word_count, 0);
+                assert_eq!(threshold, 1);
+            }
+            other => panic!("expected ContentTooShort, got {other:?}"),
+        }
+    }
+
+    /// rationale: M4 Stage 3 sub-stage C — substantive article rejected
+    /// when threshold is well above the JSON `text` field's word count.
+    #[test]
+    fn extract_to_json_threshold_above_yield_rejects() {
+        let opts = Options {
+            min_word_count: 9999,
+            ..Options::default()
+        };
+        let err = extract_to_json(SUBSTANTIVE_HTML, None, &opts)
+            .expect_err("real article well below 9999 must Err");
+        match err {
+            ExtractError::ContentTooShort { word_count, threshold } => {
+                assert_eq!(threshold, 9999);
+                assert!(word_count > 0);
+                assert!(word_count < 9999);
+            }
+            other => panic!("expected ContentTooShort, got {other:?}"),
+        }
+    }
+
+    // ---- extract_to_xml ----
+
+    /// rationale: M4 Stage 3 sub-stage D (xml.py:159-175) — default
+    /// Options on empty body returns a minimal `<doc>` (with `<main/>`
+    /// and `<comments/>` children) and NEVER errors. Pins the Bug-E2
+    /// contract at the XML formatter entry.
+    #[test]
+    fn extract_to_xml_default_options_returns_ok_on_empty_extraction() {
+        let s = extract_to_xml("<html><body></body></html>", None, &Options::default())
+            .expect("default path must Ok on empty body");
+        // Already pinned by extract_to_xml_empty_body_produces_minimal_doc;
+        // this test pins the *Result-is-Ok* contract specifically.
+        assert!(s.starts_with("<doc"), "got: {s:?}");
+        assert!(s.ends_with("</doc>"), "got: {s:?}");
+    }
+
+    /// rationale: M4 Stage 3 sub-stage D — `min_word_count=1` on empty
+    /// body trips the gate with the precise pair `{0, 1}`.
+    #[test]
+    fn extract_to_xml_threshold_one_on_empty_returns_content_too_short() {
+        let opts = Options {
+            min_word_count: 1,
+            ..Options::default()
+        };
+        let err = extract_to_xml("<html><body></body></html>", None, &opts)
+            .expect_err("must Err");
+        match err {
+            ExtractError::ContentTooShort { word_count, threshold } => {
+                assert_eq!(word_count, 0);
+                assert_eq!(threshold, 1);
+            }
+            other => panic!("expected ContentTooShort, got {other:?}"),
+        }
+    }
+
+    /// rationale: M4 Stage 3 sub-stage D — substantive article rejected
+    /// when `min_word_count` is set well above the XML body's word count.
+    #[test]
+    fn extract_to_xml_threshold_above_yield_rejects() {
+        let opts = Options {
+            min_word_count: 9999,
+            ..Options::default()
+        };
+        let err = extract_to_xml(SUBSTANTIVE_HTML, None, &opts)
+            .expect_err("real article well below 9999 must Err");
+        match err {
+            ExtractError::ContentTooShort { word_count, threshold } => {
+                assert_eq!(threshold, 9999);
+                assert!(word_count > 0);
+                assert!(word_count < 9999);
+            }
+            other => panic!("expected ContentTooShort, got {other:?}"),
+        }
+    }
+
+    // ---- extract_to_csv ----
+
+    /// rationale: M4 Stage 3 sub-stage C (xml.py:374-389) — default
+    /// Options on empty body returns a valid CSV (header row + one
+    /// data row of `null`s + body-only `null` text). NEVER errors.
+    #[test]
+    fn extract_to_csv_default_options_returns_ok_on_empty_extraction() {
+        let s = extract_to_csv("<html><body></body></html>", None, &Options::default())
+            .expect("default path must Ok on empty body");
+        // Header + at least one data row separated by \r\n; data fields
+        // are mostly `null`. We don't pin the exact shape (already pinned
+        // by `extract_to_csv_*` tests above); we pin only that Ok came
+        // back — the Bug-E2 contract at the CSV formatter entry.
+        assert!(s.contains("\r\n"), "must have header + data: {s:?}");
+    }
+
+    /// rationale: M4 Stage 3 sub-stage C — `min_word_count=1` on empty
+    /// body trips the gate with `{0, 1}`. Pins the exact pair.
+    #[test]
+    fn extract_to_csv_threshold_one_on_empty_returns_content_too_short() {
+        let opts = Options {
+            min_word_count: 1,
+            ..Options::default()
+        };
+        let err = extract_to_csv("<html><body></body></html>", None, &opts)
+            .expect_err("must Err");
+        match err {
+            ExtractError::ContentTooShort { word_count, threshold } => {
+                assert_eq!(word_count, 0);
+                assert_eq!(threshold, 1);
+            }
+            other => panic!("expected ContentTooShort, got {other:?}"),
+        }
+    }
+
+    /// rationale: M4 Stage 3 sub-stage C — substantive article rejected
+    /// when threshold is above real yield. Reported word_count is the
+    /// genuine CSV `text` column word count.
+    #[test]
+    fn extract_to_csv_threshold_above_yield_rejects() {
+        let opts = Options {
+            min_word_count: 9999,
+            ..Options::default()
+        };
+        let err = extract_to_csv(SUBSTANTIVE_HTML, None, &opts)
+            .expect_err("real article well below 9999 must Err");
+        match err {
+            ExtractError::ContentTooShort { word_count, threshold } => {
+                assert_eq!(threshold, 9999);
+                assert!(word_count > 0);
+                assert!(word_count < 9999);
+            }
+            other => panic!("expected ContentTooShort, got {other:?}"),
+        }
+    }
+
+    /// rationale: core.py:269-270 — `with_metadata=true` populates the
+    /// CSV metadata columns (url, title, hostname, image, date, license,
+    /// pagetype) from the real Metadata. Pins the `opts.with_metadata`
+    /// arm flowing into `xmltocsv`.
+    #[test]
+    fn extract_to_csv_with_metadata_populates_metadata_columns() {
+        let html = r#"<html><head>
+            <meta property="og:title" content="CSV Title">
+            <link rel="canonical" href="https://example.com/csv-page">
+            </head><body><article>
+            <p>A real readable paragraph with enough words to extract; lorem ipsum dolor
+            sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut
+            labore et dolore magna aliqua.</p>
+            </article></body></html>"#;
+        let opts = Options {
+            with_metadata: true,
+            ..Options::default()
+        };
+        let s = extract_to_csv(html, Some("https://example.com/csv-page"), &opts).expect("ok");
+        // The title column carries the real metadata title (not "null").
+        // Pin its presence in the data row.
+        assert!(
+            s.contains("CSV Title"),
+            "with_metadata=true must surface title in CSV: {s:?}"
+        );
+        assert!(
+            s.contains("https://example.com/csv-page"),
+            "with_metadata=true must surface url in CSV: {s:?}"
+        );
+    }
+
+    // ---- extract_to_tei ----
+
+    /// rationale: M4 Stage 3 sub-stage E (xml.py:186-235) — default
+    /// Options on empty body returns a structurally valid TEI tree and
+    /// NEVER errors. Pins Bug-E2 on the TEI formatter.
+    #[test]
+    fn extract_to_tei_default_options_returns_ok_on_empty_extraction() {
+        let s = extract_to_tei("<html><body></body></html>", None, &Options::default())
+            .expect("default path must Ok on empty body");
+        assert!(s.starts_with("<TEI"), "got: {s:?}");
+        assert!(s.ends_with("</TEI>"), "got: {s:?}");
+    }
+
+    /// rationale: M4 Stage 3 sub-stage E — `min_word_count=1` on empty
+    /// body trips the gate with `{0, 1}` precisely.
+    #[test]
+    fn extract_to_tei_threshold_one_on_empty_returns_content_too_short() {
+        let opts = Options {
+            min_word_count: 1,
+            ..Options::default()
+        };
+        let err = extract_to_tei("<html><body></body></html>", None, &opts)
+            .expect_err("must Err");
+        match err {
+            ExtractError::ContentTooShort { word_count, threshold } => {
+                assert_eq!(word_count, 0);
+                assert_eq!(threshold, 1);
+            }
+            other => panic!("expected ContentTooShort, got {other:?}"),
+        }
+    }
+
+    /// rationale: M4 Stage 3 sub-stage E — substantive article rejected
+    /// when threshold is above real TEI body yield.
+    #[test]
+    fn extract_to_tei_threshold_above_yield_rejects() {
+        let opts = Options {
+            min_word_count: 9999,
+            ..Options::default()
+        };
+        let err = extract_to_tei(SUBSTANTIVE_HTML, None, &opts)
+            .expect_err("real article well below 9999 must Err");
+        match err {
+            ExtractError::ContentTooShort { word_count, threshold } => {
+                assert_eq!(threshold, 9999);
+                assert!(word_count > 0);
+                assert!(word_count < 9999);
+            }
+            other => panic!("expected ContentTooShort, got {other:?}"),
+        }
+    }
+
+    // ---- extract_via_readability (the M2 legacy path) ----
+
+    /// rationale: M2 Stage 4 (HLD §7.6) preserved at M3 finale — the M2
+    /// path's default-Options contract: empty body returns an `Ok` with
+    /// `Extracted::default()`-shape values; NEVER errors. The M2
+    /// `Readability::parse()` returns `None` on empty body, which the
+    /// legacy function maps to `Extracted::default()`.
+    #[test]
+    fn extract_via_readability_default_options_returns_ok_on_empty_extraction() {
+        let e = extract_via_readability(
+            "<html><body></body></html>",
+            None,
+            &Options::default(),
+        )
+        .expect("M2 default path must Ok on empty body");
+        assert_eq!(e.text, "");
+        assert_eq!(e.word_count, 0);
+        assert!(e.title.is_none());
+        // M2 path: comments concept does not exist; the field defaults to "".
+        assert_eq!(e.comments, "");
+    }
+
+    /// rationale: M2 Stage 4 (HLD §7.6) — the M2 path's `min_word_count`
+    /// gate fires identically to extract_with on an empty extraction.
+    #[test]
+    fn extract_via_readability_threshold_one_on_empty_returns_content_too_short() {
+        let opts = Options {
+            min_word_count: 1,
+            ..Options::default()
+        };
+        let err = extract_via_readability("<html><body></body></html>", None, &opts)
+            .expect_err("must Err");
+        match err {
+            ExtractError::ContentTooShort { word_count, threshold } => {
+                assert_eq!(word_count, 0);
+                assert_eq!(threshold, 1);
+            }
+            other => panic!("expected ContentTooShort, got {other:?}"),
+        }
+    }
+
+    /// rationale: M2 Stage 4 (HLD §7.6) — the M2 path rejects a real
+    /// extraction when threshold is above its yield. Pins the
+    /// `word_count` field carries the M2-produced real count.
+    #[test]
+    fn extract_via_readability_threshold_above_yield_rejects() {
+        let opts = Options {
+            min_word_count: 9999,
+            ..Options::default()
+        };
+        let err = extract_via_readability(SUBSTANTIVE_HTML, None, &opts)
+            .expect_err("real article well below 9999 must Err");
+        match err {
+            ExtractError::ContentTooShort { word_count, threshold } => {
+                assert_eq!(threshold, 9999);
+                assert!(word_count > 0, "word_count must be real: {word_count}");
+                assert!(word_count < 9999, "below threshold: {word_count}");
+            }
+            other => panic!("expected ContentTooShort, got {other:?}"),
+        }
+    }
+
+    /// rationale: `extract_via_readability` honours `opts.include_html`
+    /// identically to the pre-Stage-9 `extract_with` (per the function's
+    /// own doc comment). Pin the include_html=true arm on the M2 path.
+    #[test]
+    fn extract_via_readability_include_html_populates_html_field() {
+        let opts = Options {
+            include_html: true,
+            ..Options::default()
+        };
+        let e = extract_via_readability(SUBSTANTIVE_HTML, None, &opts)
+            .expect("substantive article must extract");
+        assert!(
+            e.html.is_some(),
+            "include_html=true must populate html on M2 path"
+        );
+        assert!(!e.text.is_empty());
+    }
+
+    /// rationale: the M2 path on the default Options must produce a real
+    /// `Ok(Extracted)` on a normal article (the "happy path" — distinct
+    /// from the empty-body Bug-E2 test). Pins that `Some(article)` branch
+    /// of `Readability::parse()` is reachable through the public M2 entry.
+    #[test]
+    fn extract_via_readability_substantive_article_populates_text_and_title() {
+        let e = extract_via_readability(SUBSTANTIVE_HTML, None, &Options::default())
+            .expect("must extract");
+        assert!(!e.text.is_empty());
+        assert!(e.word_count > 0);
+        // The sample title is "An Article".
+        assert_eq!(e.title.as_deref(), Some("An Article"));
+    }
+
+    // ---- ExtractError Display / Error trait coverage ----
+
+    /// rationale: `ExtractError::Display` must produce a complete and
+    /// stable message for `ContentTooShort` carrying BOTH the word_count
+    /// AND threshold numbers. Already pinned by
+    /// `content_too_short_display_carries_numbers`; this adds a stricter
+    /// check on the exact substring shape from the source format string
+    /// ("words" and "threshold:").
+    #[test]
+    fn content_too_short_display_contains_words_and_threshold_labels() {
+        let err = ExtractError::ContentTooShort {
+            word_count: 42,
+            threshold: 100,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("42 words"),
+            "must contain '<n> words', got: {msg:?}"
+        );
+        assert!(
+            msg.contains("threshold: 100"),
+            "must contain 'threshold: <n>', got: {msg:?}"
+        );
+    }
+
+    /// rationale: `ExtractError` must implement `std::error::Error` so
+    /// downstream consumers can treat it as a boxed error trait object.
+    /// Pin the trait impl is wired up by attempting to box both variants.
+    #[test]
+    fn extract_error_implements_std_error_trait_for_both_variants() {
+        // Boxing into `Box<dyn Error>` only compiles when the trait impl
+        // is present; reading the source() on each variant exercises the
+        // default `source() -> None` (no `cause` is wrapped).
+        let a: Box<dyn std::error::Error> = Box::new(ExtractError::NotImplemented);
+        let b: Box<dyn std::error::Error> = Box::new(ExtractError::ContentTooShort {
+            word_count: 0,
+            threshold: 1,
+        });
+        // No source on either variant (the enum is leaf-level).
+        assert!(a.source().is_none(), "NotImplemented has no source");
+        assert!(b.source().is_none(), "ContentTooShort has no source");
+        // Display routes through the impl on both arms.
+        assert!(!a.to_string().is_empty());
+        assert!(!b.to_string().is_empty());
+    }
+
+    /// rationale: `ExtractError` derives `Debug`. Pin both variants
+    /// render with their discriminant name so a developer reading a
+    /// panic trace can tell them apart.
+    #[test]
+    fn extract_error_debug_renders_variant_names() {
+        let a = format!("{:?}", ExtractError::NotImplemented);
+        let b = format!(
+            "{:?}",
+            ExtractError::ContentTooShort {
+                word_count: 7,
+                threshold: 9,
+            }
+        );
+        assert!(a.contains("NotImplemented"), "got: {a:?}");
+        assert!(b.contains("ContentTooShort"), "got: {b:?}");
+        // ContentTooShort's Debug must include the field values too.
+        assert!(b.contains('7') && b.contains('9'), "got: {b:?}");
+    }
 }
