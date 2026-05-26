@@ -2207,4 +2207,600 @@ mod tests {
         let r = find_date(&root, &o);
         assert_eq!(r.as_deref(), Some("2024-03-15"));
     }
+
+    // -----------------------------------------------------------------------
+    // examine_header — additional arm coverage (core.py:235-352)
+    // -----------------------------------------------------------------------
+
+    /// rationale: pin `examine_header`'s `og:url` arm (core.py:272-273)
+    /// — `name="og:url"` content goes through `extract_url_date` and
+    /// lands in `reserve`, surfacing as the final headerdate.
+    #[test]
+    fn examine_header_og_url_populates_reserve() {
+        let html = r#"<html><head>
+            <meta name="og:url" content="https://example.com/2024/06/15/post">
+        </head><body></body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts_orig("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(examine_header(&root, &o).as_deref(), Some("2024-06-15"));
+    }
+
+    /// rationale: pin `examine_header`'s `NAME_MODIFIED` arm with
+    /// `options.original=false` — `name="lastmod"` populates headerdate
+    /// directly (core.py:279-282).
+    #[test]
+    fn examine_header_name_lastmod_populates_headerdate_when_not_original() {
+        let html = r#"<html><head>
+            <meta name="lastmod" content="2024-06-15">
+        </head><body></body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(examine_header(&root, &o).as_deref(), Some("2024-06-15"));
+    }
+
+    /// rationale: pin `examine_header`'s `NAME_MODIFIED` arm with
+    /// `options.original=true` — `name="lastmod"` lands in `reserve`
+    /// (core.py:283-284).
+    #[test]
+    fn examine_header_name_lastmod_populates_reserve_when_original() {
+        let html = r#"<html><head>
+            <meta name="lastmod" content="2024-06-15">
+        </head><body></body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts_orig("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        // With `original=true` and no publish date, reserve surfaces.
+        assert_eq!(examine_header(&root, &o).as_deref(), Some("2024-06-15"));
+    }
+
+    /// rationale: pin `examine_header`'s `property=` DATE_ATTRIBUTES arm
+    /// where original=true and the property is a publication marker
+    /// (core.py:294 — `(is_date && original) → headerdate`).
+    #[test]
+    fn examine_header_property_published_with_original_populates_headerdate() {
+        let html = r#"<html><head>
+            <meta property="article:published_time" content="2024-06-15">
+        </head><body></body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts_orig("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(examine_header(&root, &o).as_deref(), Some("2024-06-15"));
+    }
+
+    /// rationale: pin `examine_header`'s `property=` PROPERTY_MODIFIED arm
+    /// where original=false (core.py:294 — `(is_mod && !original) →
+    /// headerdate`).
+    #[test]
+    fn examine_header_property_modified_with_not_original_populates_headerdate() {
+        let html = r#"<html><head>
+            <meta property="article:modified_time" content="2024-06-15">
+        </head><body></body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(examine_header(&root, &o).as_deref(), Some("2024-06-15"));
+    }
+
+    /// rationale: pin `examine_header`'s `property=` "hurts precision"
+    /// arm (core.py:296-298) — DATE attr with original=FALSE goes to
+    /// reserve (surfaces when no other headerdate is found).
+    #[test]
+    fn examine_header_property_published_with_not_original_goes_to_reserve() {
+        let html = r#"<html><head>
+            <meta property="article:published_time" content="2024-06-15">
+        </head><body></body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        // No modified-time present so the published-time reserve surfaces.
+        assert_eq!(examine_header(&root, &o).as_deref(), Some("2024-06-15"));
+    }
+
+    /// rationale: pin `examine_header`'s itemprop ITEMPROP_ATTRS_MODIFIED
+    /// arm (`dateModified`) with `original=false` → headerdate.
+    #[test]
+    fn examine_header_itemprop_date_modified_populates_headerdate() {
+        let html = r#"<html><head>
+            <meta itemprop="dateModified" content="2024-06-15">
+        </head><body></body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(examine_header(&root, &o).as_deref(), Some("2024-06-15"));
+    }
+
+    /// rationale: pin `examine_header`'s itemprop `datetime`-attribute
+    /// preference arm — `elem.get("datetime") or elem.get("content")`
+    /// at core.py:305 reads `datetime` first.
+    #[test]
+    fn examine_header_itemprop_prefers_datetime_attr_over_content() {
+        let html = r#"<html><head>
+            <meta itemprop="datePublished" datetime="2024-06-15" content="2020-01-01">
+        </head><body></body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts_orig("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        // datetime attr (2024-06-15) wins over content (2020-01-01).
+        assert_eq!(examine_header(&root, &o).as_deref(), Some("2024-06-15"));
+    }
+
+    /// rationale: pin `examine_header`'s itemprop `copyrightyear`
+    /// rejection arm — the synthesised "<year>-01-01" fails is_valid_date
+    /// (year below min), so reserve is NOT set.
+    #[test]
+    fn examine_header_copyrightyear_invalid_year_not_used() {
+        let html = r#"<html><head>
+            <meta itemprop="copyrightYear" content="1980">
+        </head><body></body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts_orig("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        // 1980 is below the 1995 minimum → reserve stays None → headerdate=None.
+        assert_eq!(examine_header(&root, &o), None);
+    }
+
+    /// rationale: pin `examine_header`'s `http-equiv="date"` arm
+    /// with `original=true` (core.py:331 → headerdate).
+    #[test]
+    fn examine_header_http_equiv_date_original_populates_headerdate() {
+        let html = r#"<html><head>
+            <meta http-equiv="date" content="2024-06-15">
+        </head><body></body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts_orig("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(examine_header(&root, &o).as_deref(), Some("2024-06-15"));
+    }
+
+    /// rationale: pin `examine_header`'s `http-equiv="date"` arm
+    /// with `original=false` (core.py:333 → reserve).
+    #[test]
+    fn examine_header_http_equiv_date_not_original_goes_to_reserve() {
+        let html = r#"<html><head>
+            <meta http-equiv="date" content="2024-06-15">
+        </head><body></body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(examine_header(&root, &o).as_deref(), Some("2024-06-15"));
+    }
+
+    /// rationale: pin `examine_header`'s `http-equiv="last-modified"`
+    /// arm with `original=true` → reserve (core.py:341-343).
+    #[test]
+    fn examine_header_http_equiv_last_modified_original_goes_to_reserve() {
+        let html = r#"<html><head>
+            <meta http-equiv="last-modified" content="2024-06-15">
+        </head><body></body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts_orig("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        // reserve surfaces because no headerdate was set.
+        assert_eq!(examine_header(&root, &o).as_deref(), Some("2024-06-15"));
+    }
+
+    /// rationale: pin `examine_header`'s skip-meta-without-content arm
+    /// (core.py:262-267 — meta with NEITHER content nor datetime is
+    /// skipped entirely).
+    #[test]
+    fn examine_header_skips_meta_without_content_or_datetime() {
+        let html = r#"<html><head>
+            <meta name="datePublished">
+        </head><body></body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts_orig("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(examine_header(&root, &o), None);
+    }
+
+    /// rationale: pin `examine_header`'s pubdate-attribute non-"pubdate"
+    /// value arm — `pubdate="off"` (or anything other than literal
+    /// "pubdate") is silently skipped (core.py:325-327).
+    #[test]
+    fn examine_header_pubdate_attr_non_pubdate_value_ignored() {
+        let html = r#"<html><head>
+            <meta pubdate="off" content="2024-06-15">
+        </head><body></body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts_orig("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(examine_header(&root, &o), None);
+    }
+
+    /// rationale: pin `examine_header`'s `name=` unknown-name arm — a
+    /// `name` attribute neither in DATE_ATTRIBUTES nor NAME_MODIFIED is
+    /// silently skipped, leaving headerdate=None.
+    #[test]
+    fn examine_header_name_unknown_value_skipped() {
+        let html = r#"<html><head>
+            <meta name="totally-unrelated" content="2024-06-15">
+        </head><body></body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts_orig("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(examine_header(&root, &o), None);
+    }
+
+    /// rationale: pin `examine_header`'s early-break (`headerdate.is_some()
+    /// break`) — multiple matching metas should stop at the first.
+    #[test]
+    fn examine_header_breaks_on_first_headerdate() {
+        let html = r#"<html><head>
+            <meta name="datePublished" content="2024-01-15">
+            <meta name="datePublished" content="2020-06-15">
+        </head><body></body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts_orig("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        // The first meta wins.
+        assert_eq!(examine_header(&root, &o).as_deref(), Some("2024-01-15"));
+    }
+
+    // -----------------------------------------------------------------------
+    // examine_abbr_elements — additional shape coverage (core.py:443-497)
+    // -----------------------------------------------------------------------
+
+    /// rationale: pin `examine_abbr_elements`'s `data-utime` numeric arm
+    /// (core.py:453-464) — Unix timestamp on an <abbr> populates reference.
+    #[test]
+    fn examine_abbr_data_utime_numeric_arm() {
+        // 1718409600 = 2024-06-15 00:00:00 UTC
+        let html = r#"<html><body>
+            <abbr data-utime="1718409600">Jun 15, 2024</abbr>
+        </body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(examine_abbr_elements(&root, &o).as_deref(), Some("2024-06-15"));
+    }
+
+    /// rationale: pin `examine_abbr_elements`'s `data-utime` parse-error
+    /// continue arm (core.py:456-459) — non-numeric data-utime is skipped.
+    #[test]
+    fn examine_abbr_data_utime_non_numeric_continues() {
+        let html = r#"<html><body>
+            <abbr data-utime="not-a-number">Garbage</abbr>
+        </body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(examine_abbr_elements(&root, &o), None);
+    }
+
+    /// rationale: pin `examine_abbr_elements`'s class+title arm with
+    /// `original=false` — uses `compare_reference` to accumulate timestamps
+    /// (core.py:478-486).
+    #[test]
+    fn examine_abbr_class_title_not_original_uses_compare_reference() {
+        let html = r#"<html><body>
+            <abbr class="published" title="2024-06-15">Jun 15</abbr>
+        </body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(examine_abbr_elements(&root, &o).as_deref(), Some("2024-06-15"));
+    }
+
+    /// rationale: pin `examine_abbr_elements`'s class+text-content arm
+    /// (no title) — falls back to elem.text when title is absent
+    /// (core.py:488-490).
+    #[test]
+    fn examine_abbr_class_text_content_arm() {
+        let html = r#"<html><body>
+            <abbr class="published">15 June 2024 published</abbr>
+        </body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(examine_abbr_elements(&root, &o).as_deref(), Some("2024-06-15"));
+    }
+
+    /// rationale: pin `examine_abbr_elements`'s short-text rejection arm
+    /// — text <= 10 chars is dropped (core.py:488-490 `if len(text) > 10`).
+    #[test]
+    fn examine_abbr_class_short_text_dropped() {
+        let html = r#"<html><body>
+            <abbr class="published">Jun 15</abbr>
+        </body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(examine_abbr_elements(&root, &o), None);
+    }
+
+    /// rationale: pin `examine_abbr_elements`'s empty-list arm — no
+    /// <abbr> elements → early `None` (core.py:447).
+    #[test]
+    fn examine_abbr_no_abbr_elements_returns_none() {
+        let html = "<html><body><p>no abbrs here</p></body></html>";
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(examine_abbr_elements(&root, &o), None);
+    }
+
+    /// rationale: pin `examine_abbr_elements`'s class+title with
+    /// `original=true` and `try_date_expr` returning None — invalid title
+    /// (e.g. "not a date" with no digit content) leaves headerdate as
+    /// None (core.py:470-475).
+    #[test]
+    fn examine_abbr_class_title_invalid_returns_none() {
+        let html = r#"<html><body>
+            <abbr class="published" title="not a date">June</abbr>
+        </body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts_orig("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        // title parse fails, no text → returns None.
+        assert_eq!(examine_abbr_elements(&root, &o), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // examine_time_elements — additional shape coverage (core.py:500-562)
+    // -----------------------------------------------------------------------
+
+    /// rationale: pin `examine_time_elements`'s `pubdate` shortcut WITHOUT
+    /// the `pubdate=pubdate` attribute value — `pubdate="off"` doesn't
+    /// engage the shortcut and falls into the accumulator.
+    #[test]
+    fn examine_time_pubdate_non_match_uses_accumulator() {
+        let html = r#"<html><body>
+            <time pubdate="off" datetime="2024-06-15">Jun 15</time>
+        </body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts_orig("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        // pubdate="off" misses the shortcut; accumulator picks 2024-06-15.
+        assert_eq!(examine_time_elements(&root, &o).as_deref(), Some("2024-06-15"));
+    }
+
+    /// rationale: pin `examine_time_elements`'s `class="entry-date"`
+    /// shortcut with `original=true` (core.py:522-538).
+    #[test]
+    fn examine_time_class_entry_date_shortcut() {
+        let html = r#"<html><body>
+            <time class="entry-date" datetime="2024-06-15">Jun 15</time>
+        </body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts_orig("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(examine_time_elements(&root, &o).as_deref(), Some("2024-06-15"));
+    }
+
+    /// rationale: pin `examine_time_elements`'s `class="entry-time"`
+    /// shortcut arm (also core.py:522-538).
+    #[test]
+    fn examine_time_class_entry_time_shortcut() {
+        let html = r#"<html><body>
+            <time class="entry-time" datetime="2024-06-15">Jun 15</time>
+        </body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts_orig("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(examine_time_elements(&root, &o).as_deref(), Some("2024-06-15"));
+    }
+
+    /// rationale: pin `examine_time_elements`'s `class="updated"`
+    /// shortcut arm (with `original=false`, core.py:533).
+    #[test]
+    fn examine_time_class_updated_shortcut_when_not_original() {
+        let html = r#"<html><body>
+            <time class="updated" datetime="2024-06-15">Jun 15</time>
+        </body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(examine_time_elements(&root, &o).as_deref(), Some("2024-06-15"));
+    }
+
+    /// rationale: pin `examine_time_elements`'s "no <time> elements" arm
+    /// (core.py:504-505).
+    #[test]
+    fn examine_time_no_elements_returns_none() {
+        let html = "<html><body><p>no time tags</p></body></html>";
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(examine_time_elements(&root, &o), None);
+    }
+
+    /// rationale: pin `examine_time_elements`'s short-datetime-attr arm
+    /// — `datetime.len() <= 6` falls into the text-content branch
+    /// (core.py:556-558).
+    #[test]
+    fn examine_time_short_datetime_falls_to_text_content() {
+        let html = r#"<html><body>
+            <time datetime="2024">June 15, 2024</time>
+        </body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        // datetime="2024" has len 4 ≤ 6 → text content "June 15, 2024" is used.
+        assert_eq!(examine_time_elements(&root, &o).as_deref(), Some("2024-06-15"));
+    }
+
+    /// rationale: pin `examine_time_elements`'s shortcut-with-failed-
+    /// parse arm — datetime attr looks valid but parses to nothing,
+    /// then falls back to the accumulator (which is still 0 → None).
+    #[test]
+    fn examine_time_shortcut_failed_parse_returns_none() {
+        let html = r#"<html><body>
+            <time pubdate="pubdate" datetime="not-a-real-date">June</time>
+        </body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts_orig("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        // try_date_expr returns None → falls through, no other shortcut, accumulator=0 → None.
+        assert_eq!(examine_time_elements(&root, &o), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // search_page — additional deep-cascade coverage (core.py:574-805)
+    // -----------------------------------------------------------------------
+
+    /// rationale: pin `search_page`'s deep-cascade no-match arm — a page
+    /// whose only date-like content is the bare 2-digit year fails every
+    /// arm (THREE_COMP needs 4-digit year, SELECT_YMD needs 4-digit year,
+    /// DATESTRINGS needs 8 digits, SLASHES needs DD/MM/YY, YYYYMM needs
+    /// 4-digit year, MMYYYY needs 4-digit year, copyright text patterns
+    /// need explicit ©/Copyright, SIMPLE needs 4-digit year).
+    #[test]
+    fn search_page_all_arms_miss_returns_none() {
+        // Just a 2-digit year fragment with no surrounding date context.
+        let html = "<html><body>see 24 things</body></html>";
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(search_page(html, &o), None);
+    }
+
+    /// rationale: pin `search_page`'s YYYYMM_PATTERN copyear gate
+    /// — when copyear is set above the YYYY/MM year, the YYYYMM arm
+    /// is skipped (core.py:728 — `if (copyear == 0 || dt.year >= copyear)`).
+    #[test]
+    fn search_page_yyyymm_below_copyear_falls_through() {
+        // Copyright 2024, but YYYYMM only is 2020/06. The 2020 year is
+        // below copyear 2024 → YYYYMM arm skipped, copyright catchall fires.
+        let html = "<html><body>archive 2020/06 contents © 2024 Acme</body></html>";
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        let r = search_page(html, &o);
+        // The copyright year catchall returns 2024-01-01.
+        assert_eq!(r.as_deref(), Some("2024-01-01"));
+    }
+
+    /// rationale: pin `search_page`'s copyright-only-page arm — © year
+    /// is the only signal.
+    #[test]
+    fn search_page_copyright_text_only_returns_copyear() {
+        let html = "<html><body>Copyright 2024 by Acme.</body></html>";
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(search_page(html, &o).as_deref(), Some("2024-01-01"));
+    }
+
+    /// rationale: pin `search_page`'s copyright-rejection arm — when
+    /// the © year is below the min-date window, `is_valid_date` rejects
+    /// the year and copyear stays 0.
+    #[test]
+    fn search_page_copyright_below_min_year_not_set_as_copyear() {
+        // © 1980 with min_date=1995 → copyear stays 0.
+        // No other date → SIMPLE arm finds "1980" but min filter drops it.
+        let html = "<html><body>© 1980 Old.</body></html>";
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(search_page(html, &o), None);
+    }
+
+    /// rationale: pin `search_page`'s `simple_pattern` rejection by the
+    /// min-date filter (year < min.year is removed from occurrences).
+    #[test]
+    fn search_page_simple_pattern_rejects_year_below_min() {
+        // bare year 1980, no copyright. SIMPLE arm catches 1980 but
+        // out-of-range → drops it.
+        let html = "<html><body>see 1980 archives</body></html>";
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(search_page(html, &o), None);
+    }
+
+    /// rationale: pin `search_page`'s simple_pattern + copyear gate
+    /// — when SIMPLE finds year < copyear, it's rejected
+    /// (core.py:794-797 — `year >= copyear`). The copyright catchall
+    /// then fires and returns `copyear-01-01`.
+    #[test]
+    fn search_page_simple_year_below_copyear_uses_copyear_catchall() {
+        // © 2024, plus a bare "2020" elsewhere. SIMPLE finds 2020 but
+        // 2020 < copyear 2024 → drops it. Catchall returns 2024-01-01.
+        let html = "<html><body>info 2020 © 2024 Inc.</body></html>";
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(search_page(html, &o).as_deref(), Some("2024-01-01"));
+    }
+
+    // -----------------------------------------------------------------------
+    // make_date — calendar boundary arms
+    // -----------------------------------------------------------------------
+
+    /// rationale: pin `make_date`'s month-zero rejection arm.
+    #[test]
+    fn make_date_rejects_zero_month() {
+        assert_eq!(make_date(2024, 0, 15), None);
+    }
+
+    /// rationale: pin `make_date`'s month-13 rejection arm.
+    #[test]
+    fn make_date_rejects_month_over_twelve() {
+        assert_eq!(make_date(2024, 13, 15), None);
+    }
+
+    /// rationale: pin `make_date`'s day-zero rejection arm.
+    #[test]
+    fn make_date_rejects_zero_day() {
+        assert_eq!(make_date(2024, 6, 0), None);
+    }
+
+    /// rationale: pin `make_date`'s day-32 rejection arm.
+    #[test]
+    fn make_date_rejects_day_over_thirty_one() {
+        assert_eq!(make_date(2024, 6, 32), None);
+    }
+
+    /// rationale: pin `make_date`'s happy path.
+    #[test]
+    fn make_date_accepts_valid_date() {
+        assert!(make_date(2024, 6, 15).is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // recapture_ymd_groups — None arm coverage
+    // -----------------------------------------------------------------------
+
+    /// rationale: pin `recapture_ymd_groups`'s captures-None arm — when
+    /// the catch regex doesn't match at all, returns None.
+    #[test]
+    fn recapture_ymd_groups_returns_none_for_non_matching_string() {
+        use super::super::regex_catalogues::ymd_pattern;
+        let r = recapture_ymd_groups("no date here", ymd_pattern());
+        assert_eq!(r, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // examine_text — additional arm coverage
+    // -----------------------------------------------------------------------
+
+    /// rationale: pin `examine_text`'s scrub arm — trailing non-digits
+    /// are removed after MAX_SEGMENT_LEN truncation.
+    #[test]
+    fn examine_text_scrubs_trailing_non_digits() {
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        // "2024-06-15abcdef" — the trailing letters are scrubbed by
+        // NON_DIGITS_REGEX before try_date_expr fires.
+        let r = examine_text("2024-06-15abcdef", &o);
+        assert_eq!(r.as_deref(), Some("2024-06-15"));
+    }
+
+    // -----------------------------------------------------------------------
+    // examine_date_elements — element-bound arms
+    // -----------------------------------------------------------------------
+
+    /// rationale: pin `examine_date_elements`'s "no matches" arm.
+    #[test]
+    fn examine_date_elements_no_match_returns_none() {
+        let html = "<html><body><p>no dates</p></body></html>";
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        let r = examine_date_elements(&root, ".//time", &o);
+        assert_eq!(r, None);
+    }
+
+    /// rationale: pin `examine_date_elements`'s title-attribute arm
+    /// (core.py:227 — iterate over `[text_content, title]`).
+    #[test]
+    fn examine_date_elements_uses_title_attribute() {
+        let html = r#"<html><body>
+            <span title="published 2024-06-15 today">June</span>
+        </body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html");
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        let r = examine_date_elements(&root, ".//span", &o);
+        assert_eq!(r.as_deref(), Some("2024-06-15"));
+    }
 }

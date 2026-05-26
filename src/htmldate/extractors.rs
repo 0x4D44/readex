@@ -1228,4 +1228,342 @@ mod tests {
             None
         );
     }
+
+    // -----------------------------------------------------------------------
+    // extract_url_date — additional fail paths
+    // -----------------------------------------------------------------------
+
+    /// rationale: pin `extract_url_date`'s `make_datetime` rejection arm
+    /// — the URL captures a calendar-invalid date (Feb 30).
+    #[test]
+    fn extract_url_date_rejects_invalid_calendar_date() {
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        let r = extract_url_date(Some("https://example.com/2024/02/30/post"), &o);
+        assert_eq!(r, None);
+    }
+
+    /// rationale: pin `extract_url_date`'s month=00 rejection arm
+    /// (`make_datetime` rejects month outside 1..=12).
+    #[test]
+    fn extract_url_date_rejects_zero_month() {
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        let r = extract_url_date(Some("https://example.com/2024/00/15/post"), &o);
+        assert_eq!(r, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // try_fromisoformat — shape catalog
+    // -----------------------------------------------------------------------
+
+    /// rationale: pin `try_fromisoformat`'s `Z` suffix strip + date-only
+    /// shape.
+    #[test]
+    fn try_fromisoformat_handles_z_suffix() {
+        let r = try_fromisoformat("2024-06-15Z").expect("should parse with Z");
+        assert_eq!((r.year, r.month, r.day), (2024, 6, 15));
+    }
+
+    /// rationale: pin `try_fromisoformat`'s `+HH:MM` offset strip arm.
+    #[test]
+    fn try_fromisoformat_handles_positive_offset() {
+        let r = try_fromisoformat("2024-06-15T12:34:56+05:30").expect("should parse");
+        assert_eq!((r.year, r.month, r.day), (2024, 6, 15));
+        assert_eq!((r.hour, r.minute, r.second), (12, 34, 56));
+    }
+
+    /// rationale: pin `try_fromisoformat`'s `-HH:MM` offset strip arm.
+    #[test]
+    fn try_fromisoformat_handles_negative_offset() {
+        let r = try_fromisoformat("2024-06-15T12:34:56-05:00").expect("should parse");
+        assert_eq!(r.year, 2024);
+    }
+
+    /// rationale: pin `try_fromisoformat`'s space-separator arm.
+    #[test]
+    fn try_fromisoformat_handles_space_separator() {
+        let r = try_fromisoformat("2024-06-15 12:34:56").expect("should parse");
+        assert_eq!(r.hour, 12);
+    }
+
+    /// rationale: pin `try_fromisoformat`'s rejection of bad separator
+    /// in datetime form.
+    #[test]
+    fn try_fromisoformat_rejects_bad_separator() {
+        assert_eq!(try_fromisoformat("2024-06-15X12:34:56"), None);
+    }
+
+    /// rationale: pin `try_fromisoformat`'s rejection of unusual length
+    /// (not 10 and not 19).
+    #[test]
+    fn try_fromisoformat_rejects_unexpected_length() {
+        assert_eq!(try_fromisoformat("2024-06-15T12"), None);
+    }
+
+    /// rationale: pin `try_fromisoformat`'s rejection of out-of-range
+    /// hour value.
+    #[test]
+    fn try_fromisoformat_rejects_out_of_range_hour() {
+        assert_eq!(try_fromisoformat("2024-06-15T25:00:00"), None);
+    }
+
+    /// rationale: pin `try_fromisoformat`'s rejection of bad colon
+    /// at position 13.
+    #[test]
+    fn try_fromisoformat_rejects_bad_hour_minute_colon() {
+        assert_eq!(try_fromisoformat("2024-06-15T12.34:56"), None);
+    }
+
+    /// rationale: pin `try_fromisoformat`'s rejection of bad colon
+    /// at position 16.
+    #[test]
+    fn try_fromisoformat_rejects_bad_minute_second_colon() {
+        assert_eq!(try_fromisoformat("2024-06-15T12:34.56"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // custom_parse — each path through the cascade
+    // -----------------------------------------------------------------------
+
+    /// rationale: pin `custom_parse`'s `dateutil_parse_fallback` arm —
+    /// when fromisoformat fails but the explicit-format list catches it.
+    /// Input starts with 4 digits (so the leading-digits branch fires),
+    /// but its full shape (e.g. `YYYY/MM/DD`) isn't ISO.
+    #[test]
+    fn custom_parse_uses_dateutil_fallback_for_yyyy_slash_mmdd() {
+        let min = dt(1995, 1, 1);
+        let max = dt(2030, 12, 31);
+        let r = custom_parse("2024/06/15", "%Y-%m-%d", &min, &max);
+        assert_eq!(r.as_deref(), Some("2024-06-15"));
+    }
+
+    /// rationale: pin `custom_parse`'s YMD_NO_SEP arm — 8-digit run
+    /// embedded in surrounding non-digit text (forced via leading `x`
+    /// to bypass the leading-digits shortcut).
+    #[test]
+    fn custom_parse_finds_embedded_yyyymmdd_no_sep() {
+        let min = dt(1995, 1, 1);
+        let max = dt(2030, 12, 31);
+        let r = custom_parse("ref 20240615 today", "%Y-%m-%d", &min, &max);
+        assert_eq!(r.as_deref(), Some("2024-06-15"));
+    }
+
+    /// rationale: pin `custom_parse`'s YM_PATTERN arm — year+month only,
+    /// no day. Forced via a non-digit leading character so the digit
+    /// shortcut does NOT short-circuit.
+    #[test]
+    fn custom_parse_ym_only_defaults_day_to_one() {
+        let min = dt(1995, 1, 1);
+        let max = dt(2030, 12, 31);
+        let r = custom_parse("see 2024-06 here", "%Y-%m-%d", &min, &max);
+        // YM_PATTERN defaults the day to 1.
+        assert_eq!(r.as_deref(), Some("2024-06-01"));
+    }
+
+    /// rationale: pin `custom_parse`'s 8-digit YMD shortcut rejecting
+    /// an invalid calendar date (Feb 30 returns None from make_datetime).
+    #[test]
+    fn custom_parse_rejects_invalid_eight_digit_yyyymmdd() {
+        let min = dt(1995, 1, 1);
+        let max = dt(2030, 12, 31);
+        // 20240230 → year=2024, month=02, day=30 → invalid calendar.
+        let r = custom_parse("20240230", "%Y-%m-%d", &min, &max);
+        assert_eq!(r, None);
+    }
+
+    /// rationale: pin `custom_parse`'s YMD-arm calendar-rejection inside
+    /// the YMD_PATTERN scan (year-month-day with calendar-invalid day).
+    /// The YMD_PATTERN match's make_datetime returns None, then the cascade
+    /// falls through to YM_PATTERN which captures the year-month prefix
+    /// and emits day=01. Pins the make_datetime-rejection arm in the YMD
+    /// branch via the observation that the YM fallback fires instead.
+    #[test]
+    fn custom_parse_invalid_ymd_day_falls_through_to_ym_pattern() {
+        let min = dt(1995, 1, 1);
+        let max = dt(2030, 12, 31);
+        let r = custom_parse("xx 2024-02-30 yy", "%Y-%m-%d", &min, &max);
+        // YMD calendar rejected → YM_PATTERN catches "2024-02" → day=01.
+        assert_eq!(r.as_deref(), Some("2024-02-01"));
+    }
+
+    /// rationale: pin `custom_parse`'s reverse DMY arm (year2/month2/day2)
+    /// when YMD_PATTERN matches the dd/mm/yyyy alternative.
+    #[test]
+    fn custom_parse_handles_dmy_pattern_with_two_digit_year() {
+        let min = dt(1995, 1, 1);
+        let max = dt(2030, 12, 31);
+        // The DMY arm uses correct_year on a 2-digit year.
+        let r = custom_parse("on 15.06.24 today", "%Y-%m-%d", &min, &max);
+        assert_eq!(r.as_deref(), Some("2024-06-15"));
+    }
+
+    // -----------------------------------------------------------------------
+    // try_date_expr — defensive arms
+    // -----------------------------------------------------------------------
+
+    /// rationale: pin `try_date_expr`'s digit-count > 18 rejection arm.
+    #[test]
+    fn try_date_expr_rejects_over_eighteen_digits() {
+        let min = dt(1995, 1, 1);
+        let max = dt(2030, 12, 31);
+        // 19 digits exceeds the upper bound of 4..=18.
+        let r = try_date_expr(
+            Some("1234567890123456789"),
+            "%Y-%m-%d",
+            false,
+            &min,
+            &max,
+        );
+        assert_eq!(r, None);
+    }
+
+    /// rationale: pin `try_date_expr`'s `extensive_search=false +
+    /// custom_parse miss` arm — no fallback path engaged.
+    #[test]
+    fn try_date_expr_returns_none_when_custom_parse_misses_and_not_extensive() {
+        let min = dt(1995, 1, 1);
+        let max = dt(2030, 12, 31);
+        // "on Tuesday 15" survives the digit-count gate but custom_parse
+        // returns None; extensive=false so external_date_parser isn't tried.
+        let r = try_date_expr(
+            Some("on Tuesday 15"),
+            "%Y-%m-%d",
+            false,
+            &min,
+            &max,
+        );
+        assert_eq!(r, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // pattern_search — defensive arms
+    // -----------------------------------------------------------------------
+
+    /// rationale: pin `pattern_search`'s `caps.get(1)?` None arm — when
+    /// the pattern has no group 1.
+    #[test]
+    fn pattern_search_returns_none_when_no_match() {
+        use super::super::regex_catalogues::timestamp_pattern;
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        // Text without a timestamp shape returns None.
+        let r = pattern_search("no dates here", timestamp_pattern(), &o);
+        assert_eq!(r, None);
+    }
+
+    /// rationale: pin `pattern_search`'s `is_valid_date == false` arm —
+    /// the candidate parses but falls outside the (min, max) window.
+    #[test]
+    fn pattern_search_rejects_out_of_range_candidate() {
+        use super::super::regex_catalogues::timestamp_pattern;
+        let o = opts("%Y-%m-%d", (2025, 1, 1), (2030, 12, 31));
+        let r = pattern_search("2024-06-15T12:34:56", timestamp_pattern(), &o);
+        assert_eq!(r, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // regex_parse — additional arms
+    // -----------------------------------------------------------------------
+
+    /// rationale: pin `regex_parse`'s American "Month Day, Year" arm
+    /// (lastgroup == "year"). Note: TEXT_MONTHS lookup uses `.lower()
+    /// .strip('.')` so "January" → "january".
+    #[test]
+    fn regex_parse_american_long_form() {
+        let r = regex_parse("January 15, 2024").expect("should match");
+        assert_eq!((r.year, r.month, r.day), (2024, 1, 15));
+    }
+
+    /// rationale: pin `regex_parse`'s month-name table coverage —
+    /// abbreviated forms like "Dec" map through TEXT_MONTHS to month 12.
+    #[test]
+    fn regex_parse_abbreviated_month_form() {
+        let r = regex_parse("15 Dec 2024").expect("should match");
+        assert_eq!(r.month, 12);
+    }
+
+    /// rationale: pin `regex_parse`'s TEXT_MONTHS .lower() arm — German
+    /// "Dezember" with capital D should still resolve via the
+    /// case-insensitive lookup.
+    #[test]
+    fn regex_parse_case_insensitive_month() {
+        let r = regex_parse("15 Dezember 2024").expect("should match");
+        assert_eq!(r.month, 12);
+    }
+
+    // -----------------------------------------------------------------------
+    // json_search — additional shapes
+    // -----------------------------------------------------------------------
+
+    /// rationale: pin `json_search`'s "no date keyword" skip arm — the
+    /// script content lacks `"date` substring entirely so it's skipped.
+    #[test]
+    fn json_search_skips_script_without_date_substring() {
+        let html = r#"<html><head>
+            <script type="application/ld+json">
+            {"foo": "bar"}
+            </script>
+        </head><body></body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html root");
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(json_search(&root, &o), None);
+    }
+
+    /// rationale: pin `json_search`'s "no script tag" empty-vec arm.
+    #[test]
+    fn json_search_returns_none_when_no_script_tag() {
+        let html = "<html><head></head><body><p>nothing</p></body></html>";
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html root");
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(json_search(&root, &o), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // idiosyncrasies_search — additional defensive arms
+    // -----------------------------------------------------------------------
+
+    /// rationale: pin `idiosyncrasies_search`'s `parts.len() < 3` early
+    /// return — a text fragment that matches the regex but produces fewer
+    /// than 3 non-empty groups.
+    /// Note: TEXT_PATTERNS always yields 3 groups when it matches; the
+    /// negative shape is just "no match at all" already covered. This
+    /// test pins the `is_valid_date == false` rejection arm instead.
+    #[test]
+    fn idiosyncrasies_search_rejects_out_of_range_date() {
+        // 1980-06-15 — below the configured min of 1995.
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        let r = idiosyncrasies_search("Datum: 15.06.1980", &o);
+        assert_eq!(r, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // img_search — defensive
+    // -----------------------------------------------------------------------
+
+    /// rationale: pin `img_search`'s og:image without dated URL arm —
+    /// meta tag exists, content has no date → returns None.
+    #[test]
+    fn img_search_returns_none_when_url_has_no_date() {
+        let html = r#"<html><head>
+            <meta property="og:image" content="https://example.com/img/photo.jpg">
+        </head><body></body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html root");
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(img_search(&root, &o), None);
+    }
+
+    /// rationale: pin `img_search`'s missing-`content` attribute arm.
+    /// Note: the xpath requires `[@content]` so a meta WITHOUT content
+    /// doesn't match — the `into_iter().next()` returns None.
+    #[test]
+    fn img_search_returns_none_when_content_attr_missing() {
+        let html = r#"<html><head>
+            <meta property="og:image">
+        </head><body></body></html>"#;
+        let dom = Dom::parse(html);
+        let root = dom.root_element().expect("html root");
+        let o = opts("%Y-%m-%d", (1995, 1, 1), (2030, 12, 31));
+        assert_eq!(img_search(&root, &o), None);
+    }
 }

@@ -1110,4 +1110,42 @@ mod tests {
         assert!(simple_pattern_post_filter("foo", 0));
         assert!(simple_pattern_post_filter(" 2020", 1));
     }
+
+    // -------------------------------------------------------------------
+    // OnceLock re-entry coverage — every catalogue's "already initialised"
+    // arm fires on the second call.
+    // -------------------------------------------------------------------
+
+    /// rationale: pin the `OnceLock::get_or_init` "already initialised"
+    /// arm by invoking the same accessor twice and confirming the same
+    /// `&'static Regex` is returned (pointer-equality).
+    #[test]
+    fn text_months_get_or_init_is_idempotent() {
+        let a = text_months() as *const _;
+        let b = text_months() as *const _;
+        assert!(std::ptr::eq(a, b));
+    }
+
+    /// rationale: same as above but on a Regex catalogue (the dominant
+    /// shape — most public helpers use Regex).
+    #[test]
+    fn ymd_pattern_get_or_init_is_idempotent() {
+        let a = ymd_pattern() as *const _;
+        let b = ymd_pattern() as *const _;
+        assert!(std::ptr::eq(a, b));
+    }
+
+    /// rationale: pin the post_filter's internal `LB` OnceLock — second
+    /// invocation reuses the same static regex. We can't ptr-cmp from
+    /// outside, so we assert the observable contract: two back-to-back
+    /// calls with the same input return the same boolean.
+    #[test]
+    fn simple_pattern_post_filter_repeated_calls_are_consistent() {
+        let haystack = "w3.org 2020 ";
+        let m = simple_pattern().find(haystack).unwrap();
+        let first = simple_pattern_post_filter(haystack, m.start());
+        let second = simple_pattern_post_filter(haystack, m.start());
+        assert_eq!(first, second);
+        assert!(!first); // w3.org prefix → drop.
+    }
 }
