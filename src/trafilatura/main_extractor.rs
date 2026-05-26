@@ -1670,7 +1670,7 @@ pub fn recover_wild_text(
     //
     // M5 Stage 6a: see `_extract` above for the rationale. In Python's
     // lxml the element's `tail` attribute is intrinsic so
-    // `result_body.extend([el])` moves it along; mdrcel's tail is a
+    // `result_body.extend([el])` moves it along; readex's tail is a
     // sibling Text node in the OLD parent, so `append_child` leaves it
     // behind. Re-attach when the returned element shares the source's
     // tag (same-tag heuristic — see _extract's comment for the wrapped-
@@ -1875,7 +1875,7 @@ pub fn _extract(tree: &NodeRef, options: &Options) -> (NodeRef, String, HashSet<
             // M5 Stage 6a: in Python/lxml, `tail` is intrinsic to the
             // element node — `result_body.append(el)`
             // (main_extractor.py:608) moves the tail along with the
-            // element. mdrcel models tail as sibling Text nodes in the
+            // element. readex models tail as sibling Text nodes in the
             // OLD parent, so `append_child` leaves them behind.
             //
             // We capture `tail(&e)` AFTER handle_textelem (which may have
@@ -4002,7 +4002,7 @@ mod tests {
         // `<code>` close (and before the closing `| `), so `sanitize`
         // breaks the cell onto its own line in the rendered markdown table.
         //
-        // mdrcel previously trimmed whitespace-only tails before recovering
+        // readex previously trimmed whitespace-only tails before recovering
         // them onto the cell-child (Stage 6d gate, avoiding a d71ec714
         // regression where the `\n` BETWEEN two `<p>` siblings would leak).
         // This test pins the refined gate: whitespace-only tails on the

@@ -53,7 +53,7 @@ pub const JS_SPACE_CLASS: &str = "\u{0009}\u{000A}\u{000B}\u{000C}\u{000D}\u{002
 /// compile-time-constant patterns authored here; a failure is a port bug, not
 /// a runtime input error — failing loudly at first use is correct).
 fn compile(pattern: &str) -> Regex {
-    Regex::new(pattern).unwrap_or_else(|e| panic!("mdrcel regexps: bad pattern {pattern:?}: {e}"))
+    Regex::new(pattern).unwrap_or_else(|e| panic!("readex regexps: bad pattern {pattern:?}: {e}"))
 }
 
 /// `REGEXPS.unlikelyCandidates` (`Readability.js:140-141`, `/…/i`).

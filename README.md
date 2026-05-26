@@ -111,7 +111,7 @@ JavaScript projects are the differential-test oracles, not vendored code.
 | Function | Purpose |
 | --- | --- |
 | [`extract`] | Default extraction. Returns an [`Extracted`] with title, body text, canonical URL, language, byline, excerpt, site name, published time, categories, tags, image, license, hostname, and (optionally) sanitised HTML. |
-| [`extract_with`] | Same as `extract` but lets you pass an [`Options`] to opt into sanitised HTML output, set a minimum word-count threshold, or request a YAML metadata header. |
+| [`extract_with`] | `extract(html, base_url)` plus a third `&Options` parameter (so `extract_with(html, base_url, &Options::default())` is exactly equivalent to `extract(html, base_url)`). Lets you opt into sanitised HTML output, set a minimum word-count threshold, or request a YAML metadata header. |
 | [`extract_to_markdown`] | Body as Markdown — Trafilatura's `output_format="markdown"`. |
 | [`extract_to_txt`] | Plain-text body — Trafilatura's `output_format="txt"`. |
 | `extract_to_json` / `extract_to_csv` / `extract_to_xml` / `extract_to_tei` | Structured output formats. |

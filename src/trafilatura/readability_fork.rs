@@ -565,7 +565,7 @@ impl Document {
     ///
     /// # Faithful retry semantics (M6 Stage 2 fix)
     ///
-    /// Earlier versions of mdrcel's readability_fork re-parsed `self.html`
+    /// Earlier versions of readex's readability_fork re-parsed `self.html`
     /// from scratch at the top of every retry iteration, applying M2 Mozilla
     /// Readability's flag-sieve pattern (HLD §m-3) to Trafilatura's
     /// `readability_lxml`. That was an anti-inversion violation: Python's
@@ -580,11 +580,11 @@ impl Document {
     /// listing, 0 candidates either way) is exactly the substantive content
     /// the user wants.
     ///
-    /// With re-parse-per-attempt, mdrcel's lenient attempt found 2 candidates
+    /// With re-parse-per-attempt, readex's lenient attempt found 2 candidates
     /// (best score 4.73 on a footer div) and returned a 343-char article that
     /// `sanitize` then crushed to 11 chars — bypassing Python's `<body>`
     /// rescue path. The PBS fixture (`e1106c5e26712078.html`) exposed this:
-    /// Python emits 20,834-byte "Latest Stories" sidebar; mdrcel emitted
+    /// Python emits 20,834-byte "Latest Stories" sidebar; readex emitted
     /// nothing and the cascade fell through to lower-quality fallbacks.
     pub fn summary(&mut self) -> Option<NodeRef> {
         // readability_lxml.py:131-132 — drop every script/style subtree
@@ -784,7 +784,7 @@ impl Document {
     ///    tail into a fresh `<p>` next-sibling (reverse-iterated so
     ///    insertions do not shift yet-to-be-processed indices), and
     ///    `drop_tree` every `<br>` child (lxml's `drop_tree` re-anchors
-    ///    the tail onto the previous sibling / parent text — mdrcel's
+    ///    the tail onto the previous sibling / parent text — readex's
     ///    `delete_with_tail_preserve_free` mirrors that semantic).
     ///    Ported in M10 Phase 2C per `2026.05.23 - HLD - M10 Phase 2C
     ///    rescue pass.md`. The rescue pass IS load-bearing for scoring:
@@ -2251,7 +2251,7 @@ pub fn bare_extraction_with_cascade(
     //         postbody, temp_text, len_text = baseline(deepcopy(tree_backup))
     //
     // M5 Stage 6c: this was the missing limb of `trafilatura_sequence` in
-    // mdrcel. Without it, the link-only `<p>` cluster (example.com,
+    // readex. Without it, the link-only `<p>` cluster (example.com,
     // `0f115db062b7c0dd.html` / `8198d1bac40a1033.html`) saw `_extract` +
     // `recover_wild_text` return only the first paragraph (101 chars,
     // below the 250 default `min_extracted_size`), the cascade arbiter

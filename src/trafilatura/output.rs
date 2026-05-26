@@ -818,7 +818,7 @@ pub(crate) fn xmltotxt(xmloutput: Option<&NodeRef>, include_formatting: bool) ->
 /// `sanitize` over its `.text` and `.tail`, computing the `preserve_space` /
 /// `trailing_space` knobs from the `SPACING_PROTECTED` / `FORMATTING_PROTECTED`
 /// tag sets (utils.py:79-80, 323-324). Python runs this at `xml.py:167`
-/// between `build_xml_output` and the pretty-printing reparse; mdrcel had
+/// between `build_xml_output` and the pretty-printing reparse; readex had
 /// deferred it (the `serialize_xml_pretty` doc noted "the sanitize_tree
 /// behaviour is deferred"), which left raw source whitespace (newlines, runs of
 /// spaces) inside element text on the XML path. This restores it.
@@ -1195,7 +1195,7 @@ fn unescape_html(s: &str) -> String {
             // CPython's `html.entities.html5` recognises `ddagger;` as a
             // case-insensitive alias for `Dagger;` (both decode to
             // U+2021 DOUBLE DAGGER). HTML5 spec permits both spellings.
-            // Without this row mdrcel passes `&ddagger;` through verbatim
+            // Without this row readex passes `&ddagger;` through verbatim
             // (e.g. surfaced on M5 fixture 86df4d2e's HTML-entity
             // reference table) while Python's `unescape` decodes it.
             "ddagger" => Some("\u{2021}".to_string()),
@@ -1518,13 +1518,13 @@ fn json_str(s: &str) -> String {
 /// `options.with_metadata` is `false`, so every metadata-derived CSV column
 /// (`url`, `id`, `fingerprint`, `hostname`, `title`, `image`, `date`,
 /// `license`, `pagetype`) renders as the `null` token — only the body-derived
-/// `text` / `comments` columns carry content. mdrcel has no separate
+/// `text` / `comments` columns carry content. readex has no separate
 /// "empty Document" carrier, so we mirror the same observable behaviour with
 /// a `with_metadata` flag: when `false`, the metadata columns are forced to
 /// `null` regardless of what `doc.metadata` holds. This matches how
 /// [`build_json_output`] honours the same flag.
 ///
-/// The `fingerprint` column is *always* `null` here (mdrcel deliberately does
+/// The `fingerprint` column is *always* `null` here (readex deliberately does
 /// not compute Python's blake2b `content_fingerprint`; see the CSV gate's
 /// `wrk_docs/m7-deferred/fingerprint-blake2b.md` ADR). Python emits a real
 /// 16-char hex fingerprint even with `with_metadata=false`, so the csv gate

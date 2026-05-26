@@ -822,7 +822,7 @@ fn extract_title(doc: &Dom) -> Option<String> {
 /// the discard-prune (was skipped): it removes comment/sidebar/title/date/
 /// `//time`/`//figure` blocks before AUTHOR_XPATHS runs, so spurious matches
 /// (a headline or nav text mistaken for a byline) are pruned — Python returns
-/// no author there, and mdrcel now matches (5f27add4, eceb9608). We `deep_clone`
+/// no author there, and readex now matches (5f27add4, eceb9608). We `deep_clone`
 /// the body so the shared metadata `Dom` (reused for categories/tags/license)
 /// is not mutated.
 fn extract_author(doc: &Dom, blacklist: &[String]) -> Option<String> {
@@ -859,7 +859,7 @@ fn extract_description(_doc: &Dom) -> Option<String> {
 /// Python's `set_date_params` (`settings.py:202`) computes
 /// `datetime.now().strftime("%Y-%m-%d")` — *local* civil date — and uses it
 /// for BOTH `filedate` (`metadata.py:586`) and htmldate's `max_date` upper
-/// bound (`metadata.py:546`). mdrcel is otherwise fully deterministic, but
+/// bound (`metadata.py:546`). readex is otherwise fully deterministic, but
 /// reproducing Python's "today" is the ONLY way to byte-match the
 /// `<date type="download">` filedate and to reject post-today garbage dates in
 /// htmldate. We compute the UTC civil date from the system clock via Howard
@@ -867,7 +867,7 @@ fn extract_description(_doc: &Dom) -> Option<String> {
 ///
 /// Caveat (documented in the M8 journal): we use UTC, Python uses local. On
 /// this UTC+1 host the two civil dates agree except in the ~1h window around
-/// local midnight (UTC 23:00–00:00), where mdrcel would be one day behind. The
+/// local midnight (UTC 23:00–00:00), where readex would be one day behind. The
 /// live TEI gate runs both sides within milliseconds, so this only flakes if a
 /// run straddles that window — an accepted residual versus adding a timezone
 /// dependency.

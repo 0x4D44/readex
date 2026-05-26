@@ -1014,7 +1014,7 @@ pub fn replace_child(parent: &NodeRef, new_node: &NodeRef, old_node: &NodeRef) {
 ///
 /// In lxml, `.tail` is an intrinsic attribute of the element node, so
 /// `parent.append(el)` / `parent.insert(i, el)` / `parent.extend([...])`
-/// move the element **together with its tail**. mdrcel models a tail as a
+/// move the element **together with its tail**. readex models a tail as a
 /// *separate* run of following `Text` siblings ([`tail`] / [`set_tail`]), so
 /// the naive port `remove(child); append_child(new_parent, child)` MOVES the
 /// element but LEAVES its tail Text-node(s) orphaned in the old parent —
@@ -2115,7 +2115,7 @@ mod tests {
     fn parse_strips_comment_tail_into_element_text() {
         // The load-bearing tail-merge case (M5 fixture 859b46bf108e3db4.html,
         // byte 383): `<p>foo<!-- -->bar</p>` -- lxml's `<p>.text` reads
-        // `"foobar"`, mdrcel must agree. Verified via `element_text`, which
+        // `"foobar"`, readex must agree. Verified via `element_text`, which
         // concatenates the leading Text run.
         let dom = Dom::parse("<p>foo<!-- -->bar</p>");
         let p = get_elements_by_tag_name(&dom.body().unwrap(), "p")
@@ -2575,7 +2575,7 @@ mod tests {
     //
     // Every expected value is hand-derived from the lxml `.tail` definition
     // (text content of the next-sibling Text node(s), terminated by the first
-    // non-Text sibling) + html5ever's spec tree construction. The mdrcel
+    // non-Text sibling) + html5ever's spec tree construction. The readex
     // facade returns `None` where lxml returns `""`; the brief documents
     // that callers treat the two as equivalent.
 

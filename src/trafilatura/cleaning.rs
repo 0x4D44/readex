@@ -427,7 +427,7 @@ pub fn prune_html(tree: &NodeRef, focus: Focus) {
         // **Parser-equivalence note (Stage 1b finding):** Trafilatura parses
         // HTML via `load_html` -> `lxml.html.HTMLParser(remove_comments=True,
         // remove_pis=True)` (`utils.py:70`). Comments and PIs are stripped
-        // BEFORE `prune_html` sees the tree. mdrcel uses html5ever which
+        // BEFORE `prune_html` sees the tree. readex uses html5ever which
         // preserves comments/PIs, so to match Python's `not(node())` we
         // must treat Comment / ProcessingInstruction children as if absent.
         // Text-node children (including whitespace-only text) DO count as

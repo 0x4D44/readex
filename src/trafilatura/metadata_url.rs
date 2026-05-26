@@ -444,7 +444,7 @@ pub(crate) fn get_base_url(url: &str) -> Option<String> {
 ///
 /// # Hand-rolled scope
 ///
-/// The `url` crate is NOT a dependency of `mdrcel` (Cargo.toml lists only
+/// The `url` crate is NOT a dependency of `readex` (Cargo.toml lists only
 /// `html5ever` / `markup5ever_rcdom` / `tendril` / `regex` / `serde_json`;
 /// DEC-3 "deferred until the algorithm needs it" — relative-URL resolution
 /// at `convert_tags`'s anchor branch is too small a surface to justify a

@@ -6,6 +6,23 @@ as a comment in the project's `Cargo.toml` manifest and is preserved verbatim so
 the institutional memory is not lost. Future releases (0.19.1+) will be recorded
 in standard Markdown sections at the top of this file as they ship.
 
+## 0.19.1 — 2026-05-26 — cosmetic cleanup
+
+- `src/**/*.rs` rustdoc references renamed `mdrcel` → `readex`. The
+  0.19.0 publish missed these, so docs.rs rendered the crate-level
+  header as *"`mdrcel` — main-content extraction for arbitrary HTML"*.
+  HLD filename references (`2026.05.19 - HLD - mdrcel Trafilatura
+  Port (M3)` and similar) are preserved verbatim because they point
+  to actual files in `wrk_docs/` with those literal names.
+- `Cargo.toml` `exclude` list now also lists `/.publish-prep/` for
+  defense in depth. The directory was already gitignored so nothing
+  ever leaked, but the package-level exclude is the proper safety net.
+- README `extract_with` cheat-sheet row now spells out the signature
+  explicitly (`extract(html, base_url)` plus a third `&Options`
+  parameter) rather than asking the reader to infer it.
+- No source-code behaviour change. No public API change. No new
+  dependency.
+
 ## 0.19.0 — 2026-05-25 — first crates.io release
 
 - Renamed crate from `mdrcel` to `readex`.

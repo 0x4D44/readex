@@ -52,7 +52,7 @@
 //!   crypto crate, and the M3 Stage 8 docs flagged simhash as
 //!   non-load-bearing on the `bare_extraction` path: "used only by
 //!   `meta.py:11,29` (which clears the LRU cache)". No consumer in
-//!   mdrcel currently depends on byte-identity with Python's simhash
+//!   readex currently depends on byte-identity with Python's simhash
 //!   output.
 //! - `sample_tokens` + `generate_bow_hash` (lines 35-55): `sample_tokens`
 //!   is ported (Simhash depends on it); `generate_bow_hash` is **NOT**
@@ -556,7 +556,7 @@ pub fn sample_tokens(inputstring: &str, length: usize) -> Vec<String> {
 /// alternative is pulling in `blake2 = "0.10"` (or the `blake2b_simd`
 /// crate) for a single function that is **not on the bare_extraction
 /// hot path** (the M3 Stage 8 docs flagged this: simhash is only used
-/// by `meta.py` to clear the LRU cache, not consumed by any mdrcel
+/// by `meta.py` to clear the LRU cache, not consumed by any readex
 /// extractor today). FNV-1a 64-bit is the smallest-change-that-works.
 ///
 /// # Constants
@@ -639,7 +639,7 @@ impl Simhash {
     }
 
     /// Compute a Charikar simhash with an explicit bit length.
-    /// `length` is clamped to 64 (the only width mdrcel needs and the
+    /// `length` is clamped to 64 (the only width readex needs and the
     /// only width Python's call sites use).
     ///
     /// **Source line-cite:** `deduplication.py:62-106`
@@ -871,7 +871,7 @@ fn strip_extension(s: &str) -> String {
 ///
 /// 1. `lru_cache(maxsize=1024)` — Python memoises. Rust port does NOT
 ///    memoise: the function is pure, deterministic, and called rarely
-///    (only by metadata-pipeline code which mdrcel doesn't drive yet).
+///    (only by metadata-pipeline code which readex doesn't drive yet).
 ///    Adding a global memo would need a `Mutex<HashMap>` for one call
 ///    site that doesn't exist yet — premature.
 /// 2. The default `threshold` is 0.5 ([`IS_SIMILAR_DOMAIN_DEFAULT_THRESHOLD`]).

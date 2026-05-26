@@ -3,7 +3,7 @@ members = ["benchmark"]
 
 [package]
 name = "readex"
-version = "0.19.0"
+version = "0.19.1"
 edition = "2024"
 rust-version = "1.85"
 authors = ["Martin Davidson <martingdavidson@gmail.com>"]
@@ -34,6 +34,7 @@ exclude = [
     "/examples/",
     "/tests/",
     "/.claude/",
+    "/.publish-prep/",
     "*.log",
 ]
 

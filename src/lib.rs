@@ -1,6 +1,6 @@
-//! `mdrcel` — main-content extraction for arbitrary HTML.
+//! `readex` — main-content extraction for arbitrary HTML.
 //!
-//! `mdrcel` takes a `&str` of HTML plus an optional base URL and returns the
+//! `readex` takes a `&str` of HTML plus an optional base URL and returns the
 //! page's main textual content together with a little metadata. It performs
 //! **no** network I/O, **no** JavaScript rendering, and **no** encoding
 //! detection — the caller owns all of that (parent brief
@@ -691,7 +691,7 @@ pub fn extract_to_markdown(
     // `Element("body")` whenever `options.comments` is true — which is the
     // default. The empty body's `xmltotxt` returns `""`, so the branch is
     // equivalent to `(returnstring + "\n").strip()` for the default
-    // extraction. mdrcel does not currently extract a commentsbody (always
+    // extraction. readex does not currently extract a commentsbody (always
     // None in our cascade), but Python's default behaviour always strips,
     // so to match `extract(output_format='markdown')` byte-for-byte we
     // mirror the strip path. This drops the stray trailing `\n` that
@@ -805,7 +805,7 @@ pub fn extract_to_txt(
     let mut returnstring = format!("{header}{body_text}");
 
     // core.py:95-96 — commentsbody strip path (see extract_to_markdown for
-    // the full rationale; mdrcel's cascade never sets commentsbody, but the
+    // the full rationale; readex's cascade never sets commentsbody, but the
     // default Python path always strips, so we mirror it for byte parity).
     returnstring = format!("{returnstring}\n").trim().to_string();
 
@@ -1915,7 +1915,7 @@ mod tests {
         // include_formatting=true unconditionally on the markdown formatter
         // — the paragraph emits the U+2424 spacing hack which `sanitize`
         // strips. Per Python's `core.py:95-96` commentsbody-strip branch
-        // (mdrcel mirrors it unconditionally because Python's default
+        // (readex mirrors it unconditionally because Python's default
         // `options.comments=True` always sets `commentsbody` to a non-None
         // Element), the trailing `\n` is stripped, leaving the single
         // paragraph as a single line with no embedded newlines.
@@ -2548,7 +2548,7 @@ mod tests {
     /// Brief #2 — Output is a serialisable XML byte stream (the only way to
     /// "parse back" cheaply is to re-render via the same path; what we
     /// actually verify is that the byte stream is well-formed enough to
-    /// re-pass through mdrcel's HTML5 parser without panic).
+    /// re-pass through readex's HTML5 parser without panic).
     #[test]
     fn extract_to_xml_output_is_parseable_html_subset() {
         use crate::readability::dom::Dom;
